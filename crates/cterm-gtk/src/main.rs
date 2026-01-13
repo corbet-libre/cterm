@@ -19,7 +19,11 @@ use std::path::PathBuf;
 
 /// Command-line arguments for cterm
 #[derive(Parser, Debug)]
-#[command(name = "cterm", version, about = "A high-performance terminal emulator")]
+#[command(
+    name = "cterm",
+    version,
+    about = "A high-performance terminal emulator"
+)]
 pub struct Args {
     /// Execute a command instead of the default shell
     #[arg(short = 'e', long = "execute")]

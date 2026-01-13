@@ -77,8 +77,8 @@ impl Updater {
     /// * `repo` - GitHub repository in "owner/repo" format
     /// * `current_version` - Current version string
     pub fn new(repo: &str, current_version: &str) -> Result<Self, UpdateError> {
-        let version = Version::parse(current_version)
-            .map_err(|e| UpdateError::Version(e.to_string()))?;
+        let version =
+            Version::parse(current_version).map_err(|e| UpdateError::Version(e.to_string()))?;
 
         let client = reqwest::Client::builder()
             .user_agent(format!("cterm/{}", current_version))
@@ -98,7 +98,8 @@ impl Updater {
     pub async fn check_for_update(&self) -> Result<Option<UpdateInfo>, UpdateError> {
         let url = format!("https://api.github.com/repos/{}/releases/latest", self.repo);
 
-        let response = self.client
+        let response = self
+            .client
             .get(&url)
             .header("Accept", "application/vnd.github.v3+json")
             .send()
@@ -110,7 +111,9 @@ impl Updater {
 
         if response.status() == reqwest::StatusCode::FORBIDDEN {
             // Check if it's rate limiting
-            if response.headers().get("X-RateLimit-Remaining")
+            if response
+                .headers()
+                .get("X-RateLimit-Remaining")
                 .and_then(|v| v.to_str().ok())
                 .map(|v| v == "0")
                 .unwrap_or(false)
@@ -119,7 +122,9 @@ impl Updater {
             }
         }
 
-        let release: Value = response.json().await
+        let release: Value = response
+            .json()
+            .await
             .map_err(|e| UpdateError::Json(e.to_string()))?;
 
         self.parse_release(&release)
@@ -134,8 +139,8 @@ impl Updater {
         // Strip 'v' prefix if present
         let version_str = tag_name.strip_prefix('v').unwrap_or(tag_name);
 
-        let version = Version::parse(version_str)
-            .map_err(|e| UpdateError::Version(e.to_string()))?;
+        let version =
+            Version::parse(version_str).map_err(|e| UpdateError::Version(e.to_string()))?;
 
         // Check if this is newer than current
         if version <= self.current_version {
@@ -148,19 +153,11 @@ impl Updater {
         // Look for checksum file
         let checksum_url = self.find_checksum_asset(release);
 
-        let release_notes = release["body"]
-            .as_str()
-            .unwrap_or("")
-            .to_string();
+        let release_notes = release["body"].as_str().unwrap_or("").to_string();
 
-        let name = release["name"]
-            .as_str()
-            .unwrap_or(tag_name)
-            .to_string();
+        let name = release["name"].as_str().unwrap_or(tag_name).to_string();
 
-        let prerelease = release["prerelease"]
-            .as_bool()
-            .unwrap_or(false);
+        let prerelease = release["prerelease"].as_bool().unwrap_or(false);
 
         Ok(Some(UpdateInfo {
             version: version_str.to_string(),
@@ -192,9 +189,7 @@ impl Updater {
                     .ok_or(UpdateError::NoAssetFound)?
                     .to_string();
 
-                let size = asset["size"]
-                    .as_u64()
-                    .unwrap_or(0);
+                let size = asset["size"].as_u64().unwrap_or(0);
 
                 return Ok((url, size));
             }
@@ -261,14 +256,9 @@ impl Updater {
     where
         F: FnMut(u64, u64),
     {
-        let response = self.client
-            .get(&info.download_url)
-            .send()
-            .await?;
+        let response = self.client.get(&info.download_url).send().await?;
 
-        let total_size = response
-            .content_length()
-            .unwrap_or(info.size);
+        let total_size = response.content_length().unwrap_or(info.size);
 
         // Create temp file
         let temp_dir = std::env::temp_dir();
@@ -318,10 +308,7 @@ impl Updater {
         };
 
         // Download checksum file
-        let response = self.client
-            .get(checksum_url)
-            .send()
-            .await?;
+        let response = self.client.get(checksum_url).send().await?;
 
         let checksum_text = response.text().await?;
 

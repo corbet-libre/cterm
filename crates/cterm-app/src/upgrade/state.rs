@@ -5,9 +5,9 @@
 
 use serde::{Deserialize, Serialize};
 
+use cterm_core::cell::CellStyle;
 use cterm_core::grid::{Grid, Row};
 use cterm_core::screen::{Cursor, CursorStyle, MouseMode, ScrollRegion, TerminalModes};
-use cterm_core::cell::CellStyle;
 
 /// Complete upgrade state for all windows
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -225,7 +225,8 @@ mod tests {
         };
 
         let bytes = bincode::serialize(&terminal).expect("Failed to serialize");
-        let restored: TerminalUpgradeState = bincode::deserialize(&bytes).expect("Failed to deserialize");
+        let restored: TerminalUpgradeState =
+            bincode::deserialize(&bytes).expect("Failed to deserialize");
 
         assert_eq!(restored.cols, 120);
         assert_eq!(restored.rows, 40);

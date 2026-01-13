@@ -265,10 +265,7 @@ impl NativePty {
         libc::setenv(term.as_ptr(), term_value.as_ptr(), 1);
 
         // Determine the shell to execute
-        let shell = config
-            .shell
-            .clone()
-            .unwrap_or_else(get_default_shell);
+        let shell = config.shell.clone().unwrap_or_else(get_default_shell);
 
         let shell_cstring = match CString::new(shell.as_str()) {
             Ok(s) => s,
@@ -279,11 +276,9 @@ impl NativePty {
         let mut args_cstrings: Vec<CString> = Vec::new();
 
         // Shell name as argv[0]
-        let shell_name = shell
-            .rsplit('/')
-            .next()
-            .unwrap_or(&shell);
-        args_cstrings.push(CString::new(shell_name).unwrap_or_else(|_| CString::new("sh").unwrap()));
+        let shell_name = shell.rsplit('/').next().unwrap_or(&shell);
+        args_cstrings
+            .push(CString::new(shell_name).unwrap_or_else(|_| CString::new("sh").unwrap()));
 
         // Add additional arguments
         for arg in &config.args {

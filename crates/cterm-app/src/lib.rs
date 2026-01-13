@@ -12,6 +12,6 @@ pub mod upgrade;
 pub use config::{load_config, save_config, Config};
 pub use session::{Session, TabState, WindowState};
 pub use shortcuts::ShortcutManager;
-pub use upgrade::{UpdateError, UpdateInfo, Updater, UpgradeState};
 #[cfg(unix)]
 pub use upgrade::{execute_upgrade, receive_upgrade, UpgradeError};
+pub use upgrade::{UpdateError, UpdateInfo, Updater, UpgradeState};

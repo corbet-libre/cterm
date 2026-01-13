@@ -113,11 +113,7 @@ thread_local! {
 }
 
 /// Reconstruct windows from the upgrade state
-fn reconstruct_windows(
-    _app: &gtk4::Application,
-    state: UpgradeState,
-    fds: Vec<RawFd>,
-) {
+fn reconstruct_windows(_app: &gtk4::Application, state: UpgradeState, fds: Vec<RawFd>) {
     log::info!("Reconstructing {} windows", state.windows.len());
 
     for (window_idx, window_state) in state.windows.iter().enumerate() {

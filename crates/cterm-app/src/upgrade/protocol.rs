@@ -84,10 +84,14 @@ pub fn execute_upgrade(
     log::info!("Upgrade socket created at {:?}", socket_path);
 
     // Serialize the state
-    let state_bytes = bincode::serialize(state)
-        .map_err(|e| UpgradeError::Serialization(e.to_string()))?;
+    let state_bytes =
+        bincode::serialize(state).map_err(|e| UpgradeError::Serialization(e.to_string()))?;
 
-    log::info!("State serialized: {} bytes, {} FDs", state_bytes.len(), fds.len());
+    log::info!(
+        "State serialized: {} bytes, {} FDs",
+        state_bytes.len(),
+        fds.len()
+    );
 
     // Spawn the new process
     let child = Command::new(new_binary)
@@ -102,7 +106,8 @@ pub fn execute_upgrade(
     listener.set_nonblocking(false)?;
 
     // Accept the connection from the new process
-    let (mut stream, _) = listener.accept()
+    let (mut stream, _) = listener
+        .accept()
         .map_err(|e| UpgradeError::Socket(format!("Failed to accept connection: {}", e)))?;
 
     log::info!("Connection accepted from new process");
@@ -114,7 +119,8 @@ pub fn execute_upgrade(
 
     // Wait for acknowledgment
     let mut ack = [0u8; 1];
-    stream.read_exact(&mut ack)
+    stream
+        .read_exact(&mut ack)
         .map_err(|_| UpgradeError::AckTimeout)?;
 
     if ack[0] != 1 {
@@ -154,7 +160,11 @@ pub fn receive_upgrade(socket_path: &Path) -> Result<(UpgradeState, Vec<RawFd>),
     let mut buf = vec![0u8; MAX_STATE_SIZE];
     let (fds, data_len) = fd_passing::recv_fds(&stream, MAX_FDS, &mut buf)?;
 
-    log::info!("Received {} bytes of state data and {} FDs", data_len, fds.len());
+    log::info!(
+        "Received {} bytes of state data and {} FDs",
+        data_len,
+        fds.len()
+    );
 
     // Deserialize the state
     let state: UpgradeState = bincode::deserialize(&buf[..data_len])

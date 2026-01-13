@@ -158,12 +158,10 @@ pub fn show_update_dialog(parent: &impl IsA<Window>) {
                                 let path = path.clone();
                                 move || {
                                     *downloaded_path.borrow_mut() = Some(path.clone());
-                                    *state.borrow_mut() =
-                                        UpdateState::Downloaded { path, info };
+                                    *state.borrow_mut() = UpdateState::Downloaded { path, info };
                                     action_btn.set_label("Install and Restart");
                                     action_btn.set_sensitive(true);
-                                    status_label
-                                        .set_text("Download complete. Ready to install.");
+                                    status_label.set_text("Download complete. Ready to install.");
                                 }
                             });
                         }

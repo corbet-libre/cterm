@@ -9,14 +9,12 @@
 //! - Passing PTY file descriptors to the new process
 //! - Reconstructing windows and tabs in the new process
 
-mod state;
 #[cfg(unix)]
 mod protocol;
+mod state;
 mod updater;
 
-pub use state::{
-    TabUpgradeState, TerminalUpgradeState, UpgradeState, WindowUpgradeState,
-};
 #[cfg(unix)]
 pub use protocol::{execute_upgrade, receive_upgrade, UpgradeError, MAX_FDS, MAX_STATE_SIZE};
+pub use state::{TabUpgradeState, TerminalUpgradeState, UpgradeState, WindowUpgradeState};
 pub use updater::{UpdateError, UpdateInfo, Updater};
