@@ -5,10 +5,11 @@
 
 use crate::cell::{Cell, CellStyle};
 use crate::grid::{Grid, Row};
+use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 
 /// Configuration for the screen
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ScreenConfig {
     /// Maximum scrollback lines (0 = no scrollback)
     pub scrollback_lines: usize,
@@ -23,7 +24,7 @@ impl Default for ScreenConfig {
 }
 
 /// Cursor position and state
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Cursor {
     /// Column position (0-indexed)
     pub col: usize,
@@ -38,7 +39,7 @@ pub struct Cursor {
 }
 
 /// Cursor shape style
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CursorStyle {
     #[default]
     Block,
@@ -47,7 +48,7 @@ pub enum CursorStyle {
 }
 
 /// Scroll region bounds
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct ScrollRegion {
     pub top: usize,
     pub bottom: usize,
@@ -60,7 +61,7 @@ impl ScrollRegion {
 }
 
 /// Terminal modes that affect behavior
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct TerminalModes {
     /// Application cursor keys mode (DECCKM)
     pub application_cursor: bool,
@@ -87,7 +88,7 @@ pub struct TerminalModes {
 }
 
 /// Mouse reporting modes
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum MouseMode {
     #[default]
     None,
@@ -102,7 +103,7 @@ pub enum MouseMode {
 }
 
 /// Clipboard selection type for OSC 52
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ClipboardSelection {
     /// System clipboard (c)
     Clipboard,
@@ -113,7 +114,7 @@ pub enum ClipboardSelection {
 }
 
 /// Clipboard operation from OSC 52
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ClipboardOperation {
     /// Set clipboard content (base64 decoded data)
     Set {

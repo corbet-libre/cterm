@@ -4,9 +4,10 @@
 //! access to cells by row and column.
 
 use crate::cell::Cell;
+use serde::{Deserialize, Serialize};
 
 /// A row of cells in the terminal
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Row {
     cells: Vec<Cell>,
     /// Whether this row has been wrapped from the previous row
@@ -95,7 +96,7 @@ impl std::ops::IndexMut<usize> for Row {
 }
 
 /// 2D grid of terminal cells
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Grid {
     rows: Vec<Row>,
     width: usize,

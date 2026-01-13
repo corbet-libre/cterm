@@ -17,7 +17,7 @@ description = "A high-performance, customizable terminal emulator"
 
 [workspace.dependencies]
 # Core dependencies
-bitflags = "2"
+bitflags = { version = "2", features = ["serde"] }
 unicode-width = "0.2"
 log = "0.4"
 env_logger = "0.11"
@@ -32,7 +32,7 @@ portable-pty = "0.8"
 anyhow = "1"
 
 # Config
-serde = { version = "1", features = ["derive"] }
+serde = { version = "1", features = ["derive", "rc"] }
 toml = "0.8"
 directories = "6"
 
@@ -42,6 +42,16 @@ base64 = "0.22"
 # Async
 tokio = { version = "1", features = ["full"] }
 futures = "0.3"
+
+# Upgrade system
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+sha2 = "0.10"
+semver = "1"
+bincode = "1"
+libc = "0.2"
+serde_json = "1"
+futures-util = "0.3"
+clap = { version = "4", features = ["derive"] }
 
 # GTK4
 gtk4 = "0.9"

@@ -8,7 +8,10 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use parking_lot::Mutex;
-use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
+use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty};
+
+// Re-export PtySize for use by native_pty and external consumers
+pub use portable_pty::PtySize;
 use thiserror::Error;
 use tokio::sync::mpsc;
 

@@ -8,7 +8,11 @@
 
 pub mod cell;
 pub mod color;
+#[cfg(unix)]
+pub mod fd_passing;
 pub mod grid;
+#[cfg(unix)]
+pub mod native_pty;
 pub mod parser;
 pub mod pty;
 pub mod screen;

@@ -5,11 +5,12 @@
 
 use crate::color::Color;
 use bitflags::bitflags;
+use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
 bitflags! {
     /// Cell rendering attributes
-    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
     pub struct CellAttrs: u16 {
         /// Bold/bright text
         const BOLD = 1 << 0;
@@ -69,7 +70,7 @@ impl CellAttrs {
 }
 
 /// Hyperlink information (OSC 8)
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Hyperlink {
     /// Unique ID for the hyperlink (optional)
     pub id: Option<String>,
@@ -88,7 +89,7 @@ impl Hyperlink {
 }
 
 /// A single terminal cell
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Cell {
     /// The character in this cell
     pub c: char,
@@ -166,7 +167,7 @@ impl Cell {
 }
 
 /// Current terminal styling state (used when writing new characters)
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct CellStyle {
     pub fg: Color,
     pub bg: Color,

@@ -456,6 +456,16 @@ impl CtermWindow {
             window.add_action(&action);
         }
 
+        // Check for updates action
+        {
+            let window_clone = window.clone();
+            let action = gio::SimpleAction::new("check-updates", None);
+            action.connect_activate(move |_, _| {
+                crate::update_dialog::show_update_dialog(&window_clone);
+            });
+            window.add_action(&action);
+        }
+
         {
             let window_clone = window.clone();
             let action = gio::SimpleAction::new("about", None);

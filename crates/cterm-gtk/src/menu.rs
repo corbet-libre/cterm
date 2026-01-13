@@ -61,6 +61,7 @@ pub fn create_menu_model() -> gio::Menu {
     // Help menu
     let help_menu = gio::Menu::new();
     help_menu.append(Some("Preferences..."), Some("win.preferences"));
+    help_menu.append(Some("Check for Updates..."), Some("win.check-updates"));
     help_menu.append(Some("About"), Some("win.about"));
     menu.append_submenu(Some("Help"), &help_menu);
 
