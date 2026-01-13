@@ -36,6 +36,7 @@ pub struct CtermWindow {
     pub shortcuts: ShortcutManager,
     tabs: Rc<RefCell<Vec<TabEntry>>>,
     next_tab_id: Rc<RefCell<u64>>,
+    #[allow(dead_code)] // Kept to hold reference to menu model
     menu_model: gio::Menu,
 }
 

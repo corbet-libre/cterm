@@ -2,15 +2,12 @@
 //!
 //! Handles terminal sessions, tabs, and window state.
 
-use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
 
-use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 
-use cterm_core::pty::{Pty, PtyConfig, PtyError};
+use cterm_core::pty::{PtyConfig, PtyError};
 use cterm_core::screen::ScreenConfig;
 use cterm_core::term::Terminal;
 

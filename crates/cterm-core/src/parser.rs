@@ -4,9 +4,9 @@
 //! actions that can be applied to the terminal screen.
 
 use std::sync::Arc;
-use vte::{Params, ParamsIter};
+use vte::Params;
 
-use crate::cell::{CellAttrs, CellStyle, Hyperlink};
+use crate::cell::{CellAttrs, Hyperlink};
 use crate::color::{AnsiColor, Color, Rgb};
 use crate::screen::{
     ClearMode, ClipboardOperation, ClipboardSelection, CursorStyle, LineClearMode, MouseMode,
@@ -68,7 +68,7 @@ impl vte::Perform for ScreenPerformer<'_> {
                 self.screen.tab_forward(1);
             }
             // Line Feed (LF), Vertical Tab (VT), Form Feed (FF)
-            0x0a | 0x0b | 0x0c => {
+            0x0a..=0x0c => {
                 self.screen.line_feed();
                 if self.screen.modes.line_feed_mode {
                     self.screen.carriage_return();

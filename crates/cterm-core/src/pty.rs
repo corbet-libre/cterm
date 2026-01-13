@@ -204,8 +204,6 @@ impl Pty {
     /// Send a signal to the child process (Unix only)
     #[cfg(unix)]
     pub fn send_signal(&self, signal: i32) -> Result<(), PtyError> {
-        use std::os::unix::process::ExitStatusExt;
-
         if let Some(pid) = self.process_id() {
             // Use libc to send the signal
             let result = unsafe { libc::kill(pid as i32, signal) };

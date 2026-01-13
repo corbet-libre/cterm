@@ -672,7 +672,7 @@ fn create_shortcuts_preferences(config: &Config) -> (GtkBox, Vec<(String, Entry)
         grid.attach(&name_label, 0, i as i32, 1, 1);
 
         let shortcut_entry = Entry::new();
-        shortcut_entry.set_text(*shortcut);
+        shortcut_entry.set_text(shortcut);
         shortcut_entry.set_hexpand(true);
         grid.attach(&shortcut_entry, 1, i as i32, 1, 1);
 

@@ -168,9 +168,11 @@ pub struct Screen {
 impl Screen {
     /// Create a new screen with the given dimensions
     pub fn new(width: usize, height: usize, config: ScreenConfig) -> Self {
-        let mut modes = TerminalModes::default();
-        modes.auto_wrap = true;
-        modes.show_cursor = true;
+        let modes = TerminalModes {
+            auto_wrap: true,
+            show_cursor: true,
+            ..Default::default()
+        };
 
         Self {
             grid: Grid::new(width, height),

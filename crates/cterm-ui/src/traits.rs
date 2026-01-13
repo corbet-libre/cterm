@@ -3,7 +3,6 @@
 //! These traits define the interface that any UI backend must implement
 //! to work with cterm.
 
-use crate::events::InputEvent;
 use crate::theme::Theme;
 use cterm_core::color::ColorPalette;
 use cterm_core::screen::Screen;

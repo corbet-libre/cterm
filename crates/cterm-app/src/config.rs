@@ -28,7 +28,7 @@ pub enum ConfigError {
 }
 
 /// Main configuration struct
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(default)]
 pub struct Config {
     /// General settings
@@ -41,18 +41,6 @@ pub struct Config {
     pub shortcuts: ShortcutsConfig,
     /// Sticky tabs configuration
     pub sticky_tabs: Vec<StickyTabConfig>,
-}
-
-impl Default for Config {
-    fn default() -> Self {
-        Self {
-            general: GeneralConfig::default(),
-            appearance: AppearanceConfig::default(),
-            tabs: TabsConfig::default(),
-            shortcuts: ShortcutsConfig::default(),
-            sticky_tabs: Vec::new(),
-        }
-    }
 }
 
 /// General settings

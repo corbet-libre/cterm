@@ -16,7 +16,7 @@ use cterm_app::config::Config;
 use cterm_core::cell::CellAttrs;
 use cterm_core::color::{Color, Rgb};
 use cterm_core::pty::{PtyConfig, PtyError};
-use cterm_core::screen::{ClipboardOperation, ClipboardSelection, CursorStyle, ScreenConfig};
+use cterm_core::screen::{ClipboardOperation, CursorStyle, ScreenConfig};
 use cterm_core::term::{Key, Modifiers, Terminal, TerminalEvent};
 use cterm_ui::theme::Theme;
 
@@ -27,6 +27,9 @@ pub struct CellDimensions {
     pub height: f64,
 }
 
+/// Callback type for terminal events
+type EventCallback = Rc<RefCell<Option<Box<dyn Fn()>>>>;
+
 /// Terminal widget wrapping GTK drawing area
 pub struct TerminalWidget {
     drawing_area: DrawingArea,
@@ -36,8 +39,8 @@ pub struct TerminalWidget {
     font_size: Rc<RefCell<f64>>,
     default_font_size: f64,
     cell_dims: Rc<RefCell<CellDimensions>>,
-    on_exit: Rc<RefCell<Option<Box<dyn Fn()>>>>,
-    on_bell: Rc<RefCell<Option<Box<dyn Fn()>>>>,
+    on_exit: EventCallback,
+    on_bell: EventCallback,
 }
 
 impl TerminalWidget {
@@ -123,6 +126,7 @@ impl TerminalWidget {
     }
 
     /// Get the current cell dimensions
+    #[allow(dead_code)]
     pub fn cell_dimensions(&self) -> CellDimensions {
         *self.cell_dims.borrow()
     }
@@ -284,7 +288,7 @@ impl TerminalWidget {
                 if has_ctrl && !has_alt {
                     let term = terminal_key.lock();
                     let ctrl_char = match c.to_ascii_lowercase() {
-                        'a'..='z' => Some((c.to_ascii_lowercase() as u8 - b'a' + 1) as u8),
+                        'a'..='z' => Some(c.to_ascii_lowercase() as u8 - b'a' + 1),
                         '[' | '3' => Some(0x1b), // Escape
                         '\\' | '4' => Some(0x1c),
                         ']' | '5' => Some(0x1d),
@@ -372,7 +376,7 @@ impl TerminalWidget {
             let mut buf = vec![0u8; 4096];
             loop {
                 let term = terminal.lock();
-                if let Some(pty) = term.pty() {
+                if term.pty().is_some() {
                     drop(term); // Release lock before blocking read
 
                     let terminal_clone = Arc::clone(&terminal);
@@ -677,7 +681,7 @@ fn draw_terminal(
                     cr.set_source_rgb(r, g, b);
 
                     // Apply text attributes to font
-                    let mut attrs = pango::AttrList::new();
+                    let attrs = pango::AttrList::new();
 
                     if cell.attrs.contains(CellAttrs::BOLD) {
                         let attr = pango::AttrInt::new_weight(pango::Weight::Bold);

@@ -159,7 +159,7 @@ impl Cell {
     pub fn copy_style_from(&mut self, other: &Cell) {
         self.fg = other.fg;
         self.bg = other.bg;
-        self.underline_color = other.underline_color.clone();
+        self.underline_color = other.underline_color;
         self.attrs = other.attrs;
         self.hyperlink = other.hyperlink.clone();
     }
@@ -180,7 +180,7 @@ impl CellStyle {
     pub fn apply_to(&self, cell: &mut Cell) {
         cell.fg = self.fg;
         cell.bg = self.bg;
-        cell.underline_color = self.underline_color.clone();
+        cell.underline_color = self.underline_color;
         cell.attrs = self.attrs;
         cell.hyperlink = self.hyperlink.clone();
     }
@@ -191,7 +191,7 @@ impl CellStyle {
             c,
             fg: self.fg,
             bg: self.bg,
-            underline_color: self.underline_color.clone(),
+            underline_color: self.underline_color,
             attrs: self.attrs,
             hyperlink: self.hyperlink.clone(),
         }

@@ -2,12 +2,6 @@
 //!
 //! Provides a high-level interface for terminal emulation.
 
-use std::io::Write;
-use std::path::PathBuf;
-use std::sync::Arc;
-
-use parking_lot::Mutex;
-
 use crate::parser::Parser;
 use crate::pty::{Pty, PtyConfig, PtyError};
 use crate::screen::{ClipboardOperation, Screen, ScreenConfig};
@@ -28,21 +22,12 @@ pub enum TerminalEvent {
 }
 
 /// Terminal configuration
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct TerminalConfig {
     /// Screen configuration
     pub screen: ScreenConfig,
     /// PTY configuration
     pub pty: PtyConfig,
-}
-
-impl Default for TerminalConfig {
-    fn default() -> Self {
-        Self {
-            screen: ScreenConfig::default(),
-            pty: PtyConfig::default(),
-        }
-    }
 }
 
 /// Terminal instance managing screen, parser, and PTY
@@ -182,7 +167,7 @@ impl Terminal {
 
     /// Check if the process is still running
     pub fn is_running(&self) -> bool {
-        self.pty.as_ref().map_or(false, |p| p.is_running())
+        self.pty.as_ref().is_some_and(|p| p.is_running())
     }
 
     /// Send a signal to the child process
@@ -233,14 +218,14 @@ impl Terminal {
     /// Handle keyboard input and generate appropriate escape sequences
     pub fn handle_key(&self, key: Key, modifiers: Modifiers) -> Option<Vec<u8>> {
         let app_cursor = self.screen.modes.application_cursor;
-        let app_keypad = self.screen.modes.application_keypad;
+        let _app_keypad = self.screen.modes.application_keypad;
 
         match key {
             Key::Char(c) => {
                 if modifiers.contains(Modifiers::CTRL) {
                     // Control characters
                     let ctrl_char = match c.to_ascii_lowercase() {
-                        'a'..='z' => Some((c.to_ascii_lowercase() as u8 - b'a' + 1) as u8),
+                        'a'..='z' => Some(c.to_ascii_lowercase() as u8 - b'a' + 1),
                         '[' => Some(0x1b),
                         '\\' => Some(0x1c),
                         ']' => Some(0x1d),
@@ -272,10 +257,10 @@ impl Terminal {
             Key::Left => Some(cursor_key(b'D', modifiers, app_cursor)),
             Key::Home => Some(cursor_key(b'H', modifiers, app_cursor)),
             Key::End => Some(cursor_key(b'F', modifiers, app_cursor)),
-            Key::PageUp => Some(format!("\x1b[5~").into_bytes()),
-            Key::PageDown => Some(format!("\x1b[6~").into_bytes()),
-            Key::Insert => Some(format!("\x1b[2~").into_bytes()),
-            Key::Delete => Some(format!("\x1b[3~").into_bytes()),
+            Key::PageUp => Some(b"\x1b[5~".to_vec()),
+            Key::PageDown => Some(b"\x1b[6~".to_vec()),
+            Key::Insert => Some(b"\x1b[2~".to_vec()),
+            Key::Delete => Some(b"\x1b[3~".to_vec()),
             Key::F(n) => Some(function_key(n, modifiers)),
         }
     }

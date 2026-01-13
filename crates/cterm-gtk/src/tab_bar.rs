@@ -5,19 +5,25 @@ use std::collections::HashMap;
 use std::rc::Rc;
 
 use gtk4::prelude::*;
-use gtk4::{Box as GtkBox, Button, Label, Orientation, Widget};
+use gtk4::{Box as GtkBox, Button, Label, Orientation};
+
+/// Callback type for tab bar events
+type TabCallback = Rc<RefCell<Option<Box<dyn Fn()>>>>;
+/// Callback map type for per-tab callbacks
+type TabCallbackMap = Rc<RefCell<HashMap<u64, Box<dyn Fn()>>>>;
 
 /// Tab bar widget
 #[derive(Clone)]
 pub struct TabBar {
     container: GtkBox,
     tabs_box: GtkBox,
+    #[allow(dead_code)] // Kept to prevent button from being dropped
     new_tab_button: Button,
     tabs: Rc<RefCell<Vec<TabInfo>>>,
     active_tab: Rc<RefCell<Option<u64>>>,
-    on_new_tab: Rc<RefCell<Option<Box<dyn Fn()>>>>,
-    on_close_callbacks: Rc<RefCell<HashMap<u64, Box<dyn Fn()>>>>,
-    on_click_callbacks: Rc<RefCell<HashMap<u64, Box<dyn Fn()>>>>,
+    on_new_tab: TabCallback,
+    on_close_callbacks: TabCallbackMap,
+    on_click_callbacks: TabCallbackMap,
 }
 
 struct TabInfo {
@@ -25,6 +31,7 @@ struct TabInfo {
     button: Button,
     label: Label,
     bell_icon: Label,
+    #[allow(dead_code)] // Kept to prevent button from being dropped
     close_button: Button,
 }
 
@@ -178,10 +185,8 @@ impl TabBar {
     pub fn set_color(&self, id: u64, color: Option<&str>) {
         for tab in self.tabs.borrow().iter() {
             if tab.id == id {
-                if let Some(color) = color {
-                    // Apply inline style for color
-                    let css = format!("border-left: 3px solid {};", color);
-                    // Note: In a real implementation, we'd use a CSS provider
+                if let Some(_color) = color {
+                    // TODO: Apply inline style for color using CSS provider
                     // For now, we just add a class
                     tab.button.add_css_class("colored-tab");
                 } else {
@@ -193,6 +198,7 @@ impl TabBar {
     }
 
     /// Mark tab as having unread content
+    #[allow(dead_code)]
     pub fn set_unread(&self, id: u64, unread: bool) {
         for tab in self.tabs.borrow().iter() {
             if tab.id == id {
@@ -226,6 +232,7 @@ impl TabBar {
     }
 
     /// Get number of tabs
+    #[allow(dead_code)]
     pub fn tab_count(&self) -> usize {
         self.tabs.borrow().len()
     }

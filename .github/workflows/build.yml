@@ -11,9 +11,40 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  lint:
+    name: Lint (rustfmt & clippy)
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libgtk-4-dev \
+            libadwaita-1-dev \
+            libpango1.0-dev \
+            libcairo2-dev \
+            libglib2.0-dev
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Run clippy
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
   build-linux:
     name: Build Linux (Ubuntu 22.04)
     runs-on: ubuntu-22.04
+    needs: lint
     steps:
       - uses: actions/checkout@v4
 
@@ -52,6 +83,7 @@ jobs:
   build-windows:
     name: Build Windows
     runs-on: windows-latest
+    needs: lint
     defaults:
       run:
         shell: msys2 {0}
@@ -137,6 +169,7 @@ jobs:
   build-macos-intel:
     name: Build macOS (Intel)
     runs-on: macos-15
+    needs: lint
     steps:
       - uses: actions/checkout@v4
 

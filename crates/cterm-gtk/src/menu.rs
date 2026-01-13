@@ -1,7 +1,6 @@
 //! Application menu system
 
-use gtk4::prelude::*;
-use gtk4::{gio, glib, ApplicationWindow};
+use gtk4::gio;
 
 /// Create the application menu model
 pub fn create_menu_model() -> gio::Menu {
@@ -69,6 +68,7 @@ pub fn create_menu_model() -> gio::Menu {
 }
 
 /// Create the tabs submenu (called when tabs change)
+#[allow(dead_code)]
 pub fn create_tabs_submenu(tab_names: &[(u64, String)]) -> gio::Menu {
     let menu = gio::Menu::new();
 

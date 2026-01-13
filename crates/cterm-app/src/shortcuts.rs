@@ -3,7 +3,6 @@
 //! Handles parsing, matching, and managing keyboard shortcuts.
 
 use std::collections::HashMap;
-use std::str::FromStr;
 
 use cterm_ui::events::{Action, KeyCode, Modifiers, Shortcut};
 
