@@ -13,6 +13,7 @@ use gtk4::{
 use parking_lot::Mutex;
 
 use cterm_app::config::Config;
+use cterm_app::upgrade::TerminalUpgradeState;
 use cterm_core::cell::CellAttrs;
 use cterm_core::color::{Color, Rgb};
 use cterm_core::pty::{PtyConfig, PtyError};
@@ -120,6 +121,99 @@ impl TerminalWidget {
         Ok(widget)
     }
 
+    /// Create a terminal widget from restored state (for seamless upgrades)
+    ///
+    /// This takes a pre-existing terminal with restored screen state and PTY,
+    /// and sets up the GTK widget around it.
+    #[cfg(unix)]
+    pub fn from_restored(
+        terminal: Terminal,
+        config: &Config,
+        theme: &Theme,
+    ) -> Self {
+        // Get font settings
+        let font_family = config.appearance.font.family.clone();
+        let font_size = config.appearance.font.size;
+
+        // Calculate cell dimensions using Pango font metrics
+        let cell_dims = calculate_cell_dimensions(&font_family, font_size);
+
+        // Create drawing area with proper sizing
+        let drawing_area = DrawingArea::new();
+        drawing_area.set_can_focus(true);
+        drawing_area.set_focusable(true);
+        drawing_area.add_css_class("terminal");
+        drawing_area.set_vexpand(true);
+        drawing_area.set_hexpand(true);
+
+        // Set minimum size for 80x24 characters
+        let min_width = (cell_dims.width * 80.0).ceil() as i32;
+        let min_height = (cell_dims.height * 24.0).ceil() as i32;
+        drawing_area.set_size_request(min_width, min_height);
+
+        let terminal = Arc::new(Mutex::new(terminal));
+        let cell_dims = Rc::new(RefCell::new(cell_dims));
+
+        let widget = Self {
+            drawing_area: drawing_area.clone(),
+            terminal: Arc::clone(&terminal),
+            theme: theme.clone(),
+            font_family,
+            font_size: Rc::new(RefCell::new(font_size)),
+            default_font_size: font_size,
+            cell_dims,
+            on_exit: Rc::new(RefCell::new(None)),
+            on_bell: Rc::new(RefCell::new(None)),
+        };
+
+        // Set up drawing
+        widget.setup_drawing();
+
+        // Set up input handling
+        widget.setup_input();
+
+        // Set up PTY reading (the restored PTY should already be running)
+        widget.setup_pty_reader();
+
+        // Set up resize handling
+        widget.setup_resize();
+
+        widget
+    }
+
+    /// Export terminal state for seamless upgrade
+    #[cfg(unix)]
+    pub fn export_state(&self) -> TerminalUpgradeState {
+        let term = self.terminal.lock();
+        let screen = term.screen();
+
+        TerminalUpgradeState {
+            cols: screen.grid().width(),
+            rows: screen.grid().height(),
+            grid: screen.grid().clone(),
+            scrollback: screen.scrollback().iter().cloned().collect(),
+            alternate_grid: screen.alternate_grid().cloned(),
+            cursor: screen.cursor.clone(),
+            saved_cursor: screen.saved_cursor().cloned(),
+            alt_saved_cursor: screen.alt_saved_cursor().cloned(),
+            scroll_region: *screen.scroll_region(),
+            style: screen.style.clone(),
+            modes: screen.modes.clone(),
+            title: screen.title.clone(),
+            scroll_offset: screen.scroll_offset,
+            tab_stops: screen.tab_stops().to_vec(),
+            alternate_active: screen.alternate_grid().is_some(),
+            cursor_style: screen.cursor.style,
+            mouse_mode: screen.modes.mouse_mode,
+        }
+    }
+
+    /// Get the underlying terminal (for upgrade operations)
+    #[cfg(unix)]
+    pub fn terminal(&self) -> &Arc<Mutex<Terminal>> {
+        &self.terminal
+    }
+
     /// Get the widget for adding to containers
     pub fn widget(&self) -> &DrawingArea {
         &self.drawing_area
@@ -143,7 +237,7 @@ impl TerminalWidget {
 
     /// Write a string to the terminal (for paste operations)
     pub fn write_str(&self, s: &str) {
-        let term = self.terminal.lock();
+        let mut term = self.terminal.lock();
         if let Err(e) = term.write_str(s) {
             log::error!("Failed to write to terminal: {}", e);
         }
@@ -313,7 +407,7 @@ impl TerminalWidget {
 
             // Handle special keys (arrows, function keys, etc.)
             if let Some(key) = keyval_to_key(keyval) {
-                let term = terminal_key.lock();
+                let mut term = terminal_key.lock();
                 if let Some(bytes) = term.handle_key(key, modifiers) {
                     if let Err(e) = term.write(&bytes) {
                         log::error!("Failed to write to PTY: {}", e);
@@ -326,7 +420,7 @@ impl TerminalWidget {
             if let Some(c) = keyval.to_unicode() {
                 // Handle Ctrl+letter -> control character
                 if has_ctrl && !has_alt {
-                    let term = terminal_key.lock();
+                    let mut term = terminal_key.lock();
                     let ctrl_char = match c.to_ascii_lowercase() {
                         'a'..='z' => Some(c.to_ascii_lowercase() as u8 - b'a' + 1),
                         '[' | '3' => Some(0x1b), // Escape
@@ -349,7 +443,7 @@ impl TerminalWidget {
 
                 // Handle Alt+key -> ESC + key
                 if has_alt && !has_ctrl {
-                    let term = terminal_key.lock();
+                    let mut term = terminal_key.lock();
                     let mut buf = vec![0x1b]; // ESC
                     let mut char_buf = [0u8; 4];
                     let s = c.encode_utf8(&mut char_buf);
@@ -362,7 +456,7 @@ impl TerminalWidget {
 
                 // Regular character (no Ctrl/Alt)
                 if !has_ctrl && !has_alt {
-                    let term = terminal_key.lock();
+                    let mut term = terminal_key.lock();
                     let mut buf = [0u8; 4];
                     let s = c.encode_utf8(&mut buf);
                     if let Err(e) = term.write(s.as_bytes()) {
@@ -409,47 +503,40 @@ impl TerminalWidget {
         let terminal = Arc::clone(&self.terminal);
         let drawing_area = self.drawing_area.clone();
 
-        // Spawn a thread to read from PTY using glib's spawn_future_local
+        // Spawn a thread to read from PTY
         let (tx, rx) = std::sync::mpsc::channel::<PtyMessage>();
 
         std::thread::spawn(move || {
             let mut buf = vec![0u8; 4096];
-            loop {
+
+            // Get a reader for the PTY
+            let reader = {
                 let term = terminal.lock();
-                if term.pty().is_some() {
-                    drop(term); // Release lock before blocking read
+                term.pty_reader()
+            };
 
-                    let terminal_clone = Arc::clone(&terminal);
-                    let reader = {
-                        let term = terminal_clone.lock();
-                        term.pty().map(|p| p.clone_reader())
-                    };
+            let Some(mut reader) = reader else {
+                log::warn!("No PTY reader available");
+                return;
+            };
 
-                    if let Some(reader) = reader {
-                        let mut reader = reader.lock();
-                        match reader.read(&mut buf) {
-                            Ok(0) => {
-                                // EOF - process exited
-                                let _ = tx.send(PtyMessage::Exited);
-                                break;
-                            }
-                            Ok(n) => {
-                                let data = buf[..n].to_vec();
-                                if tx.send(PtyMessage::Data(data)).is_err() {
-                                    break;
-                                }
-                            }
-                            Err(e) => {
-                                log::error!("PTY read error: {}", e);
-                                let _ = tx.send(PtyMessage::Exited);
-                                break;
-                            }
-                        }
-                    } else {
+            loop {
+                match reader.read(&mut buf) {
+                    Ok(0) => {
+                        let _ = tx.send(PtyMessage::Exited);
                         break;
                     }
-                } else {
-                    std::thread::sleep(Duration::from_millis(100));
+                    Ok(n) => {
+                        let data = buf[..n].to_vec();
+                        if tx.send(PtyMessage::Data(data)).is_err() {
+                            break;
+                        }
+                    }
+                    Err(e) => {
+                        log::error!("PTY read error: {}", e);
+                        let _ = tx.send(PtyMessage::Exited);
+                        break;
+                    }
                 }
             }
         });

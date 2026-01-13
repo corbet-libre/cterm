@@ -27,8 +27,7 @@ parking_lot = "0.12"
 # Parser
 vte = "0.13"
 
-# PTY
-portable-pty = "0.8"
+# General
 anyhow = "1"
 
 # Config

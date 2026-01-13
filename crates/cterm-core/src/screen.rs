@@ -429,6 +429,26 @@ impl Screen {
         &self.scrollback
     }
 
+    /// Get alternate grid if active
+    pub fn alternate_grid(&self) -> Option<&Grid> {
+        self.alternate_grid.as_ref()
+    }
+
+    /// Get saved cursor
+    pub fn saved_cursor(&self) -> Option<&Cursor> {
+        self.saved_cursor.as_ref()
+    }
+
+    /// Get alternate saved cursor
+    pub fn alt_saved_cursor(&self) -> Option<&Cursor> {
+        self.alt_saved_cursor.as_ref()
+    }
+
+    /// Get tab stops
+    pub fn tab_stops(&self) -> &[bool] {
+        &self.tab_stops
+    }
+
     /// Total lines (scrollback + visible)
     pub fn total_lines(&self) -> usize {
         self.scrollback.len() + self.height()

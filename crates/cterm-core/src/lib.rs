@@ -11,8 +11,6 @@ pub mod color;
 #[cfg(unix)]
 pub mod fd_passing;
 pub mod grid;
-#[cfg(unix)]
-pub mod native_pty;
 pub mod parser;
 pub mod pty;
 pub mod screen;
@@ -22,6 +20,6 @@ pub use cell::{Cell, CellAttrs};
 pub use color::{AnsiColor, Color, Rgb};
 pub use grid::Grid;
 pub use parser::Parser;
-pub use pty::Pty;
+pub use pty::{Pty, PtyConfig, PtyError, PtySize};
 pub use screen::{ClipboardOperation, ClipboardSelection, ColorQuery, Screen, SearchResult};
 pub use term::Terminal;

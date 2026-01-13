@@ -62,6 +62,30 @@ impl Terminal {
         }
     }
 
+    /// Create a terminal from restored screen state and PTY file descriptor (Unix only)
+    ///
+    /// This is used during seamless upgrades on Unix to restore terminals
+    /// using file descriptors passed from the old process.
+    ///
+    /// # Safety
+    /// The caller must ensure `fd` is a valid master PTY file descriptor
+    /// and `child_pid` is the correct process ID of the child process.
+    #[cfg(unix)]
+    pub unsafe fn from_restored_fd(
+        screen: Screen,
+        fd: std::os::unix::io::RawFd,
+        child_pid: i32,
+    ) -> Self {
+        let title = screen.title.clone();
+        let pty = Pty::from_raw_fd(fd, child_pid);
+        Self {
+            screen,
+            parser: Parser::new(),
+            pty: Some(pty),
+            last_title: title,
+        }
+    }
+
     /// Create a terminal and spawn a shell
     pub fn with_shell(
         cols: usize,
@@ -98,6 +122,11 @@ impl Terminal {
         self.pty.as_ref()
     }
 
+    /// Get a mutable reference to the PTY if available
+    pub fn pty_mut(&mut self) -> Option<&mut Pty> {
+        self.pty.as_mut()
+    }
+
     /// Process input from the PTY and update the screen
     pub fn process(&mut self, data: &[u8]) -> Vec<TerminalEvent> {
         let mut events = Vec::new();
@@ -107,11 +136,9 @@ impl Terminal {
         // Send any pending responses back to the PTY
         if self.screen.has_pending_responses() {
             let responses = self.screen.take_pending_responses();
-            if let Some(ref pty) = self.pty {
-                for response in responses {
-                    if let Err(e) = pty.write(&response) {
-                        log::error!("Failed to send response to PTY: {}", e);
-                    }
+            for response in responses {
+                if let Err(e) = self.write(&response) {
+                    log::error!("Failed to send response to PTY: {}", e);
                 }
             }
         }
@@ -138,21 +165,21 @@ impl Terminal {
     }
 
     /// Write input to the PTY (keyboard input)
-    pub fn write(&self, data: &[u8]) -> Result<(), PtyError> {
-        if let Some(ref pty) = self.pty {
+    pub fn write(&mut self, data: &[u8]) -> Result<(), PtyError> {
+        if let Some(ref mut pty) = self.pty {
             pty.write(data)?;
         }
         Ok(())
     }
 
     /// Write a string to the PTY
-    pub fn write_str(&self, s: &str) -> Result<(), PtyError> {
+    pub fn write_str(&mut self, s: &str) -> Result<(), PtyError> {
         self.write(s.as_bytes())
     }
 
     /// Send clipboard data as OSC 52 response
     pub fn send_clipboard_response(
-        &self,
+        &mut self,
         selection: crate::screen::ClipboardSelection,
         data: &[u8],
     ) -> Result<(), PtyError> {
@@ -179,17 +206,38 @@ impl Terminal {
     }
 
     /// Check if the process is still running
-    pub fn is_running(&self) -> bool {
-        self.pty.as_ref().is_some_and(|p| p.is_running())
+    pub fn is_running(&mut self) -> bool {
+        if let Some(ref mut pty) = self.pty {
+            return pty.is_running();
+        }
+        false
     }
 
     /// Send a signal to the child process
     pub fn send_signal(&self, signal: i32) -> Result<(), PtyError> {
         if let Some(ref pty) = self.pty {
-            pty.send_signal(signal)
-        } else {
-            Err(PtyError::NotRunning)
+            return pty.send_signal(signal).map_err(PtyError::Io);
         }
+        Err(PtyError::NotRunning)
+    }
+
+    /// Get a cloned reader for the PTY
+    pub fn pty_reader(&self) -> Option<std::fs::File> {
+        self.pty.as_ref().and_then(|p| p.try_clone_reader().ok())
+    }
+
+    /// Get the child process ID
+    pub fn child_pid(&self) -> Option<i32> {
+        self.pty.as_ref().map(|p| p.child_pid())
+    }
+
+    /// Get a duplicated file descriptor for the PTY (Unix only)
+    ///
+    /// The returned FD is a duplicate and must be closed by the caller
+    /// if not passed to another process.
+    #[cfg(unix)]
+    pub fn dup_pty_fd(&self) -> Option<std::os::unix::io::RawFd> {
+        self.pty.as_ref().and_then(|p| p.dup_fd().ok())
     }
 
     /// Get terminal width

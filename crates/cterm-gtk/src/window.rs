@@ -483,8 +483,10 @@ impl CtermWindow {
         }
 
         // Execute upgrade action (called from update dialog)
+        #[cfg(unix)]
         {
             let tabs = Rc::clone(&tabs);
+            let window_clone = window.clone();
             let action = gio::SimpleAction::new(
                 "execute-upgrade",
                 Some(&glib::VariantType::new("s").unwrap()),
@@ -493,40 +495,140 @@ impl CtermWindow {
                 if let Some(binary_path) = param.and_then(|p| p.get::<String>()) {
                     log::info!("Executing seamless upgrade with binary: {}", binary_path);
 
-                    // Get the current tabs for state collection
+                    // Collect upgrade state from current window
                     let tabs_borrowed = tabs.borrow();
-                    let tab_count = tabs_borrowed.len();
+
+                    // Build upgrade state
+                    let mut upgrade_state =
+                        cterm_app::upgrade::UpgradeState::new(env!("CARGO_PKG_VERSION"));
+
+                    // Collect window state
+                    let mut window_state = cterm_app::upgrade::WindowUpgradeState::new();
+                    window_state.width = window_clone.default_width();
+                    window_state.height = window_clone.default_height();
+                    window_state.maximized = window_clone.is_maximized();
+                    window_state.fullscreen = window_clone.is_fullscreen();
+
+                    // Collect FDs for terminals
+                    let mut fds: Vec<std::os::unix::io::RawFd> = Vec::new();
+
+                    for tab in tabs_borrowed.iter() {
+                        let mut tab_state = cterm_app::upgrade::TabUpgradeState::new(tab.id, 0, 0);
+                        tab_state.title = tab.title.clone();
+
+                        // Export terminal state
+                        tab_state.terminal = tab.terminal.export_state();
+
+                        // Try to get PTY file descriptor
+                        let term = tab.terminal.terminal().lock();
+                        if let Some(fd) = term.dup_pty_fd() {
+                            tab_state.pty_fd_index = fds.len();
+                            tab_state.child_pid = term.child_pid().unwrap_or(0);
+                            fds.push(fd);
+                            log::info!(
+                                "Tab {}: Got PTY FD {} (index {}), child_pid={}",
+                                tab.id, fd, tab_state.pty_fd_index, tab_state.child_pid
+                            );
+                        } else {
+                            log::warn!("Tab {}: Failed to get PTY FD", tab.id);
+                        }
+                        drop(term);
+
+                        window_state.tabs.push(tab_state);
+                    }
+
+                    // Set active tab
+                    // Note: We'd need access to the notebook to know which tab is active
+                    window_state.active_tab = 0;
+
+                    upgrade_state.windows.push(window_state);
+
+                    drop(tabs_borrowed);
 
                     log::info!(
-                        "Upgrade would preserve {} tabs (not yet fully implemented)",
-                        tab_count
+                        "Collected upgrade state: {} windows, {} FDs",
+                        upgrade_state.windows.len(),
+                        fds.len()
                     );
 
-                    // TODO: Full implementation requires:
-                    // 1. Stop all PTY readers
-                    // 2. Collect upgrade state from all windows/tabs
-                    // 3. Create Unix socket
-                    // 4. Spawn new process with --upgrade-receiver
-                    // 5. Send state and FDs via SCM_RIGHTS
-                    // 6. Wait for ack and exit
+                    // Check if we have any FDs to pass
+                    if fds.is_empty() {
+                        log::warn!(
+                            "No PTY file descriptors available for seamless upgrade. \
+                             Terminal sessions will not be preserved."
+                        );
 
-                    // For now, show a dialog explaining the limitation
-                    let dialog = gtk4::MessageDialog::new(
-                        None::<&gtk4::Window>,
-                        gtk4::DialogFlags::MODAL,
-                        gtk4::MessageType::Info,
-                        gtk4::ButtonsType::Ok,
-                        format!(
-                            "Seamless upgrade is ready to be implemented.\n\n\
-                            Binary: {}\n\
-                            Tabs to preserve: {}\n\n\
-                            Full implementation pending.",
-                            binary_path, tab_count
-                        ),
-                    );
-                    dialog.connect_response(|d, _| d.close());
-                    dialog.present();
+                        // Show warning dialog
+                        let dialog = gtk4::MessageDialog::new(
+                            Some(&window_clone),
+                            gtk4::DialogFlags::MODAL,
+                            gtk4::MessageType::Warning,
+                            gtk4::ButtonsType::OkCancel,
+                            "Seamless upgrade is not fully available.\n\n\
+                             Could not get file descriptors for the terminal sessions. \
+                             Terminal sessions will be lost during upgrade.\n\n\
+                             Continue anyway?",
+                        );
+
+                        let binary = binary_path.clone();
+                        dialog.connect_response(move |d, response| {
+                            d.close();
+                            if response == gtk4::ResponseType::Ok {
+                                // Proceed without FD passing - spawn new process
+                                log::info!("User chose to proceed without seamless upgrade");
+                                if let Err(e) = std::process::Command::new(&binary).spawn() {
+                                    log::error!("Failed to spawn new process: {}", e);
+                                } else {
+                                    // Exit current process
+                                    std::process::exit(0);
+                                }
+                            }
+                        });
+                        dialog.present();
+                        return;
+                    }
+
+                    // Execute the upgrade
+                    let binary = std::path::Path::new(&binary_path);
+                    match cterm_app::upgrade::execute_upgrade(binary, &upgrade_state, &fds) {
+                        Ok(()) => {
+                            log::info!("Upgrade successful, exiting");
+                            std::process::exit(0);
+                        }
+                        Err(e) => {
+                            log::error!("Upgrade failed: {}", e);
+
+                            // Close the FDs we duplicated
+                            for fd in fds {
+                                unsafe { libc::close(fd) };
+                            }
+
+                            // Show error dialog
+                            let dialog = gtk4::MessageDialog::new(
+                                Some(&window_clone),
+                                gtk4::DialogFlags::MODAL,
+                                gtk4::MessageType::Error,
+                                gtk4::ButtonsType::Ok,
+                                format!("Upgrade failed: {}", e),
+                            );
+                            dialog.connect_response(|d, _| d.close());
+                            dialog.present();
+                        }
+                    }
                 }
+            });
+            window.add_action(&action);
+        }
+
+        // Non-Unix fallback for execute-upgrade
+        #[cfg(not(unix))]
+        {
+            let action = gio::SimpleAction::new(
+                "execute-upgrade",
+                Some(&glib::VariantType::new("s").unwrap()),
+            );
+            action.connect_activate(|_, _| {
+                log::warn!("Seamless upgrade not supported on this platform");
             });
             window.add_action(&action);
         }

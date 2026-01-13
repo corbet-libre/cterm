@@ -154,7 +154,7 @@ impl TabState {
     }
 
     /// Check if process is running
-    pub fn is_running(&self) -> bool {
+    pub fn is_running(&mut self) -> bool {
         self.terminal.is_running()
     }
 }
