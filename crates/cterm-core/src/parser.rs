@@ -8,7 +8,10 @@ use vte::{Params, ParamsIter};
 
 use crate::cell::{CellAttrs, CellStyle, Hyperlink};
 use crate::color::{AnsiColor, Color, Rgb};
-use crate::screen::{ClearMode, ClipboardOperation, ClipboardSelection, CursorStyle, LineClearMode, MouseMode, Screen};
+use crate::screen::{
+    ClearMode, ClipboardOperation, ClipboardSelection, CursorStyle, LineClearMode, MouseMode,
+    Screen,
+};
 
 /// Parser wraps the vte parser and applies actions to a Screen
 pub struct Parser {
@@ -185,13 +188,18 @@ impl vte::Perform for ScreenPerformer<'_> {
                     if data_str == "?" {
                         // Query clipboard
                         log::debug!("Clipboard query for {:?}", selection);
-                        self.screen.queue_clipboard_op(ClipboardOperation::Query { selection });
+                        self.screen
+                            .queue_clipboard_op(ClipboardOperation::Query { selection });
                     } else if !data_str.is_empty() {
                         // Set clipboard - decode base64
                         use base64::Engine;
                         match base64::engine::general_purpose::STANDARD.decode(data_str) {
                             Ok(decoded) => {
-                                log::debug!("Clipboard set {:?}: {} bytes", selection, decoded.len());
+                                log::debug!(
+                                    "Clipboard set {:?}: {} bytes",
+                                    selection,
+                                    decoded.len()
+                                );
                                 self.screen.queue_clipboard_op(ClipboardOperation::Set {
                                     selection,
                                     data: decoded,
@@ -707,11 +715,7 @@ impl ScreenPerformer<'_> {
             7 => self.screen.modes.auto_wrap = set,
             // X10 Mouse Reporting
             9 => {
-                self.screen.modes.mouse_mode = if set {
-                    MouseMode::X10
-                } else {
-                    MouseMode::None
-                };
+                self.screen.modes.mouse_mode = if set { MouseMode::X10 } else { MouseMode::None };
             }
             // DECTCEM - Show Cursor
             25 => self.screen.modes.show_cursor = set,
@@ -807,11 +811,19 @@ fn params_to_vec(params: &Params) -> Vec<usize> {
 }
 
 fn first_param(params: &[usize], default: usize) -> usize {
-    params.first().copied().filter(|&v| v != 0).unwrap_or(default)
+    params
+        .first()
+        .copied()
+        .filter(|&v| v != 0)
+        .unwrap_or(default)
 }
 
 fn second_param(params: &[usize], default: usize) -> usize {
-    params.get(1).copied().filter(|&v| v != 0).unwrap_or(default)
+    params
+        .get(1)
+        .copied()
+        .filter(|&v| v != 0)
+        .unwrap_or(default)
 }
 
 #[cfg(test)]

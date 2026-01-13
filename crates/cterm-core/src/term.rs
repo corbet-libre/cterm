@@ -158,8 +158,8 @@ impl Terminal {
         selection: crate::screen::ClipboardSelection,
         data: &[u8],
     ) -> Result<(), PtyError> {
-        use base64::Engine;
         use crate::screen::ClipboardSelection;
+        use base64::Engine;
 
         let selection_char = match selection {
             ClipboardSelection::Clipboard => 'c',

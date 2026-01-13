@@ -1,6 +1,6 @@
 //! Application setup and management
 
-use gtk4::{Application, CssProvider, gdk};
+use gtk4::{gdk, Application, CssProvider};
 
 use cterm_app::config::{load_config, Config};
 use cterm_ui::theme::Theme;

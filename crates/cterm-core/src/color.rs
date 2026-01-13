@@ -256,7 +256,11 @@ fn index_to_rgb(index: u8, palette: &ColorPalette) -> Rgb {
             let b = idx % 6;
 
             let to_component = |c: u8| -> u8 {
-                if c == 0 { 0 } else { 55 + c * 40 }
+                if c == 0 {
+                    0
+                } else {
+                    55 + c * 40
+                }
             };
 
             Rgb::new(to_component(r), to_component(g), to_component(b))

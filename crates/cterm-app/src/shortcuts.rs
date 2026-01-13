@@ -63,7 +63,10 @@ impl ShortcutManager {
         // Tab shortcuts
         self.bind(Shortcut::ctrl_shift(KeyCode::T), Action::NewTab);
         self.bind(Shortcut::ctrl_shift(KeyCode::W), Action::CloseTab);
-        self.bind(Shortcut::new(KeyCode::Tab, Modifiers::CTRL), Action::NextTab);
+        self.bind(
+            Shortcut::new(KeyCode::Tab, Modifiers::CTRL),
+            Action::NextTab,
+        );
         self.bind(Shortcut::ctrl_shift(KeyCode::Tab), Action::PrevTab);
 
         // Tab number shortcuts (Ctrl+1-9)
@@ -100,20 +103,11 @@ impl ShortcutManager {
             Shortcut::new(KeyCode::PageDown, Modifiers::SHIFT),
             Action::ScrollPageDown,
         );
-        self.bind(
-            Shortcut::ctrl_shift(KeyCode::Home),
-            Action::ScrollToTop,
-        );
-        self.bind(
-            Shortcut::ctrl_shift(KeyCode::End),
-            Action::ScrollToBottom,
-        );
+        self.bind(Shortcut::ctrl_shift(KeyCode::Home), Action::ScrollToTop);
+        self.bind(Shortcut::ctrl_shift(KeyCode::End), Action::ScrollToBottom);
 
         // Other shortcuts
-        self.bind(
-            Shortcut::ctrl(KeyCode::Comma),
-            Action::OpenPreferences,
-        );
+        self.bind(Shortcut::ctrl(KeyCode::Comma), Action::OpenPreferences);
         self.bind(Shortcut::ctrl_shift(KeyCode::F), Action::FindText);
     }
 

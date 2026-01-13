@@ -5,11 +5,13 @@ use std::rc::Rc;
 
 use gtk4::prelude::*;
 use gtk4::{
-    Align, Box as GtkBox, Button, ComboBoxText, Dialog, Entry, Grid, Label,
-    Orientation, ResponseType, ScrolledWindow, SpinButton, Switch, Window,
+    Align, Box as GtkBox, Button, ComboBoxText, Dialog, Entry, Grid, Label, Orientation,
+    ResponseType, ScrolledWindow, SpinButton, Switch, Window,
 };
 
-use cterm_app::config::{Config, CursorStyleConfig, NewTabPosition, TabBarPosition, TabBarVisibility};
+use cterm_app::config::{
+    Config, CursorStyleConfig, NewTabPosition, TabBarPosition, TabBarVisibility,
+};
 
 /// Show the "Set Title" dialog
 pub fn show_set_title_dialog<F>(parent: &impl IsA<Window>, current_title: &str, callback: F)
@@ -302,7 +304,11 @@ impl PreferencesWidgets {
 }
 
 /// Show the Preferences dialog
-pub fn show_preferences_dialog(parent: &impl IsA<Window>, config: &Config, on_save: impl Fn(Config) + 'static) {
+pub fn show_preferences_dialog(
+    parent: &impl IsA<Window>,
+    config: &Config,
+    on_save: impl Fn(Config) + 'static,
+) {
     let dialog = Dialog::builder()
         .title("Preferences")
         .transient_for(parent)
@@ -324,15 +330,26 @@ pub fn show_preferences_dialog(parent: &impl IsA<Window>, config: &Config, on_sa
     content.append(&notebook);
 
     // General tab
-    let (general_page, scrollback_spin, confirm_switch, copy_select_switch) = create_general_preferences(config);
+    let (general_page, scrollback_spin, confirm_switch, copy_select_switch) =
+        create_general_preferences(config);
     notebook.append_page(&general_page, Some(&Label::new(Some("General"))));
 
     // Appearance tab
-    let (appearance_page, theme_combo, font_entry, size_spin, cursor_combo, blink_switch, opacity_scale, bold_switch) = create_appearance_preferences(config);
+    let (
+        appearance_page,
+        theme_combo,
+        font_entry,
+        size_spin,
+        cursor_combo,
+        blink_switch,
+        opacity_scale,
+        bold_switch,
+    ) = create_appearance_preferences(config);
     notebook.append_page(&appearance_page, Some(&Label::new(Some("Appearance"))));
 
     // Tabs tab
-    let (tabs_page, show_combo, position_combo, new_combo, close_switch) = create_tabs_preferences(config);
+    let (tabs_page, show_combo, position_combo, new_combo, close_switch) =
+        create_tabs_preferences(config);
     notebook.append_page(&tabs_page, Some(&Label::new(Some("Tabs"))));
 
     // Shortcuts tab
@@ -358,18 +375,16 @@ pub fn show_preferences_dialog(parent: &impl IsA<Window>, config: &Config, on_sa
     });
 
     let base_config = config.clone();
-    dialog.connect_response(move |dialog, response| {
-        match response {
-            ResponseType::Ok | ResponseType::Apply => {
-                let new_config = widgets.collect_config(&base_config);
-                on_save(new_config);
-                if response == ResponseType::Ok {
-                    dialog.close();
-                }
-            }
-            _ => {
+    dialog.connect_response(move |dialog, response| match response {
+        ResponseType::Ok | ResponseType::Apply => {
+            let new_config = widgets.collect_config(&base_config);
+            on_save(new_config);
+            if response == ResponseType::Ok {
                 dialog.close();
             }
+        }
+        _ => {
+            dialog.close();
         }
     });
 
@@ -420,7 +435,18 @@ fn create_general_preferences(config: &Config) -> (GtkBox, SpinButton, Switch, S
     (page, scrollback_spin, confirm_switch, copy_select_switch)
 }
 
-fn create_appearance_preferences(config: &Config) -> (GtkBox, ComboBoxText, Entry, SpinButton, ComboBoxText, Switch, gtk4::Scale, Switch) {
+fn create_appearance_preferences(
+    config: &Config,
+) -> (
+    GtkBox,
+    ComboBoxText,
+    Entry,
+    SpinButton,
+    ComboBoxText,
+    Switch,
+    gtk4::Scale,
+    Switch,
+) {
     let page = GtkBox::new(Orientation::Vertical, 12);
     page.set_margin_top(12);
     page.set_margin_bottom(12);
@@ -512,10 +538,21 @@ fn create_appearance_preferences(config: &Config) -> (GtkBox, ComboBoxText, Entr
     grid.attach(&bold_switch, 1, 6, 1, 1);
 
     page.append(&grid);
-    (page, theme_combo, font_entry, size_spin, cursor_combo, blink_switch, opacity_scale, bold_switch)
+    (
+        page,
+        theme_combo,
+        font_entry,
+        size_spin,
+        cursor_combo,
+        blink_switch,
+        opacity_scale,
+        bold_switch,
+    )
 }
 
-fn create_tabs_preferences(config: &Config) -> (GtkBox, ComboBoxText, ComboBoxText, ComboBoxText, Switch) {
+fn create_tabs_preferences(
+    config: &Config,
+) -> (GtkBox, ComboBoxText, ComboBoxText, ComboBoxText, Switch) {
     let page = GtkBox::new(Orientation::Vertical, 12);
     page.set_margin_top(12);
     page.set_margin_bottom(12);
@@ -612,7 +649,11 @@ fn create_shortcuts_preferences(config: &Config) -> (GtkBox, Vec<(String, Entry)
         ("next_tab", "Next Tab", &config.shortcuts.next_tab),
         ("prev_tab", "Previous Tab", &config.shortcuts.prev_tab),
         ("new_window", "New Window", &config.shortcuts.new_window),
-        ("close_window", "Close Window", &config.shortcuts.close_window),
+        (
+            "close_window",
+            "Close Window",
+            &config.shortcuts.close_window,
+        ),
         ("copy", "Copy", &config.shortcuts.copy),
         ("paste", "Paste", &config.shortcuts.paste),
         ("select_all", "Select All", &config.shortcuts.select_all),

@@ -8,14 +8,13 @@ use std::time::Duration;
 
 use gtk4::prelude::*;
 use gtk4::{
-    DrawingArea, EventControllerKey, EventControllerScroll,
-    GestureClick, gdk, glib, pango,
+    gdk, glib, pango, DrawingArea, EventControllerKey, EventControllerScroll, GestureClick,
 };
 use parking_lot::Mutex;
 
 use cterm_app::config::Config;
-use cterm_core::color::{Color, Rgb};
 use cterm_core::cell::CellAttrs;
+use cterm_core::color::{Color, Rgb};
 use cterm_core::pty::{PtyConfig, PtyError};
 use cterm_core::screen::{ClipboardOperation, ClipboardSelection, CursorStyle, ScreenConfig};
 use cterm_core::term::{Key, Modifiers, Terminal, TerminalEvent};
@@ -240,18 +239,12 @@ impl TerminalWidget {
         let font_size = Rc::clone(&self.font_size);
         let cell_dims = Rc::clone(&self.cell_dims);
 
-        self.drawing_area.set_draw_func(move |_area, cr, _width, _height| {
-            let font_size = *font_size.borrow();
-            let dims = *cell_dims.borrow();
-            draw_terminal(
-                cr,
-                &terminal,
-                &theme,
-                &font_family,
-                font_size,
-                dims,
-            );
-        });
+        self.drawing_area
+            .set_draw_func(move |_area, cr, _width, _height| {
+                let font_size = *font_size.borrow();
+                let dims = *cell_dims.borrow();
+                draw_terminal(cr, &terminal, &theme, &font_family, font_size, dims);
+            });
     }
 
     /// Set up input handling
@@ -294,7 +287,7 @@ impl TerminalWidget {
                         '^' | '6' => Some(0x1e),
                         '_' | '7' | '/' => Some(0x1f),
                         ' ' | '2' | '@' => Some(0x00), // Ctrl-Space/Ctrl-@
-                        '?' | '8' => Some(0x7f), // DEL
+                        '?' | '8' => Some(0x7f),       // DEL
                         _ => None,
                     };
 
@@ -342,9 +335,8 @@ impl TerminalWidget {
         self.drawing_area.add_controller(click_controller);
 
         // Scroll handling
-        let scroll_controller = EventControllerScroll::new(
-            gtk4::EventControllerScrollFlags::VERTICAL,
-        );
+        let scroll_controller =
+            EventControllerScroll::new(gtk4::EventControllerScrollFlags::VERTICAL);
         let terminal_scroll = Arc::clone(&terminal);
         let drawing_area_scroll = self.drawing_area.clone();
 
@@ -436,7 +428,10 @@ impl TerminalWidget {
                                                 // Set clipboard content
                                                 if let Ok(text) = String::from_utf8(data) {
                                                     clipboard.set_text(&text);
-                                                    log::debug!("Set clipboard via OSC 52: {} bytes", text.len());
+                                                    log::debug!(
+                                                        "Set clipboard via OSC 52: {} bytes",
+                                                        text.len()
+                                                    );
                                                 }
                                             }
                                             ClipboardOperation::Query { selection } => {
@@ -444,7 +439,8 @@ impl TerminalWidget {
                                                 // Note: GTK clipboard read is async, but we'll handle it synchronously for simplicity
                                                 log::debug!("Clipboard query via OSC 52 (async not implemented)");
                                                 // For now, send empty response
-                                                let _ = term.send_clipboard_response(selection, b"");
+                                                let _ =
+                                                    term.send_clipboard_response(selection, b"");
                                             }
                                         }
                                     }
@@ -496,17 +492,18 @@ impl TerminalWidget {
         let terminal = Arc::clone(&self.terminal);
         let cell_dims = Rc::clone(&self.cell_dims);
 
-        self.drawing_area.connect_resize(move |_area, width, height| {
-            let dims = cell_dims.borrow();
-            let cols = ((width as f64) / dims.width).floor() as usize;
-            let rows = ((height as f64) / dims.height).floor() as usize;
-            drop(dims);
+        self.drawing_area
+            .connect_resize(move |_area, width, height| {
+                let dims = cell_dims.borrow();
+                let cols = ((width as f64) / dims.width).floor() as usize;
+                let rows = ((height as f64) / dims.height).floor() as usize;
+                drop(dims);
 
-            if cols > 0 && rows > 0 {
-                let mut term = terminal.lock();
-                term.resize(cols, rows);
-            }
-        });
+                if cols > 0 && rows > 0 {
+                    let mut term = terminal.lock();
+                    term.resize(cols, rows);
+                }
+            });
     }
 }
 
@@ -517,13 +514,11 @@ fn calculate_cell_dimensions(font_family: &str, font_size: f64) -> CellDimension
     let context = font_map.create_context();
 
     // Try the requested font first, then fall back to generic monospace
-    let fonts_to_try = [
-        font_family.to_string(),
-        "monospace".to_string(),
-    ];
+    let fonts_to_try = [font_family.to_string(), "monospace".to_string()];
 
     for font_name in &fonts_to_try {
-        let font_desc = pango::FontDescription::from_string(&format!("{} {}", font_name, font_size));
+        let font_desc =
+            pango::FontDescription::from_string(&format!("{} {}", font_name, font_size));
 
         if let Some(font) = font_map.load_font(&context, &font_desc) {
             let metrics = font.metrics(None);
@@ -538,7 +533,10 @@ fn calculate_cell_dimensions(font_family: &str, font_size: f64) -> CellDimension
             if char_width > 0.0 && height > 0.0 {
                 log::debug!(
                     "Using font '{}' at {}pt: cell={}x{}",
-                    font_name, font_size, char_width, height * 1.1
+                    font_name,
+                    font_size,
+                    char_width,
+                    height * 1.1
                 );
                 return CellDimensions {
                     width: char_width,
@@ -558,7 +556,8 @@ fn calculate_cell_dimensions(font_family: &str, font_size: f64) -> CellDimension
     if width > 0 && height > 0 {
         log::warn!(
             "Font metrics unavailable, using layout measurement: {}x{}",
-            width, height
+            width,
+            height
         );
         return CellDimensions {
             width: width as f64,

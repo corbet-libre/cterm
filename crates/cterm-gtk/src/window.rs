@@ -5,8 +5,8 @@ use std::rc::Rc;
 
 use gtk4::prelude::*;
 use gtk4::{
-    Application, ApplicationWindow, Box as GtkBox, EventControllerKey,
-    Notebook, Orientation, PopoverMenuBar, gdk, gio, glib,
+    gdk, gio, glib, Application, ApplicationWindow, Box as GtkBox, EventControllerKey, Notebook,
+    Orientation, PopoverMenuBar,
 };
 
 use cterm_app::config::Config;
@@ -133,7 +133,15 @@ impl CtermWindow {
             let window_clone = window.clone();
             let action = gio::SimpleAction::new("new-tab", None);
             action.connect_activate(move |_, _| {
-                create_new_tab(&notebook, &tabs, &next_tab_id, &config, &theme, &tab_bar, &window_clone);
+                create_new_tab(
+                    &notebook,
+                    &tabs,
+                    &next_tab_id,
+                    &config,
+                    &theme,
+                    &tab_bar,
+                    &window_clone,
+                );
             });
             window.add_action(&action);
         }
@@ -249,7 +257,9 @@ impl CtermWindow {
                 let current_title = {
                     if let Some(page_idx) = notebook.current_page() {
                         let tabs = tabs.borrow();
-                        tabs.get(page_idx as usize).map(|t| t.title.clone()).unwrap_or_default()
+                        tabs.get(page_idx as usize)
+                            .map(|t| t.title.clone())
+                            .unwrap_or_default()
                     } else {
                         String::new()
                     }
@@ -305,7 +315,8 @@ impl CtermWindow {
         }
 
         {
-            let action = gio::SimpleAction::new("set-encoding", Some(&glib::VariantType::new("s").unwrap()));
+            let action =
+                gio::SimpleAction::new("set-encoding", Some(&glib::VariantType::new("s").unwrap()));
             action.connect_activate(|_, param| {
                 if let Some(encoding) = param.and_then(|p| p.get::<String>()) {
                     log::info!("Set encoding: {}", encoding);
@@ -318,7 +329,8 @@ impl CtermWindow {
         {
             let tabs = Rc::clone(&tabs);
             let notebook = notebook.clone();
-            let action = gio::SimpleAction::new("send-signal", Some(&glib::VariantType::new("s").unwrap()));
+            let action =
+                gio::SimpleAction::new("send-signal", Some(&glib::VariantType::new("s").unwrap()));
             action.connect_activate(move |_, param| {
                 if let Some(signal_str) = param.and_then(|p| p.get::<String>()) {
                     if let Ok(signal) = signal_str.parse::<i32>() {
@@ -403,7 +415,8 @@ impl CtermWindow {
             let notebook = notebook.clone();
             let tabs = Rc::clone(&tabs);
             let tab_bar = tab_bar.clone();
-            let action = gio::SimpleAction::new("switch-tab", Some(&glib::VariantType::new("s").unwrap()));
+            let action =
+                gio::SimpleAction::new("switch-tab", Some(&glib::VariantType::new("s").unwrap()));
             action.connect_activate(move |_, param| {
                 if let Some(id_str) = param.and_then(|p| p.get::<String>()) {
                     if let Ok(id) = id_str.parse::<u64>() {
@@ -480,7 +493,15 @@ impl CtermWindow {
                 if let Some(action) = shortcuts.match_event(key, modifiers) {
                     match action {
                         Action::NewTab => {
-                            create_new_tab(&notebook, &tabs, &next_tab_id, &config, &theme, &tab_bar, &window);
+                            create_new_tab(
+                                &notebook,
+                                &tabs,
+                                &next_tab_id,
+                                &config,
+                                &theme,
+                                &tab_bar,
+                                &window,
+                            );
                             return glib::Propagation::Stop;
                         }
                         Action::CloseTab => {
@@ -524,17 +545,20 @@ impl CtermWindow {
                                 let clipboard = display.clipboard();
                                 let tabs_paste = Rc::clone(&tabs);
                                 let notebook_paste = notebook.clone();
-                                clipboard.read_text_async(None::<&gio::Cancellable>, move |result| {
-                                    if let Ok(Some(text)) = result {
-                                        // Find current terminal and write
-                                        if let Some(page_idx) = notebook_paste.current_page() {
-                                            let tabs = tabs_paste.borrow();
-                                            if let Some(tab) = tabs.get(page_idx as usize) {
-                                                tab.terminal.write_str(&text);
+                                clipboard.read_text_async(
+                                    None::<&gio::Cancellable>,
+                                    move |result| {
+                                        if let Ok(Some(text)) = result {
+                                            // Find current terminal and write
+                                            if let Some(page_idx) = notebook_paste.current_page() {
+                                                let tabs = tabs_paste.borrow();
+                                                if let Some(tab) = tabs.get(page_idx as usize) {
+                                                    tab.terminal.write_str(&text);
+                                                }
                                             }
                                         }
-                                    }
-                                });
+                                    },
+                                );
                             }
                             return glib::Propagation::Stop;
                         }
@@ -593,7 +617,15 @@ impl CtermWindow {
 
         // New tab button
         self.tab_bar.set_on_new_tab(move || {
-            create_new_tab(&notebook, &tabs, &next_tab_id, &config, &theme, &tab_bar, &window);
+            create_new_tab(
+                &notebook,
+                &tabs,
+                &next_tab_id,
+                &config,
+                &theme,
+                &tab_bar,
+                &window,
+            );
         });
     }
 
@@ -651,7 +683,13 @@ fn create_new_tab(
     let tab_bar_close = tab_bar.clone();
     let window_close = window.clone();
     tab_bar.set_on_close(tab_id, move || {
-        close_tab_by_id(&notebook_close, &tabs_close, &tab_bar_close, &window_close, tab_id);
+        close_tab_by_id(
+            &notebook_close,
+            &tabs_close,
+            &tab_bar_close,
+            &window_close,
+            tab_id,
+        );
     });
 
     // Set up click callback
@@ -675,7 +713,13 @@ fn create_new_tab(
     let tab_bar_exit = tab_bar.clone();
     let window_exit = window.clone();
     terminal.set_on_exit(move || {
-        close_tab_by_id(&notebook_exit, &tabs_exit, &tab_bar_exit, &window_exit, tab_id);
+        close_tab_by_id(
+            &notebook_exit,
+            &tabs_exit,
+            &tab_bar_exit,
+            &window_exit,
+            tab_id,
+        );
     });
 
     // Set up bell callback to show bell icon on inactive tabs
@@ -946,13 +990,11 @@ fn calculate_initial_cell_dimensions(config: &Config) -> CellDimensions {
     let context = font_map.create_context();
 
     // Try the requested font first, then fall back to generic monospace
-    let fonts_to_try = [
-        font_family.to_string(),
-        "monospace".to_string(),
-    ];
+    let fonts_to_try = [font_family.to_string(), "monospace".to_string()];
 
     for font_name in &fonts_to_try {
-        let font_desc = pango::FontDescription::from_string(&format!("{} {}", font_name, font_size));
+        let font_desc =
+            pango::FontDescription::from_string(&format!("{} {}", font_name, font_size));
 
         if let Some(font) = font_map.load_font(&context, &font_desc) {
             let metrics = font.metrics(None);

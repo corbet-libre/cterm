@@ -6,18 +6,18 @@
 //! - ANSI/VT sequence parsing
 //! - Cross-platform PTY handling
 
-pub mod color;
 pub mod cell;
+pub mod color;
 pub mod grid;
-pub mod screen;
 pub mod parser;
 pub mod pty;
+pub mod screen;
 pub mod term;
 
-pub use color::{Color, AnsiColor, Rgb};
 pub use cell::{Cell, CellAttrs};
+pub use color::{AnsiColor, Color, Rgb};
 pub use grid::Grid;
-pub use screen::{Screen, ClipboardSelection, ClipboardOperation};
 pub use parser::Parser;
 pub use pty::Pty;
+pub use screen::{ClipboardOperation, ClipboardSelection, Screen};
 pub use term::Terminal;

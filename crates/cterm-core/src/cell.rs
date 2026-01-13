@@ -3,9 +3,9 @@
 //! A cell represents a single character position in the terminal grid,
 //! including its character, colors, and attributes.
 
-use std::sync::Arc;
-use bitflags::bitflags;
 use crate::color::Color;
+use bitflags::bitflags;
+use std::sync::Arc;
 
 bitflags! {
     /// Cell rendering attributes

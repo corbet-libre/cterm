@@ -4,10 +4,10 @@
 //! different UI backends (GTK4, Qt, etc.) to implement the terminal
 //! interface.
 
-pub mod traits;
 pub mod events;
 pub mod theme;
+pub mod traits;
 
-pub use traits::*;
 pub use events::*;
 pub use theme::*;
+pub use traits::*;

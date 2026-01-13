@@ -3,9 +3,9 @@
 //! Manages the visible grid and scrollback history, handling resize
 //! and scroll operations.
 
-use std::collections::VecDeque;
-use crate::grid::{Grid, Row};
 use crate::cell::{Cell, CellStyle};
+use crate::grid::{Grid, Row};
+use std::collections::VecDeque;
 
 /// Configuration for the screen
 #[derive(Debug, Clone)]
@@ -121,9 +121,7 @@ pub enum ClipboardOperation {
         data: Vec<u8>,
     },
     /// Query clipboard content
-    Query {
-        selection: ClipboardSelection,
-    },
+    Query { selection: ClipboardSelection },
 }
 
 /// Terminal screen state
@@ -465,11 +463,9 @@ impl Screen {
 
     /// Scroll up within scroll region
     pub fn scroll_up(&mut self, count: usize) {
-        let scrolled = self.grid.scroll_up(
-            count,
-            self.scroll_region.top,
-            self.scroll_region.bottom,
-        );
+        let scrolled =
+            self.grid
+                .scroll_up(count, self.scroll_region.top, self.scroll_region.bottom);
 
         // Add to scrollback if not in alternate screen and scrolling from top
         if !self.modes.alternate_screen && self.scroll_region.top == 0 {
@@ -486,11 +482,8 @@ impl Screen {
 
     /// Scroll down within scroll region
     pub fn scroll_down(&mut self, count: usize) {
-        self.grid.scroll_down(
-            count,
-            self.scroll_region.top,
-            self.scroll_region.bottom,
-        );
+        self.grid
+            .scroll_down(count, self.scroll_region.top, self.scroll_region.bottom);
         self.dirty = true;
     }
 

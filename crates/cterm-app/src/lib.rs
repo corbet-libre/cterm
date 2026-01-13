@@ -7,6 +7,6 @@ pub mod config;
 pub mod session;
 pub mod shortcuts;
 
-pub use config::{Config, load_config, save_config};
+pub use config::{load_config, save_config, Config};
 pub use session::{Session, TabState, WindowState};
 pub use shortcuts::ShortcutManager;

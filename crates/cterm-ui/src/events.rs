@@ -19,42 +19,117 @@ bitflags! {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum KeyCode {
     // Letters
-    A, B, C, D, E, F, G, H, I, J, K, L, M,
-    N, O, P, Q, R, S, T, U, V, W, X, Y, Z,
+    A,
+    B,
+    C,
+    D,
+    E,
+    F,
+    G,
+    H,
+    I,
+    J,
+    K,
+    L,
+    M,
+    N,
+    O,
+    P,
+    Q,
+    R,
+    S,
+    T,
+    U,
+    V,
+    W,
+    X,
+    Y,
+    Z,
 
     // Numbers
-    Key0, Key1, Key2, Key3, Key4, Key5, Key6, Key7, Key8, Key9,
+    Key0,
+    Key1,
+    Key2,
+    Key3,
+    Key4,
+    Key5,
+    Key6,
+    Key7,
+    Key8,
+    Key9,
 
     // Function keys
-    F1, F2, F3, F4, F5, F6, F7, F8, F9, F10, F11, F12,
+    F1,
+    F2,
+    F3,
+    F4,
+    F5,
+    F6,
+    F7,
+    F8,
+    F9,
+    F10,
+    F11,
+    F12,
 
     // Navigation
-    Up, Down, Left, Right,
-    Home, End,
-    PageUp, PageDown,
+    Up,
+    Down,
+    Left,
+    Right,
+    Home,
+    End,
+    PageUp,
+    PageDown,
 
     // Editing
-    Insert, Delete, Backspace,
-    Enter, Tab,
+    Insert,
+    Delete,
+    Backspace,
+    Enter,
+    Tab,
 
     // Modifiers (as keys)
     Escape,
     Space,
 
     // Punctuation
-    Minus, Equals, LeftBracket, RightBracket,
-    Semicolon, Quote, Backquote,
-    Backslash, Comma, Period, Slash,
+    Minus,
+    Equals,
+    LeftBracket,
+    RightBracket,
+    Semicolon,
+    Quote,
+    Backquote,
+    Backslash,
+    Comma,
+    Period,
+    Slash,
 
     // Numpad
-    Numpad0, Numpad1, Numpad2, Numpad3, Numpad4,
-    Numpad5, Numpad6, Numpad7, Numpad8, Numpad9,
-    NumpadAdd, NumpadSubtract, NumpadMultiply, NumpadDivide,
-    NumpadDecimal, NumpadEnter,
+    Numpad0,
+    Numpad1,
+    Numpad2,
+    Numpad3,
+    Numpad4,
+    Numpad5,
+    Numpad6,
+    Numpad7,
+    Numpad8,
+    Numpad9,
+    NumpadAdd,
+    NumpadSubtract,
+    NumpadMultiply,
+    NumpadDivide,
+    NumpadDecimal,
+    NumpadEnter,
 
     // Other
-    PrintScreen, ScrollLock, Pause,
-    CapsLock, NumLock,
+    PrintScreen,
+    ScrollLock,
+    Pause,
+    CapsLock,
+    NumLock,
 
     /// Unknown key
     Unknown,
@@ -91,10 +166,7 @@ pub enum InputEvent {
     },
 
     /// Key was released
-    KeyRelease {
-        key: KeyCode,
-        modifiers: Modifiers,
-    },
+    KeyRelease { key: KeyCode, modifiers: Modifiers },
 
     /// Mouse button pressed
     MousePress {
@@ -135,10 +207,7 @@ pub enum InputEvent {
     FocusOut,
 
     /// Window resized
-    Resize {
-        width: f64,
-        height: f64,
-    },
+    Resize { width: f64, height: f64 },
 
     /// Paste from clipboard
     Paste(String),

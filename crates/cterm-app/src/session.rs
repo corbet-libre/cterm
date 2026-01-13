@@ -83,7 +83,11 @@ impl TabState {
             shell: config.command.clone(),
             args: config.args.clone(),
             cwd: config.working_directory.clone(),
-            env: config.env.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
+            env: config
+                .env
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect(),
             ..Default::default()
         };
 
@@ -348,10 +352,9 @@ impl SessionState {
     pub fn save(&self) -> Result<(), std::io::Error> {
         let path = crate::config::config_dir()
             .map(|p| p.join("session.toml"))
-            .ok_or_else(|| std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                "Config directory not found",
-            ))?;
+            .ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::NotFound, "Config directory not found")
+            })?;
 
         let content = toml::to_string_pretty(self)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
@@ -363,13 +366,14 @@ impl SessionState {
     pub fn load() -> Result<Self, std::io::Error> {
         let path = crate::config::config_dir()
             .map(|p| p.join("session.toml"))
-            .ok_or_else(|| std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                "Config directory not found",
-            ))?;
+            .ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::NotFound, "Config directory not found")
+            })?;
 
         if !path.exists() {
-            return Ok(Self { windows: Vec::new() });
+            return Ok(Self {
+                windows: Vec::new(),
+            });
         }
 
         let content = std::fs::read_to_string(path)?;

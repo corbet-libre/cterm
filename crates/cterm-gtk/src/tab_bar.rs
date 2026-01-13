@@ -43,10 +43,7 @@ impl TabBar {
             .hexpand(true)
             .build();
 
-        let new_tab_button = Button::builder()
-            .label("+")
-            .focusable(false)
-            .build();
+        let new_tab_button = Button::builder().label("+").focusable(false).build();
         new_tab_button.add_css_class("new-tab-button");
 
         container.append(&tabs_box);
@@ -90,20 +87,14 @@ impl TabBar {
 
         let label = Label::new(Some(title));
 
-        let close_button = Button::builder()
-            .label("×")
-            .focusable(false)
-            .build();
+        let close_button = Button::builder().label("×").focusable(false).build();
         close_button.add_css_class("tab-close-button");
 
         tab_box.append(&bell_icon);
         tab_box.append(&label);
         tab_box.append(&close_button);
 
-        let button = Button::builder()
-            .child(&tab_box)
-            .focusable(false)
-            .build();
+        let button = Button::builder().child(&tab_box).focusable(false).build();
 
         // Set up close button
         let close_callbacks = Rc::clone(&self.on_close_callbacks);
