@@ -466,6 +466,10 @@ mod windows {
         exit_status: Option<i32>,
     }
 
+    // SAFETY: Windows HANDLEs are just integer values that can be safely sent between threads.
+    // The underlying resources are managed by the Windows kernel and are not tied to any thread.
+    unsafe impl Send for Pty {}
+
     impl Pty {
         /// Create a new PTY and spawn the shell
         pub fn new(config: &PtyConfig) -> Result<Self, PtyError> {
