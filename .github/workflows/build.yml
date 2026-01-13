@@ -126,10 +126,35 @@ jobs:
           name: cterm-linux-x86_64
           path: release/cterm-linux-x86_64.tar.gz
 
+  test-windows:
+    name: Test (Windows)
+    runs-on: windows-latest
+    needs: lint
+    defaults:
+      run:
+        shell: msys2 {0}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup MSYS2
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          update: true
+          install: >-
+            mingw-w64-ucrt-x86_64-gtk4
+            mingw-w64-ucrt-x86_64-libadwaita
+            mingw-w64-ucrt-x86_64-rust
+            mingw-w64-ucrt-x86_64-pkgconf
+            base-devel
+
+      - name: Run tests
+        run: cargo test --all
+
   build-windows:
     name: Build Windows
     runs-on: windows-latest
-    needs: lint
+    needs: test-windows
     defaults:
       run:
         shell: msys2 {0}
