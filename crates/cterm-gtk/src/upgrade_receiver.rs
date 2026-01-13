@@ -206,6 +206,9 @@ fn create_restored_window(
     // Track tabs for callbacks
     let tabs: Rc<RefCell<Vec<(u64, String, TerminalWidget)>>> = Rc::new(RefCell::new(Vec::new()));
 
+    // Track bell state for window title
+    let has_bell: Rc<RefCell<bool>> = Rc::new(RefCell::new(false));
+
     // Reconstruct each tab
     for (tab_idx, tab_state) in window_state.tabs.into_iter().enumerate() {
         log::info!(
@@ -272,14 +275,28 @@ fn create_restored_window(
                 let tab_bar_bell = tab_bar.clone();
                 let notebook_bell = notebook.clone();
                 let tabs_bell = Rc::clone(&tabs);
+                let window_bell = window.clone();
+                let has_bell_bell = Rc::clone(&has_bell);
                 terminal_widget.set_on_bell(move || {
-                    if let Some(current_page) = notebook_bell.current_page() {
+                    let is_window_active = window_bell.is_active();
+                    let is_current_tab = if let Some(current_page) = notebook_bell.current_page() {
                         let tabs = tabs_bell.borrow();
-                        if let Some((current_id, _, _)) = tabs.get(current_page as usize) {
-                            if *current_id != tab_id {
-                                tab_bar_bell.set_bell(tab_id, true);
-                            }
-                        }
+                        tabs.get(current_page as usize)
+                            .map(|(id, _, _)| *id == tab_id)
+                            .unwrap_or(false)
+                    } else {
+                        false
+                    };
+
+                    // Show bell indicator on tab if not current or window not active
+                    if !is_current_tab || !is_window_active {
+                        tab_bar_bell.set_bell(tab_id, true);
+                    }
+
+                    // Update window title if window is not active
+                    if !is_window_active {
+                        *has_bell_bell.borrow_mut() = true;
+                        window_bell.set_title(Some("🔔 cterm"));
                     }
                 });
 
@@ -290,6 +307,35 @@ fn create_restored_window(
                 log::error!("Failed to restore tab {}: {}", tab_idx, e);
             }
         }
+    }
+
+    // Update tab bar visibility (hide if only one tab)
+    tab_bar.update_visibility();
+
+    // Set up window focus handler to clear bell when window becomes active
+    {
+        let has_bell_focus = Rc::clone(&has_bell);
+        let window_focus = window.clone();
+        let tab_bar_focus = tab_bar.clone();
+        let tabs_focus = Rc::clone(&tabs);
+        let notebook_focus = notebook.clone();
+        window.connect_is_active_notify(move |win| {
+            if win.is_active() {
+                let mut bell = has_bell_focus.borrow_mut();
+                if *bell {
+                    *bell = false;
+                    window_focus.set_title(Some("cterm"));
+
+                    // Clear bell on the currently active tab
+                    if let Some(page_idx) = notebook_focus.current_page() {
+                        let tabs = tabs_focus.borrow();
+                        if let Some((tab_id, _, _)) = tabs.get(page_idx as usize) {
+                            tab_bar_focus.clear_bell(*tab_id);
+                        }
+                    }
+                }
+            }
+        });
     }
 
     // Set active tab
@@ -396,6 +442,9 @@ fn close_tab_by_id(
 
     // Remove from tab bar
     tab_bar.remove_tab(id);
+
+    // Update tab bar visibility (hide if only one tab)
+    tab_bar.update_visibility();
 
     // Close window if no tabs left
     if tabs.borrow().is_empty() {

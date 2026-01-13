@@ -187,6 +187,37 @@ mod unix {
             Ok(exit_code)
         }
 
+        /// Try to wait for the child process without blocking
+        /// Returns Ok(Some(exit_code)) if process exited, Ok(None) if still running
+        pub fn try_wait(&mut self) -> io::Result<Option<i32>> {
+            if let Some(status) = self.exit_status {
+                return Ok(Some(status));
+            }
+
+            let mut status: libc::c_int = 0;
+            let ret = unsafe { libc::waitpid(self.child_pid, &mut status, libc::WNOHANG) };
+
+            if ret < 0 {
+                return Err(io::Error::last_os_error());
+            }
+
+            if ret == 0 {
+                // Child still running
+                return Ok(None);
+            }
+
+            let exit_code = if libc::WIFEXITED(status) {
+                libc::WEXITSTATUS(status)
+            } else if libc::WIFSIGNALED(status) {
+                128 + libc::WTERMSIG(status)
+            } else {
+                -1
+            };
+
+            self.exit_status = Some(exit_code);
+            Ok(Some(exit_code))
+        }
+
         /// Send a signal to the child process
         pub fn send_signal(&self, signal: i32) -> io::Result<()> {
             let ret = unsafe { libc::kill(self.child_pid, signal) };
@@ -788,6 +819,21 @@ mod tests {
         assert_eq!(size.pixel_height, 0);
     }
 
+    /// Helper to wait with a timeout for tests
+    fn wait_with_timeout(pty: &mut Pty, timeout_ms: u64) -> Option<i32> {
+        let start = std::time::Instant::now();
+        let timeout = std::time::Duration::from_millis(timeout_ms);
+        loop {
+            if let Ok(Some(status)) = pty.try_wait() {
+                return Some(status);
+            }
+            if start.elapsed() > timeout {
+                return None;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
     #[test]
     #[cfg(unix)]
     fn test_pty_creation_unix() {
@@ -805,8 +851,15 @@ mod tests {
         let mut pty = Pty::new(&config).expect("Failed to create PTY");
         assert!(pty.child_pid() > 0);
 
-        // Wait for the child to exit
-        let status = pty.wait().expect("Failed to wait");
+        // Give the command time to produce output
+        std::thread::sleep(std::time::Duration::from_millis(100));
+
+        // Read the output (important on macOS to unblock the child)
+        let mut buf = [0u8; 1024];
+        let _ = pty.read(&mut buf);
+
+        // Wait for the child with a timeout
+        let status = wait_with_timeout(&mut pty, 5000).expect("Child did not exit in time");
         assert_eq!(status, 0);
     }
 
@@ -1052,7 +1105,7 @@ mod tests {
         };
 
         let mut pty = Pty::new(&config).expect("Failed to create PTY");
-        let status = pty.wait().expect("Failed to wait");
+        let status = wait_with_timeout(&mut pty, 5000).expect("Child did not exit in time");
         assert_eq!(status, 0);
 
         // Test non-zero exit
@@ -1068,7 +1121,7 @@ mod tests {
         };
 
         let mut pty = Pty::new(&config).expect("Failed to create PTY");
-        let status = pty.wait().expect("Failed to wait");
+        let status = wait_with_timeout(&mut pty, 5000).expect("Child did not exit in time");
         assert_eq!(status, 42);
     }
 

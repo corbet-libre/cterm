@@ -289,6 +289,22 @@ impl TabBar {
     pub fn clear_bell(&self, id: u64) {
         self.set_bell(id, false);
     }
+
+    /// Update tab bar visibility based on tab count
+    /// Hide when there's only one tab, show when there are multiple
+    pub fn update_visibility(&self) {
+        let tab_count = self.tabs.borrow().len();
+        self.container.set_visible(tab_count > 1);
+    }
+
+    /// Check if any tab has a bell indicator active
+    #[allow(dead_code)]
+    pub fn has_any_bell(&self) -> bool {
+        self.tabs
+            .borrow()
+            .iter()
+            .any(|tab| tab.bell_icon.is_visible())
+    }
 }
 
 impl Default for TabBar {

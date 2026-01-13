@@ -38,6 +38,7 @@ pub struct CtermWindow {
     next_tab_id: Rc<RefCell<u64>>,
     menu_bar: PopoverMenuBar,
     debug_menu_shown: Rc<RefCell<bool>>,
+    has_bell: Rc<RefCell<bool>>,
 }
 
 impl CtermWindow {
@@ -87,6 +88,7 @@ impl CtermWindow {
         let shortcuts = ShortcutManager::from_config(&config.shortcuts);
 
         let debug_menu_shown = Rc::new(RefCell::new(false));
+        let has_bell = Rc::new(RefCell::new(false));
 
         let cterm_window = Self {
             window: window.clone(),
@@ -99,6 +101,7 @@ impl CtermWindow {
             next_tab_id: Rc::new(RefCell::new(0)),
             menu_bar,
             debug_menu_shown,
+            has_bell,
         };
 
         // Set up window actions
@@ -110,8 +113,14 @@ impl CtermWindow {
         // Set up Shift key tracking for debug menu
         cterm_window.setup_debug_menu_handler();
 
+        // Set up window focus handler to clear bell on focus
+        cterm_window.setup_focus_handler();
+
         // Create initial tab
         cterm_window.new_tab();
+
+        // Initially hide tab bar (only one tab)
+        cterm_window.tab_bar.update_visibility();
 
         // Set up tab bar callbacks
         cterm_window.setup_tab_bar_callbacks();
@@ -128,6 +137,7 @@ impl CtermWindow {
         let config = Rc::clone(&self.config);
         let theme = self.theme.clone();
         let tab_bar = self.tab_bar.clone();
+        let has_bell = Rc::clone(&self.has_bell);
 
         // File menu actions
         {
@@ -138,6 +148,7 @@ impl CtermWindow {
             let theme = theme.clone();
             let tab_bar = tab_bar.clone();
             let window_clone = window.clone();
+            let has_bell = Rc::clone(&has_bell);
             let action = gio::SimpleAction::new("new-tab", None);
             action.connect_activate(move |_, _| {
                 create_new_tab(
@@ -148,6 +159,7 @@ impl CtermWindow {
                     &theme,
                     &tab_bar,
                     &window_clone,
+                    &has_bell,
                 );
             });
             window.add_action(&action);
@@ -720,6 +732,7 @@ impl CtermWindow {
         let config = self.config.clone();
         let theme = self.theme.clone();
         let tab_bar = self.tab_bar.clone();
+        let has_bell = Rc::clone(&self.has_bell);
 
         key_controller.connect_key_pressed(move |_, keyval, _keycode, state| {
             // Convert GTK modifiers to our modifiers
@@ -739,6 +752,7 @@ impl CtermWindow {
                                 &theme,
                                 &tab_bar,
                                 &window,
+                                &has_bell,
                             );
                             return glib::Propagation::Stop;
                         }
@@ -882,6 +896,34 @@ impl CtermWindow {
         self.window.add_controller(debug_controller);
     }
 
+    /// Set up window focus handler to clear bell when window becomes active
+    fn setup_focus_handler(&self) {
+        let has_bell = Rc::clone(&self.has_bell);
+        let window = self.window.clone();
+        let tab_bar = self.tab_bar.clone();
+        let tabs = Rc::clone(&self.tabs);
+        let notebook = self.notebook.clone();
+
+        self.window.connect_is_active_notify(move |win| {
+            if win.is_active() {
+                // Window became active, clear bell indicator
+                let mut bell = has_bell.borrow_mut();
+                if *bell {
+                    *bell = false;
+                    window.set_title(Some("cterm"));
+
+                    // Clear bell on the currently active tab
+                    if let Some(page_idx) = notebook.current_page() {
+                        let tabs = tabs.borrow();
+                        if let Some(tab) = tabs.get(page_idx as usize) {
+                            tab_bar.clear_bell(tab.id);
+                        }
+                    }
+                }
+            }
+        });
+    }
+
     /// Set up tab bar callbacks
     fn setup_tab_bar_callbacks(&self) {
         let notebook = self.notebook.clone();
@@ -891,6 +933,7 @@ impl CtermWindow {
         let theme = self.theme.clone();
         let tab_bar = self.tab_bar.clone();
         let window = self.window.clone();
+        let has_bell = Rc::clone(&self.has_bell);
 
         // New tab button
         self.tab_bar.set_on_new_tab(move || {
@@ -902,6 +945,7 @@ impl CtermWindow {
                 &theme,
                 &tab_bar,
                 &window,
+                &has_bell,
             );
         });
     }
@@ -916,11 +960,13 @@ impl CtermWindow {
             &self.theme,
             &self.tab_bar,
             &self.window,
+            &self.has_bell,
         );
     }
 }
 
 /// Create a new terminal tab
+#[allow(clippy::too_many_arguments)]
 fn create_new_tab(
     notebook: &Notebook,
     tabs: &Rc<RefCell<Vec<TabEntry>>>,
@@ -929,6 +975,7 @@ fn create_new_tab(
     theme: &Theme,
     tab_bar: &TabBar,
     window: &ApplicationWindow,
+    has_bell: &Rc<RefCell<bool>>,
 ) {
     // Create terminal widget
     let cfg = config.borrow();
@@ -999,20 +1046,34 @@ fn create_new_tab(
         );
     });
 
-    // Set up bell callback to show bell icon on inactive tabs
+    // Set up bell callback to show bell icon and update window title
     let tab_bar_bell = tab_bar.clone();
     let notebook_bell = notebook.clone();
     let tabs_bell = Rc::clone(tabs);
+    let window_bell = window.clone();
+    let has_bell_bell = Rc::clone(has_bell);
     terminal.set_on_bell(move || {
-        // Only show bell if this tab is not active
-        if let Some(current_page) = notebook_bell.current_page() {
+        let is_window_active = window_bell.is_active();
+        let is_current_tab = if let Some(current_page) = notebook_bell.current_page() {
             let tabs = tabs_bell.borrow();
-            if let Some(current_tab) = tabs.get(current_page as usize) {
-                if current_tab.id != tab_id {
-                    // This tab is not active, show bell
-                    tab_bar_bell.set_bell(tab_id, true);
-                }
-            }
+            tabs.get(current_page as usize)
+                .map(|t| t.id == tab_id)
+                .unwrap_or(false)
+        } else {
+            false
+        };
+
+        // Show bell indicator on tab if:
+        // - This is not the current tab, OR
+        // - The window is not active (even for current tab)
+        if !is_current_tab || !is_window_active {
+            tab_bar_bell.set_bell(tab_id, true);
+        }
+
+        // Update window title if window is not active
+        if !is_window_active {
+            *has_bell_bell.borrow_mut() = true;
+            window_bell.set_title(Some("🔔 cterm"));
         }
     });
 
@@ -1022,6 +1083,9 @@ fn create_new_tab(
         title: "Terminal".to_string(),
         terminal,
     });
+
+    // Update tab bar visibility (show if >1 tabs)
+    tab_bar.update_visibility();
 
     // Switch to new tab and focus terminal
     notebook.set_current_page(Some(page_num));
@@ -1075,6 +1139,9 @@ fn close_tab_by_id(
 
     // Remove from tab bar
     tab_bar.remove_tab(id);
+
+    // Update tab bar visibility (hide if only one tab)
+    tab_bar.update_visibility();
 
     // Close window if no tabs left
     if tabs.borrow().is_empty() {
@@ -1134,6 +1201,9 @@ fn close_other_tabs(
             tab_bar.remove_tab(id);
         }
     }
+
+    // Update tab bar visibility (hide if only one tab)
+    tab_bar.update_visibility();
 
     // Update active tab in tab bar
     sync_tab_bar_active(tab_bar, tabs, notebook);
