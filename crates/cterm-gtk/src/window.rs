@@ -1,13 +1,12 @@
 //! Main window implementation
 
 use std::cell::RefCell;
-use std::collections::HashMap;
 use std::rc::Rc;
 
 use gtk4::prelude::*;
 use gtk4::{
     Application, ApplicationWindow, Box as GtkBox, EventControllerKey,
-    Notebook, Orientation, gdk, gio, glib,
+    Notebook, Orientation, PopoverMenuBar, gdk, gio, glib,
 };
 
 use cterm_app::config::Config;
@@ -15,12 +14,15 @@ use cterm_app::shortcuts::ShortcutManager;
 use cterm_ui::events::{Action, KeyCode, Modifiers};
 use cterm_ui::theme::Theme;
 
+use crate::dialogs;
+use crate::menu;
 use crate::tab_bar::TabBar;
 use crate::terminal_widget::TerminalWidget;
 
 /// Tab entry tracking terminal and its ID
 struct TabEntry {
     id: u64,
+    title: String,
     terminal: TerminalWidget,
 }
 
@@ -29,11 +31,12 @@ pub struct CtermWindow {
     pub window: ApplicationWindow,
     pub notebook: Notebook,
     pub tab_bar: TabBar,
-    pub config: Config,
+    pub config: Rc<RefCell<Config>>,
     pub theme: Theme,
     pub shortcuts: ShortcutManager,
     tabs: Rc<RefCell<Vec<TabEntry>>>,
     next_tab_id: Rc<RefCell<u64>>,
+    menu_model: gio::Menu,
 }
 
 impl CtermWindow {
@@ -49,6 +52,11 @@ impl CtermWindow {
 
         // Create the main container
         let main_box = GtkBox::new(Orientation::Vertical, 0);
+
+        // Create menu bar
+        let menu_model = menu::create_menu_model();
+        let menu_bar = PopoverMenuBar::from_model(Some(&menu_model));
+        main_box.append(&menu_bar);
 
         // Create tab bar
         let tab_bar = TabBar::new();
@@ -73,12 +81,16 @@ impl CtermWindow {
             window: window.clone(),
             notebook: notebook.clone(),
             tab_bar,
-            config: config.clone(),
+            config: Rc::new(RefCell::new(config.clone())),
             theme: theme.clone(),
             shortcuts,
             tabs: Rc::new(RefCell::new(Vec::new())),
             next_tab_id: Rc::new(RefCell::new(0)),
+            menu_model,
         };
+
+        // Set up window actions
+        cterm_window.setup_actions();
 
         // Set up key event handling
         cterm_window.setup_key_handler();
@@ -90,6 +102,333 @@ impl CtermWindow {
         cterm_window.setup_tab_bar_callbacks();
 
         cterm_window
+    }
+
+    /// Set up window actions for the menu
+    fn setup_actions(&self) {
+        let window = &self.window;
+        let notebook = self.notebook.clone();
+        let tabs = Rc::clone(&self.tabs);
+        let next_tab_id = Rc::clone(&self.next_tab_id);
+        let config = Rc::clone(&self.config);
+        let theme = self.theme.clone();
+        let tab_bar = self.tab_bar.clone();
+
+        // File menu actions
+        {
+            let notebook = notebook.clone();
+            let tabs = Rc::clone(&tabs);
+            let next_tab_id = Rc::clone(&next_tab_id);
+            let config = Rc::clone(&config);
+            let theme = theme.clone();
+            let tab_bar = tab_bar.clone();
+            let window_clone = window.clone();
+            let action = gio::SimpleAction::new("new-tab", None);
+            action.connect_activate(move |_, _| {
+                create_new_tab(&notebook, &tabs, &next_tab_id, &config, &theme, &tab_bar, &window_clone);
+            });
+            window.add_action(&action);
+        }
+
+        {
+            let app = window.application().unwrap();
+            let config = Rc::clone(&config);
+            let theme = theme.clone();
+            let action = gio::SimpleAction::new("new-window", None);
+            action.connect_activate(move |_, _| {
+                let cfg = config.borrow();
+                if let Some(gtk_app) = app.downcast_ref::<Application>() {
+                    let new_win = CtermWindow::new(gtk_app, &cfg, &theme);
+                    new_win.present();
+                }
+            });
+            window.add_action(&action);
+        }
+
+        {
+            let notebook = notebook.clone();
+            let tabs = Rc::clone(&tabs);
+            let tab_bar = tab_bar.clone();
+            let window_clone = window.clone();
+            let action = gio::SimpleAction::new("close-tab", None);
+            action.connect_activate(move |_, _| {
+                close_current_tab(&notebook, &tabs, &tab_bar, &window_clone);
+            });
+            window.add_action(&action);
+        }
+
+        {
+            let notebook = notebook.clone();
+            let tabs = Rc::clone(&tabs);
+            let tab_bar = tab_bar.clone();
+            let window_clone = window.clone();
+            let action = gio::SimpleAction::new("close-other-tabs", None);
+            action.connect_activate(move |_, _| {
+                close_other_tabs(&notebook, &tabs, &tab_bar, &window_clone);
+            });
+            window.add_action(&action);
+        }
+
+        {
+            let window_clone = window.clone();
+            let action = gio::SimpleAction::new("quit", None);
+            action.connect_activate(move |_, _| {
+                window_clone.close();
+            });
+            window.add_action(&action);
+        }
+
+        // Edit menu actions
+        {
+            // Copy - placeholder until selection is implemented
+            let action = gio::SimpleAction::new("copy", None);
+            action.connect_activate(|_, _| {
+                log::info!("Copy action triggered - selection not yet implemented");
+            });
+            window.add_action(&action);
+        }
+
+        {
+            // Copy as HTML - placeholder
+            let action = gio::SimpleAction::new("copy-html", None);
+            action.connect_activate(|_, _| {
+                log::info!("Copy as HTML action triggered - not yet implemented");
+            });
+            window.add_action(&action);
+        }
+
+        {
+            let notebook = notebook.clone();
+            let tabs = Rc::clone(&tabs);
+            let action = gio::SimpleAction::new("paste", None);
+            action.connect_activate(move |_, _| {
+                if let Some(display) = gdk::Display::default() {
+                    let clipboard = display.clipboard();
+                    let tabs_paste = Rc::clone(&tabs);
+                    let notebook_paste = notebook.clone();
+                    clipboard.read_text_async(None::<&gio::Cancellable>, move |result| {
+                        if let Ok(Some(text)) = result {
+                            if let Some(page_idx) = notebook_paste.current_page() {
+                                let tabs = tabs_paste.borrow();
+                                if let Some(tab) = tabs.get(page_idx as usize) {
+                                    tab.terminal.write_str(&text);
+                                }
+                            }
+                        }
+                    });
+                }
+            });
+            window.add_action(&action);
+        }
+
+        {
+            // Select All - placeholder
+            let action = gio::SimpleAction::new("select-all", None);
+            action.connect_activate(|_, _| {
+                log::info!("Select All action triggered - selection not yet implemented");
+            });
+            window.add_action(&action);
+        }
+
+        // Terminal menu actions
+        {
+            let window_clone = window.clone();
+            let tabs = Rc::clone(&tabs);
+            let notebook = notebook.clone();
+            let tab_bar = tab_bar.clone();
+            let action = gio::SimpleAction::new("set-title", None);
+            action.connect_activate(move |_, _| {
+                let current_title = {
+                    if let Some(page_idx) = notebook.current_page() {
+                        let tabs = tabs.borrow();
+                        tabs.get(page_idx as usize).map(|t| t.title.clone()).unwrap_or_default()
+                    } else {
+                        String::new()
+                    }
+                };
+                let tabs_clone = Rc::clone(&tabs);
+                let notebook_clone = notebook.clone();
+                let tab_bar_clone = tab_bar.clone();
+                dialogs::show_set_title_dialog(&window_clone, &current_title, move |new_title| {
+                    if let Some(page_idx) = notebook_clone.current_page() {
+                        let mut tabs = tabs_clone.borrow_mut();
+                        if let Some(tab) = tabs.get_mut(page_idx as usize) {
+                            tab.title = new_title.clone();
+                            tab_bar_clone.set_title(tab.id, &new_title);
+                        }
+                    }
+                });
+            });
+            window.add_action(&action);
+        }
+
+        {
+            let window_clone = window.clone();
+            let tabs = Rc::clone(&tabs);
+            let notebook = notebook.clone();
+            let tab_bar = tab_bar.clone();
+            let action = gio::SimpleAction::new("set-color", None);
+            action.connect_activate(move |_, _| {
+                let tabs_clone = Rc::clone(&tabs);
+                let notebook_clone = notebook.clone();
+                let tab_bar_clone = tab_bar.clone();
+                dialogs::show_set_color_dialog(&window_clone, move |color| {
+                    if let Some(page_idx) = notebook_clone.current_page() {
+                        let tabs = tabs_clone.borrow();
+                        if let Some(tab) = tabs.get(page_idx as usize) {
+                            tab_bar_clone.set_color(tab.id, color.as_deref());
+                        }
+                    }
+                });
+            });
+            window.add_action(&action);
+        }
+
+        {
+            let window_clone = window.clone();
+            let action = gio::SimpleAction::new("find", None);
+            action.connect_activate(move |_, _| {
+                dialogs::show_find_dialog(&window_clone, |text, case_sensitive, regex| {
+                    log::info!("Find: '{}' case={} regex={}", text, case_sensitive, regex);
+                    // TODO: Implement actual find in scrollback
+                });
+            });
+            window.add_action(&action);
+        }
+
+        {
+            let action = gio::SimpleAction::new("set-encoding", Some(&glib::VariantType::new("s").unwrap()));
+            action.connect_activate(|_, param| {
+                if let Some(encoding) = param.and_then(|p| p.get::<String>()) {
+                    log::info!("Set encoding: {}", encoding);
+                    // TODO: Implement encoding change
+                }
+            });
+            window.add_action(&action);
+        }
+
+        {
+            let tabs = Rc::clone(&tabs);
+            let notebook = notebook.clone();
+            let action = gio::SimpleAction::new("send-signal", Some(&glib::VariantType::new("s").unwrap()));
+            action.connect_activate(move |_, param| {
+                if let Some(signal_str) = param.and_then(|p| p.get::<String>()) {
+                    if let Ok(signal) = signal_str.parse::<i32>() {
+                        log::info!("Sending signal {} to terminal", signal);
+                        // TODO: Get PID from PTY and send signal
+                    }
+                }
+            });
+            window.add_action(&action);
+        }
+
+        {
+            let tabs = Rc::clone(&tabs);
+            let notebook = notebook.clone();
+            let action = gio::SimpleAction::new("reset", None);
+            action.connect_activate(move |_, _| {
+                if let Some(page_idx) = notebook.current_page() {
+                    let tabs = tabs.borrow();
+                    if let Some(tab) = tabs.get(page_idx as usize) {
+                        tab.terminal.reset();
+                    }
+                }
+            });
+            window.add_action(&action);
+        }
+
+        {
+            let tabs = Rc::clone(&tabs);
+            let notebook = notebook.clone();
+            let action = gio::SimpleAction::new("clear-reset", None);
+            action.connect_activate(move |_, _| {
+                if let Some(page_idx) = notebook.current_page() {
+                    let tabs = tabs.borrow();
+                    if let Some(tab) = tabs.get(page_idx as usize) {
+                        tab.terminal.clear_scrollback_and_reset();
+                    }
+                }
+            });
+            window.add_action(&action);
+        }
+
+        // Tabs menu actions
+        {
+            let notebook = notebook.clone();
+            let tabs = Rc::clone(&tabs);
+            let tab_bar = tab_bar.clone();
+            let action = gio::SimpleAction::new("prev-tab", None);
+            action.connect_activate(move |_, _| {
+                let n = notebook.n_pages();
+                if n > 0 {
+                    let current = notebook.current_page().unwrap_or(0);
+                    let prev = if current == 0 { n - 1 } else { current - 1 };
+                    notebook.set_current_page(Some(prev));
+                    sync_tab_bar_active(&tab_bar, &tabs, &notebook);
+                }
+            });
+            window.add_action(&action);
+        }
+
+        {
+            let notebook = notebook.clone();
+            let tabs = Rc::clone(&tabs);
+            let tab_bar = tab_bar.clone();
+            let action = gio::SimpleAction::new("next-tab", None);
+            action.connect_activate(move |_, _| {
+                let n = notebook.n_pages();
+                if n > 0 {
+                    let current = notebook.current_page().unwrap_or(0);
+                    notebook.set_current_page(Some((current + 1) % n));
+                    sync_tab_bar_active(&tab_bar, &tabs, &notebook);
+                }
+            });
+            window.add_action(&action);
+        }
+
+        {
+            let notebook = notebook.clone();
+            let tabs = Rc::clone(&tabs);
+            let tab_bar = tab_bar.clone();
+            let action = gio::SimpleAction::new("switch-tab", Some(&glib::VariantType::new("s").unwrap()));
+            action.connect_activate(move |_, param| {
+                if let Some(id_str) = param.and_then(|p| p.get::<String>()) {
+                    if let Ok(id) = id_str.parse::<u64>() {
+                        let tabs_ref = tabs.borrow();
+                        if let Some(idx) = tabs_ref.iter().position(|t| t.id == id) {
+                            notebook.set_current_page(Some(idx as u32));
+                            drop(tabs_ref);
+                            sync_tab_bar_active(&tab_bar, &tabs, &notebook);
+                        }
+                    }
+                }
+            });
+            window.add_action(&action);
+        }
+
+        // Help menu actions
+        {
+            let window_clone = window.clone();
+            let config = Rc::clone(&config);
+            let action = gio::SimpleAction::new("preferences", None);
+            action.connect_activate(move |_, _| {
+                let cfg = config.borrow().clone();
+                dialogs::show_preferences_dialog(&window_clone, &cfg, |new_config| {
+                    log::info!("Preferences saved");
+                    // TODO: Apply and save config
+                });
+            });
+            window.add_action(&action);
+        }
+
+        {
+            let window_clone = window.clone();
+            let action = gio::SimpleAction::new("about", None);
+            action.connect_activate(move |_, _| {
+                dialogs::show_about_dialog(&window_clone);
+            });
+            window.add_action(&action);
+        }
     }
 
     /// Present the window
@@ -256,13 +595,14 @@ fn create_new_tab(
     notebook: &Notebook,
     tabs: &Rc<RefCell<Vec<TabEntry>>>,
     next_tab_id: &Rc<RefCell<u64>>,
-    config: &Config,
+    config: &Rc<RefCell<Config>>,
     theme: &Theme,
     tab_bar: &TabBar,
     window: &ApplicationWindow,
 ) {
     // Create terminal widget
-    let terminal = match TerminalWidget::new(config, theme) {
+    let cfg = config.borrow();
+    let terminal = match TerminalWidget::new(&cfg, theme) {
         Ok(t) => t,
         Err(e) => {
             log::error!("Failed to create terminal: {}", e);
@@ -335,7 +675,11 @@ fn create_new_tab(
     });
 
     // Store terminal with its ID
-    tabs.borrow_mut().push(TabEntry { id: tab_id, terminal });
+    tabs.borrow_mut().push(TabEntry {
+        id: tab_id,
+        title: "Terminal".to_string(),
+        terminal,
+    });
 
     // Switch to new tab and focus terminal
     notebook.set_current_page(Some(page_num));
@@ -405,6 +749,52 @@ fn close_tab_by_id(
             widget.grab_focus();
         }
     }
+}
+
+/// Close all tabs except the current one
+fn close_other_tabs(
+    notebook: &Notebook,
+    tabs: &Rc<RefCell<Vec<TabEntry>>>,
+    tab_bar: &TabBar,
+    _window: &ApplicationWindow,
+) {
+    let current_id = {
+        if let Some(page_idx) = notebook.current_page() {
+            let tabs = tabs.borrow();
+            tabs.get(page_idx as usize).map(|t| t.id)
+        } else {
+            None
+        }
+    };
+
+    let Some(current_id) = current_id else { return };
+
+    // Collect IDs of tabs to close (all except current)
+    let ids_to_close: Vec<u64> = {
+        let tabs = tabs.borrow();
+        tabs.iter()
+            .filter(|t| t.id != current_id)
+            .map(|t| t.id)
+            .collect()
+    };
+
+    // Close each tab by removing from notebook, tabs list, and tab bar
+    for id in ids_to_close {
+        // Find index of this tab
+        let index = {
+            let tabs = tabs.borrow();
+            tabs.iter().position(|t| t.id == id)
+        };
+
+        if let Some(index) = index {
+            notebook.remove_page(Some(index as u32));
+            tabs.borrow_mut().remove(index);
+            tab_bar.remove_tab(id);
+        }
+    }
+
+    // Update active tab in tab bar
+    sync_tab_bar_active(tab_bar, tabs, notebook);
 }
 
 /// Sync tab bar active state with notebook

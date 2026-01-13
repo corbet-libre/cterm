@@ -3,9 +3,11 @@
 //! Main entry point for the GTK4 application.
 
 mod app;
-mod window;
-mod terminal_widget;
+mod dialogs;
+mod menu;
 mod tab_bar;
+mod terminal_widget;
+mod window;
 
 use gtk4::prelude::*;
 use gtk4::{Application, glib};

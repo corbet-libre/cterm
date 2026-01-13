@@ -162,6 +162,32 @@ impl TerminalWidget {
         self.trigger_resize();
     }
 
+    /// Reset the terminal (soft reset - keeps scrollback)
+    pub fn reset(&self) {
+        let mut term = self.terminal.lock();
+        let screen = term.screen_mut();
+        // Soft reset: reset modes and cursor but keep scrollback
+        screen.cursor = cterm_core::screen::Cursor::default();
+        screen.style = cterm_core::cell::CellStyle::default();
+        screen.modes = cterm_core::screen::TerminalModes {
+            auto_wrap: true,
+            show_cursor: true,
+            ..Default::default()
+        };
+        screen.reset_scroll_region();
+        screen.dirty = true;
+        drop(term);
+        self.drawing_area.queue_draw();
+    }
+
+    /// Clear scrollback buffer and fully reset the terminal
+    pub fn clear_scrollback_and_reset(&self) {
+        let mut term = self.terminal.lock();
+        term.screen_mut().reset();
+        drop(term);
+        self.drawing_area.queue_draw();
+    }
+
     /// Trigger a resize to recalculate terminal dimensions
     fn trigger_resize(&self) {
         // Force a resize by getting current size and calling resize signal
