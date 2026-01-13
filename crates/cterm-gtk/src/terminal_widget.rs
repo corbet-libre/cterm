@@ -30,6 +30,8 @@ pub struct CellDimensions {
 
 /// Callback type for terminal events
 type EventCallback = Rc<RefCell<Option<Box<dyn Fn()>>>>;
+/// Callback type for title change events
+type TitleCallback = Rc<RefCell<Option<Box<dyn Fn(&str)>>>>;
 
 /// Terminal widget wrapping GTK drawing area
 pub struct TerminalWidget {
@@ -42,6 +44,7 @@ pub struct TerminalWidget {
     cell_dims: Rc<RefCell<CellDimensions>>,
     on_exit: EventCallback,
     on_bell: EventCallback,
+    on_title_change: TitleCallback,
 }
 
 impl TerminalWidget {
@@ -104,6 +107,7 @@ impl TerminalWidget {
             cell_dims,
             on_exit: Rc::new(RefCell::new(None)),
             on_bell: Rc::new(RefCell::new(None)),
+            on_title_change: Rc::new(RefCell::new(None)),
         };
 
         // Set up drawing
@@ -160,6 +164,7 @@ impl TerminalWidget {
             cell_dims,
             on_exit: Rc::new(RefCell::new(None)),
             on_bell: Rc::new(RefCell::new(None)),
+            on_title_change: Rc::new(RefCell::new(None)),
         };
 
         // Set up drawing
@@ -229,6 +234,11 @@ impl TerminalWidget {
     /// Set callback for when the terminal rings the bell
     pub fn set_on_bell<F: Fn() + 'static>(&self, callback: F) {
         *self.on_bell.borrow_mut() = Some(Box::new(callback));
+    }
+
+    /// Set callback for when the terminal title changes
+    pub fn set_on_title_change<F: Fn(&str) + 'static>(&self, callback: F) {
+        *self.on_title_change.borrow_mut() = Some(Box::new(callback));
     }
 
     /// Write a string to the terminal (for paste operations)
@@ -543,6 +553,7 @@ impl TerminalWidget {
         let terminal_main = Arc::clone(&self.terminal);
         let on_exit = Rc::clone(&self.on_exit);
         let on_bell = Rc::clone(&self.on_bell);
+        let on_title_change = Rc::clone(&self.on_title_change);
         glib::timeout_add_local(Duration::from_millis(10), move || {
             // Process all pending messages
             while let Ok(msg) = rx.try_recv() {
@@ -585,8 +596,10 @@ impl TerminalWidget {
                                         callback();
                                     }
                                 }
-                                TerminalEvent::TitleChanged(_) => {
-                                    // Title changes are handled elsewhere
+                                TerminalEvent::TitleChanged(ref title) => {
+                                    if let Some(ref callback) = *on_title_change.borrow() {
+                                        callback(title);
+                                    }
                                 }
                                 TerminalEvent::ContentChanged => {
                                     // We always redraw below

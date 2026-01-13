@@ -1134,6 +1134,39 @@ fn create_new_tab(
         }
     });
 
+    // Set up title change callback to update tab bar and window title
+    let tab_bar_title = tab_bar.clone();
+    let tabs_title = Rc::clone(tabs);
+    let window_title = window.clone();
+    let notebook_title = notebook.clone();
+    let has_bell_title = Rc::clone(has_bell);
+    terminal.set_on_title_change(move |title| {
+        // Update tab bar
+        tab_bar_title.set_title(tab_id, title);
+
+        // Update stored title in tabs
+        {
+            let mut tabs = tabs_title.borrow_mut();
+            if let Some(entry) = tabs.iter_mut().find(|t| t.id == tab_id) {
+                entry.title = title.to_string();
+            }
+        }
+
+        // Update window title if this is the active tab
+        if let Some(current_page) = notebook_title.current_page() {
+            let tabs = tabs_title.borrow();
+            if tabs
+                .get(current_page as usize)
+                .map(|t| t.id == tab_id)
+                .unwrap_or(false)
+            {
+                // Clear bell indicator from window title
+                *has_bell_title.borrow_mut() = false;
+                window_title.set_title(Some(title));
+            }
+        }
+    });
+
     // Store terminal with its ID
     tabs.borrow_mut().push(TabEntry {
         id: tab_id,
@@ -1267,6 +1300,39 @@ fn create_docker_tab(
         if !is_window_active {
             *has_bell_bell.borrow_mut() = true;
             window_bell.set_title(Some("🔔 cterm"));
+        }
+    });
+
+    // Set up title change callback to update tab bar and window title
+    let tab_bar_title = tab_bar.clone();
+    let tabs_title = Rc::clone(tabs);
+    let window_title = window.clone();
+    let notebook_title = notebook.clone();
+    let has_bell_title = Rc::clone(has_bell);
+    terminal.set_on_title_change(move |title| {
+        // Update tab bar
+        tab_bar_title.set_title(tab_id, title);
+
+        // Update stored title in tabs
+        {
+            let mut tabs = tabs_title.borrow_mut();
+            if let Some(entry) = tabs.iter_mut().find(|t| t.id == tab_id) {
+                entry.title = title.to_string();
+            }
+        }
+
+        // Update window title if this is the active tab
+        if let Some(current_page) = notebook_title.current_page() {
+            let tabs = tabs_title.borrow();
+            if tabs
+                .get(current_page as usize)
+                .map(|t| t.id == tab_id)
+                .unwrap_or(false)
+            {
+                // Clear bell indicator from window title
+                *has_bell_title.borrow_mut() = false;
+                window_title.set_title(Some(title));
+            }
         }
     });
 
