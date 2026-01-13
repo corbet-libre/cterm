@@ -291,6 +291,7 @@ dependencies = [
  "log",
  "parking_lot",
  "portable-pty",
+ "regex",
  "serde",
  "thiserror 2.0.17",
  "tokio",

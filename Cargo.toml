@@ -39,6 +39,9 @@ directories = "6"
 # Encoding
 base64 = "0.22"
 
+# Search
+regex = "1"
+
 # Async
 tokio = { version = "1", features = ["full"] }
 futures = "0.3"

@@ -185,12 +185,50 @@ impl TabBar {
     pub fn set_color(&self, id: u64, color: Option<&str>) {
         for tab in self.tabs.borrow().iter() {
             if tab.id == id {
-                if let Some(_color) = color {
-                    // TODO: Apply inline style for color using CSS provider
-                    // For now, we just add a class
-                    tab.button.add_css_class("colored-tab");
+                if let Some(color) = color {
+                    // Apply inline style using CSS provider
+                    let css = format!(
+                        "button.colored-tab-{} {{ background-color: {}; }}",
+                        id, color
+                    );
+                    let provider = gtk4::CssProvider::new();
+                    provider.load_from_data(&css);
+
+                    // Remove old colored-tab class if any
+                    let classes: Vec<_> = tab
+                        .button
+                        .css_classes()
+                        .iter()
+                        .filter(|c| c.starts_with("colored-tab"))
+                        .map(|c| c.to_string())
+                        .collect();
+                    for class in classes {
+                        tab.button.remove_css_class(&class);
+                    }
+
+                    // Add new class and style
+                    let class_name = format!("colored-tab-{}", id);
+                    tab.button.add_css_class(&class_name);
+
+                    if let Some(display) = gtk4::gdk::Display::default() {
+                        gtk4::style_context_add_provider_for_display(
+                            &display,
+                            &provider,
+                            gtk4::STYLE_PROVIDER_PRIORITY_APPLICATION,
+                        );
+                    }
                 } else {
-                    tab.button.remove_css_class("colored-tab");
+                    // Remove any colored-tab class
+                    let classes: Vec<_> = tab
+                        .button
+                        .css_classes()
+                        .iter()
+                        .filter(|c| c.starts_with("colored-tab"))
+                        .map(|c| c.to_string())
+                        .collect();
+                    for class in classes {
+                        tab.button.remove_css_class(&class);
+                    }
                 }
                 break;
             }

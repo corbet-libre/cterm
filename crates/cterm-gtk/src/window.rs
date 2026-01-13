@@ -305,11 +305,21 @@ impl CtermWindow {
 
         {
             let window_clone = window.clone();
+            let tabs = Rc::clone(&tabs);
+            let notebook = notebook.clone();
             let action = gio::SimpleAction::new("find", None);
             action.connect_activate(move |_, _| {
-                dialogs::show_find_dialog(&window_clone, |text, case_sensitive, regex| {
+                let tabs = Rc::clone(&tabs);
+                let notebook = notebook.clone();
+                dialogs::show_find_dialog(&window_clone, move |text, case_sensitive, regex| {
                     log::info!("Find: '{}' case={} regex={}", text, case_sensitive, regex);
-                    // TODO: Implement actual find in scrollback
+                    if let Some(page_idx) = notebook.current_page() {
+                        let tabs = tabs.borrow();
+                        if let Some(tab) = tabs.get(page_idx as usize) {
+                            let count = tab.terminal.find(&text, case_sensitive, regex);
+                            log::info!("Found {} matches", count);
+                        }
+                    }
                 });
             });
             window.add_action(&action);
@@ -462,6 +472,55 @@ impl CtermWindow {
             let action = gio::SimpleAction::new("check-updates", None);
             action.connect_activate(move |_, _| {
                 crate::update_dialog::show_update_dialog(&window_clone);
+            });
+            window.add_action(&action);
+        }
+
+        // Execute upgrade action (called from update dialog)
+        {
+            let tabs = Rc::clone(&tabs);
+            let action = gio::SimpleAction::new(
+                "execute-upgrade",
+                Some(&glib::VariantType::new("s").unwrap()),
+            );
+            action.connect_activate(move |_, param| {
+                if let Some(binary_path) = param.and_then(|p| p.get::<String>()) {
+                    log::info!("Executing seamless upgrade with binary: {}", binary_path);
+
+                    // Get the current tabs for state collection
+                    let tabs_borrowed = tabs.borrow();
+                    let tab_count = tabs_borrowed.len();
+
+                    log::info!(
+                        "Upgrade would preserve {} tabs (not yet fully implemented)",
+                        tab_count
+                    );
+
+                    // TODO: Full implementation requires:
+                    // 1. Stop all PTY readers
+                    // 2. Collect upgrade state from all windows/tabs
+                    // 3. Create Unix socket
+                    // 4. Spawn new process with --upgrade-receiver
+                    // 5. Send state and FDs via SCM_RIGHTS
+                    // 6. Wait for ack and exit
+
+                    // For now, show a dialog explaining the limitation
+                    let dialog = gtk4::MessageDialog::new(
+                        None::<&gtk4::Window>,
+                        gtk4::DialogFlags::MODAL,
+                        gtk4::MessageType::Info,
+                        gtk4::ButtonsType::Ok,
+                        format!(
+                            "Seamless upgrade is ready to be implemented.\n\n\
+                            Binary: {}\n\
+                            Tabs to preserve: {}\n\n\
+                            Full implementation pending.",
+                            binary_path, tab_count
+                        ),
+                    );
+                    dialog.connect_response(|d, _| d.close());
+                    dialog.present();
+                }
             });
             window.add_action(&action);
         }

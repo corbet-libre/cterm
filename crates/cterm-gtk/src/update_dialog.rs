@@ -134,21 +134,52 @@ pub fn show_update_dialog(parent: &impl IsA<Window>) {
                 progress_bar_clone.set_visible(true);
                 progress_bar_clone.set_fraction(0.0);
 
+                // Use Arc<Mutex> for thread-safe progress updates
+                let progress_state =
+                    std::sync::Arc::new(std::sync::Mutex::new((0u64, 0u64, false)));
+                let progress_bar_update = progress_bar_clone.clone();
+                let progress_state_timer = progress_state.clone();
+
+                // Set up timer to poll progress state
+                glib::timeout_add_local(std::time::Duration::from_millis(100), move || {
+                    let (downloaded, total, done) = *progress_state_timer.lock().unwrap();
+                    if total > 0 {
+                        let fraction = downloaded as f64 / total as f64;
+                        progress_bar_update.set_fraction(fraction);
+                        progress_bar_update.set_text(Some(&format!(
+                            "{:.1} MB / {:.1} MB",
+                            downloaded as f64 / 1_048_576.0,
+                            total as f64 / 1_048_576.0
+                        )));
+                    }
+                    if done {
+                        glib::ControlFlow::Break
+                    } else {
+                        glib::ControlFlow::Continue
+                    }
+                });
+
                 // Spawn download task
-                let _progress_bar = progress_bar_clone.clone();
                 let status_label = status_label_clone.clone();
                 let action_btn = action_button_clone.clone();
                 let state = state_clone.clone();
                 let downloaded_path = downloaded_path_clone.clone();
+                let progress_state_download = progress_state.clone();
 
                 glib::spawn_future_local(async move {
-                    match download_update(&info, move |_downloaded, _total| {
-                        // TODO: Progress callback - update the progress bar
-                        // using glib channels or RefCell to communicate with GTK main loop
+                    match download_update(&info, move |downloaded, total| {
+                        // Update shared progress state (thread-safe)
+                        if let Ok(mut state) = progress_state_download.lock() {
+                            *state = (downloaded, total, false);
+                        }
                     })
                     .await
                     {
                         Ok(path) => {
+                            // Mark progress timer as done
+                            if let Ok(mut state) = progress_state.lock() {
+                                state.2 = true;
+                            }
                             glib::idle_add_local_once({
                                 let action_btn = action_btn.clone();
                                 let status_label = status_label.clone();
@@ -166,6 +197,10 @@ pub fn show_update_dialog(parent: &impl IsA<Window>) {
                             });
                         }
                         Err(e) => {
+                            // Mark progress timer as done
+                            if let Ok(mut state) = progress_state.lock() {
+                                state.2 = true;
+                            }
                             glib::idle_add_local_once({
                                 let state = state.clone();
                                 let status_label = status_label.clone();
@@ -187,12 +222,18 @@ pub fn show_update_dialog(parent: &impl IsA<Window>) {
                 status_label_clone.set_text("Starting upgrade...");
                 btn.set_sensitive(false);
 
-                // Close dialog and trigger upgrade through the window
-                // The actual upgrade execution will be implemented in Phase 8
+                // Close dialog
                 dialog_clone.close();
 
-                // TODO: Signal the main window to execute the upgrade
-                log::warn!("Upgrade execution not yet implemented");
+                // Signal the main window to execute the upgrade via action
+                if let Some(toplevel) = dialog_clone.transient_for() {
+                    let path_str = path.to_string_lossy().to_string();
+                    if let Err(e) = toplevel
+                        .activate_action("win.execute-upgrade", Some(&path_str.to_variant()))
+                    {
+                        log::error!("Failed to activate upgrade action: {}", e);
+                    }
+                }
             }
             _ => {}
         }

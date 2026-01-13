@@ -216,6 +216,46 @@ impl TerminalWidget {
         }
     }
 
+    /// Search for text in terminal buffer (scrollback + visible)
+    ///
+    /// Returns the number of matches found. If matches are found, scrolls to the first match.
+    pub fn find(&self, pattern: &str, case_sensitive: bool, regex: bool) -> usize {
+        let term = self.terminal.lock();
+        let results = term.find(pattern, case_sensitive, regex);
+        let count = results.len();
+
+        if let Some(first) = results.first() {
+            // Need to release the lock before we can take mutable lock
+            let line_idx = first.line;
+            drop(term);
+
+            let mut term = self.terminal.lock();
+            term.scroll_to_line(line_idx);
+            self.drawing_area.queue_draw();
+        }
+
+        count
+    }
+
+    /// Search and return all matches (for iteration/highlighting)
+    pub fn find_all(
+        &self,
+        pattern: &str,
+        case_sensitive: bool,
+        regex: bool,
+    ) -> Vec<cterm_core::SearchResult> {
+        let term = self.terminal.lock();
+        term.find(pattern, case_sensitive, regex)
+    }
+
+    /// Scroll to a specific search result
+    pub fn scroll_to_result(&self, result: &cterm_core::SearchResult) {
+        let mut term = self.terminal.lock();
+        term.scroll_to_line(result.line);
+        drop(term);
+        self.drawing_area.queue_draw();
+    }
+
     /// Trigger a resize to recalculate terminal dimensions
     fn trigger_resize(&self) {
         // Force a resize by getting current size

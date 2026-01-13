@@ -4,7 +4,7 @@
 
 use crate::parser::Parser;
 use crate::pty::{Pty, PtyConfig, PtyError};
-use crate::screen::{ClipboardOperation, Screen, ScreenConfig};
+use crate::screen::{ClipboardOperation, Screen, ScreenConfig, SearchResult};
 
 /// Events emitted by the terminal
 #[derive(Debug, Clone)]
@@ -46,6 +46,19 @@ impl Terminal {
             parser: Parser::new(),
             pty: None,
             last_title: String::new(),
+        }
+    }
+
+    /// Create a terminal from restored screen state and PTY
+    ///
+    /// This is used during seamless upgrades to restore terminals from the old process.
+    pub fn from_restored(screen: Screen, pty: Pty) -> Self {
+        let title = screen.title.clone();
+        Self {
+            screen,
+            parser: Parser::new(),
+            pty: Some(pty),
+            last_title: title,
         }
     }
 
@@ -213,6 +226,16 @@ impl Terminal {
     /// Check if viewport is at bottom
     pub fn is_at_bottom(&self) -> bool {
         self.screen.scroll_offset == 0
+    }
+
+    /// Search for text in scrollback and visible buffer
+    pub fn find(&self, pattern: &str, case_sensitive: bool, regex: bool) -> Vec<SearchResult> {
+        self.screen.find(pattern, case_sensitive, regex)
+    }
+
+    /// Scroll to show a specific line from find results
+    pub fn scroll_to_line(&mut self, line_idx: usize) {
+        self.screen.scroll_offset = self.screen.line_to_scroll_offset(line_idx);
     }
 
     /// Handle keyboard input and generate appropriate escape sequences

@@ -85,6 +85,20 @@ pub struct TerminalModes {
     pub focus_events: bool,
     /// Alternate screen buffer active
     pub alternate_screen: bool,
+    /// Active charset (true = G1, false = G0) - controlled by SO/SI
+    pub charset_g1_active: bool,
+}
+
+/// Character set designations
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Charset {
+    /// ASCII (USASCII)
+    #[default]
+    Ascii,
+    /// DEC Special Graphics (line drawing)
+    DecSpecialGraphics,
+    /// UK character set
+    Uk,
 }
 
 /// Mouse reporting modes
@@ -123,6 +137,17 @@ pub enum ClipboardOperation {
     },
     /// Query clipboard content
     Query { selection: ClipboardSelection },
+}
+
+/// Color query type (OSC 10-12)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ColorQuery {
+    /// Query foreground color (OSC 10)
+    Foreground,
+    /// Query background color (OSC 11)
+    Background,
+    /// Query cursor color (OSC 12)
+    Cursor,
 }
 
 /// Terminal screen state
@@ -164,9 +189,54 @@ pub struct Screen {
     pending_responses: Vec<Vec<u8>>,
     /// Pending clipboard operations from OSC 52
     pending_clipboard_ops: Vec<ClipboardOperation>,
+    /// Pending color queries (OSC 10-12)
+    pending_color_queries: Vec<ColorQuery>,
 }
 
 impl Screen {
+    /// Create a screen restored from upgrade state
+    ///
+    /// This is used during seamless upgrades to restore the terminal state
+    /// from the old process.
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_upgrade_state(
+        grid: crate::grid::Grid,
+        scrollback: Vec<crate::grid::Row>,
+        alternate_grid: Option<crate::grid::Grid>,
+        cursor: Cursor,
+        saved_cursor: Option<Cursor>,
+        alt_saved_cursor: Option<Cursor>,
+        scroll_region: ScrollRegion,
+        style: crate::cell::CellStyle,
+        modes: TerminalModes,
+        title: String,
+        scroll_offset: usize,
+        tab_stops: Vec<bool>,
+        config: ScreenConfig,
+    ) -> Self {
+        Self {
+            grid,
+            scrollback: scrollback.into(),
+            alternate_grid,
+            config,
+            cursor,
+            saved_cursor,
+            alt_saved_cursor,
+            scroll_region,
+            style,
+            modes,
+            title,
+            icon_name: String::new(),
+            dirty: true,
+            scroll_offset,
+            bell: false,
+            tab_stops,
+            pending_responses: Vec::new(),
+            pending_clipboard_ops: Vec::new(),
+            pending_color_queries: Vec::new(),
+        }
+    }
+
     /// Create a new screen with the given dimensions
     pub fn new(width: usize, height: usize, config: ScreenConfig) -> Self {
         let modes = TerminalModes {
@@ -201,6 +271,7 @@ impl Screen {
             tab_stops: Self::default_tab_stops(width),
             pending_responses: Vec::new(),
             pending_clipboard_ops: Vec::new(),
+            pending_color_queries: Vec::new(),
         }
     }
 
@@ -222,6 +293,27 @@ impl Screen {
     /// Check if there are pending clipboard operations
     pub fn has_clipboard_ops(&self) -> bool {
         !self.pending_clipboard_ops.is_empty()
+    }
+
+    /// Queue a color query (from OSC 10-12)
+    pub fn queue_color_query(&mut self, osc_code: u8) {
+        let query = match osc_code {
+            10 => ColorQuery::Foreground,
+            11 => ColorQuery::Background,
+            12 => ColorQuery::Cursor,
+            _ => return,
+        };
+        self.pending_color_queries.push(query);
+    }
+
+    /// Take all pending color queries (drains the queue)
+    pub fn take_color_queries(&mut self) -> Vec<ColorQuery> {
+        std::mem::take(&mut self.pending_color_queries)
+    }
+
+    /// Check if there are pending color queries
+    pub fn has_color_queries(&self) -> bool {
+        !self.pending_color_queries.is_empty()
     }
 
     /// Take all pending responses (drains the queue)
@@ -703,6 +795,117 @@ impl Screen {
         self.dirty = true;
         self.scroll_offset = 0;
     }
+
+    /// Search for text in scrollback and visible buffer
+    ///
+    /// Returns all matches found, starting from the oldest scrollback line.
+    /// Line index 0 is the oldest scrollback line, and increases toward
+    /// the most recent visible line.
+    pub fn find(&self, pattern: &str, case_sensitive: bool, regex: bool) -> Vec<SearchResult> {
+        let mut results = Vec::new();
+
+        if pattern.is_empty() {
+            return results;
+        }
+
+        // Build the regex or prepare for simple search
+        let regex_pattern = if regex {
+            match regex::RegexBuilder::new(pattern)
+                .case_insensitive(!case_sensitive)
+                .build()
+            {
+                Ok(re) => Some(re),
+                Err(_) => return results, // Invalid regex
+            }
+        } else {
+            None
+        };
+
+        let search_pattern = if !case_sensitive && !regex {
+            pattern.to_lowercase()
+        } else {
+            pattern.to_string()
+        };
+
+        // Search scrollback
+        for (line_idx, row) in self.scrollback.iter().enumerate() {
+            self.search_row(
+                row,
+                line_idx,
+                &search_pattern,
+                case_sensitive,
+                &regex_pattern,
+                &mut results,
+            );
+        }
+
+        // Search visible grid
+        let scrollback_len = self.scrollback.len();
+        for row_idx in 0..self.grid.height() {
+            if let Some(row) = self.grid.row(row_idx) {
+                self.search_row(
+                    row,
+                    scrollback_len + row_idx,
+                    &search_pattern,
+                    case_sensitive,
+                    &regex_pattern,
+                    &mut results,
+                );
+            }
+        }
+
+        results
+    }
+
+    /// Search a single row for matches
+    fn search_row(
+        &self,
+        row: &crate::grid::Row,
+        line_idx: usize,
+        pattern: &str,
+        case_sensitive: bool,
+        regex_pattern: &Option<regex::Regex>,
+        results: &mut Vec<SearchResult>,
+    ) {
+        let line_text = row.text();
+
+        if let Some(re) = regex_pattern {
+            for m in re.find_iter(&line_text) {
+                results.push(SearchResult {
+                    line: line_idx,
+                    col: m.start(),
+                    len: m.len(),
+                });
+            }
+        } else {
+            // Simple string search
+            let search_text = if case_sensitive {
+                line_text.clone()
+            } else {
+                line_text.to_lowercase()
+            };
+
+            let mut start = 0;
+            while let Some(pos) = search_text[start..].find(pattern) {
+                let col = start + pos;
+                results.push(SearchResult {
+                    line: line_idx,
+                    col,
+                    len: pattern.len(),
+                });
+                start = col + 1;
+            }
+        }
+    }
+
+    /// Convert a line index from find() to scroll offset
+    ///
+    /// Returns the scroll offset needed to show the given line at the top of the visible area.
+    pub fn line_to_scroll_offset(&self, line_idx: usize) -> usize {
+        let scrollback_len = self.scrollback.len();
+        // If line is in scrollback, return offset; otherwise 0 for visible area
+        scrollback_len.saturating_sub(line_idx)
+    }
 }
 
 /// Screen clear mode
@@ -716,6 +919,17 @@ pub enum ClearMode {
     All,
     /// Clear scrollback buffer
     Scrollback,
+}
+
+/// Search result in terminal buffer
+#[derive(Debug, Clone)]
+pub struct SearchResult {
+    /// Line index (0 = oldest scrollback line)
+    pub line: usize,
+    /// Column where match starts
+    pub col: usize,
+    /// Length of match
+    pub len: usize,
 }
 
 /// Line clear mode
