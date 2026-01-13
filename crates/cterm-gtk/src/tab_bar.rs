@@ -44,6 +44,7 @@ impl TabBar {
 
         let new_tab_button = Button::builder()
             .label("+")
+            .focusable(false)
             .build();
         new_tab_button.add_css_class("new-tab-button");
 
@@ -85,6 +86,7 @@ impl TabBar {
 
         let close_button = Button::builder()
             .label("×")
+            .focusable(false)
             .build();
         close_button.add_css_class("tab-close-button");
 
@@ -93,6 +95,7 @@ impl TabBar {
 
         let button = Button::builder()
             .child(&tab_box)
+            .focusable(false)
             .build();
 
         // Set up close button

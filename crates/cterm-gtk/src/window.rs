@@ -1,26 +1,28 @@
 //! Main window implementation
 
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::rc::Rc;
-use std::sync::Arc;
-use std::time::Duration;
 
 use gtk4::prelude::*;
 use gtk4::{
-    Application, ApplicationWindow, Box as GtkBox, EventControllerKey, Label,
-    Notebook, Orientation, Stack, Widget, gdk, gio, glib,
+    Application, ApplicationWindow, Box as GtkBox, EventControllerKey,
+    Notebook, Orientation, gdk, glib,
 };
-use parking_lot::Mutex;
 
 use cterm_app::config::Config;
-use cterm_app::session::{TabState, WindowState};
 use cterm_app::shortcuts::ShortcutManager;
-use cterm_core::pty::PtyError;
 use cterm_ui::events::{Action, KeyCode, Modifiers};
 use cterm_ui::theme::Theme;
 
 use crate::tab_bar::TabBar;
 use crate::terminal_widget::TerminalWidget;
+
+/// Tab entry tracking terminal and its ID
+struct TabEntry {
+    id: u64,
+    terminal: TerminalWidget,
+}
 
 /// Main window container
 pub struct CtermWindow {
@@ -30,7 +32,8 @@ pub struct CtermWindow {
     pub config: Config,
     pub theme: Theme,
     pub shortcuts: ShortcutManager,
-    pub terminals: Rc<RefCell<Vec<TerminalWidget>>>,
+    tabs: Rc<RefCell<Vec<TabEntry>>>,
+    next_tab_id: Rc<RefCell<u64>>,
 }
 
 impl CtermWindow {
@@ -73,7 +76,8 @@ impl CtermWindow {
             config: config.clone(),
             theme: theme.clone(),
             shortcuts,
-            terminals: Rc::new(RefCell::new(Vec::new())),
+            tabs: Rc::new(RefCell::new(Vec::new())),
+            next_tab_id: Rc::new(RefCell::new(0)),
         };
 
         // Set up key event handling
@@ -99,7 +103,8 @@ impl CtermWindow {
 
         let shortcuts = self.shortcuts.clone();
         let notebook = self.notebook.clone();
-        let terminals = Rc::clone(&self.terminals);
+        let tabs = Rc::clone(&self.tabs);
+        let next_tab_id = Rc::clone(&self.next_tab_id);
         let window = self.window.clone();
         let config = self.config.clone();
         let theme = self.theme.clone();
@@ -115,11 +120,11 @@ impl CtermWindow {
                 if let Some(action) = shortcuts.match_event(key, modifiers) {
                     match action {
                         Action::NewTab => {
-                            create_new_tab(&notebook, &terminals, &config, &theme, &tab_bar);
+                            create_new_tab(&notebook, &tabs, &next_tab_id, &config, &theme, &tab_bar, &window);
                             return glib::Propagation::Stop;
                         }
                         Action::CloseTab => {
-                            close_current_tab(&notebook, &terminals, &tab_bar);
+                            close_current_tab(&notebook, &tabs, &tab_bar, &window);
                             return glib::Propagation::Stop;
                         }
                         Action::NextTab => {
@@ -127,7 +132,7 @@ impl CtermWindow {
                             if n > 0 {
                                 let current = notebook.current_page().unwrap_or(0);
                                 notebook.set_current_page(Some((current + 1) % n));
-                                update_tab_bar_active(&tab_bar, &notebook);
+                                sync_tab_bar_active(&tab_bar, &tabs, &notebook);
                             }
                             return glib::Propagation::Stop;
                         }
@@ -137,7 +142,7 @@ impl CtermWindow {
                                 let current = notebook.current_page().unwrap_or(0);
                                 let prev = if current == 0 { n - 1 } else { current - 1 };
                                 notebook.set_current_page(Some(prev));
-                                update_tab_bar_active(&tab_bar, &notebook);
+                                sync_tab_bar_active(&tab_bar, &tabs, &notebook);
                             }
                             return glib::Propagation::Stop;
                         }
@@ -145,7 +150,7 @@ impl CtermWindow {
                             let idx = (*n as u32).saturating_sub(1);
                             if idx < notebook.n_pages() {
                                 notebook.set_current_page(Some(idx));
-                                update_tab_bar_active(&tab_bar, &notebook);
+                                sync_tab_bar_active(&tab_bar, &tabs, &notebook);
                             }
                             return glib::Propagation::Stop;
                         }
@@ -188,14 +193,16 @@ impl CtermWindow {
     /// Set up tab bar callbacks
     fn setup_tab_bar_callbacks(&self) {
         let notebook = self.notebook.clone();
-        let terminals = Rc::clone(&self.terminals);
+        let tabs = Rc::clone(&self.tabs);
+        let next_tab_id = Rc::clone(&self.next_tab_id);
         let config = self.config.clone();
         let theme = self.theme.clone();
         let tab_bar = self.tab_bar.clone();
+        let window = self.window.clone();
 
         // New tab button
         self.tab_bar.set_on_new_tab(move || {
-            create_new_tab(&notebook, &terminals, &config, &theme, &tab_bar);
+            create_new_tab(&notebook, &tabs, &next_tab_id, &config, &theme, &tab_bar, &window);
         });
     }
 
@@ -203,10 +210,12 @@ impl CtermWindow {
     pub fn new_tab(&self) {
         create_new_tab(
             &self.notebook,
-            &self.terminals,
+            &self.tabs,
+            &self.next_tab_id,
             &self.config,
             &self.theme,
             &self.tab_bar,
+            &self.window,
         );
     }
 }
@@ -214,10 +223,12 @@ impl CtermWindow {
 /// Create a new terminal tab
 fn create_new_tab(
     notebook: &Notebook,
-    terminals: &Rc<RefCell<Vec<TerminalWidget>>>,
+    tabs: &Rc<RefCell<Vec<TabEntry>>>,
+    next_tab_id: &Rc<RefCell<u64>>,
     config: &Config,
     theme: &Theme,
     tab_bar: &TabBar,
+    window: &ApplicationWindow,
 ) {
     // Create terminal widget
     let terminal = match TerminalWidget::new(config, theme) {
@@ -228,94 +239,131 @@ fn create_new_tab(
         }
     };
 
+    // Generate unique tab ID
+    let tab_id = {
+        let mut id = next_tab_id.borrow_mut();
+        let current = *id;
+        *id += 1;
+        current
+    };
+
     // Add to notebook
-    let page_num = notebook.append_page(terminal.widget(), None::<&Widget>);
+    let page_num = notebook.append_page(terminal.widget(), None::<&gtk4::Widget>);
 
     // Add to tab bar
-    let tab_id = terminals.borrow().len() as u64;
     tab_bar.add_tab(tab_id, "Terminal");
 
     // Set up close callback
     let notebook_close = notebook.clone();
-    let terminals_close = Rc::clone(terminals);
+    let tabs_close = Rc::clone(tabs);
     let tab_bar_close = tab_bar.clone();
+    let window_close = window.clone();
     tab_bar.set_on_close(tab_id, move || {
-        close_tab_by_id(&notebook_close, &terminals_close, &tab_bar_close, tab_id);
+        close_tab_by_id(&notebook_close, &tabs_close, &tab_bar_close, &window_close, tab_id);
     });
 
     // Set up click callback
     let notebook_click = notebook.clone();
-    let terminals_click = Rc::clone(terminals);
+    let tabs_click = Rc::clone(tabs);
     let tab_bar_click = tab_bar.clone();
     tab_bar.set_on_click(tab_id, move || {
-        // Find the page index for this tab
-        let terminals = terminals_click.borrow();
-        if let Some(idx) = terminals.iter().position(|_| true) {
+        // Find the page index for this tab ID
+        let tabs = tabs_click.borrow();
+        if let Some(idx) = tabs.iter().position(|t| t.id == tab_id) {
             notebook_click.set_current_page(Some(idx as u32));
-            update_tab_bar_active(&tab_bar_click, &notebook_click);
+            tab_bar_click.set_active(tab_id);
         }
     });
 
-    // Store terminal
-    terminals.borrow_mut().push(terminal);
+    // Set up terminal exit callback to close tab when process exits
+    let notebook_exit = notebook.clone();
+    let tabs_exit = Rc::clone(tabs);
+    let tab_bar_exit = tab_bar.clone();
+    let window_exit = window.clone();
+    terminal.set_on_exit(move || {
+        close_tab_by_id(&notebook_exit, &tabs_exit, &tab_bar_exit, &window_exit, tab_id);
+    });
 
-    // Switch to new tab
+    // Store terminal with its ID
+    tabs.borrow_mut().push(TabEntry { id: tab_id, terminal });
+
+    // Switch to new tab and focus terminal
     notebook.set_current_page(Some(page_num));
-    update_tab_bar_active(tab_bar, notebook);
+    tab_bar.set_active(tab_id);
+
+    // Focus the terminal widget
+    if let Some(widget) = notebook.nth_page(Some(page_num)) {
+        widget.grab_focus();
+    }
 }
 
 /// Close current tab
 fn close_current_tab(
     notebook: &Notebook,
-    terminals: &Rc<RefCell<Vec<TerminalWidget>>>,
+    tabs: &Rc<RefCell<Vec<TabEntry>>>,
     tab_bar: &TabBar,
+    window: &ApplicationWindow,
 ) {
-    if let Some(page) = notebook.current_page() {
-        close_tab(notebook, terminals, tab_bar, page as usize);
+    if let Some(page_idx) = notebook.current_page() {
+        let tab_id = {
+            let tabs = tabs.borrow();
+            tabs.get(page_idx as usize).map(|t| t.id)
+        };
+        if let Some(id) = tab_id {
+            close_tab_by_id(notebook, tabs, tab_bar, window, id);
+        }
     }
-}
-
-/// Close tab by index
-fn close_tab(
-    notebook: &Notebook,
-    terminals: &Rc<RefCell<Vec<TerminalWidget>>>,
-    tab_bar: &TabBar,
-    index: usize,
-) {
-    let n_pages = notebook.n_pages() as usize;
-    if n_pages <= 1 || index >= n_pages {
-        return;
-    }
-
-    // Remove from notebook
-    notebook.remove_page(Some(index as u32));
-
-    // Remove from terminals list
-    terminals.borrow_mut().remove(index);
-
-    // Remove from tab bar
-    tab_bar.remove_tab(index as u64);
-
-    update_tab_bar_active(tab_bar, notebook);
 }
 
 /// Close tab by ID
 fn close_tab_by_id(
     notebook: &Notebook,
-    terminals: &Rc<RefCell<Vec<TerminalWidget>>>,
+    tabs: &Rc<RefCell<Vec<TabEntry>>>,
     tab_bar: &TabBar,
-    _id: u64,
+    window: &ApplicationWindow,
+    id: u64,
 ) {
-    // For now, find by position (in a real impl we'd track IDs properly)
+    // Find index of this tab
+    let index = {
+        let tabs = tabs.borrow();
+        tabs.iter().position(|t| t.id == id)
+    };
+
+    let Some(index) = index else { return };
+
+    // Remove from notebook
+    notebook.remove_page(Some(index as u32));
+
+    // Remove from tabs list
+    tabs.borrow_mut().remove(index);
+
+    // Remove from tab bar
+    tab_bar.remove_tab(id);
+
+    // Close window if no tabs left
+    if tabs.borrow().is_empty() {
+        window.close();
+        return;
+    }
+
+    // Update active tab in tab bar
+    sync_tab_bar_active(tab_bar, tabs, notebook);
+
+    // Focus the current terminal
     if let Some(page) = notebook.current_page() {
-        close_tab(notebook, terminals, tab_bar, page as usize);
+        if let Some(widget) = notebook.nth_page(Some(page)) {
+            widget.grab_focus();
+        }
     }
 }
 
-/// Update tab bar active state
-fn update_tab_bar_active(tab_bar: &TabBar, notebook: &Notebook) {
-    if let Some(page) = notebook.current_page() {
-        tab_bar.set_active(page as u64);
+/// Sync tab bar active state with notebook
+fn sync_tab_bar_active(tab_bar: &TabBar, tabs: &Rc<RefCell<Vec<TabEntry>>>, notebook: &Notebook) {
+    if let Some(page_idx) = notebook.current_page() {
+        let tabs = tabs.borrow();
+        if let Some(tab) = tabs.get(page_idx as usize) {
+            tab_bar.set_active(tab.id);
+        }
     }
 }
 

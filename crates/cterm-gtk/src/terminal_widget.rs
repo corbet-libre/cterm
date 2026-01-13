@@ -32,6 +32,7 @@ pub struct TerminalWidget {
     font_size: f64,
     cell_width: f64,
     cell_height: f64,
+    on_exit: Rc<RefCell<Option<Box<dyn Fn()>>>>,
 }
 
 impl TerminalWidget {
@@ -94,6 +95,7 @@ impl TerminalWidget {
             font_size,
             cell_width,
             cell_height,
+            on_exit: Rc::new(RefCell::new(None)),
         };
 
         // Set up drawing
@@ -114,6 +116,11 @@ impl TerminalWidget {
     /// Get the widget for adding to containers
     pub fn widget(&self) -> &ScrolledWindow {
         &self.container
+    }
+
+    /// Set callback for when the terminal process exits
+    pub fn set_on_exit<F: Fn() + 'static>(&self, callback: F) {
+        *self.on_exit.borrow_mut() = Some(Box::new(callback));
     }
 
     /// Set up the draw function
@@ -296,6 +303,7 @@ impl TerminalWidget {
 
         // Handle messages on main thread using glib timeout
         let terminal_main = Arc::clone(&self.terminal);
+        let on_exit = Rc::clone(&self.on_exit);
         glib::timeout_add_local(Duration::from_millis(10), move || {
             // Process all pending messages
             while let Ok(msg) = rx.try_recv() {
@@ -308,7 +316,10 @@ impl TerminalWidget {
                     }
                     PtyMessage::Exited => {
                         log::info!("Terminal process exited");
-                        // TODO: Handle process exit (close tab or show message)
+                        // Call exit callback to close tab
+                        if let Some(ref callback) = *on_exit.borrow() {
+                            callback();
+                        }
                         return glib::ControlFlow::Break;
                     }
                 }
