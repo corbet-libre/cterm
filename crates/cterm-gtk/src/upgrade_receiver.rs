@@ -373,6 +373,7 @@ fn create_restored_tab(
 }
 
 /// Close a tab by its ID
+#[allow(clippy::type_complexity)]
 fn close_tab_by_id(
     notebook: &gtk4::Notebook,
     tabs: &Rc<RefCell<Vec<(u64, String, TerminalWidget)>>>,

@@ -773,6 +773,15 @@ mod tests {
     }
 
     #[test]
+    fn test_pty_size_default() {
+        let size = PtySize::default();
+        assert_eq!(size.rows, 0);
+        assert_eq!(size.cols, 0);
+        assert_eq!(size.pixel_width, 0);
+        assert_eq!(size.pixel_height, 0);
+    }
+
+    #[test]
     #[cfg(unix)]
     fn test_pty_creation_unix() {
         let config = PtyConfig {
@@ -823,5 +832,258 @@ mod tests {
 
         // Kill the process
         pty.send_signal(15).expect("Failed to send signal");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_pty_resize_unix() {
+        let config = PtyConfig {
+            size: PtySize {
+                rows: 24,
+                cols: 80,
+                ..Default::default()
+            },
+            shell: Some("/bin/sh".to_string()),
+            args: vec!["-c".to_string(), "sleep 1".to_string()],
+            ..Default::default()
+        };
+
+        let pty = Pty::new(&config).expect("Failed to create PTY");
+
+        // Test resize
+        pty.resize(40, 120).expect("Failed to resize PTY");
+        pty.resize(25, 80).expect("Failed to resize PTY again");
+
+        // Clean up
+        let _ = pty.send_signal(15);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_pty_is_running_unix() {
+        let config = PtyConfig {
+            size: PtySize {
+                rows: 24,
+                cols: 80,
+                ..Default::default()
+            },
+            shell: Some("/bin/sh".to_string()),
+            args: vec!["-c".to_string(), "sleep 10".to_string()],
+            ..Default::default()
+        };
+
+        let mut pty = Pty::new(&config).expect("Failed to create PTY");
+
+        // Should be running initially
+        assert!(pty.is_running());
+
+        // Send SIGTERM
+        pty.send_signal(15).expect("Failed to send signal");
+
+        // Give it time to terminate
+        std::thread::sleep(std::time::Duration::from_millis(100));
+
+        // Should no longer be running
+        assert!(!pty.is_running());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_pty_try_clone_reader_unix() {
+        let config = PtyConfig {
+            size: PtySize {
+                rows: 24,
+                cols: 80,
+                ..Default::default()
+            },
+            shell: Some("/bin/sh".to_string()),
+            args: vec!["-c".to_string(), "echo clone_test".to_string()],
+            ..Default::default()
+        };
+
+        let pty = Pty::new(&config).expect("Failed to create PTY");
+
+        // Clone the reader
+        let mut reader = pty.try_clone_reader().expect("Failed to clone reader");
+
+        // Give it time to produce output
+        std::thread::sleep(std::time::Duration::from_millis(100));
+
+        // Read from cloned reader
+        use std::io::Read;
+        let mut buf = [0u8; 1024];
+        let n = reader.read(&mut buf).expect("Failed to read from cloned reader");
+        assert!(n > 0);
+
+        // The output should contain "clone_test"
+        let output = String::from_utf8_lossy(&buf[..n]);
+        assert!(output.contains("clone_test"), "Output was: {}", output);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_pty_dup_fd_unix() {
+        let config = PtyConfig {
+            size: PtySize {
+                rows: 24,
+                cols: 80,
+                ..Default::default()
+            },
+            shell: Some("/bin/sh".to_string()),
+            args: vec!["-c".to_string(), "sleep 1".to_string()],
+            ..Default::default()
+        };
+
+        let pty = Pty::new(&config).expect("Failed to create PTY");
+
+        // Duplicate the FD
+        let duped_fd = pty.dup_fd().expect("Failed to dup FD");
+        assert!(duped_fd >= 0);
+
+        // The original FD should still be valid
+        let original_fd = pty.raw_fd();
+        assert!(original_fd >= 0);
+
+        // They should be different FDs
+        assert_ne!(duped_fd, original_fd);
+
+        // Clean up the duped FD
+        unsafe {
+            libc::close(duped_fd);
+        }
+
+        // Clean up
+        let _ = pty.send_signal(15);
+    }
+
+    /// Test FD passover: create a PTY, duplicate the FD, and reconstruct from raw FD
+    #[test]
+    #[cfg(unix)]
+    fn test_pty_fd_passover_unix() {
+        // Create original PTY running cat (echoes input)
+        let config = PtyConfig {
+            size: PtySize {
+                rows: 24,
+                cols: 80,
+                ..Default::default()
+            },
+            shell: Some("/bin/cat".to_string()),
+            args: vec![],
+            ..Default::default()
+        };
+
+        let mut original_pty = Pty::new(&config).expect("Failed to create PTY");
+        let child_pid = original_pty.child_pid();
+
+        // Duplicate the FD (simulating what happens during upgrade)
+        let duped_fd = original_pty.dup_fd().expect("Failed to dup FD");
+
+        // Write something to the original PTY
+        original_pty.write(b"hello_passover\n").expect("Failed to write");
+
+        // Give it time to echo
+        std::thread::sleep(std::time::Duration::from_millis(100));
+
+        // Drop the original PTY (but the child should still be running due to duped FD)
+        // Note: In real usage, we'd transfer FD before dropping, here we simulate with dup
+        // Actually, don't drop original_pty yet - we need it to keep the child alive
+
+        // Create a new PTY from the duplicated FD
+        let mut restored_pty = unsafe { Pty::from_raw_fd(duped_fd, child_pid) };
+
+        // The restored PTY should be able to read
+        let mut buf = [0u8; 1024];
+        let n = restored_pty.read(&mut buf).expect("Failed to read from restored PTY");
+        assert!(n > 0);
+        let output = String::from_utf8_lossy(&buf[..n]);
+        assert!(output.contains("hello_passover"), "Output was: {}", output);
+
+        // The restored PTY should be able to write
+        restored_pty.write(b"test_write\n").expect("Failed to write to restored PTY");
+
+        // Give it time to echo
+        std::thread::sleep(std::time::Duration::from_millis(100));
+
+        // Read again
+        let n = restored_pty.read(&mut buf).expect("Failed to read again");
+        assert!(n > 0);
+        let output = String::from_utf8_lossy(&buf[..n]);
+        assert!(output.contains("test_write"), "Output was: {}", output);
+
+        // Child PID should match
+        assert_eq!(restored_pty.child_pid(), child_pid);
+
+        // Clean up - send signal to terminate cat
+        restored_pty.send_signal(15).expect("Failed to send signal");
+
+        // Don't drop original_pty here - it will try to SIGHUP the same process
+        std::mem::forget(original_pty);
+    }
+
+    /// Test PTY exit status
+    #[test]
+    #[cfg(unix)]
+    fn test_pty_exit_status_unix() {
+        // Test successful exit
+        let config = PtyConfig {
+            size: PtySize {
+                rows: 24,
+                cols: 80,
+                ..Default::default()
+            },
+            shell: Some("/bin/sh".to_string()),
+            args: vec!["-c".to_string(), "exit 0".to_string()],
+            ..Default::default()
+        };
+
+        let mut pty = Pty::new(&config).expect("Failed to create PTY");
+        let status = pty.wait().expect("Failed to wait");
+        assert_eq!(status, 0);
+
+        // Test non-zero exit
+        let config = PtyConfig {
+            size: PtySize {
+                rows: 24,
+                cols: 80,
+                ..Default::default()
+            },
+            shell: Some("/bin/sh".to_string()),
+            args: vec!["-c".to_string(), "exit 42".to_string()],
+            ..Default::default()
+        };
+
+        let mut pty = Pty::new(&config).expect("Failed to create PTY");
+        let status = pty.wait().expect("Failed to wait");
+        assert_eq!(status, 42);
+    }
+
+    /// Test PTY with environment variables
+    #[test]
+    #[cfg(unix)]
+    fn test_pty_env_vars_unix() {
+        use std::io::Read;
+
+        let config = PtyConfig {
+            size: PtySize {
+                rows: 24,
+                cols: 80,
+                ..Default::default()
+            },
+            shell: Some("/bin/sh".to_string()),
+            args: vec!["-c".to_string(), "echo $TEST_VAR".to_string()],
+            env: vec![("TEST_VAR".to_string(), "test_value_123".to_string())],
+            ..Default::default()
+        };
+
+        let pty = Pty::new(&config).expect("Failed to create PTY");
+
+        // Give it time to produce output
+        std::thread::sleep(std::time::Duration::from_millis(100));
+
+        let mut reader = pty.try_clone_reader().expect("Failed to clone reader");
+        let mut buf = [0u8; 1024];
+        let n = reader.read(&mut buf).expect("Failed to read");
+        let output = String::from_utf8_lossy(&buf[..n]);
+        assert!(output.contains("test_value_123"), "Output was: {}", output);
     }
 }

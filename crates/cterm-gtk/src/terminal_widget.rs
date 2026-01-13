@@ -332,6 +332,7 @@ impl TerminalWidget {
     }
 
     /// Search and return all matches (for iteration/highlighting)
+    #[allow(dead_code)]
     pub fn find_all(
         &self,
         pattern: &str,
@@ -343,6 +344,7 @@ impl TerminalWidget {
     }
 
     /// Scroll to a specific search result
+    #[allow(dead_code)]
     pub fn scroll_to_result(&self, result: &cterm_core::SearchResult) {
         let mut term = self.terminal.lock();
         term.scroll_to_line(result.line);
