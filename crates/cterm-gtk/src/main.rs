@@ -4,6 +4,7 @@
 
 mod app;
 mod dialogs;
+mod docker_dialog;
 mod menu;
 mod tab_bar;
 mod terminal_widget;

@@ -180,6 +180,41 @@ pub enum NewTabPosition {
     AfterCurrent,
 }
 
+/// Docker mode for sticky tabs
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum DockerMode {
+    /// Connect to a running container with `docker exec`
+    #[default]
+    Exec,
+    /// Start a new container with `docker run`
+    Run,
+}
+
+/// Docker-specific configuration for a sticky tab
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct DockerTabConfig {
+    /// Docker mode: exec (connect to running container) or run (start new container)
+    pub mode: DockerMode,
+    /// Container name or ID (for exec mode)
+    pub container: Option<String>,
+    /// Image name with optional tag (for run mode)
+    pub image: Option<String>,
+    /// Shell to use inside the container (default: /bin/sh)
+    pub shell: Option<String>,
+    /// Additional docker exec/run arguments (e.g., -v, --env)
+    #[serde(default)]
+    pub docker_args: Vec<String>,
+    /// Auto-remove container on exit (run mode only, default: true)
+    #[serde(default = "default_true")]
+    pub auto_remove: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
 /// Keyboard shortcuts configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -233,23 +268,30 @@ impl Default for ShortcutsConfig {
 
 /// Sticky tab configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct StickyTabConfig {
     /// Tab name
     pub name: String,
     /// Command to run (None = default shell)
     pub command: Option<String>,
     /// Command arguments
+    #[serde(default)]
     pub args: Vec<String>,
     /// Working directory
     pub working_directory: Option<PathBuf>,
     /// Tab color (hex)
     pub color: Option<String>,
     /// Whether to auto-start this tab on launch
+    #[serde(default)]
     pub auto_start: bool,
     /// Keep tab open after process exits
+    #[serde(default)]
     pub keep_open: bool,
     /// Environment variables
+    #[serde(default)]
     pub env: HashMap<String, String>,
+    /// Docker-specific configuration (if present, this is a Docker tab)
+    pub docker: Option<DockerTabConfig>,
 }
 
 impl Default for StickyTabConfig {
@@ -263,6 +305,7 @@ impl Default for StickyTabConfig {
             auto_start: false,
             keep_open: false,
             env: HashMap::new(),
+            docker: None,
         }
     }
 }
@@ -291,6 +334,71 @@ impl StickyTabConfig {
             auto_start: false,
             keep_open: true,
             ..Default::default()
+        }
+    }
+
+    /// Create a Docker exec tab configuration (connect to running container)
+    pub fn docker_exec(name: &str, container: &str) -> Self {
+        Self {
+            name: name.to_string(),
+            color: Some("#0db7ed".to_string()), // Docker blue
+            keep_open: true,
+            docker: Some(DockerTabConfig {
+                mode: DockerMode::Exec,
+                container: Some(container.to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    /// Create a Docker run tab configuration (start new container from image)
+    pub fn docker_run(name: &str, image: &str) -> Self {
+        Self {
+            name: name.to_string(),
+            color: Some("#0db7ed".to_string()), // Docker blue
+            docker: Some(DockerTabConfig {
+                mode: DockerMode::Run,
+                image: Some(image.to_string()),
+                auto_remove: true,
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    /// Check if this is a Docker tab
+    pub fn is_docker(&self) -> bool {
+        self.docker.is_some()
+    }
+
+    /// Get the command and arguments for this sticky tab
+    ///
+    /// For Docker tabs, this builds the appropriate docker exec/run command.
+    /// For regular tabs, this returns the configured command and args.
+    pub fn get_command_args(&self) -> (Option<String>, Vec<String>) {
+        if let Some(ref docker) = self.docker {
+            match docker.mode {
+                DockerMode::Exec => {
+                    let container = docker.container.as_deref().unwrap_or("");
+                    let shell = docker.shell.as_deref();
+                    let (cmd, args) = crate::docker::build_exec_command(container, shell);
+                    (Some(cmd), args)
+                }
+                DockerMode::Run => {
+                    let image = docker.image.as_deref().unwrap_or("");
+                    let shell = docker.shell.as_deref();
+                    let (cmd, args) = crate::docker::build_run_command(
+                        image,
+                        shell,
+                        docker.auto_remove,
+                        &docker.docker_args,
+                    );
+                    (Some(cmd), args)
+                }
+            }
+        } else {
+            (self.command.clone(), self.args.clone())
         }
     }
 }

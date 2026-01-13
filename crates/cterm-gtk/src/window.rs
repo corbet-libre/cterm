@@ -15,6 +15,7 @@ use cterm_ui::events::{Action, KeyCode, Modifiers};
 use cterm_ui::theme::Theme;
 
 use crate::dialogs;
+use crate::docker_dialog::{self, DockerSelection};
 use crate::menu;
 use crate::tab_bar::TabBar;
 use crate::terminal_widget::{CellDimensions, TerminalWidget};
@@ -209,6 +210,62 @@ impl CtermWindow {
             let action = gio::SimpleAction::new("quit", None);
             action.connect_activate(move |_, _| {
                 window_clone.close();
+            });
+            window.add_action(&action);
+        }
+
+        // Docker picker action
+        {
+            let notebook = notebook.clone();
+            let tabs = Rc::clone(&tabs);
+            let next_tab_id = Rc::clone(&next_tab_id);
+            let config = Rc::clone(&config);
+            let theme = theme.clone();
+            let tab_bar = tab_bar.clone();
+            let window_clone = window.clone();
+            let has_bell = Rc::clone(&has_bell);
+            let action = gio::SimpleAction::new("docker-picker", None);
+            action.connect_activate(move |_, _| {
+                let notebook = notebook.clone();
+                let tabs = Rc::clone(&tabs);
+                let next_tab_id = Rc::clone(&next_tab_id);
+                let config = Rc::clone(&config);
+                let theme = theme.clone();
+                let tab_bar = tab_bar.clone();
+                let window_inner = window_clone.clone();
+                let has_bell = Rc::clone(&has_bell);
+
+                docker_dialog::show_docker_picker(&window_clone, move |selection| {
+                    let (command, args, title) = match &selection {
+                        DockerSelection::ExecContainer(c) => {
+                            let (cmd, args) = cterm_app::docker::build_exec_command(&c.name, None);
+                            (cmd, args, format!("Docker: {}", c.name))
+                        }
+                        DockerSelection::RunImage(i) => {
+                            let (cmd, args) = cterm_app::docker::build_run_command(
+                                &format!("{}:{}", i.repository, i.tag),
+                                None,
+                                true,
+                                &[],
+                            );
+                            (cmd, args, format!("Docker: {}:{}", i.repository, i.tag))
+                        }
+                    };
+
+                    create_docker_tab(
+                        &notebook,
+                        &tabs,
+                        &next_tab_id,
+                        &config,
+                        &theme,
+                        &tab_bar,
+                        &window_inner,
+                        &has_bell,
+                        &command,
+                        &args,
+                        &title,
+                    );
+                });
             });
             window.add_action(&action);
         }
@@ -1085,6 +1142,143 @@ fn create_new_tab(
     });
 
     // Update tab bar visibility (show if >1 tabs)
+    tab_bar.update_visibility();
+
+    // Switch to new tab and focus terminal
+    notebook.set_current_page(Some(page_num));
+    tab_bar.set_active(tab_id);
+
+    // Focus the terminal widget
+    if let Some(widget) = notebook.nth_page(Some(page_num)) {
+        widget.grab_focus();
+    }
+}
+
+/// Create a new Docker terminal tab
+#[allow(clippy::too_many_arguments)]
+fn create_docker_tab(
+    notebook: &Notebook,
+    tabs: &Rc<RefCell<Vec<TabEntry>>>,
+    next_tab_id: &Rc<RefCell<u64>>,
+    config: &Rc<RefCell<Config>>,
+    theme: &Theme,
+    tab_bar: &TabBar,
+    window: &ApplicationWindow,
+    has_bell: &Rc<RefCell<bool>>,
+    command: &str,
+    args: &[String],
+    title: &str,
+) {
+    // Create modified config with docker command
+    let mut cfg = config.borrow().clone();
+    cfg.general.default_shell = Some(command.to_string());
+    cfg.general.shell_args = args.to_vec();
+
+    // Create terminal widget with docker command
+    let terminal = match TerminalWidget::new(&cfg, theme) {
+        Ok(t) => t,
+        Err(e) => {
+            log::error!("Failed to create Docker terminal: {}", e);
+            return;
+        }
+    };
+
+    // Generate unique tab ID
+    let tab_id = {
+        let mut id = next_tab_id.borrow_mut();
+        let current = *id;
+        *id += 1;
+        current
+    };
+
+    // Add to notebook
+    let page_num = notebook.append_page(terminal.widget(), None::<&gtk4::Widget>);
+
+    // Add to tab bar with docker title
+    tab_bar.add_tab(tab_id, title);
+
+    // Set Docker blue color
+    tab_bar.set_color(tab_id, Some("#0db7ed"));
+
+    // Set up close callback
+    let notebook_close = notebook.clone();
+    let tabs_close = Rc::clone(tabs);
+    let tab_bar_close = tab_bar.clone();
+    let window_close = window.clone();
+    tab_bar.set_on_close(tab_id, move || {
+        close_tab_by_id(
+            &notebook_close,
+            &tabs_close,
+            &tab_bar_close,
+            &window_close,
+            tab_id,
+        );
+    });
+
+    // Set up click callback
+    let notebook_click = notebook.clone();
+    let tabs_click = Rc::clone(tabs);
+    let tab_bar_click = tab_bar.clone();
+    tab_bar.set_on_click(tab_id, move || {
+        let tabs = tabs_click.borrow();
+        if let Some(idx) = tabs.iter().position(|t| t.id == tab_id) {
+            notebook_click.set_current_page(Some(idx as u32));
+            tab_bar_click.set_active(tab_id);
+            tab_bar_click.clear_bell(tab_id);
+        }
+    });
+
+    // Set up terminal exit callback to close tab when docker process exits
+    let notebook_exit = notebook.clone();
+    let tabs_exit = Rc::clone(tabs);
+    let tab_bar_exit = tab_bar.clone();
+    let window_exit = window.clone();
+    terminal.set_on_exit(move || {
+        close_tab_by_id(
+            &notebook_exit,
+            &tabs_exit,
+            &tab_bar_exit,
+            &window_exit,
+            tab_id,
+        );
+    });
+
+    // Set up bell callback
+    let tab_bar_bell = tab_bar.clone();
+    let notebook_bell = notebook.clone();
+    let tabs_bell = Rc::clone(tabs);
+    let window_bell = window.clone();
+    let has_bell_bell = Rc::clone(has_bell);
+    terminal.set_on_bell(move || {
+        let is_window_active = window_bell.is_active();
+        let is_current_tab = if let Some(current_page) = notebook_bell.current_page() {
+            let tabs = tabs_bell.borrow();
+            tabs.get(current_page as usize)
+                .map(|t| t.id == tab_id)
+                .unwrap_or(false)
+        } else {
+            false
+        };
+
+        if !is_current_tab || !is_window_active {
+            tab_bar_bell.set_bell(tab_id, true);
+        }
+
+        if !is_window_active {
+            *has_bell_bell.borrow_mut() = true;
+            window_bell.set_title(Some("🔔 cterm"));
+        }
+    });
+
+    // Store terminal with its ID
+    let title_string = title.to_string();
+    tabs.borrow_mut().push(TabEntry {
+        id: tab_id,
+        title: title_string,
+        terminal,
+    });
+
+    // Update tab bar visibility
     tab_bar.update_visibility();
 
     // Switch to new tab and focus terminal

@@ -5,6 +5,7 @@
 //! and seamless upgrade functionality.
 
 pub mod config;
+pub mod docker;
 pub mod session;
 pub mod shortcuts;
 pub mod upgrade;
