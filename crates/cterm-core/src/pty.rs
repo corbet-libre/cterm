@@ -437,10 +437,10 @@ mod windows {
     use winapi::um::namedpipeapi::CreatePipe;
     use winapi::um::processthreadsapi::{
         CreateProcessW, DeleteProcThreadAttributeList, InitializeProcThreadAttributeList,
-        UpdateProcThreadAttribute, PROCESS_INFORMATION, STARTUPINFOEXW,
+        UpdateProcThreadAttribute, PROCESS_INFORMATION,
     };
     use winapi::um::synchapi::WaitForSingleObject;
-    use winapi::um::winbase::{EXTENDED_STARTUPINFO_PRESENT, INFINITE, WAIT_OBJECT_0};
+    use winapi::um::winbase::{EXTENDED_STARTUPINFO_PRESENT, INFINITE, STARTUPINFOEXW, WAIT_OBJECT_0};
     use winapi::um::wincon::COORD;
     use winapi::um::winnt::HANDLE;
 
