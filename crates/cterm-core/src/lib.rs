@@ -17,7 +17,7 @@ pub mod term;
 pub use color::{Color, AnsiColor, Rgb};
 pub use cell::{Cell, CellAttrs};
 pub use grid::Grid;
-pub use screen::Screen;
+pub use screen::{Screen, ClipboardSelection, ClipboardOperation};
 pub use parser::Parser;
 pub use pty::Pty;
 pub use term::Terminal;

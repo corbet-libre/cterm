@@ -8,7 +8,7 @@ use vte::{Params, ParamsIter};
 
 use crate::cell::{CellAttrs, CellStyle, Hyperlink};
 use crate::color::{AnsiColor, Color, Rgb};
-use crate::screen::{ClearMode, CursorStyle, LineClearMode, MouseMode, Screen};
+use crate::screen::{ClearMode, ClipboardOperation, ClipboardSelection, CursorStyle, LineClearMode, MouseMode, Screen};
 
 /// Parser wraps the vte parser and applies actions to a Screen
 pub struct Parser {
@@ -166,8 +166,43 @@ impl vte::Perform for ScreenPerformer<'_> {
             }
             // Copy to clipboard (52)
             52 => {
-                // TODO: Clipboard integration
-                log::trace!("Clipboard OSC");
+                // OSC 52 ; Pc ; Pd ST
+                // Pc = clipboard selection (c=clipboard, p=primary, s=select)
+                // Pd = base64 data or ? for query
+                if params.len() >= 3 {
+                    let selection_str = std::str::from_utf8(params[1]).unwrap_or("c");
+                    let data_str = std::str::from_utf8(params[2]).unwrap_or("");
+
+                    // Parse selection - default to clipboard
+                    let selection = if selection_str.contains('p') {
+                        ClipboardSelection::Primary
+                    } else if selection_str.contains('s') {
+                        ClipboardSelection::Select
+                    } else {
+                        ClipboardSelection::Clipboard
+                    };
+
+                    if data_str == "?" {
+                        // Query clipboard
+                        log::debug!("Clipboard query for {:?}", selection);
+                        self.screen.queue_clipboard_op(ClipboardOperation::Query { selection });
+                    } else if !data_str.is_empty() {
+                        // Set clipboard - decode base64
+                        use base64::Engine;
+                        match base64::engine::general_purpose::STANDARD.decode(data_str) {
+                            Ok(decoded) => {
+                                log::debug!("Clipboard set {:?}: {} bytes", selection, decoded.len());
+                                self.screen.queue_clipboard_op(ClipboardOperation::Set {
+                                    selection,
+                                    data: decoded,
+                                });
+                            }
+                            Err(e) => {
+                                log::warn!("Failed to decode OSC 52 base64 data: {}", e);
+                            }
+                        }
+                    }
+                }
             }
             _ => {
                 log::trace!("Unhandled OSC: {}", command);

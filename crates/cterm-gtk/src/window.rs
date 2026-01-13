@@ -322,8 +322,13 @@ impl CtermWindow {
             action.connect_activate(move |_, param| {
                 if let Some(signal_str) = param.and_then(|p| p.get::<String>()) {
                     if let Ok(signal) = signal_str.parse::<i32>() {
-                        log::info!("Sending signal {} to terminal", signal);
-                        // TODO: Get PID from PTY and send signal
+                        if let Some(page_idx) = notebook.current_page() {
+                            let tabs = tabs.borrow();
+                            if let Some(tab) = tabs.get(page_idx as usize) {
+                                log::info!("Sending signal {} to terminal", signal);
+                                tab.terminal.send_signal(signal);
+                            }
+                        }
                     }
                 }
             });
@@ -421,9 +426,17 @@ impl CtermWindow {
             let action = gio::SimpleAction::new("preferences", None);
             action.connect_activate(move |_, _| {
                 let cfg = config.borrow().clone();
-                dialogs::show_preferences_dialog(&window_clone, &cfg, |new_config| {
+                let config_for_save = Rc::clone(&config);
+                dialogs::show_preferences_dialog(&window_clone, &cfg, move |new_config| {
                     log::info!("Preferences saved");
-                    // TODO: Apply and save config
+                    // Save to disk
+                    if let Err(e) = cterm_app::config::save_config(&new_config) {
+                        log::error!("Failed to save config: {}", e);
+                    } else {
+                        log::info!("Configuration saved to disk");
+                    }
+                    // Update internal config state
+                    *config_for_save.borrow_mut() = new_config;
                 });
             });
             window.add_action(&action);

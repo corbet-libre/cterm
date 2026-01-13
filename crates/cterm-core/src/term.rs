@@ -10,7 +10,7 @@ use parking_lot::Mutex;
 
 use crate::parser::Parser;
 use crate::pty::{Pty, PtyConfig, PtyError};
-use crate::screen::{Screen, ScreenConfig};
+use crate::screen::{ClipboardOperation, Screen, ScreenConfig};
 
 /// Events emitted by the terminal
 #[derive(Debug, Clone)]
@@ -23,6 +23,8 @@ pub enum TerminalEvent {
     ProcessExited(u32),
     /// Terminal content changed (needs redraw)
     ContentChanged,
+    /// Clipboard operation requested (OSC 52)
+    ClipboardRequest(ClipboardOperation),
 }
 
 /// Terminal configuration
@@ -116,6 +118,13 @@ impl Terminal {
             }
         }
 
+        // Emit clipboard operation events
+        if self.screen.has_clipboard_ops() {
+            for op in self.screen.take_clipboard_ops() {
+                events.push(TerminalEvent::ClipboardRequest(op));
+            }
+        }
+
         // Check for title change
         if self.screen.title != self.last_title {
             self.last_title = self.screen.title.clone();
@@ -143,6 +152,26 @@ impl Terminal {
         self.write(s.as_bytes())
     }
 
+    /// Send clipboard data as OSC 52 response
+    pub fn send_clipboard_response(
+        &self,
+        selection: crate::screen::ClipboardSelection,
+        data: &[u8],
+    ) -> Result<(), PtyError> {
+        use base64::Engine;
+        use crate::screen::ClipboardSelection;
+
+        let selection_char = match selection {
+            ClipboardSelection::Clipboard => 'c',
+            ClipboardSelection::Primary => 'p',
+            ClipboardSelection::Select => 's',
+        };
+
+        let encoded = base64::engine::general_purpose::STANDARD.encode(data);
+        let response = format!("\x1b]52;{};{}\x07", selection_char, encoded);
+        self.write(response.as_bytes())
+    }
+
     /// Resize the terminal
     pub fn resize(&mut self, cols: usize, rows: usize) {
         self.screen.resize(cols, rows);
@@ -154,6 +183,15 @@ impl Terminal {
     /// Check if the process is still running
     pub fn is_running(&self) -> bool {
         self.pty.as_ref().map_or(false, |p| p.is_running())
+    }
+
+    /// Send a signal to the child process
+    pub fn send_signal(&self, signal: i32) -> Result<(), PtyError> {
+        if let Some(ref pty) = self.pty {
+            pty.send_signal(signal)
+        } else {
+            Err(PtyError::NotRunning)
+        }
     }
 
     /// Get terminal width

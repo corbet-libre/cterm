@@ -17,8 +17,8 @@ use cterm_app::config::Config;
 use cterm_core::color::{Color, Rgb};
 use cterm_core::cell::CellAttrs;
 use cterm_core::pty::{PtyConfig, PtyError};
-use cterm_core::screen::{CursorStyle, ScreenConfig};
-use cterm_core::term::{Key, Modifiers, Terminal};
+use cterm_core::screen::{ClipboardOperation, ClipboardSelection, CursorStyle, ScreenConfig};
+use cterm_core::term::{Key, Modifiers, Terminal, TerminalEvent};
 use cterm_ui::theme::Theme;
 
 /// Cell dimensions calculated from font metrics
@@ -203,6 +203,14 @@ impl TerminalWidget {
         term.screen_mut().reset();
         drop(term);
         self.drawing_area.queue_draw();
+    }
+
+    /// Send a signal to the terminal process
+    pub fn send_signal(&self, signal: i32) {
+        let term = self.terminal.lock();
+        if let Err(e) = term.send_signal(signal) {
+            log::error!("Failed to send signal {}: {}", signal, e);
+        }
     }
 
     /// Trigger a resize to recalculate terminal dimensions
@@ -414,9 +422,51 @@ impl TerminalWidget {
                 match msg {
                     PtyMessage::Data(data) => {
                         let mut term = terminal_main.lock();
-                        term.process(&data);
+                        let events = term.process(&data);
 
-                        // Check for bell
+                        // Handle terminal events
+                        for event in events {
+                            match event {
+                                TerminalEvent::ClipboardRequest(op) => {
+                                    // Get clipboard from display
+                                    if let Some(display) = gdk::Display::default() {
+                                        let clipboard = display.clipboard();
+                                        match op {
+                                            ClipboardOperation::Set { selection: _, data } => {
+                                                // Set clipboard content
+                                                if let Ok(text) = String::from_utf8(data) {
+                                                    clipboard.set_text(&text);
+                                                    log::debug!("Set clipboard via OSC 52: {} bytes", text.len());
+                                                }
+                                            }
+                                            ClipboardOperation::Query { selection } => {
+                                                // Query clipboard and send response
+                                                // Note: GTK clipboard read is async, but we'll handle it synchronously for simplicity
+                                                log::debug!("Clipboard query via OSC 52 (async not implemented)");
+                                                // For now, send empty response
+                                                let _ = term.send_clipboard_response(selection, b"");
+                                            }
+                                        }
+                                    }
+                                }
+                                TerminalEvent::Bell => {
+                                    if let Some(ref callback) = *on_bell.borrow() {
+                                        callback();
+                                    }
+                                }
+                                TerminalEvent::TitleChanged(_) => {
+                                    // Title changes are handled elsewhere
+                                }
+                                TerminalEvent::ContentChanged => {
+                                    // We always redraw below
+                                }
+                                TerminalEvent::ProcessExited(_) => {
+                                    // Handled by PtyMessage::Exited
+                                }
+                            }
+                        }
+
+                        // Check for bell (legacy, might be redundant now)
                         if term.screen().bell {
                             term.screen_mut().bell = false;
                             if let Some(ref callback) = *on_bell.borrow() {

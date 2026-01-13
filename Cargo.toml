@@ -36,6 +36,9 @@ serde = { version = "1", features = ["derive"] }
 toml = "0.8"
 directories = "6"
 
+# Encoding
+base64 = "0.22"
+
 # Async
 tokio = { version = "1", features = ["full"] }
 futures = "0.3"

@@ -101,6 +101,31 @@ pub enum MouseMode {
     AnyEvent,
 }
 
+/// Clipboard selection type for OSC 52
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClipboardSelection {
+    /// System clipboard (c)
+    Clipboard,
+    /// Primary selection (p)
+    Primary,
+    /// Both clipboard and primary (s)
+    Select,
+}
+
+/// Clipboard operation from OSC 52
+#[derive(Debug, Clone)]
+pub enum ClipboardOperation {
+    /// Set clipboard content (base64 decoded data)
+    Set {
+        selection: ClipboardSelection,
+        data: Vec<u8>,
+    },
+    /// Query clipboard content
+    Query {
+        selection: ClipboardSelection,
+    },
+}
+
 /// Terminal screen state
 #[derive(Debug)]
 pub struct Screen {
@@ -138,6 +163,8 @@ pub struct Screen {
     tab_stops: Vec<bool>,
     /// Pending responses to send back to the PTY (for DSR etc)
     pending_responses: Vec<Vec<u8>>,
+    /// Pending clipboard operations from OSC 52
+    pending_clipboard_ops: Vec<ClipboardOperation>,
 }
 
 impl Screen {
@@ -172,12 +199,28 @@ impl Screen {
             bell: false,
             tab_stops: Self::default_tab_stops(width),
             pending_responses: Vec::new(),
+            pending_clipboard_ops: Vec::new(),
         }
     }
 
     /// Queue a response to be sent back through the PTY
     pub fn queue_response(&mut self, response: Vec<u8>) {
         self.pending_responses.push(response);
+    }
+
+    /// Queue a clipboard operation (from OSC 52)
+    pub fn queue_clipboard_op(&mut self, op: ClipboardOperation) {
+        self.pending_clipboard_ops.push(op);
+    }
+
+    /// Take all pending clipboard operations (drains the queue)
+    pub fn take_clipboard_ops(&mut self) -> Vec<ClipboardOperation> {
+        std::mem::take(&mut self.pending_clipboard_ops)
+    }
+
+    /// Check if there are pending clipboard operations
+    pub fn has_clipboard_ops(&self) -> bool {
+        !self.pending_clipboard_ops.is_empty()
     }
 
     /// Take all pending responses (drains the queue)

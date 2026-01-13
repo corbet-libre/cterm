@@ -197,6 +197,50 @@ impl Pty {
         Ok(())
     }
 
+    /// Get the process ID of the child process
+    pub fn process_id(&self) -> Option<u32> {
+        let child = self.child.lock();
+        child.process_id()
+    }
+
+    /// Send a signal to the child process (Unix only)
+    #[cfg(unix)]
+    pub fn send_signal(&self, signal: i32) -> Result<(), PtyError> {
+        use std::os::unix::process::ExitStatusExt;
+
+        if let Some(pid) = self.process_id() {
+            // Use libc to send the signal
+            let result = unsafe { libc::kill(pid as i32, signal) };
+            if result == 0 {
+                Ok(())
+            } else {
+                Err(PtyError::Io(std::io::Error::last_os_error()))
+            }
+        } else {
+            Err(PtyError::NotRunning)
+        }
+    }
+
+    /// Send a signal to the child process (Windows - limited support)
+    #[cfg(windows)]
+    pub fn send_signal(&self, signal: i32) -> Result<(), PtyError> {
+        // Windows doesn't have Unix signals, but we can handle some cases
+        match signal {
+            // SIGTERM/SIGKILL - just kill the process
+            9 | 15 => self.kill(),
+            // SIGINT - we could try to send Ctrl+C via the PTY
+            2 => {
+                // Send Ctrl+C character
+                self.write(&[0x03])?;
+                Ok(())
+            }
+            _ => {
+                log::warn!("Signal {} not supported on Windows", signal);
+                Ok(())
+            }
+        }
+    }
+
     /// Get a clone of the reader for async operations
     pub fn clone_reader(&self) -> Arc<Mutex<Box<dyn Read + Send>>> {
         Arc::clone(&self.reader)

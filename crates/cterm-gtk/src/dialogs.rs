@@ -212,6 +212,95 @@ pub fn show_about_dialog(parent: &impl IsA<Window>) {
     about.present();
 }
 
+/// Widgets for collecting preference values
+struct PreferencesWidgets {
+    // General
+    scrollback_spin: SpinButton,
+    confirm_switch: Switch,
+    copy_select_switch: Switch,
+    // Appearance
+    theme_combo: ComboBoxText,
+    font_entry: Entry,
+    size_spin: SpinButton,
+    cursor_combo: ComboBoxText,
+    blink_switch: Switch,
+    opacity_scale: gtk4::Scale,
+    bold_switch: Switch,
+    // Tabs
+    show_combo: ComboBoxText,
+    position_combo: ComboBoxText,
+    new_combo: ComboBoxText,
+    close_switch: Switch,
+    // Shortcuts
+    shortcut_entries: Vec<(String, Entry)>,
+}
+
+impl PreferencesWidgets {
+    fn collect_config(&self, base_config: &Config) -> Config {
+        let mut config = base_config.clone();
+
+        // General
+        config.general.scrollback_lines = self.scrollback_spin.value() as usize;
+        config.general.confirm_close_with_running = self.confirm_switch.is_active();
+        config.general.copy_on_select = self.copy_select_switch.is_active();
+
+        // Appearance
+        if let Some(theme_id) = self.theme_combo.active_id() {
+            config.appearance.theme = theme_id.to_string();
+        }
+        config.appearance.font.family = self.font_entry.text().to_string();
+        config.appearance.font.size = self.size_spin.value();
+        config.appearance.cursor_style = match self.cursor_combo.active_id().as_deref() {
+            Some("underline") => CursorStyleConfig::Underline,
+            Some("bar") => CursorStyleConfig::Bar,
+            _ => CursorStyleConfig::Block,
+        };
+        config.appearance.cursor_blink = self.blink_switch.is_active();
+        config.appearance.opacity = self.opacity_scale.value();
+        config.appearance.bold_is_bright = self.bold_switch.is_active();
+
+        // Tabs
+        config.tabs.show_tab_bar = match self.show_combo.active_id().as_deref() {
+            Some("multiple") => TabBarVisibility::Multiple,
+            Some("never") => TabBarVisibility::Never,
+            _ => TabBarVisibility::Always,
+        };
+        config.tabs.tab_bar_position = match self.position_combo.active_id().as_deref() {
+            Some("bottom") => TabBarPosition::Bottom,
+            _ => TabBarPosition::Top,
+        };
+        config.tabs.new_tab_position = match self.new_combo.active_id().as_deref() {
+            Some("after_current") => NewTabPosition::AfterCurrent,
+            _ => NewTabPosition::End,
+        };
+        config.tabs.show_close_button = self.close_switch.is_active();
+
+        // Shortcuts
+        for (name, entry) in &self.shortcut_entries {
+            let value = entry.text().to_string();
+            match name.as_str() {
+                "new_tab" => config.shortcuts.new_tab = value,
+                "close_tab" => config.shortcuts.close_tab = value,
+                "next_tab" => config.shortcuts.next_tab = value,
+                "prev_tab" => config.shortcuts.prev_tab = value,
+                "new_window" => config.shortcuts.new_window = value,
+                "close_window" => config.shortcuts.close_window = value,
+                "copy" => config.shortcuts.copy = value,
+                "paste" => config.shortcuts.paste = value,
+                "select_all" => config.shortcuts.select_all = value,
+                "zoom_in" => config.shortcuts.zoom_in = value,
+                "zoom_out" => config.shortcuts.zoom_out = value,
+                "zoom_reset" => config.shortcuts.zoom_reset = value,
+                "find" => config.shortcuts.find = value,
+                "reset" => config.shortcuts.reset = value,
+                _ => {}
+            }
+        }
+
+        config
+    }
+}
+
 /// Show the Preferences dialog
 pub fn show_preferences_dialog(parent: &impl IsA<Window>, config: &Config, on_save: impl Fn(Config) + 'static) {
     let dialog = Dialog::builder()
@@ -235,28 +324,44 @@ pub fn show_preferences_dialog(parent: &impl IsA<Window>, config: &Config, on_sa
     content.append(&notebook);
 
     // General tab
-    let general_page = create_general_preferences(config);
+    let (general_page, scrollback_spin, confirm_switch, copy_select_switch) = create_general_preferences(config);
     notebook.append_page(&general_page, Some(&Label::new(Some("General"))));
 
     // Appearance tab
-    let appearance_page = create_appearance_preferences(config);
+    let (appearance_page, theme_combo, font_entry, size_spin, cursor_combo, blink_switch, opacity_scale, bold_switch) = create_appearance_preferences(config);
     notebook.append_page(&appearance_page, Some(&Label::new(Some("Appearance"))));
 
     // Tabs tab
-    let tabs_page = create_tabs_preferences(config);
+    let (tabs_page, show_combo, position_combo, new_combo, close_switch) = create_tabs_preferences(config);
     notebook.append_page(&tabs_page, Some(&Label::new(Some("Tabs"))));
 
     // Shortcuts tab
-    let shortcuts_page = create_shortcuts_preferences(config);
+    let (shortcuts_page, shortcut_entries) = create_shortcuts_preferences(config);
     notebook.append_page(&shortcuts_page, Some(&Label::new(Some("Shortcuts"))));
 
-    let config = config.clone();
+    let widgets = Rc::new(PreferencesWidgets {
+        scrollback_spin,
+        confirm_switch,
+        copy_select_switch,
+        theme_combo,
+        font_entry,
+        size_spin,
+        cursor_combo,
+        blink_switch,
+        opacity_scale,
+        bold_switch,
+        show_combo,
+        position_combo,
+        new_combo,
+        close_switch,
+        shortcut_entries,
+    });
+
+    let base_config = config.clone();
     dialog.connect_response(move |dialog, response| {
         match response {
             ResponseType::Ok | ResponseType::Apply => {
-                // Collect settings and save
-                // For now, just close - full implementation would read all widgets
-                let new_config = config.clone();
+                let new_config = widgets.collect_config(&base_config);
                 on_save(new_config);
                 if response == ResponseType::Ok {
                     dialog.close();
@@ -271,7 +376,7 @@ pub fn show_preferences_dialog(parent: &impl IsA<Window>, config: &Config, on_sa
     dialog.present();
 }
 
-fn create_general_preferences(config: &Config) -> GtkBox {
+fn create_general_preferences(config: &Config) -> (GtkBox, SpinButton, Switch, Switch) {
     let page = GtkBox::new(Orientation::Vertical, 12);
     page.set_margin_top(12);
     page.set_margin_bottom(12);
@@ -312,10 +417,10 @@ fn create_general_preferences(config: &Config) -> GtkBox {
     grid.attach(&copy_select_switch, 1, 2, 1, 1);
 
     page.append(&grid);
-    page
+    (page, scrollback_spin, confirm_switch, copy_select_switch)
 }
 
-fn create_appearance_preferences(config: &Config) -> GtkBox {
+fn create_appearance_preferences(config: &Config) -> (GtkBox, ComboBoxText, Entry, SpinButton, ComboBoxText, Switch, gtk4::Scale, Switch) {
     let page = GtkBox::new(Orientation::Vertical, 12);
     page.set_margin_top(12);
     page.set_margin_bottom(12);
@@ -407,10 +512,10 @@ fn create_appearance_preferences(config: &Config) -> GtkBox {
     grid.attach(&bold_switch, 1, 6, 1, 1);
 
     page.append(&grid);
-    page
+    (page, theme_combo, font_entry, size_spin, cursor_combo, blink_switch, opacity_scale, bold_switch)
 }
 
-fn create_tabs_preferences(config: &Config) -> GtkBox {
+fn create_tabs_preferences(config: &Config) -> (GtkBox, ComboBoxText, ComboBoxText, ComboBoxText, Switch) {
     let page = GtkBox::new(Orientation::Vertical, 12);
     page.set_margin_top(12);
     page.set_margin_bottom(12);
@@ -479,10 +584,10 @@ fn create_tabs_preferences(config: &Config) -> GtkBox {
     grid.attach(&close_switch, 1, 3, 1, 1);
 
     page.append(&grid);
-    page
+    (page, show_combo, position_combo, new_combo, close_switch)
 }
 
-fn create_shortcuts_preferences(config: &Config) -> GtkBox {
+fn create_shortcuts_preferences(config: &Config) -> (GtkBox, Vec<(String, Entry)>) {
     let page = GtkBox::new(Orientation::Vertical, 12);
     page.set_margin_top(12);
     page.set_margin_bottom(12);
@@ -502,34 +607,38 @@ fn create_shortcuts_preferences(config: &Config) -> GtkBox {
     grid.set_column_spacing(12);
 
     let shortcuts = [
-        ("New Tab", &config.shortcuts.new_tab),
-        ("Close Tab", &config.shortcuts.close_tab),
-        ("Next Tab", &config.shortcuts.next_tab),
-        ("Previous Tab", &config.shortcuts.prev_tab),
-        ("New Window", &config.shortcuts.new_window),
-        ("Close Window", &config.shortcuts.close_window),
-        ("Copy", &config.shortcuts.copy),
-        ("Paste", &config.shortcuts.paste),
-        ("Select All", &config.shortcuts.select_all),
-        ("Zoom In", &config.shortcuts.zoom_in),
-        ("Zoom Out", &config.shortcuts.zoom_out),
-        ("Zoom Reset", &config.shortcuts.zoom_reset),
-        ("Find", &config.shortcuts.find),
-        ("Reset", &config.shortcuts.reset),
+        ("new_tab", "New Tab", &config.shortcuts.new_tab),
+        ("close_tab", "Close Tab", &config.shortcuts.close_tab),
+        ("next_tab", "Next Tab", &config.shortcuts.next_tab),
+        ("prev_tab", "Previous Tab", &config.shortcuts.prev_tab),
+        ("new_window", "New Window", &config.shortcuts.new_window),
+        ("close_window", "Close Window", &config.shortcuts.close_window),
+        ("copy", "Copy", &config.shortcuts.copy),
+        ("paste", "Paste", &config.shortcuts.paste),
+        ("select_all", "Select All", &config.shortcuts.select_all),
+        ("zoom_in", "Zoom In", &config.shortcuts.zoom_in),
+        ("zoom_out", "Zoom Out", &config.shortcuts.zoom_out),
+        ("zoom_reset", "Zoom Reset", &config.shortcuts.zoom_reset),
+        ("find", "Find", &config.shortcuts.find),
+        ("reset", "Reset", &config.shortcuts.reset),
     ];
 
-    for (i, (name, shortcut)) in shortcuts.iter().enumerate() {
-        let name_label = Label::new(Some(name));
+    let mut entries = Vec::new();
+
+    for (i, (key, name, shortcut)) in shortcuts.iter().enumerate() {
+        let name_label = Label::new(Some(*name));
         name_label.set_halign(Align::End);
         grid.attach(&name_label, 0, i as i32, 1, 1);
 
         let shortcut_entry = Entry::new();
-        shortcut_entry.set_text(shortcut);
+        shortcut_entry.set_text(*shortcut);
         shortcut_entry.set_hexpand(true);
         grid.attach(&shortcut_entry, 1, i as i32, 1, 1);
+
+        entries.push((key.to_string(), shortcut_entry));
     }
 
     scroll.set_child(Some(&grid));
     page.append(&scroll);
-    page
+    (page, entries)
 }
