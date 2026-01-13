@@ -1,0 +1,238 @@
+name: Build
+
+on:
+  push:
+    branches: [master, main]
+    tags: ['v*']
+  pull_request:
+    branches: [master, main]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build-linux:
+    name: Build Linux (Ubuntu 22.04)
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libgtk-4-dev \
+            libadwaita-1-dev \
+            libpango1.0-dev \
+            libcairo2-dev \
+            libglib2.0-dev
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build
+        run: cargo build --release
+
+      - name: Create release archive
+        run: |
+          mkdir -p release/cterm-linux-x86_64
+          cp target/release/cterm release/cterm-linux-x86_64/
+          cp README.md LICENSE release/cterm-linux-x86_64/
+          cd release && tar -czvf cterm-linux-x86_64.tar.gz cterm-linux-x86_64
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: cterm-linux-x86_64
+          path: release/cterm-linux-x86_64.tar.gz
+
+  build-windows:
+    name: Build Windows
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: msys2 {0}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup MSYS2
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          update: true
+          install: >-
+            mingw-w64-ucrt-x86_64-gtk4
+            mingw-w64-ucrt-x86_64-libadwaita
+            mingw-w64-ucrt-x86_64-rust
+            mingw-w64-ucrt-x86_64-pkgconf
+            base-devel
+
+      - name: Build
+        run: cargo build --release
+
+      - name: Create release archive
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path release/cterm-windows-x86_64
+          Copy-Item target/release/cterm.exe release/cterm-windows-x86_64/
+          Copy-Item README.md release/cterm-windows-x86_64/
+          Copy-Item LICENSE release/cterm-windows-x86_64/
+          # Copy required DLLs
+          $msysPath = "D:/a/_temp/msys64/ucrt64/bin"
+          $dlls = @(
+            "libgtk-4-1.dll",
+            "libadwaita-1-0.dll",
+            "libgio-2.0-0.dll",
+            "libglib-2.0-0.dll",
+            "libgobject-2.0-0.dll",
+            "libcairo-2.dll",
+            "libcairo-gobject-2.dll",
+            "libpango-1.0-0.dll",
+            "libpangocairo-1.0-0.dll",
+            "libgdk_pixbuf-2.0-0.dll",
+            "libepoxy-0.dll",
+            "libfribidi-0.dll",
+            "libharfbuzz-0.dll",
+            "libpangowin32-1.0-0.dll",
+            "libpangoft2-1.0-0.dll",
+            "libfontconfig-1.dll",
+            "libfreetype-6.dll",
+            "libpng16-16.dll",
+            "zlib1.dll",
+            "libintl-8.dll",
+            "libiconv-2.dll",
+            "libpcre2-8-0.dll",
+            "libffi-8.dll",
+            "libgraphene-1.0-0.dll",
+            "libjpeg-8.dll",
+            "libtiff-6.dll",
+            "libxml2-2.dll",
+            "liblzma-5.dll",
+            "libzstd.dll",
+            "libbz2-1.dll",
+            "libbrotlidec.dll",
+            "libbrotlicommon.dll",
+            "libexpat-1.dll",
+            "libgcc_s_seh-1.dll",
+            "libstdc++-6.dll",
+            "libwinpthread-1.dll"
+          )
+          foreach ($dll in $dlls) {
+            $src = Join-Path $msysPath $dll
+            if (Test-Path $src) {
+              Copy-Item $src release/cterm-windows-x86_64/
+            }
+          }
+          Compress-Archive -Path release/cterm-windows-x86_64 -DestinationPath release/cterm-windows-x86_64.zip
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: cterm-windows-x86_64
+          path: release/cterm-windows-x86_64.zip
+
+  build-macos-intel:
+    name: Build macOS (Intel)
+    runs-on: macos-13
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          brew install gtk4 libadwaita pango cairo glib pkg-config
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build
+        run: cargo build --release
+
+      - name: Upload binary artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: cterm-macos-x86_64-binary
+          path: target/release/cterm
+
+  build-macos-arm:
+    name: Build macOS (Apple Silicon)
+    runs-on: macos-14
+    needs: build-macos-intel
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          brew install gtk4 libadwaita pango cairo glib pkg-config
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build
+        run: cargo build --release
+
+      - name: Download Intel binary
+        uses: actions/download-artifact@v4
+        with:
+          name: cterm-macos-x86_64-binary
+          path: intel-binary
+
+      - name: Create universal binary
+        run: |
+          mkdir -p release/cterm-macos-universal
+          lipo -create -output release/cterm-macos-universal/cterm \
+            intel-binary/cterm \
+            target/release/cterm
+          chmod +x release/cterm-macos-universal/cterm
+          # Verify it's universal
+          file release/cterm-macos-universal/cterm
+          lipo -info release/cterm-macos-universal/cterm
+
+      - name: Add README and LICENSE
+        run: |
+          cp README.md LICENSE release/cterm-macos-universal/
+
+      - name: Create release archive
+        run: |
+          cd release && tar -czvf cterm-macos-universal.tar.gz cterm-macos-universal
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: cterm-macos-universal
+          path: release/cterm-macos-universal.tar.gz
+
+  release:
+    name: Create Release
+    needs: [build-linux, build-windows, build-macos-arm]
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+    permissions:
+      contents: write
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: List artifacts
+        run: find artifacts -type f
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v1
+        with:
+          files: |
+            artifacts/cterm-linux-x86_64/cterm-linux-x86_64.tar.gz
+            artifacts/cterm-windows-x86_64/cterm-windows-x86_64.zip
+            artifacts/cterm-macos-universal/cterm-macos-universal.tar.gz
+          draft: false
+          prerelease: false
+          generate_release_notes: true
