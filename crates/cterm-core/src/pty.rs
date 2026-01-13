@@ -440,7 +440,9 @@ mod windows {
         UpdateProcThreadAttribute, PROCESS_INFORMATION,
     };
     use winapi::um::synchapi::WaitForSingleObject;
-    use winapi::um::winbase::{EXTENDED_STARTUPINFO_PRESENT, INFINITE, STARTUPINFOEXW, WAIT_OBJECT_0};
+    use winapi::um::winbase::{
+        EXTENDED_STARTUPINFO_PRESENT, INFINITE, STARTUPINFOEXW, WAIT_OBJECT_0,
+    };
     use winapi::um::wincon::COORD;
     use winapi::um::winnt::HANDLE;
 
