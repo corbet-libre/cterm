@@ -37,8 +37,6 @@ pub struct CtermWindow {
     pub shortcuts: ShortcutManager,
     tabs: Rc<RefCell<Vec<TabEntry>>>,
     next_tab_id: Rc<RefCell<u64>>,
-    menu_bar: PopoverMenuBar,
-    debug_menu_shown: Rc<RefCell<bool>>,
     has_bell: Rc<RefCell<bool>>,
 }
 
@@ -64,8 +62,8 @@ impl CtermWindow {
         // Create the main container
         let main_box = GtkBox::new(Orientation::Vertical, 0);
 
-        // Create menu bar
-        let menu_model = menu::create_menu_model();
+        // Create menu bar (always include debug menu - it's harmless)
+        let menu_model = menu::create_menu_model_with_options(true);
         let menu_bar = PopoverMenuBar::from_model(Some(&menu_model));
         main_box.append(&menu_bar);
 
@@ -88,7 +86,6 @@ impl CtermWindow {
         // Create shortcut manager
         let shortcuts = ShortcutManager::from_config(&config.shortcuts);
 
-        let debug_menu_shown = Rc::new(RefCell::new(false));
         let has_bell = Rc::new(RefCell::new(false));
 
         let cterm_window = Self {
@@ -100,8 +97,6 @@ impl CtermWindow {
             shortcuts,
             tabs: Rc::new(RefCell::new(Vec::new())),
             next_tab_id: Rc::new(RefCell::new(0)),
-            menu_bar,
-            debug_menu_shown,
             has_bell,
         };
 
@@ -110,9 +105,6 @@ impl CtermWindow {
 
         // Set up key event handling
         cterm_window.setup_key_handler();
-
-        // Set up Shift key tracking for debug menu
-        cterm_window.setup_debug_menu_handler();
 
         // Set up window focus handler to clear bell on focus
         cterm_window.setup_focus_handler();
@@ -912,45 +904,6 @@ impl CtermWindow {
         });
 
         self.window.add_controller(key_controller);
-    }
-
-    /// Set up Shift key tracking for debug menu visibility
-    fn setup_debug_menu_handler(&self) {
-        let debug_controller = EventControllerKey::new();
-
-        let menu_bar = self.menu_bar.clone();
-        let debug_menu_shown = Rc::clone(&self.debug_menu_shown);
-
-        // Track Shift key for debug menu
-        debug_controller.connect_key_pressed(move |_, keyval, _keycode, _state| {
-            // Check if Shift was pressed
-            if keyval == gdk::Key::Shift_L || keyval == gdk::Key::Shift_R {
-                let mut shown = debug_menu_shown.borrow_mut();
-                if !*shown {
-                    *shown = true;
-                    let new_menu = menu::create_menu_model_with_options(true);
-                    menu_bar.set_menu_model(Some(&new_menu));
-                }
-            }
-            glib::Propagation::Proceed
-        });
-
-        let menu_bar = self.menu_bar.clone();
-        let debug_menu_shown = Rc::clone(&self.debug_menu_shown);
-
-        debug_controller.connect_key_released(move |_, keyval, _keycode, _state| {
-            // Check if Shift was released
-            if keyval == gdk::Key::Shift_L || keyval == gdk::Key::Shift_R {
-                let mut shown = debug_menu_shown.borrow_mut();
-                if *shown {
-                    *shown = false;
-                    let new_menu = menu::create_menu_model_with_options(false);
-                    menu_bar.set_menu_model(Some(&new_menu));
-                }
-            }
-        });
-
-        self.window.add_controller(debug_controller);
     }
 
     /// Set up window focus handler to clear bell when window becomes active
