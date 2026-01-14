@@ -8,10 +8,6 @@ description = "GTK4 UI implementation for cterm"
 name = "cterm_gtk"
 path = "src/lib.rs"
 
-[[bin]]
-name = "cterm-gtk"
-path = "src/main.rs"
-
 [features]
 default = []
 adwaita = ["dep:libadwaita"]

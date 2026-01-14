@@ -6,10 +6,6 @@ authors.workspace = true
 license.workspace = true
 description = "Native macOS UI for cterm using AppKit and Metal"
 
-[[bin]]
-name = "cterm-cocoa"
-path = "src/main.rs"
-
 [dependencies]
 # Internal crates
 cterm-core.workspace = true
