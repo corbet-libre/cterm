@@ -90,10 +90,7 @@ define_class!(
         }
 
         #[unsafe(method(applicationShouldTerminateAfterLastWindowClosed:))]
-        fn should_terminate_after_last_window_closed(
-            &self,
-            _sender: &NSApplication,
-        ) -> bool {
+        fn should_terminate_after_last_window_closed(&self, _sender: &NSApplication) -> bool {
             true
         }
     }

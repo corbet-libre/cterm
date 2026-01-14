@@ -7,9 +7,7 @@ use std::cell::RefCell;
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2::{define_class, msg_send, AllocAnyThread, DefinedClass, MainThreadOnly};
-use objc2_app_kit::{
-    NSWindow, NSWindowDelegate, NSWindowStyleMask,
-};
+use objc2_app_kit::{NSWindow, NSWindowDelegate, NSWindowStyleMask};
 use objc2_foundation::{
     MainThreadMarker, NSNotification, NSObjectProtocol, NSPoint, NSRect, NSSize, NSString,
 };
@@ -83,10 +81,7 @@ impl CtermWindow {
         let width = cell_width * 80.0 + 20.0;
         let height = cell_height * 24.0 + 60.0; // Extra for tab bar
 
-        let content_rect = NSRect::new(
-            NSPoint::new(200.0, 200.0),
-            NSSize::new(width, height),
-        );
+        let content_rect = NSRect::new(NSPoint::new(200.0, 200.0), NSSize::new(width, height));
 
         let style_mask = NSWindowStyleMask::Titled
             | NSWindowStyleMask::Closable

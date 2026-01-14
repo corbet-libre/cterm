@@ -204,11 +204,10 @@ impl TerminalView {
 
     /// Spawn the shell process
     fn spawn_shell(&self, config: &Config) {
-        let shell = config
-            .general
-            .default_shell
-            .clone()
-            .unwrap_or_else(|| std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".to_string()));
+        let shell =
+            config.general.default_shell.clone().unwrap_or_else(|| {
+                std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".to_string())
+            });
 
         let args: Vec<String> = config.general.shell_args.clone();
 

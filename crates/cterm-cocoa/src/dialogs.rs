@@ -2,9 +2,7 @@
 //!
 //! Native macOS dialogs using NSAlert and other AppKit dialogs.
 
-use objc2_app_kit::{
-    NSAlert, NSAlertFirstButtonReturn, NSAlertStyle, NSTextField, NSWindow,
-};
+use objc2_app_kit::{NSAlert, NSAlertFirstButtonReturn, NSAlertStyle, NSTextField, NSWindow};
 use objc2_foundation::{MainThreadMarker, NSSize, NSString};
 
 /// Show an error dialog

@@ -44,10 +44,7 @@ define_class!(
 impl TabBar {
     /// Create a new tab bar
     pub fn new(mtm: MainThreadMarker) -> Retained<Self> {
-        let frame = NSRect::new(
-            NSPoint::ZERO,
-            NSSize::new(800.0, 28.0),
-        );
+        let frame = NSRect::new(NSPoint::ZERO, NSSize::new(800.0, 28.0));
 
         let this = mtm.alloc::<Self>();
         let this = this.set_ivars(TabBarIvars {
@@ -73,12 +70,7 @@ impl TabBar {
 
         // Add "new tab" button
         let new_tab_button = unsafe {
-            NSButton::buttonWithTitle_target_action(
-                &NSString::from_str("+"),
-                None,
-                None,
-                mtm,
-            )
+            NSButton::buttonWithTitle_target_action(&NSString::from_str("+"), None, None, mtm)
         };
         this.addView_inGravity(&new_tab_button, NSStackViewGravity::Trailing);
 

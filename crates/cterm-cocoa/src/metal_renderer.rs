@@ -2,9 +2,9 @@
 //!
 //! Renders the terminal content using Metal for GPU acceleration.
 
+use objc2::msg_send;
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
-use objc2::msg_send;
 use objc2_app_kit::NSView;
 use objc2_foundation::{NSRect, NSSize};
 use objc2_metal::{
@@ -77,8 +77,11 @@ impl MetalRenderer {
         let pass_descriptor = MTLRenderPassDescriptor::new();
 
         // Configure color attachment
-        let color_attachment =
-            unsafe { pass_descriptor.colorAttachments().objectAtIndexedSubscript(0) };
+        let color_attachment = unsafe {
+            pass_descriptor
+                .colorAttachments()
+                .objectAtIndexedSubscript(0)
+        };
         color_attachment.setTexture(Some(&texture));
         color_attachment.setLoadAction(objc2_metal::MTLLoadAction::Clear);
         color_attachment.setStoreAction(objc2_metal::MTLStoreAction::Store);
@@ -122,7 +125,8 @@ impl MetalRenderer {
         // Present and commit
         // CAMetalDrawable extends MTLDrawable, use the as_super() pattern
         unsafe {
-            let drawable_ptr = drawable.as_ref() as *const _ as *const ProtocolObject<dyn MTLDrawable>;
+            let drawable_ptr =
+                drawable.as_ref() as *const _ as *const ProtocolObject<dyn MTLDrawable>;
             command_buffer.presentDrawable(&*drawable_ptr);
         }
         command_buffer.commit();

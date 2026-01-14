@@ -279,7 +279,12 @@ fn create_terminal_menu(mtm: MainThreadMarker) -> Retained<NSMenuItem> {
     menu.setTitle(&NSString::from_str("Terminal"));
 
     // Reset
-    menu.addItem(&create_menu_item(mtm, "Reset", Some(sel!(resetTerminal:)), ""));
+    menu.addItem(&create_menu_item(
+        mtm,
+        "Reset",
+        Some(sel!(resetTerminal:)),
+        "",
+    ));
 
     menu.addItem(&create_menu_item(
         mtm,
