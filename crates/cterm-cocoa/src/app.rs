@@ -2,19 +2,60 @@
 //!
 //! Handles NSApplication lifecycle and main event loop.
 
+use clap::Parser;
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
-use objc2::{define_class, msg_send, AllocAnyThread, DefinedClass, MainThreadOnly};
-use objc2_app_kit::{
-    NSApplication, NSApplicationActivationPolicy, NSApplicationDelegate,
-};
+use objc2::{define_class, msg_send, DefinedClass, MainThreadOnly};
+use objc2_app_kit::{NSApplication, NSApplicationActivationPolicy, NSApplicationDelegate};
 use objc2_foundation::{MainThreadMarker, NSNotification, NSObject, NSObjectProtocol};
+use std::path::PathBuf;
 
 use cterm_app::config::{load_config, Config};
 use cterm_ui::theme::Theme;
 
 use crate::menu;
 use crate::window::CtermWindow;
+
+/// Command-line arguments for cterm
+#[derive(Parser, Debug)]
+#[command(
+    name = "cterm",
+    version,
+    about = "A high-performance terminal emulator"
+)]
+pub struct Args {
+    /// Execute a command instead of the default shell
+    #[arg(short = 'e', long = "execute")]
+    pub command: Option<String>,
+
+    /// Set the working directory
+    #[arg(short = 'd', long = "directory")]
+    pub directory: Option<PathBuf>,
+
+    /// Start in fullscreen mode
+    #[arg(long)]
+    pub fullscreen: bool,
+
+    /// Start maximized
+    #[arg(long)]
+    pub maximized: bool,
+
+    /// Set the window title
+    #[arg(short = 't', long = "title")]
+    pub title: Option<String>,
+
+    /// Receive upgrade state from parent process via inherited FD (internal use)
+    #[arg(long, hide = true)]
+    pub upgrade_receiver: Option<i32>,
+}
+
+/// Global application arguments (accessible from window creation)
+static APP_ARGS: std::sync::OnceLock<Args> = std::sync::OnceLock::new();
+
+/// Get the application arguments (call only after run())
+pub fn get_args() -> &'static Args {
+    APP_ARGS.get().expect("Args not initialized")
+}
 
 /// Application state stored in the delegate
 pub struct AppDelegateIvars {
@@ -86,6 +127,17 @@ fn get_theme(config: &Config) -> Theme {
 
 /// Run the native macOS application
 pub fn run() {
+    // Parse command-line arguments first
+    let args = Args::parse();
+
+    // Initialize logging
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+
+    log::info!("Starting cterm (native macOS)");
+
+    // Store args for later access
+    let _ = APP_ARGS.set(args);
+
     // Get main thread marker - this must be called on the main thread
     let mtm = MainThreadMarker::new().expect("Must be called on main thread");
 
@@ -119,5 +171,5 @@ pub fn run() {
     log::info!("Starting main run loop");
 
     // Run the main event loop
-    unsafe { app.run() };
+    app.run();
 }

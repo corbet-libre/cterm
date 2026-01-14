@@ -7,7 +7,7 @@ license.workspace = true
 description = "Native macOS UI for cterm using AppKit and Metal"
 
 [[bin]]
-name = "cterm"
+name = "cterm-cocoa"
 path = "src/main.rs"
 
 [dependencies]

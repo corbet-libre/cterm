@@ -260,6 +260,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "cterm"
+version = "0.0.1"
+dependencies = [
+ "cterm-cocoa",
+ "cterm-gtk",
+]
+
+[[package]]
 name = "cterm-app"
 version = "0.0.1"
 dependencies = [
