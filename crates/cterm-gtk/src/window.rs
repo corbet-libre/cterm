@@ -782,9 +782,21 @@ impl CtermWindow {
         }
     }
 
-    /// Present the window
+    /// Present the window and focus the terminal
     pub fn present(&self) {
         self.window.present();
+
+        // Focus the current terminal after the window is presented
+        let notebook = self.notebook.clone();
+        let tabs = Rc::clone(&self.tabs);
+        glib::idle_add_local_once(move || {
+            if let Some(page_idx) = notebook.current_page() {
+                let tabs_ref = tabs.borrow();
+                if let Some(tab) = tabs_ref.get(page_idx as usize) {
+                    tab.terminal.widget().grab_focus();
+                }
+            }
+        });
     }
 
     /// Set up keyboard event handler
