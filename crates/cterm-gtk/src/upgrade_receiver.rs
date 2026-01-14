@@ -92,6 +92,7 @@ fn run_gtk_with_state(
     state: UpgradeState,
     fds: Vec<RawFd>,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    use gtk4::gio;
     use gtk4::Application;
 
     // Store state and FDs for use during window construction
@@ -100,8 +101,11 @@ fn run_gtk_with_state(
         *s.borrow_mut() = Some((state, fds));
     });
 
+    // Use NON_UNIQUE flag to prevent DBus conflicts with the old instance
+    // that may still be shutting down
     let app = Application::builder()
         .application_id("com.cterm.terminal")
+        .flags(gio::ApplicationFlags::NON_UNIQUE)
         .build();
 
     app.connect_activate(|app| {
