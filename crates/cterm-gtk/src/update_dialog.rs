@@ -288,16 +288,44 @@ pub fn show_update_dialog(parent: &impl IsA<Window>) {
 }
 
 /// Check for updates asynchronously
+///
+/// Runs the reqwest-based updater inside a Tokio runtime since reqwest
+/// requires Tokio's reactor.
 async fn check_for_updates() -> Result<Option<UpdateInfo>, UpdateError> {
-    let updater = Updater::new(GITHUB_REPO, CURRENT_VERSION)?;
-    updater.check_for_update().await
+    // Run in a blocking thread with its own Tokio runtime
+    let (tx, rx) = futures::channel::oneshot::channel::<Result<Option<UpdateInfo>, UpdateError>>();
+
+    std::thread::spawn(move || {
+        let rt = tokio::runtime::Runtime::new().expect("Failed to create Tokio runtime");
+        let result = rt.block_on(async {
+            let updater = Updater::new(GITHUB_REPO, CURRENT_VERSION)?;
+            updater.check_for_update().await
+        });
+        let _ = tx.send(result);
+    });
+
+    rx.await.unwrap_or_else(|_| Err(UpdateError::NotFound))
 }
 
 /// Download update with progress callback
+///
+/// Runs the reqwest-based updater inside a Tokio runtime since reqwest
+/// requires Tokio's reactor.
 async fn download_update<F>(info: &UpdateInfo, on_progress: F) -> Result<PathBuf, UpdateError>
 where
     F: FnMut(u64, u64) + Send + 'static,
 {
-    let updater = Updater::new(GITHUB_REPO, CURRENT_VERSION)?;
-    updater.download(info, on_progress).await
+    let info = info.clone();
+    let (tx, rx) = futures::channel::oneshot::channel::<Result<PathBuf, UpdateError>>();
+
+    std::thread::spawn(move || {
+        let rt = tokio::runtime::Runtime::new().expect("Failed to create Tokio runtime");
+        let result = rt.block_on(async {
+            let updater = Updater::new(GITHUB_REPO, CURRENT_VERSION)?;
+            updater.download(&info, on_progress).await
+        });
+        let _ = tx.send(result);
+    });
+
+    rx.await.unwrap_or_else(|_| Err(UpdateError::NotFound))
 }
