@@ -235,6 +235,10 @@ fn create_restored_window(
                         notebook_click.set_current_page(Some(idx as u32));
                         tab_bar_click.set_active(tab_id);
                         tab_bar_click.clear_bell(tab_id);
+                        // Focus the terminal widget
+                        if let Some(widget) = notebook_click.nth_page(Some(idx as u32)) {
+                            widget.grab_focus();
+                        }
                     }
                 });
 
@@ -328,11 +332,16 @@ fn create_restored_window(
         }
     }
 
-    // Focus the current terminal
-    if let Some(page) = notebook.current_page() {
-        if let Some(widget) = notebook.nth_page(Some(page)) {
-            widget.grab_focus();
-        }
+    // Focus the current terminal (deferred until after window is realized)
+    {
+        let notebook_focus = notebook.clone();
+        glib::idle_add_local_once(move || {
+            if let Some(page) = notebook_focus.current_page() {
+                if let Some(widget) = notebook_focus.nth_page(Some(page)) {
+                    widget.grab_focus();
+                }
+            }
+        });
     }
 
     // Handle maximized/fullscreen state

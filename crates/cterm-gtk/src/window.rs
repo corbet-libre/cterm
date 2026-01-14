@@ -1115,6 +1115,10 @@ fn create_new_tab(
             tab_bar_click.set_active(tab_id);
             // Clear bell when tab becomes active
             tab_bar_click.clear_bell(tab_id);
+            // Focus the terminal widget
+            if let Some(widget) = notebook_click.nth_page(Some(idx as u32)) {
+                widget.grab_focus();
+            }
         }
     });
 
@@ -1288,6 +1292,10 @@ fn create_docker_tab(
             notebook_click.set_current_page(Some(idx as u32));
             tab_bar_click.set_active(tab_id);
             tab_bar_click.clear_bell(tab_id);
+            // Focus the terminal widget
+            if let Some(widget) = notebook_click.nth_page(Some(idx as u32)) {
+                widget.grab_focus();
+            }
         }
     });
 
