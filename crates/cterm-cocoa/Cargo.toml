@@ -1,0 +1,47 @@
+[package]
+name = "cterm-cocoa"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Native macOS UI for cterm using AppKit and Metal"
+
+[[bin]]
+name = "cterm"
+path = "src/main.rs"
+
+[dependencies]
+# Internal crates
+cterm-core.workspace = true
+cterm-ui.workspace = true
+cterm-app.workspace = true
+
+# Logging
+log.workspace = true
+env_logger.workspace = true
+
+# Error handling
+anyhow.workspace = true
+thiserror.workspace = true
+
+# Async runtime
+tokio.workspace = true
+futures.workspace = true
+
+# objc2 ecosystem for macOS
+objc2.workspace = true
+objc2-foundation.workspace = true
+objc2-app-kit.workspace = true
+objc2-metal.workspace = true
+objc2-core-graphics.workspace = true
+objc2-quartz-core.workspace = true
+block2.workspace = true
+
+# Synchronization
+parking_lot.workspace = true
+
+# CLI parsing
+clap.workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+libc.workspace = true

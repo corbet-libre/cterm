@@ -5,6 +5,7 @@ members = [
     "crates/cterm-ui",
     "crates/cterm-app",
     "crates/cterm-gtk",
+    "crates/cterm-cocoa",
 ]
 
 [workspace.package]
@@ -64,6 +65,15 @@ gdk4 = "0.9"
 cairo-rs = { version = "0.20", features = ["png"] }
 pango = "0.20"
 pangocairo = "0.20"
+
+# macOS native (objc2 ecosystem)
+objc2 = "0.6"
+objc2-foundation = "0.3"
+objc2-app-kit = "0.3"
+objc2-metal = "0.3"
+objc2-core-graphics = "0.3"
+objc2-quartz-core = "0.3"
+block2 = "0.6"
 
 # Internal crates
 cterm-core = { path = "crates/cterm-core" }
