@@ -113,7 +113,9 @@ fn run_gtk_with_state(
         });
     });
 
-    app.run();
+    // Use run_with_args with empty args to prevent GTK from parsing
+    // the command line (which contains --upgrade-receiver that GTK doesn't know)
+    app.run_with_args(&[] as &[&str]);
     Ok(())
 }
 
