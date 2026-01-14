@@ -15,7 +15,7 @@ mod window;
 
 use clap::Parser;
 use gtk4::prelude::*;
-use gtk4::{glib, Application};
+use gtk4::Application;
 use std::path::PathBuf;
 
 /// Command-line arguments for cterm
