@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use objc2::rc::Retained;
 use objc2::runtime::AnyObject;
-use objc2::{class, define_class, msg_send, sel, DefinedClass, MainThreadOnly};
+use objc2::{define_class, msg_send, sel, DefinedClass, MainThreadOnly};
 use objc2_app_kit::{NSEvent, NSView};
 use objc2_foundation::{MainThreadMarker, NSObjectProtocol, NSPoint, NSRect, NSSize};
 use parking_lot::Mutex;
@@ -120,9 +120,19 @@ define_class!(
             self.set_needs_display();
         }
 
-        #[unsafe(method(refreshTimerFired:))]
-        fn refresh_timer_fired(&self, _timer: &AnyObject) {
+        #[unsafe(method(scheduleRedraw))]
+        fn schedule_redraw(&self) {
             self.set_needs_display();
+            // Schedule next redraw
+            unsafe {
+                let delay: f64 = 1.0 / 60.0;
+                let _: () = msg_send![
+                    self,
+                    performSelector: sel!(scheduleRedraw),
+                    withObject: std::ptr::null::<AnyObject>(),
+                    afterDelay: delay
+                ];
+            }
         }
     }
 );
@@ -157,10 +167,17 @@ impl TerminalView {
         // Spawn shell
         this.spawn_shell(config);
 
-        // Start refresh timer for PTY updates
-        this.start_refresh_timer();
+        // Start the redraw loop
+        this.start_redraw_loop();
 
         this
+    }
+
+    /// Start the periodic redraw loop
+    fn start_redraw_loop(&self) {
+        unsafe {
+            let _: () = msg_send![self, scheduleRedraw];
+        }
     }
 
     /// Spawn the shell process
@@ -237,21 +254,6 @@ impl TerminalView {
 
         // Don't close the fd - it's owned by the Pty struct
         std::mem::forget(file);
-    }
-
-    /// Start a timer to periodically refresh the display
-    fn start_refresh_timer(&self) {
-        unsafe {
-            let interval: f64 = 1.0 / 60.0; // 60 FPS
-            let _: Retained<AnyObject> = msg_send![
-                class!(NSTimer),
-                scheduledTimerWithTimeInterval: interval,
-                target: self,
-                selector: sel!(refreshTimerFired:),
-                userInfo: std::ptr::null::<AnyObject>(),
-                repeats: true
-            ];
-        }
     }
 
     /// Handle window resize
