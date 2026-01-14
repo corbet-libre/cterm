@@ -1,19 +1,22 @@
 //! Upgrade protocol - handles sending and receiving upgrade state
 //!
 //! This module provides the core protocol for seamless upgrades:
-//! - Sender side: serializes state and sends to new process
+//! - Sender side: serializes state and sends to new process via inherited FD
 //! - Receiver side: deserializes state and reconstructs terminals
 
 #[cfg(unix)]
 use cterm_core::fd_passing;
 
 use std::io;
+#[cfg(unix)]
 use std::path::Path;
 
 #[cfg(unix)]
-use std::os::unix::io::RawFd;
+use std::os::unix::io::{FromRawFd, RawFd};
 #[cfg(unix)]
-use std::os::unix::net::{UnixListener, UnixStream};
+use std::os::unix::net::UnixStream;
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
 #[cfg(unix)]
 use std::process::Command;
 
@@ -71,17 +74,15 @@ pub fn execute_upgrade(
         return Err(UpgradeError::TooManyFds(fds.len(), MAX_FDS));
     }
 
-    // Create a temporary socket path
-    let socket_path = std::env::temp_dir().join(format!("cterm-upgrade-{}", std::process::id()));
+    // Create a socketpair for communication
+    let (parent_sock, child_sock) = UnixStream::pair()
+        .map_err(|e| UpgradeError::Socket(format!("Failed to create socketpair: {}", e)))?;
 
-    // Clean up any existing socket
-    let _ = std::fs::remove_file(&socket_path);
+    // Get the raw FD for the child socket - this will be inherited
+    use std::os::unix::io::AsRawFd;
+    let child_fd = child_sock.as_raw_fd();
 
-    // Create the listener
-    let listener = UnixListener::bind(&socket_path)
-        .map_err(|e| UpgradeError::Socket(format!("Failed to bind socket: {}", e)))?;
-
-    log::info!("Upgrade socket created at {:?}", socket_path);
+    log::info!("Created socketpair, child FD: {}", child_fd);
 
     // Serialize the state
     let state_bytes =
@@ -93,31 +94,43 @@ pub fn execute_upgrade(
         fds.len()
     );
 
-    // Spawn the new process
-    let child = Command::new(new_binary)
-        .arg("--upgrade-receiver")
-        .arg(&socket_path)
-        .spawn()
-        .map_err(|e| UpgradeError::Spawn(e.to_string()))?;
+    // Spawn the new process with the child socket FD inherited
+    // We need to keep child_sock alive until after spawn, and use pre_exec to
+    // prevent it from being closed
+    let child_fd_for_closure = child_fd;
+    let child = unsafe {
+        Command::new(new_binary)
+            .arg("--upgrade-receiver")
+            .arg(child_fd.to_string())
+            .pre_exec(move || {
+                // Clear the close-on-exec flag for the child socket FD
+                // so it gets inherited by the child process
+                let flags = libc::fcntl(child_fd_for_closure, libc::F_GETFD);
+                if flags != -1 {
+                    libc::fcntl(
+                        child_fd_for_closure,
+                        libc::F_SETFD,
+                        flags & !libc::FD_CLOEXEC,
+                    );
+                }
+                Ok(())
+            })
+            .spawn()
+            .map_err(|e| UpgradeError::Spawn(e.to_string()))?
+    };
 
     log::info!("New process spawned with PID: {}", child.id());
 
-    // Set a timeout for accepting the connection
-    listener.set_nonblocking(false)?;
+    // Close our copy of the child socket - child has its own now
+    drop(child_sock);
 
-    // Accept the connection from the new process
-    let (mut stream, _) = listener
-        .accept()
-        .map_err(|e| UpgradeError::Socket(format!("Failed to accept connection: {}", e)))?;
-
-    log::info!("Connection accepted from new process");
-
-    // Send the state and FDs
-    fd_passing::send_fds(&stream, fds, &state_bytes)?;
+    // Send the state and FDs over the parent socket
+    fd_passing::send_fds(&parent_sock, fds, &state_bytes)?;
 
     log::info!("State and FDs sent");
 
     // Wait for acknowledgment
+    let mut stream = parent_sock;
     let mut ack = [0u8; 1];
     stream
         .read_exact(&mut ack)
@@ -129,9 +142,6 @@ pub fn execute_upgrade(
 
     log::info!("Acknowledgment received, upgrade successful");
 
-    // Clean up the socket
-    let _ = std::fs::remove_file(&socket_path);
-
     Ok(())
 }
 
@@ -140,21 +150,18 @@ pub fn execute_upgrade(
 /// This is called by the new process when started with --upgrade-receiver
 ///
 /// # Arguments
-/// * `socket_path` - Path to the Unix socket to connect to
+/// * `fd` - The inherited file descriptor to read from
 ///
 /// # Returns
 /// The upgrade state and file descriptors received
 #[cfg(unix)]
-pub fn receive_upgrade(socket_path: &Path) -> Result<(UpgradeState, Vec<RawFd>), UpgradeError> {
+pub fn receive_upgrade(fd: RawFd) -> Result<(UpgradeState, Vec<RawFd>), UpgradeError> {
     use std::io::Write;
 
-    log::info!("Connecting to upgrade socket: {:?}", socket_path);
+    log::info!("Receiving upgrade state from FD {}", fd);
 
-    // Connect to the socket
-    let mut stream = UnixStream::connect(socket_path)
-        .map_err(|e| UpgradeError::Socket(format!("Failed to connect: {}", e)))?;
-
-    log::info!("Connected to upgrade socket");
+    // Create a UnixStream from the inherited FD
+    let mut stream = unsafe { UnixStream::from_raw_fd(fd) };
 
     // Receive state and FDs
     let mut buf = vec![0u8; MAX_STATE_SIZE];

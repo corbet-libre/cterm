@@ -1,12 +1,11 @@
 //! Upgrade receiver - handles receiving state from the old process during seamless upgrade
 //!
 //! This module is used when cterm is started with --upgrade-receiver flag.
-//! It connects to the old process via Unix socket, receives the terminal state
+//! It receives state from the parent process via an inherited FD, receives the terminal state
 //! and PTY file descriptors, then reconstructs the windows and tabs.
 
 use cterm_app::config::{load_config, Config};
-use cterm_app::upgrade::{TabUpgradeState, UpgradeState, WindowUpgradeState};
-use cterm_core::fd_passing;
+use cterm_app::upgrade::{receive_upgrade, TabUpgradeState, UpgradeState, WindowUpgradeState};
 use cterm_core::pty::Pty;
 use cterm_core::screen::{Screen, ScreenConfig};
 use cterm_core::term::Terminal;
@@ -14,31 +13,22 @@ use cterm_ui::theme::Theme;
 use gtk4::glib;
 use gtk4::prelude::*;
 use std::cell::RefCell;
-use std::io::Write;
 use std::os::unix::io::RawFd;
-use std::os::unix::net::UnixStream;
-use std::path::Path;
 use std::rc::Rc;
 
 use crate::menu;
 use crate::tab_bar::TabBar;
 use crate::terminal_widget::TerminalWidget;
 
-/// Maximum size of the state buffer (64MB)
-const MAX_STATE_SIZE: usize = 64 * 1024 * 1024;
-
-/// Maximum number of file descriptors to receive
-const MAX_FDS: usize = 256;
-
 /// Run the upgrade receiver
 ///
 /// This function:
-/// 1. Connects to the Unix socket at the given path
+/// 1. Reads from the inherited FD passed by the parent
 /// 2. Receives the upgrade state and PTY file descriptors
 /// 3. Sends acknowledgment
 /// 4. Reconstructs the GTK application with the received state
-pub fn run_receiver(socket_path: &Path) -> glib::ExitCode {
-    match receive_and_reconstruct(socket_path) {
+pub fn run_receiver(fd: i32) -> glib::ExitCode {
+    match receive_and_reconstruct(fd) {
         Ok(()) => glib::ExitCode::SUCCESS,
         Err(e) => {
             log::error!("Upgrade receiver failed: {}", e);
@@ -47,26 +37,9 @@ pub fn run_receiver(socket_path: &Path) -> glib::ExitCode {
     }
 }
 
-fn receive_and_reconstruct(socket_path: &Path) -> Result<(), Box<dyn std::error::Error>> {
-    log::info!("Connecting to upgrade socket: {:?}", socket_path);
-
-    // Connect to the socket
-    let mut stream = UnixStream::connect(socket_path)?;
-
-    log::info!("Connected, receiving state and file descriptors...");
-
-    // Receive state and FDs
-    let mut buf = vec![0u8; MAX_STATE_SIZE];
-    let (fds, data_len) = fd_passing::recv_fds(&stream, MAX_FDS, &mut buf)?;
-
-    log::info!(
-        "Received {} bytes of state data and {} file descriptors",
-        data_len,
-        fds.len()
-    );
-
-    // Deserialize the state
-    let state: UpgradeState = bincode::deserialize(&buf[..data_len])?;
+fn receive_and_reconstruct(fd: i32) -> Result<(), Box<dyn std::error::Error>> {
+    // Use the upgrade module to receive the state
+    let (state, fds) = receive_upgrade(fd as RawFd)?;
 
     log::info!(
         "Upgrade state: format_version={}, cterm_version={}, windows={}",
@@ -75,11 +48,7 @@ fn receive_and_reconstruct(socket_path: &Path) -> Result<(), Box<dyn std::error:
         state.windows.len()
     );
 
-    // Send acknowledgment before we start GTK (so old process can exit)
-    stream.write_all(&[1])?;
-    stream.flush()?;
-
-    log::info!("Sent acknowledgment, starting GTK with restored state...");
+    log::info!("Starting GTK with restored state...");
 
     // Now start GTK and reconstruct the windows
     run_gtk_with_state(state, fds)?;

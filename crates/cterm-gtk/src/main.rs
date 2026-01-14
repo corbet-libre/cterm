@@ -46,9 +46,9 @@ pub struct Args {
     #[arg(short = 't', long = "title")]
     pub title: Option<String>,
 
-    /// Receive upgrade state from parent process (internal use)
+    /// Receive upgrade state from parent process via inherited FD (internal use)
     #[arg(long, hide = true)]
-    pub upgrade_receiver: Option<PathBuf>,
+    pub upgrade_receiver: Option<i32>,
 }
 
 /// Global application arguments (accessible from window creation)
@@ -70,9 +70,9 @@ fn main() -> glib::ExitCode {
 
     // Check if we're in upgrade receiver mode
     #[cfg(unix)]
-    if let Some(ref socket_path) = args.upgrade_receiver {
-        log::info!("Running in upgrade receiver mode");
-        return upgrade_receiver::run_receiver(socket_path);
+    if let Some(fd) = args.upgrade_receiver {
+        log::info!("Running in upgrade receiver mode with FD {}", fd);
+        return upgrade_receiver::run_receiver(fd);
     }
 
     // Store args for later access

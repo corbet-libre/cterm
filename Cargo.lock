@@ -252,7 +252,7 @@ dependencies = [
 
 [[package]]
 name = "cterm-app"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "bincode",
  "cterm-core",
@@ -274,7 +274,7 @@ dependencies = [
 
 [[package]]
 name = "cterm-core"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "anyhow",
  "base64",
@@ -295,7 +295,7 @@ dependencies = [
 
 [[package]]
 name = "cterm-gtk"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "bincode",
  "cairo-rs",
@@ -320,7 +320,7 @@ dependencies = [
 
 [[package]]
 name = "cterm-ui"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "bitflags",
  "cterm-core",
