@@ -361,6 +361,7 @@ impl TerminalWidget {
     /// Convert pixel coordinates to cell (row, col) coordinates
     ///
     /// Returns (visible_row, col) where visible_row is the row on screen (0 = top)
+    #[allow(dead_code)]
     pub fn pixel_to_cell(&self, x: f64, y: f64) -> (usize, usize) {
         let dims = self.cell_dims.borrow();
         let col = (x / dims.width).floor() as usize;
@@ -371,6 +372,7 @@ impl TerminalWidget {
     /// Convert pixel coordinates to absolute line index
     ///
     /// Returns (absolute_line, col) where absolute_line accounts for scrollback
+    #[allow(dead_code)]
     pub fn pixel_to_absolute(&self, x: f64, y: f64) -> (usize, usize) {
         let (visible_row, col) = self.pixel_to_cell(x, y);
         let term = self.terminal.lock();
@@ -379,6 +381,7 @@ impl TerminalWidget {
     }
 
     /// Start a new selection at the given pixel coordinates
+    #[allow(dead_code)]
     pub fn start_selection(&self, x: f64, y: f64) {
         let (line, col) = self.pixel_to_absolute(x, y);
         let mut term = self.terminal.lock();
@@ -389,6 +392,7 @@ impl TerminalWidget {
     }
 
     /// Extend the current selection to the given pixel coordinates
+    #[allow(dead_code)]
     pub fn extend_selection(&self, x: f64, y: f64) {
         let (line, col) = self.pixel_to_absolute(x, y);
         let mut term = self.terminal.lock();
@@ -398,6 +402,7 @@ impl TerminalWidget {
     }
 
     /// Clear the current selection
+    #[allow(dead_code)]
     pub fn clear_selection(&self) {
         let mut term = self.terminal.lock();
         term.screen_mut().clear_selection();
@@ -423,6 +428,7 @@ impl TerminalWidget {
 
     /// Copy the current selection to primary selection (Unix only)
     #[cfg(unix)]
+    #[allow(dead_code)]
     pub fn copy_selection_to_primary(&self) {
         if let Some(text) = self.get_selected_text() {
             if let Some(display) = gdk::Display::default() {
@@ -434,6 +440,7 @@ impl TerminalWidget {
 
     /// Paste from primary selection (Unix middle-click paste)
     #[cfg(unix)]
+    #[allow(dead_code)]
     pub fn paste_primary(&self) {
         let Some(display) = gdk::Display::default() else {
             return;
@@ -495,7 +502,6 @@ impl TerminalWidget {
     /// Set up input handling
     fn setup_input(&self) {
         let terminal = Arc::clone(&self.terminal);
-        let drawing_area = self.drawing_area.clone();
         let cell_dims = Rc::clone(&self.cell_dims);
 
         // Keyboard input
