@@ -1003,17 +1003,20 @@ fn draw_terminal(
                 // Check if this cell is selected
                 let is_selected = screen.is_selected(absolute_line, col_idx);
 
-                // Draw background
-                let needs_bg = cell.bg != Color::Default
-                    || cell.attrs.contains(CellAttrs::INVERSE)
-                    || is_selected;
+                // Determine if cell has INVERSE attribute (XOR with selection)
+                let is_inverted = cell.attrs.contains(CellAttrs::INVERSE) != is_selected;
+
+                // Draw background (always draw for selected cells to show highlight)
+                let needs_bg = cell.bg != Color::Default || is_inverted || is_selected;
 
                 if needs_bg {
-                    let bg_color = if is_selected {
-                        // Use selection color (inverted or theme selection color)
-                        palette.foreground
-                    } else if cell.attrs.contains(CellAttrs::INVERSE) {
-                        cell.fg.to_rgb(palette)
+                    let bg_color = if is_inverted {
+                        // Inverted: use foreground color as background
+                        if cell.fg == Color::Default {
+                            palette.foreground
+                        } else {
+                            cell.fg.to_rgb(palette)
+                        }
                     } else {
                         cell.bg.to_rgb(palette)
                     };
@@ -1033,10 +1036,8 @@ fn draw_terminal(
 
                 // Draw character
                 if cell.c != ' ' {
-                    let fg_color = if is_selected {
-                        // Selected text uses background color (inverted)
-                        palette.background
-                    } else if cell.attrs.contains(CellAttrs::INVERSE) {
+                    let fg_color = if is_inverted {
+                        // Inverted: use background color as foreground
                         cell.bg.to_rgb(palette)
                     } else if cell.fg == Color::Default {
                         palette.foreground
