@@ -132,6 +132,14 @@ pub fn run() {
 
     log::info!("Starting cterm (native macOS)");
 
+    // Check if we're in upgrade receiver mode
+    #[cfg(unix)]
+    if let Some(fd) = args.upgrade_receiver {
+        log::info!("Running in upgrade receiver mode with FD {}", fd);
+        let exit_code = crate::upgrade_receiver::run_receiver(fd);
+        std::process::exit(exit_code);
+    }
+
     // Store args for later access
     let _ = APP_ARGS.set(args);
 

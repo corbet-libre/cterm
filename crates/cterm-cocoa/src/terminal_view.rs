@@ -13,6 +13,9 @@ use objc2_foundation::{MainThreadMarker, NSObjectProtocol, NSPoint, NSRect, NSSi
 use parking_lot::Mutex;
 
 use cterm_app::config::Config;
+use cterm_app::upgrade::{
+    execute_upgrade, TabUpgradeState, TerminalUpgradeState, UpgradeState, WindowUpgradeState,
+};
 use cterm_core::screen::{ScreenConfig, SelectionMode};
 use cterm_core::{Pty, PtyConfig, PtySize, Terminal};
 use cterm_ui::theme::Theme;
@@ -132,11 +135,7 @@ define_class!(
             // Get the characters and write to PTY
             if let Some(chars) = keycode::characters_from_event(event) {
                 log::debug!("Writing to PTY: {:?}", chars);
-                if let Some(ref mut pty) = *self.ivars().pty.borrow_mut() {
-                    if let Err(e) = pty.write(chars.as_bytes()) {
-                        log::error!("Failed to write to PTY: {}", e);
-                    }
-                }
+                self.write_to_pty(chars.as_bytes());
             }
         }
 
@@ -263,11 +262,7 @@ define_class!(
                     text
                 };
 
-                if let Some(ref mut pty) = *self.ivars().pty.borrow_mut() {
-                    if let Err(e) = pty.write(paste_text.as_bytes()) {
-                        log::error!("Failed to paste to PTY: {}", e);
-                    }
-                }
+                self.write_to_pty(paste_text.as_bytes());
             }
         }
 
@@ -302,25 +297,76 @@ define_class!(
             crate::menu::set_debug_menu_visible(shift_pressed);
         }
 
-        /// Debug: Re-launch cterm
+        /// Debug: Re-launch cterm with state preservation
         #[unsafe(method(debugRelaunch:))]
         fn action_debug_relaunch(&self, _sender: Option<&objc2::runtime::AnyObject>) {
-            log::info!("Debug: Re-launching cterm");
+            log::info!("Debug: Re-launching cterm with state preservation");
 
             // Get the path to the current executable
-            if let Ok(exe_path) = std::env::current_exe() {
-                // Spawn a new instance
-                match std::process::Command::new(&exe_path).spawn() {
-                    Ok(_) => {
-                        log::info!("Spawned new cterm instance");
-                        // Terminate this instance
-                        let app = objc2_app_kit::NSApplication::sharedApplication(
-                            objc2_foundation::MainThreadMarker::from(self),
-                        );
-                        app.terminate(None);
-                    }
-                    Err(e) => {
-                        log::error!("Failed to relaunch: {}", e);
+            let exe_path = match std::env::current_exe() {
+                Ok(path) => path,
+                Err(e) => {
+                    log::error!("Failed to get executable path: {}", e);
+                    return;
+                }
+            };
+
+            // Build upgrade state
+            let mut state = UpgradeState::new(env!("CARGO_PKG_VERSION"));
+            let mut fds = Vec::new();
+
+            // Create window state
+            let mut window_state = WindowUpgradeState::new();
+
+            // Get window geometry if available
+            if let Some(window) = self.window() {
+                let frame = window.frame();
+                window_state.x = frame.origin.x as i32;
+                window_state.y = frame.origin.y as i32;
+                window_state.width = frame.size.width as i32;
+                window_state.height = frame.size.height as i32;
+            }
+
+            // Export terminal state and get PTY FD
+            let terminal_state = self.export_state();
+            let child_pid = self.child_pid().unwrap_or(0);
+
+            if let Some(fd) = self.dup_pty_fd() {
+                let mut tab_state = TabUpgradeState::new(1, fds.len(), child_pid);
+                tab_state.title = terminal_state.title.clone();
+                tab_state.terminal = terminal_state;
+                fds.push(fd);
+                window_state.tabs.push(tab_state);
+            } else {
+                log::error!("Failed to duplicate PTY FD for upgrade");
+                return;
+            }
+
+            state.windows.push(window_state);
+
+            // Execute upgrade using the existing protocol
+            log::info!(
+                "Executing upgrade: {} windows, {} FDs",
+                state.windows.len(),
+                fds.len()
+            );
+
+            match execute_upgrade(&exe_path, &state, &fds) {
+                Ok(()) => {
+                    log::info!("Upgrade successful, terminating old process");
+                    // Terminate this instance
+                    let app = objc2_app_kit::NSApplication::sharedApplication(
+                        objc2_foundation::MainThreadMarker::from(self),
+                    );
+                    app.terminate(None);
+                }
+                Err(e) => {
+                    log::error!("Upgrade failed: {}", e);
+                    // Close the duplicated FDs on failure
+                    for fd in fds {
+                        unsafe {
+                            libc::close(fd);
+                        }
                     }
                 }
             }
@@ -349,6 +395,7 @@ define_class!(
 );
 
 impl TerminalView {
+    /// Create a new terminal view with a fresh shell
     pub fn new(mtm: MainThreadMarker, config: &Config, theme: &Theme) -> Retained<Self> {
         // Create CoreGraphics renderer first to get cell dimensions
         let font_name = &config.appearance.font.family;
@@ -390,6 +437,95 @@ impl TerminalView {
 
         // Spawn shell
         this.spawn_shell(config, state.clone());
+
+        // Start the redraw check loop
+        this.schedule_redraw_check(view_ptr, state);
+
+        this
+    }
+
+    /// Create a terminal view from a restored Terminal (for seamless upgrades)
+    ///
+    /// The Terminal should already have its PTY attached via `Terminal::from_restored()`.
+    #[cfg(unix)]
+    pub fn from_restored(
+        mtm: MainThreadMarker,
+        config: &Config,
+        theme: &Theme,
+        terminal: Terminal,
+    ) -> Retained<Self> {
+        use std::io::Read;
+
+        // Create CoreGraphics renderer first to get cell dimensions
+        let font_name = &config.appearance.font.family;
+        let font_size = config.appearance.font.size;
+        let renderer = CGRenderer::new(mtm, font_name, font_size, theme);
+        let (cell_width, cell_height) = renderer.cell_size();
+
+        // Get a reader for the PTY before wrapping terminal in Arc<Mutex>
+        let pty_reader = terminal.pty_reader();
+
+        // Wrap terminal in Arc<Mutex> for sharing
+        let terminal = Arc::new(Mutex::new(terminal));
+
+        // Create shared state for PTY thread communication
+        let state = Arc::new(ViewState {
+            needs_redraw: AtomicBool::new(false),
+            pty_closed: AtomicBool::new(false),
+            view_invalid: AtomicBool::new(false),
+        });
+
+        // Initial frame
+        let frame = NSRect::new(NSPoint::ZERO, NSSize::new(800.0, 600.0));
+
+        // Allocate and initialize
+        let this = mtm.alloc::<Self>();
+        let this = this.set_ivars(TerminalViewIvars {
+            terminal: terminal.clone(),
+            pty: RefCell::new(None), // PTY is owned by Terminal for restored case
+            renderer: RefCell::new(Some(renderer)),
+            cell_width,
+            cell_height,
+            state: state.clone(),
+            is_selecting: Cell::new(false),
+        });
+
+        let this: Retained<Self> = unsafe { msg_send![super(this), initWithFrame: frame] };
+
+        // Store view pointer as usize for thread-safe passing
+        let view_ptr = &*this as *const _ as usize;
+
+        // Start the PTY read loop if we have a reader
+        if let Some(mut reader) = pty_reader {
+            let terminal_clone = terminal.clone();
+            let state_clone = state.clone();
+            std::thread::spawn(move || {
+                let mut buf = [0u8; 4096];
+                loop {
+                    match reader.read(&mut buf) {
+                        Ok(0) => {
+                            log::info!("PTY closed (EOF) - restored terminal");
+                            break;
+                        }
+                        Ok(n) => {
+                            let mut term = terminal_clone.lock();
+                            term.process(&buf[..n]);
+                            drop(term);
+                            state_clone.needs_redraw.store(true, Ordering::Relaxed);
+                        }
+                        Err(e) => {
+                            if e.kind() != std::io::ErrorKind::Interrupted {
+                                log::error!("PTY read error (restored): {}", e);
+                                break;
+                            }
+                        }
+                    }
+                }
+                state_clone.pty_closed.store(true, Ordering::Relaxed);
+            });
+        } else {
+            log::warn!("Restored terminal has no PTY reader");
+        }
 
         // Start the redraw check loop
         this.schedule_redraw_check(view_ptr, state);
@@ -546,14 +682,33 @@ impl TerminalView {
 
         if cols > 0 && rows > 0 {
             let mut terminal = self.ivars().terminal.lock();
+            // Terminal::resize() handles PTY resize internally if terminal owns the PTY
             terminal.resize(cols, rows);
             drop(terminal);
 
+            // Also resize standalone pty if we have one (old code path)
             if let Some(ref mut pty) = *self.ivars().pty.borrow_mut() {
                 let _ = pty.resize(cols as u16, rows as u16);
             }
 
             log::debug!("Resized terminal to {}x{}", cols, rows);
+        }
+    }
+
+    /// Write data to the PTY (handles both standalone and terminal-owned PTY)
+    fn write_to_pty(&self, data: &[u8]) {
+        // Try standalone pty first (normal case)
+        if let Some(ref mut pty) = *self.ivars().pty.borrow_mut() {
+            if let Err(e) = pty.write(data) {
+                log::error!("Failed to write to PTY: {}", e);
+            }
+            return;
+        }
+
+        // Fall back to terminal's internal PTY (restored case)
+        let mut terminal = self.ivars().terminal.lock();
+        if let Err(e) = terminal.write(data) {
+            log::error!("Failed to write to terminal PTY: {}", e);
         }
     }
 
@@ -601,5 +756,52 @@ impl TerminalView {
         terminal.screen_mut().clear_selection();
         drop(terminal);
         self.set_needs_display();
+    }
+
+    /// Export terminal state for seamless upgrade
+    #[cfg(unix)]
+    pub fn export_state(&self) -> TerminalUpgradeState {
+        let term = self.ivars().terminal.lock();
+        let screen = term.screen();
+
+        TerminalUpgradeState {
+            cols: screen.grid().width(),
+            rows: screen.grid().height(),
+            grid: screen.grid().clone(),
+            scrollback: screen.scrollback().iter().cloned().collect(),
+            alternate_grid: screen.alternate_grid().cloned(),
+            cursor: screen.cursor.clone(),
+            saved_cursor: screen.saved_cursor().cloned(),
+            alt_saved_cursor: screen.alt_saved_cursor().cloned(),
+            scroll_region: *screen.scroll_region(),
+            style: screen.style.clone(),
+            modes: screen.modes.clone(),
+            title: screen.title.clone(),
+            scroll_offset: screen.scroll_offset,
+            tab_stops: screen.tab_stops().to_vec(),
+            alternate_active: screen.alternate_grid().is_some(),
+            cursor_style: screen.cursor.style,
+            mouse_mode: screen.modes.mouse_mode,
+        }
+    }
+
+    /// Duplicate the PTY file descriptor for upgrade transfer
+    #[cfg(unix)]
+    pub fn dup_pty_fd(&self) -> Option<std::os::unix::io::RawFd> {
+        self.ivars()
+            .pty
+            .borrow()
+            .as_ref()
+            .and_then(|pty| pty.dup_fd().ok())
+    }
+
+    /// Get the child process ID
+    #[cfg(unix)]
+    pub fn child_pid(&self) -> Option<i32> {
+        self.ivars()
+            .pty
+            .borrow()
+            .as_ref()
+            .map(|pty| pty.child_pid())
     }
 }
