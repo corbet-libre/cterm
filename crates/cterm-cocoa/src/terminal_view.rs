@@ -79,14 +79,30 @@ define_class!(
             }
         }
 
+        #[unsafe(method(performKeyEquivalent:))]
+        fn perform_key_equivalent(&self, event: &NSEvent) -> objc2::runtime::Bool {
+            let modifiers = keycode::modifiers_from_event(event);
+            let raw_keycode = event.keyCode();
+
+            // Handle Ctrl+Tab / Ctrl+Shift+Tab for tab switching
+            // Tab key is virtual keycode 0x30 on macOS
+            if raw_keycode == 0x30 && modifiers.contains(cterm_ui::events::Modifiers::CTRL) {
+                if let Some(window) = self.window() {
+                    if modifiers.contains(cterm_ui::events::Modifiers::SHIFT) {
+                        let _: () = unsafe { msg_send![&*window, selectPreviousTab: std::ptr::null::<objc2::runtime::AnyObject>()] };
+                    } else {
+                        let _: () = unsafe { msg_send![&*window, selectNextTab: std::ptr::null::<objc2::runtime::AnyObject>()] };
+                    }
+                }
+                return objc2::runtime::Bool::YES;
+            }
+
+            objc2::runtime::Bool::NO
+        }
+
         #[unsafe(method(keyDown:))]
         fn key_down(&self, event: &NSEvent) {
             let modifiers = keycode::modifiers_from_event(event);
-
-            // Get the key code for logging
-            if let Some(keycode) = keycode::keycode_from_event(event) {
-                log::debug!("Key down: {:?} modifiers: {:?}", keycode, modifiers);
-            }
 
             // Let Command+key combinations pass through to the menu system
             // Command is never part of terminal sequences
