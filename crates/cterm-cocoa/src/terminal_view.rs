@@ -237,6 +237,59 @@ define_class!(
             self.set_needs_display();
         }
 
+        /// Copy selection to clipboard (Command+C)
+        #[unsafe(method(copy:))]
+        fn action_copy(&self, _sender: Option<&objc2::runtime::AnyObject>) {
+            let terminal = self.ivars().terminal.lock();
+            if let Some(text) = terminal.screen().get_selected_text() {
+                drop(terminal);
+                clipboard::set_text(&text);
+                log::debug!("Copied {} chars to clipboard", text.len());
+            }
+        }
+
+        /// Paste from clipboard (Command+V)
+        #[unsafe(method(paste:))]
+        fn action_paste(&self, _sender: Option<&objc2::runtime::AnyObject>) {
+            if let Some(text) = clipboard::get_text() {
+                // Check if bracketed paste mode is enabled
+                let terminal = self.ivars().terminal.lock();
+                let bracketed = terminal.screen().modes.bracketed_paste;
+                drop(terminal);
+
+                let paste_text = if bracketed {
+                    format!("\x1b[200~{}\x1b[201~", text)
+                } else {
+                    text
+                };
+
+                if let Some(ref mut pty) = *self.ivars().pty.borrow_mut() {
+                    if let Err(e) = pty.write(paste_text.as_bytes()) {
+                        log::error!("Failed to paste to PTY: {}", e);
+                    }
+                }
+            }
+        }
+
+        /// Select all text (Command+A)
+        #[unsafe(method(selectAll:))]
+        fn action_select_all(&self, _sender: Option<&objc2::runtime::AnyObject>) {
+            let mut terminal = self.ivars().terminal.lock();
+            let total_lines = terminal.screen().total_lines();
+            let width = terminal.screen().width();
+
+            // Select from the first line to the last line
+            terminal
+                .screen_mut()
+                .start_selection(0, 0, SelectionMode::Char);
+            terminal
+                .screen_mut()
+                .extend_selection(total_lines.saturating_sub(1), width.saturating_sub(1));
+            drop(terminal);
+
+            self.set_needs_display();
+        }
+
         #[unsafe(method(triggerRedraw))]
         fn trigger_redraw(&self) {
             self.set_needs_display();
