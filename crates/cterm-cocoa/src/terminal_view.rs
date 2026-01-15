@@ -81,10 +81,18 @@ define_class!(
 
         #[unsafe(method(keyDown:))]
         fn key_down(&self, event: &NSEvent) {
+            let modifiers = keycode::modifiers_from_event(event);
+
             // Get the key code for logging
             if let Some(keycode) = keycode::keycode_from_event(event) {
-                let modifiers = keycode::modifiers_from_event(event);
                 log::debug!("Key down: {:?} modifiers: {:?}", keycode, modifiers);
+            }
+
+            // Let Command+key combinations pass through to the menu system
+            // Command is never part of terminal sequences
+            if modifiers.contains(cterm_ui::events::Modifiers::SUPER) {
+                // Don't handle - let the responder chain process it for menu shortcuts
+                return;
             }
 
             // Get the characters and write to PTY

@@ -6,7 +6,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 
 use objc2::rc::Retained;
-use objc2::{define_class, msg_send, AllocAnyThread, DefinedClass, MainThreadOnly};
+use objc2::{class, define_class, msg_send, AllocAnyThread, DefinedClass, MainThreadOnly};
 use objc2_app_kit::{NSButton, NSStackView, NSStackViewGravity, NSUserInterfaceLayoutOrientation};
 use objc2_foundation::{MainThreadMarker, NSObjectProtocol, NSPoint, NSRect, NSSize, NSString};
 
@@ -60,20 +60,47 @@ impl TabBar {
 
         // Configure stack view
         this.setOrientation(NSUserInterfaceLayoutOrientation::Horizontal);
-        this.setSpacing(2.0);
+        this.setSpacing(4.0);
         this.setEdgeInsets(objc2_foundation::NSEdgeInsets {
-            top: 2.0,
-            left: 4.0,
-            bottom: 2.0,
-            right: 4.0,
+            top: 4.0,
+            left: 8.0,
+            bottom: 4.0,
+            right: 8.0,
         });
+
+        // Set distribution
+        unsafe {
+            let _: () = msg_send![&*this, setDistribution: 0i64]; // NSStackViewDistributionFill = 0
+        }
+
+        // Enable layer backing and set background color for visibility
+        unsafe {
+            let _: () = msg_send![&*this, setWantsLayer: true];
+            let layer: *mut objc2::runtime::AnyObject = msg_send![&*this, layer];
+            if !layer.is_null() {
+                // Light gray background
+                let cg_color: *mut objc2::runtime::AnyObject = msg_send![
+                    class!(NSColor),
+                    colorWithRed: 0.9f64,
+                    green: 0.9f64,
+                    blue: 0.9f64,
+                    alpha: 1.0f64
+                ];
+                let cg_color_ref: *mut objc2::runtime::AnyObject = msg_send![cg_color, CGColor];
+                let _: () = msg_send![layer, setBackgroundColor: cg_color_ref];
+            }
+        }
 
         // Add "new tab" button
         let new_tab_button = unsafe {
             NSButton::buttonWithTitle_target_action(&NSString::from_str("+"), None, None, mtm)
         };
+        unsafe {
+            let _: () = msg_send![&*new_tab_button, setBezelStyle: 1i64]; // NSBezelStyleRounded
+        }
         this.addView_inGravity(&new_tab_button, NSStackViewGravity::Trailing);
 
+        log::debug!("TabBar created");
         this
     }
 
@@ -81,10 +108,16 @@ impl TabBar {
     pub fn add_tab(&self, id: u64, title: &str) {
         let mtm = MainThreadMarker::from(self);
 
-        // Create tab button
+        // Create tab button with proper styling
         let button = unsafe {
             NSButton::buttonWithTitle_target_action(&NSString::from_str(title), None, None, mtm)
         };
+
+        // Style the button
+        unsafe {
+            let _: () = msg_send![&*button, setBezelStyle: 1i64]; // NSBezelStyleRounded
+            let _: () = msg_send![&*button, setButtonType: 0i64]; // NSButtonTypeMomentaryLight
+        }
 
         // Store in our list
         self.ivars().tabs.borrow_mut().push(TabEntry {
@@ -102,15 +135,13 @@ impl TabBar {
 
         // Add to stack view (before the + button)
         let count = self.views().len();
-        if count > 0 {
-            self.insertView_atIndex_inGravity(
-                &button,
-                count.saturating_sub(1),
-                NSStackViewGravity::Leading,
-            );
-        } else {
-            self.addView_inGravity(&button, NSStackViewGravity::Leading);
-        }
+        log::info!("Adding tab {} - views before: {}", id, count);
+
+        // Simply add to leading gravity
+        self.addView_inGravity(&button, NSStackViewGravity::Leading);
+
+        let count_after = self.views().len();
+        log::info!("Tab {} added - views after: {}, hidden: {}", id, count_after, self.isHidden());
     }
 
     /// Remove a tab

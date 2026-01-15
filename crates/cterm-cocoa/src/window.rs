@@ -1,13 +1,13 @@
 //! Main window implementation for macOS
 //!
-//! Handles NSWindow creation and management.
+//! Handles NSWindow creation and management using native macOS window tabbing.
 
 use std::cell::RefCell;
 
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
-use objc2::{define_class, msg_send, AllocAnyThread, DefinedClass, MainThreadOnly};
-use objc2_app_kit::{NSWindow, NSWindowDelegate, NSWindowStyleMask};
+use objc2::{define_class, msg_send, DefinedClass, MainThreadOnly};
+use objc2_app_kit::{NSWindow, NSWindowDelegate, NSWindowStyleMask, NSWindowTabbingMode};
 use objc2_foundation::{
     MainThreadMarker, NSNotification, NSObjectProtocol, NSPoint, NSRect, NSSize, NSString,
 };
@@ -16,25 +16,14 @@ use cterm_app::config::Config;
 use cterm_app::shortcuts::ShortcutManager;
 use cterm_ui::theme::Theme;
 
-use crate::tab_bar::TabBar;
 use crate::terminal_view::TerminalView;
-
-/// Tab entry tracking terminal and its ID
-struct TabEntry {
-    id: u64,
-    title: String,
-    terminal: Retained<TerminalView>,
-}
 
 /// Window state stored in ivars
 pub struct CtermWindowIvars {
     config: Config,
     theme: Theme,
     shortcuts: ShortcutManager,
-    tabs: RefCell<Vec<TabEntry>>,
-    next_tab_id: RefCell<u64>,
-    tab_bar: RefCell<Option<Retained<TabBar>>>,
-    content_view: RefCell<Option<Retained<TerminalView>>>,
+    active_terminal: RefCell<Option<Retained<TerminalView>>>,
 }
 
 define_class!(
@@ -66,9 +55,22 @@ define_class!(
         fn window_did_resize(&self, _notification: &NSNotification) {
             log::debug!("Window did resize");
             // Update terminal dimensions
-            if let Some(terminal) = self.ivars().content_view.borrow().as_ref() {
+            if let Some(terminal) = self.ivars().active_terminal.borrow().as_ref() {
                 terminal.handle_resize();
             }
+        }
+    }
+
+    // Menu action handlers
+    impl CtermWindow {
+        #[unsafe(method(newTab:))]
+        fn action_new_tab(&self, _sender: Option<&objc2::runtime::AnyObject>) {
+            self.create_new_tab();
+        }
+
+        #[unsafe(method(closeTab:))]
+        fn action_close_tab(&self, _sender: Option<&objc2::runtime::AnyObject>) {
+            self.close_current_tab();
         }
     }
 );
@@ -79,7 +81,7 @@ impl CtermWindow {
         let cell_width = config.appearance.font.size * 0.6; // Approximate
         let cell_height = config.appearance.font.size * 1.2;
         let width = cell_width * 80.0 + 20.0;
-        let height = cell_height * 24.0 + 60.0; // Extra for tab bar
+        let height = cell_height * 24.0 + 20.0;
 
         let content_rect = NSRect::new(NSPoint::new(200.0, 200.0), NSSize::new(width, height));
 
@@ -94,10 +96,7 @@ impl CtermWindow {
             config: config.clone(),
             theme: theme.clone(),
             shortcuts: ShortcutManager::from_config(&config.shortcuts),
-            tabs: RefCell::new(Vec::new()),
-            next_tab_id: RefCell::new(0),
-            tab_bar: RefCell::new(None),
-            content_view: RefCell::new(None),
+            active_terminal: RefCell::new(None),
         });
 
         let this: Retained<Self> = unsafe {
@@ -116,79 +115,41 @@ impl CtermWindow {
         // Set minimum size
         this.setMinSize(NSSize::new(400.0, 200.0));
 
+        // Enable native macOS window tabbing
+        this.setTabbingMode(NSWindowTabbingMode::Preferred);
+
         // Set self as delegate
         this.setDelegate(Some(ProtocolObject::from_ref(&*this)));
 
         // Create the terminal view
         let terminal = TerminalView::new(mtm, config, theme);
         this.setContentView(Some(&terminal));
-        *this.ivars().content_view.borrow_mut() = Some(terminal.clone());
-
-        // Store terminal in tabs
-        let tab_id = {
-            let mut id = this.ivars().next_tab_id.borrow_mut();
-            let current = *id;
-            *id += 1;
-            current
-        };
-
-        this.ivars().tabs.borrow_mut().push(TabEntry {
-            id: tab_id,
-            title: "Terminal".to_string(),
-            terminal,
-        });
+        *this.ivars().active_terminal.borrow_mut() = Some(terminal);
 
         this
     }
 
-    /// Create a new tab
-    pub fn new_tab(&self) {
+    /// Create a new tab (using native macOS window tabbing)
+    pub fn create_new_tab(&self) {
         let mtm = MainThreadMarker::from(self);
 
-        let terminal = TerminalView::new(mtm, &self.ivars().config, &self.ivars().theme);
+        // Create a new window with the same configuration
+        let new_window = CtermWindow::new(mtm, &self.ivars().config, &self.ivars().theme);
 
-        let tab_id = {
-            let mut id = self.ivars().next_tab_id.borrow_mut();
-            let current = *id;
-            *id += 1;
-            current
-        };
+        // Add the new window as a tab to this window
+        self.addTabbedWindow_ordered(&new_window, objc2_app_kit::NSWindowOrderingMode::Above);
 
-        self.ivars().tabs.borrow_mut().push(TabEntry {
-            id: tab_id,
-            title: "Terminal".to_string(),
-            terminal: terminal.clone(),
-        });
+        // Make the new tab's window key
+        new_window.makeKeyAndOrderFront(None);
 
-        // Switch to new tab
-        self.setContentView(Some(&terminal));
-        *self.ivars().content_view.borrow_mut() = Some(terminal);
-
-        log::info!("Created new tab {}", tab_id);
+        log::info!("Created new tab");
     }
 
     /// Close current tab
-    pub fn close_tab(&self) {
-        let tabs = self.ivars().tabs.borrow();
-        if tabs.len() <= 1 {
-            // Last tab, close window
-            drop(tabs);
-            self.close();
-            return;
-        }
-        drop(tabs);
-
-        // Remove current tab and switch to previous
-        let mut tabs = self.ivars().tabs.borrow_mut();
-        if !tabs.is_empty() {
-            tabs.pop();
-            if let Some(last) = tabs.last() {
-                let terminal = last.terminal.clone();
-                drop(tabs);
-                self.setContentView(Some(&terminal));
-                *self.ivars().content_view.borrow_mut() = Some(terminal);
-            }
-        }
+    pub fn close_current_tab(&self) {
+        // With native tabbing, just close the window
+        // macOS will handle showing the next tab
+        self.close();
     }
 
     /// Get config reference
