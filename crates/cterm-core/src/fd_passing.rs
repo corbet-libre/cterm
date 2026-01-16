@@ -23,7 +23,14 @@ fn cmsg_space(n: usize) -> usize {
 /// # Returns
 /// * `Ok(())` on success
 /// * `Err(io::Error)` on failure
+///
+/// # Protocol
+/// For large data, this sends in two phases:
+/// 1. FDs with an 8-byte length header (u64 little-endian)
+/// 2. The actual data via regular socket write
 pub fn send_fds(socket: &UnixStream, fds: &[RawFd], data: &[u8]) -> io::Result<()> {
+    use std::io::Write;
+
     if fds.is_empty() {
         // No FDs to send, just send the data
         return send_data_only(socket, data);
@@ -35,15 +42,13 @@ pub fn send_fds(socket: &UnixStream, fds: &[RawFd], data: &[u8]) -> io::Result<(
     // Allocate control message buffer (aligned)
     let mut cmsg_buffer = vec![0u8; cmsg_buffer_len];
 
-    // Set up the iovec for the data
+    // Send FDs with length header (8 bytes for data length as u64 LE)
+    let length_header = (data.len() as u64).to_le_bytes();
+
+    // Set up the iovec for the length header
     let mut iov = libc::iovec {
-        iov_base: if data.is_empty() {
-            // Must have at least 1 byte of data for sendmsg to work
-            &mut [0u8; 1] as *mut _ as *mut libc::c_void
-        } else {
-            data.as_ptr() as *mut libc::c_void
-        },
-        iov_len: if data.is_empty() { 1 } else { data.len() },
+        iov_base: length_header.as_ptr() as *mut libc::c_void,
+        iov_len: length_header.len(),
     };
 
     // Set up the msghdr
@@ -74,19 +79,29 @@ pub fn send_fds(socket: &UnixStream, fds: &[RawFd], data: &[u8]) -> io::Result<(
         std::ptr::copy_nonoverlapping(fds.as_ptr(), cmsg_data as *mut RawFd, fds.len());
     }
 
-    // Send the message
+    // Send the FDs with length header
     let ret = unsafe { libc::sendmsg(socket.as_raw_fd(), &msg, 0) };
     if ret < 0 {
-        Err(io::Error::last_os_error())
-    } else {
-        Ok(())
+        return Err(io::Error::last_os_error());
     }
+
+    // Now send the actual data using regular write
+    let mut socket_ref = socket;
+    socket_ref.write_all(data)?;
+
+    Ok(())
 }
 
-/// Send data without file descriptors
+/// Send data without file descriptors (uses same protocol as send_fds)
 fn send_data_only(socket: &UnixStream, data: &[u8]) -> io::Result<()> {
     use std::io::Write;
     let mut socket_ref = socket;
+
+    // Send length header first (8 bytes, u64 LE)
+    let length_header = (data.len() as u64).to_le_bytes();
+    socket_ref.write_all(&length_header)?;
+
+    // Then send the data
     socket_ref.write_all(data)?;
     Ok(())
 }
@@ -101,20 +116,30 @@ fn send_data_only(socket: &UnixStream, data: &[u8]) -> io::Result<()> {
 /// # Returns
 /// * `Ok((fds, data_len))` - Vector of received file descriptors and length of data received
 /// * `Err(io::Error)` on failure
+///
+/// # Protocol
+/// Expects data sent by send_fds:
+/// 1. FDs with an 8-byte length header (u64 little-endian)
+/// 2. The actual data via regular socket read
 pub fn recv_fds(
     socket: &UnixStream,
     max_fds: usize,
     buf: &mut [u8],
 ) -> io::Result<(Vec<RawFd>, usize)> {
+    use std::io::Read;
+
     let cmsg_buffer_len = cmsg_space(max_fds);
 
     // Allocate control message buffer (aligned)
     let mut cmsg_buffer = vec![0u8; cmsg_buffer_len];
 
-    // Set up the iovec for receiving data
+    // Buffer for length header (8 bytes)
+    let mut length_header = [0u8; 8];
+
+    // Set up the iovec for receiving the length header
     let mut iov = libc::iovec {
-        iov_base: buf.as_mut_ptr() as *mut libc::c_void,
-        iov_len: buf.len(),
+        iov_base: length_header.as_mut_ptr() as *mut libc::c_void,
+        iov_len: length_header.len(),
     };
 
     // Set up the msghdr
@@ -125,13 +150,13 @@ pub fn recv_fds(
     // Cast needed: msg_controllen is usize on Linux, u32 on macOS
     msg.msg_controllen = cmsg_buffer_len as _;
 
-    // Receive the message
+    // Receive the FDs and length header
     let ret = unsafe { libc::recvmsg(socket.as_raw_fd(), &mut msg, 0) };
     if ret < 0 {
         return Err(io::Error::last_os_error());
     }
 
-    let data_len = ret as usize;
+    let header_len = ret as usize;
     let mut fds = Vec::new();
 
     // Parse control messages to extract file descriptors
@@ -153,6 +178,31 @@ pub fn recv_fds(
             cmsg = libc::CMSG_NXTHDR(&msg, cmsg);
         }
     }
+
+    // We expect a length header (8 bytes) followed by data
+    if header_len != 8 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("Expected 8-byte length header, got {} bytes", header_len),
+        ));
+    }
+
+    let data_len = u64::from_le_bytes(length_header) as usize;
+
+    if data_len > buf.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "Data length {} exceeds buffer size {}",
+                data_len,
+                buf.len()
+            ),
+        ));
+    }
+
+    // Read the actual data
+    let mut socket_ref = socket;
+    socket_ref.read_exact(&mut buf[..data_len])?;
 
     Ok((fds, data_len))
 }
