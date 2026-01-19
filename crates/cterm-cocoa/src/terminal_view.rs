@@ -123,6 +123,8 @@ define_class!(
 
         #[unsafe(method(keyDown:))]
         fn key_down(&self, event: &NSEvent) {
+            use cterm_core::term::Key;
+
             let modifiers = keycode::modifiers_from_event(event);
 
             // Let Command+key combinations pass through to the menu system
@@ -132,10 +134,82 @@ define_class!(
                 return;
             }
 
-            // Get the characters and write to PTY
+            // Convert macOS keycode to terminal Key
+            let raw_keycode = event.keyCode();
+            let key = match raw_keycode {
+                // Arrow keys
+                0x7E => Some(Key::Up),
+                0x7D => Some(Key::Down),
+                0x7B => Some(Key::Left),
+                0x7C => Some(Key::Right),
+                // Navigation
+                0x73 => Some(Key::Home),
+                0x77 => Some(Key::End),
+                0x74 => Some(Key::PageUp),
+                0x79 => Some(Key::PageDown),
+                // Editing
+                0x72 => Some(Key::Insert),
+                0x75 => Some(Key::Delete),
+                0x33 => Some(Key::Backspace),
+                0x24 => Some(Key::Enter),
+                0x30 => Some(Key::Tab),
+                0x35 => Some(Key::Escape),
+                // Function keys
+                0x7A => Some(Key::F(1)),
+                0x78 => Some(Key::F(2)),
+                0x63 => Some(Key::F(3)),
+                0x76 => Some(Key::F(4)),
+                0x60 => Some(Key::F(5)),
+                0x61 => Some(Key::F(6)),
+                0x62 => Some(Key::F(7)),
+                0x64 => Some(Key::F(8)),
+                0x65 => Some(Key::F(9)),
+                0x6D => Some(Key::F(10)),
+                0x67 => Some(Key::F(11)),
+                0x6F => Some(Key::F(12)),
+                _ => None,
+            };
+
+            // Convert cterm_ui Modifiers to cterm_core Modifiers
+            let core_mods = cterm_core::term::Modifiers::from_bits_truncate(modifiers.bits());
+
+            // If it's a special key, use Terminal::handle_key to get the escape sequence
+            if let Some(key) = key {
+                let terminal = self.ivars().terminal.lock();
+                if let Some(data) = terminal.handle_key(key, core_mods) {
+                    drop(terminal);
+                    log::debug!("Special key: {:?} -> {:?}", key, data);
+                    self.write_to_pty(&data);
+                    return;
+                }
+            }
+
+            // For regular characters, get the character from the event
             if let Some(chars) = keycode::characters_from_event(event) {
-                log::debug!("Writing to PTY: {:?}", chars);
-                self.write_to_pty(chars.as_bytes());
+                // Filter out special Unicode characters that macOS uses for function keys
+                // (U+F700-U+F8FF is the Private Use Area where macOS puts these)
+                let filtered: String = chars
+                    .chars()
+                    .filter(|c| !('\u{F700}'..='\u{F8FF}').contains(c))
+                    .collect();
+
+                if !filtered.is_empty() {
+                    // Handle Ctrl+key combinations
+                    if modifiers.contains(cterm_ui::events::Modifiers::CTRL) {
+                        for c in filtered.chars() {
+                            let key = Key::Char(c);
+                            let terminal = self.ivars().terminal.lock();
+                            if let Some(data) = terminal.handle_key(key, core_mods) {
+                                drop(terminal);
+                                log::debug!("Ctrl+{}: {:?}", c, data);
+                                self.write_to_pty(&data);
+                            }
+                        }
+                    } else {
+                        log::debug!("Writing to PTY: {:?}", filtered);
+                        self.write_to_pty(filtered.as_bytes());
+                    }
+                }
             }
         }
 
