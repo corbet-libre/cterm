@@ -791,6 +791,28 @@ impl TerminalView {
         &self.ivars().terminal
     }
 
+    /// Check if there's a foreground process running (other than the shell)
+    #[cfg(unix)]
+    pub fn has_foreground_process(&self) -> bool {
+        // Check standalone PTY first
+        if let Some(ref pty) = *self.ivars().pty.borrow() {
+            return pty.has_foreground_process();
+        }
+        // Fall back to terminal's internal PTY
+        self.ivars().terminal.lock().has_foreground_process()
+    }
+
+    /// Get the name of the foreground process (if any)
+    #[cfg(unix)]
+    pub fn foreground_process_name(&self) -> Option<String> {
+        // Check standalone PTY first
+        if let Some(ref pty) = *self.ivars().pty.borrow() {
+            return pty.foreground_process_name();
+        }
+        // Fall back to terminal's internal PTY
+        self.ivars().terminal.lock().foreground_process_name()
+    }
+
     /// Request display update
     fn set_needs_display(&self) {
         unsafe {

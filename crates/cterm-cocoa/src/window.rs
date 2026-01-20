@@ -7,7 +7,10 @@ use std::cell::RefCell;
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2::{define_class, msg_send, DefinedClass, MainThreadOnly};
-use objc2_app_kit::{NSWindow, NSWindowDelegate, NSWindowStyleMask, NSWindowTabbingMode};
+use objc2_app_kit::{
+    NSAlertFirstButtonReturn, NSAlertStyle, NSWindow, NSWindowDelegate, NSWindowStyleMask,
+    NSWindowTabbingMode,
+};
 use objc2_foundation::{
     MainThreadMarker, NSNotification, NSObjectProtocol, NSPoint, NSRect, NSSize, NSString,
 };
@@ -50,6 +53,23 @@ define_class!(
         #[unsafe(method(windowDidResignKey:))]
         fn window_did_resign_key(&self, _notification: &NSNotification) {
             log::debug!("Window resigned key");
+        }
+
+        #[unsafe(method(windowShouldClose:))]
+        fn window_should_close(&self, _sender: &NSWindow) -> objc2::runtime::Bool {
+            // Check if there's a foreground process running
+            #[cfg(unix)]
+            if let Some(terminal) = self.ivars().active_terminal.borrow().as_ref() {
+                if terminal.has_foreground_process() {
+                    let process_name = terminal
+                        .foreground_process_name()
+                        .unwrap_or_else(|| "a process".to_string());
+
+                    // Show confirmation dialog
+                    return objc2::runtime::Bool::new(self.show_close_confirmation(&process_name));
+                }
+            }
+            objc2::runtime::Bool::YES
         }
 
         #[unsafe(method(windowWillClose:))]
@@ -234,5 +254,28 @@ impl CtermWindow {
     /// Get theme reference
     pub fn theme(&self) -> &Theme {
         &self.ivars().theme
+    }
+
+    /// Show a confirmation dialog when closing with a running process
+    fn show_close_confirmation(&self, process_name: &str) -> bool {
+        use objc2_app_kit::NSAlert;
+
+        let mtm = MainThreadMarker::from(self);
+        let alert = NSAlert::new(mtm);
+
+        alert.setMessageText(&NSString::from_str(&format!(
+            "\"{}\" is still running",
+            process_name
+        )));
+        alert.setInformativeText(&NSString::from_str(
+            "Closing this terminal will terminate the running process. Are you sure you want to close?",
+        ));
+        alert.setAlertStyle(NSAlertStyle::Warning);
+
+        alert.addButtonWithTitle(&NSString::from_str("Close"));
+        alert.addButtonWithTitle(&NSString::from_str("Cancel"));
+
+        let response = alert.runModal();
+        response == NSAlertFirstButtonReturn
     }
 }

@@ -228,6 +228,68 @@ mod unix {
             }
         }
 
+        /// Get the foreground process group ID of the terminal
+        ///
+        /// Returns the process group ID of the foreground process, or None if
+        /// it cannot be determined.
+        pub fn foreground_process_group(&self) -> Option<i32> {
+            let pgid = unsafe { libc::tcgetpgrp(self.master_fd) };
+            if pgid < 0 {
+                None
+            } else {
+                Some(pgid)
+            }
+        }
+
+        /// Check if there's a foreground process running (other than the shell)
+        ///
+        /// Returns true if the foreground process group differs from the shell's
+        /// process group, indicating a command is running.
+        pub fn has_foreground_process(&self) -> bool {
+            if let Some(fg_pgid) = self.foreground_process_group() {
+                // The shell's process group is typically the same as its PID
+                // If the foreground process group differs, something else is running
+                fg_pgid != self.child_pid
+            } else {
+                false
+            }
+        }
+
+        /// Get the name of the foreground process (if any)
+        ///
+        /// Returns the process name if a foreground process is running, None otherwise.
+        #[cfg(target_os = "macos")]
+        pub fn foreground_process_name(&self) -> Option<String> {
+            let fg_pgid = self.foreground_process_group()?;
+
+            // On macOS, use proc_name to get the process name
+            let mut name_buf = [0i8; 256];
+            let ret = unsafe {
+                libc::proc_name(fg_pgid, name_buf.as_mut_ptr() as *mut libc::c_void, 256)
+            };
+
+            if ret > 0 {
+                let name = unsafe {
+                    std::ffi::CStr::from_ptr(name_buf.as_ptr())
+                        .to_string_lossy()
+                        .into_owned()
+                };
+                Some(name)
+            } else {
+                None
+            }
+        }
+
+        #[cfg(not(target_os = "macos"))]
+        pub fn foreground_process_name(&self) -> Option<String> {
+            let fg_pgid = self.foreground_process_group()?;
+
+            // On Linux, read from /proc/<pid>/comm
+            std::fs::read_to_string(format!("/proc/{}/comm", fg_pgid))
+                .ok()
+                .map(|s| s.trim().to_string())
+        }
+
         /// Try to clone the reader for concurrent access
         pub fn try_clone_reader(&self) -> io::Result<File> {
             let new_fd = unsafe { libc::dup(self.master_fd) };

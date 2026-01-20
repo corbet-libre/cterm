@@ -240,6 +240,21 @@ impl Terminal {
         self.pty.as_ref().and_then(|p| p.dup_fd().ok())
     }
 
+    /// Check if there's a foreground process running (other than the shell)
+    #[cfg(unix)]
+    pub fn has_foreground_process(&self) -> bool {
+        self.pty
+            .as_ref()
+            .map(|p| p.has_foreground_process())
+            .unwrap_or(false)
+    }
+
+    /// Get the name of the foreground process (if any)
+    #[cfg(unix)]
+    pub fn foreground_process_name(&self) -> Option<String> {
+        self.pty.as_ref().and_then(|p| p.foreground_process_name())
+    }
+
     /// Get terminal width
     pub fn cols(&self) -> usize {
         self.screen.width()
