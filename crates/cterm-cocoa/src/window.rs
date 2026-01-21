@@ -98,6 +98,16 @@ define_class!(
         fn action_close_tab(&self, _sender: Option<&objc2::runtime::AnyObject>) {
             self.close_current_tab();
         }
+
+        /// Called by macOS native tabbing when Command-T or tab bar + is pressed.
+        /// Returns a new default window (not a template duplicate).
+        #[unsafe(method(newWindowForTab:))]
+        fn new_window_for_tab(&self, _sender: Option<&objc2::runtime::AnyObject>) -> *mut NSWindow {
+            let mtm = MainThreadMarker::from(self);
+            let new_window = CtermWindow::new(mtm, &self.ivars().config, &self.ivars().theme);
+            log::info!("Created new default tab via newWindowForTab:");
+            Retained::into_raw(Retained::into_super(new_window))
+        }
     }
 );
 
