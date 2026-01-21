@@ -72,7 +72,11 @@ static WATCHDOG_FD: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32:
 #[cfg(unix)]
 pub fn get_watchdog_fd() -> Option<i32> {
     let fd = WATCHDOG_FD.load(std::sync::atomic::Ordering::SeqCst);
-    if fd >= 0 { Some(fd) } else { None }
+    if fd >= 0 {
+        Some(fd)
+    } else {
+        None
+    }
 }
 
 /// Thread-local storage for recovery FDs (used during crash recovery)
@@ -328,8 +332,8 @@ impl AppDelegate {
     /// Save crash recovery state to disk
     #[cfg(unix)]
     pub fn save_crash_state(&self) {
-        use cterm_app::upgrade::{TabUpgradeState, UpgradeState, WindowUpgradeState};
         use cterm_app::crash_recovery::{write_crash_state, CrashState};
+        use cterm_app::upgrade::{TabUpgradeState, UpgradeState, WindowUpgradeState};
 
         let windows = self.ivars().windows.borrow();
 

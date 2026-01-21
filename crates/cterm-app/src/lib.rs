@@ -13,11 +13,6 @@ pub mod shortcuts;
 pub mod upgrade;
 
 pub use config::{load_config, save_config, Config};
-pub use session::{Session, TabState, WindowState};
-pub use shortcuts::ShortcutManager;
-#[cfg(unix)]
-pub use upgrade::{execute_upgrade, receive_upgrade, UpgradeError};
-pub use upgrade::{UpdateError, UpdateInfo, Updater, UpgradeState};
 #[cfg(unix)]
 pub use crash_recovery::{
     clear_crash_state, crash_marker_path, crash_state_path, notify_watchdog_shutdown,
@@ -25,3 +20,8 @@ pub use crash_recovery::{
     run_watchdog, unregister_fd_with_watchdog, write_crash_state, CrashState, RecoveredFd,
     WatchdogError,
 };
+pub use session::{Session, TabState, WindowState};
+pub use shortcuts::ShortcutManager;
+#[cfg(unix)]
+pub use upgrade::{execute_upgrade, receive_upgrade, UpgradeError};
+pub use upgrade::{UpdateError, UpdateInfo, Updater, UpgradeState};

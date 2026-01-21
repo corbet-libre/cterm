@@ -218,10 +218,7 @@ pub fn run_watchdog(binary_path: &Path, args: &[String]) -> Result<i32, Watchdog
 fn send_recovery_fds(sock: &UnixStream, pty_fds: &HashMap<u64, HeldFd>) -> io::Result<()> {
     // Build list of (id, fd, pid) tuples
     let fds: Vec<RawFd> = pty_fds.values().map(|h| h.fd).collect();
-    let entries: Vec<(u64, i32)> = pty_fds
-        .iter()
-        .map(|(&id, h)| (id, h.child_pid))
-        .collect();
+    let entries: Vec<(u64, i32)> = pty_fds.iter().map(|(&id, h)| (id, h.child_pid)).collect();
 
     // Send count first, then id + pid pairs
     let count = fds.len() as u32;

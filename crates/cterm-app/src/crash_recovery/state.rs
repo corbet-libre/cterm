@@ -63,8 +63,8 @@ pub fn write_crash_state(state: &CrashState) -> io::Result<()> {
     }
 
     // Serialize with bincode
-    let bytes = bincode::serialize(state)
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    let bytes =
+        bincode::serialize(state).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
 
     // Write atomically using temp file + rename
     let temp_path = path.with_extension("tmp");
@@ -81,8 +81,8 @@ pub fn read_crash_state() -> io::Result<CrashState> {
     let path = crash_state_path();
     let bytes = fs::read(&path)?;
 
-    let state: CrashState = bincode::deserialize(&bytes)
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    let state: CrashState =
+        bincode::deserialize(&bytes).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
 
     log::info!(
         "Read crash state: {} windows, written by PID {} at timestamp {}",

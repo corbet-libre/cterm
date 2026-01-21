@@ -149,7 +149,5 @@ pub fn characters_from_event(event: &NSEvent) -> Option<String> {
 
 /// Get the character string ignoring modifiers (useful for Ctrl+key combinations)
 pub fn characters_ignoring_modifiers(event: &NSEvent) -> Option<String> {
-    event
-        .charactersIgnoringModifiers()
-        .map(|s| s.to_string())
+    event.charactersIgnoringModifiers().map(|s| s.to_string())
 }
