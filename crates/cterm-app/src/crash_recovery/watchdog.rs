@@ -482,15 +482,11 @@ pub fn receive_recovery_fds(watchdog_fd: RawFd) -> io::Result<Vec<RecoveredFd>> 
 
     // Parse IDs and PIDs
     let mut result = Vec::with_capacity(count);
-    for i in 0..count {
+    for (i, &fd) in fds.iter().enumerate().take(count) {
         let offset = 4 + i * 12;
         let id = u64::from_le_bytes(buf[offset..offset + 8].try_into().unwrap());
         let child_pid = i32::from_le_bytes(buf[offset + 8..offset + 12].try_into().unwrap());
-        result.push(RecoveredFd {
-            id,
-            fd: fds[i],
-            child_pid,
-        });
+        result.push(RecoveredFd { id, fd, child_pid });
     }
 
     log::info!("Received {} recovery FDs from watchdog", result.len());
