@@ -433,8 +433,8 @@ mod unix {
                 args_cstrings.iter().map(|s| s.as_ptr()).collect();
             args_ptrs.push(std::ptr::null());
 
-            // Execute the shell
-            libc::execv(shell_cstring.as_ptr(), args_ptrs.as_ptr());
+            // Execute the shell (execvp searches PATH)
+            libc::execvp(shell_cstring.as_ptr(), args_ptrs.as_ptr());
 
             // If exec fails, exit
             libc::_exit(127);
