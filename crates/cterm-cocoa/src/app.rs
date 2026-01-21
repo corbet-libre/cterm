@@ -47,10 +47,29 @@ pub struct Args {
     /// Receive upgrade state from parent process via inherited FD (internal use)
     #[arg(long, hide = true)]
     pub upgrade_receiver: Option<i32>,
+
+    /// Run under watchdog supervision (internal use)
+    #[arg(long, hide = true)]
+    pub supervised: Option<i32>,
+
+    /// Disable watchdog supervision (run directly without crash recovery)
+    #[arg(long)]
+    pub no_watchdog: bool,
 }
 
 /// Global application arguments (accessible from window creation)
 static APP_ARGS: std::sync::OnceLock<Args> = std::sync::OnceLock::new();
+
+/// Watchdog FD for crash recovery (-1 if not supervised)
+#[cfg(unix)]
+static WATCHDOG_FD: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
+
+/// Get the watchdog FD if we're running supervised
+#[cfg(unix)]
+pub fn get_watchdog_fd() -> Option<i32> {
+    let fd = WATCHDOG_FD.load(std::sync::atomic::Ordering::SeqCst);
+    if fd >= 0 { Some(fd) } else { None }
+}
 
 /// Get the application arguments (call only after run())
 pub fn get_args() -> &'static Args {
@@ -218,6 +237,31 @@ pub fn run() {
         log::info!("Running in upgrade receiver mode with FD {}", fd);
         let exit_code = crate::upgrade_receiver::run_receiver(fd);
         std::process::exit(exit_code);
+    }
+
+    // Check if we should start with watchdog for crash recovery
+    #[cfg(unix)]
+    if args.supervised.is_none() && !args.no_watchdog {
+        // We're not supervised and watchdog is not disabled - start watchdog
+        log::info!("Starting watchdog for crash recovery...");
+
+        let binary = std::env::current_exe().expect("Failed to get current executable");
+        let other_args: Vec<String> = std::env::args().skip(1).collect();
+
+        match cterm_app::run_watchdog(&binary, &other_args) {
+            Ok(exit_code) => std::process::exit(exit_code),
+            Err(e) => {
+                log::error!("Watchdog failed: {}, running without crash recovery", e);
+                // Fall through to normal startup
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    if let Some(fd) = args.supervised {
+        log::info!("Running under watchdog supervision (FD {})", fd);
+        // Store watchdog FD for later use (registering PTYs, shutdown notification)
+        WATCHDOG_FD.store(fd, std::sync::atomic::Ordering::SeqCst);
     }
 
     // Store args for later access
