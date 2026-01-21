@@ -106,8 +106,8 @@ impl CtermWindow {
         // Calculate initial window size for 80x24 terminal
         let cell_width = config.appearance.font.size * 0.6; // Approximate
         let cell_height = config.appearance.font.size * 1.2;
-        let width = cell_width * 80.0 + 20.0;
-        let height = cell_height * 24.0 + 20.0;
+        let width = cell_width * 80.0;
+        let height = cell_height * 24.0;
 
         let content_rect = NSRect::new(NSPoint::new(200.0, 200.0), NSSize::new(width, height));
 
@@ -166,8 +166,8 @@ impl CtermWindow {
         // Calculate initial window size for 80x24 terminal
         let cell_width = config.appearance.font.size * 0.6;
         let cell_height = config.appearance.font.size * 1.2;
-        let width = cell_width * 80.0 + 20.0;
-        let height = cell_height * 24.0 + 20.0;
+        let width = cell_width * 80.0;
+        let height = cell_height * 24.0;
 
         let content_rect = NSRect::new(NSPoint::new(200.0, 200.0), NSSize::new(width, height));
 
@@ -271,8 +271,8 @@ impl CtermWindow {
         // Calculate initial window size for 80x24 terminal
         let cell_width = config.appearance.font.size * 0.6;
         let cell_height = config.appearance.font.size * 1.2;
-        let width = cell_width * 80.0 + 20.0;
-        let height = cell_height * 24.0 + 20.0;
+        let width = cell_width * 80.0;
+        let height = cell_height * 24.0;
 
         let content_rect = NSRect::new(NSPoint::new(200.0, 200.0), NSSize::new(width, height));
 
