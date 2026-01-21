@@ -266,11 +266,11 @@ impl Default for ShortcutsConfig {
     }
 }
 
-/// Sticky tab configuration
+/// Sticky tab configuration (tab template)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct StickyTabConfig {
-    /// Tab name
+    /// Tab name (also used as unique identifier for the template)
     pub name: String,
     /// Command to run (None = default shell)
     pub command: Option<String>,
@@ -281,12 +281,17 @@ pub struct StickyTabConfig {
     pub working_directory: Option<PathBuf>,
     /// Tab color (hex)
     pub color: Option<String>,
+    /// Theme override for this tab (None = use default theme)
+    pub theme: Option<String>,
     /// Whether to auto-start this tab on launch
     #[serde(default)]
     pub auto_start: bool,
     /// Keep tab open after process exits
     #[serde(default)]
     pub keep_open: bool,
+    /// Unique tab - if true, opening this template focuses existing tab instead of creating new one
+    #[serde(default)]
+    pub unique: bool,
     /// Environment variables
     #[serde(default)]
     pub env: HashMap<String, String>,
@@ -302,8 +307,10 @@ impl Default for StickyTabConfig {
             args: Vec::new(),
             working_directory: None,
             color: None,
+            theme: None,
             auto_start: false,
             keep_open: false,
+            unique: false,
             env: HashMap::new(),
             docker: None,
         }
@@ -320,6 +327,7 @@ impl StickyTabConfig {
             color: Some("#7c3aed".into()),
             auto_start: false,
             keep_open: true,
+            unique: true, // Claude tabs are unique by default
             ..Default::default()
         }
     }
@@ -333,6 +341,7 @@ impl StickyTabConfig {
             color: Some("#7c3aed".into()),
             auto_start: false,
             keep_open: true,
+            unique: true, // Claude tabs are unique by default
             ..Default::default()
         }
     }

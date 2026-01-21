@@ -106,6 +106,30 @@ define_class!(
                 log::info!("Preferences saved");
             });
         }
+
+        #[unsafe(method(showTabTemplates:))]
+        fn action_show_tab_templates(&self, _sender: Option<&objc2::runtime::AnyObject>) {
+            let mtm = MainThreadMarker::from(self);
+            let templates = cterm_app::config::load_sticky_tabs().unwrap_or_default();
+            crate::tab_templates::show_tab_templates(mtm, templates);
+        }
+
+        #[unsafe(method(openTabTemplate:))]
+        fn action_open_tab_template(&self, sender: Option<&objc2::runtime::AnyObject>) {
+            use objc2_app_kit::NSMenuItem;
+
+            if let Some(sender) = sender {
+                // Get the menu item's tag which is the template index
+                let item: &NSMenuItem = unsafe { &*(sender as *const _ as *const NSMenuItem) };
+                let index = item.tag() as usize;
+
+                if let Ok(templates) = cterm_app::config::load_sticky_tabs() {
+                    if let Some(template) = templates.get(index) {
+                        self.open_template(template);
+                    }
+                }
+            }
+        }
     }
 );
 
@@ -118,6 +142,34 @@ impl AppDelegate {
             windows: std::cell::RefCell::new(Vec::new()),
         });
         unsafe { msg_send![super(this), init] }
+    }
+
+    /// Open a tab from a template
+    fn open_template(&self, template: &cterm_app::config::StickyTabConfig) {
+        let mtm = MainThreadMarker::from(self);
+
+        // If the template is unique, check if we already have a tab with this template
+        if template.unique {
+            // Look through all windows to find a matching tab
+            let windows = self.ivars().windows.borrow();
+            for window in windows.iter() {
+                // Check if this window has a tab with the template name
+                if let Some(terminal_view) = window.active_terminal() {
+                    if terminal_view.template_name().as_deref() == Some(template.name.as_str()) {
+                        // Focus this window
+                        window.makeKeyAndOrderFront(None);
+                        log::info!("Focused existing unique tab: {}", template.name);
+                        return;
+                    }
+                }
+            }
+        }
+
+        // Create a new tab from the template
+        let window = CtermWindow::from_template(mtm, &self.ivars().config, &self.ivars().theme, template);
+        self.ivars().windows.borrow_mut().push(window.clone());
+        window.makeKeyAndOrderFront(None);
+        log::info!("Created new tab from template: {}", template.name);
     }
 }
 

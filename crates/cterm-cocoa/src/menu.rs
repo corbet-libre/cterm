@@ -168,6 +168,49 @@ fn create_file_menu(mtm: MainThreadMarker) -> Retained<NSMenuItem> {
 
     menu.addItem(&NSMenuItem::separatorItem(mtm));
 
+    // Tab Templates submenu
+    let templates_submenu = NSMenu::new(mtm);
+    templates_submenu.setTitle(&NSString::from_str("Tab Templates"));
+
+    // Load templates to populate submenu
+    if let Ok(templates) = cterm_app::config::load_sticky_tabs() {
+        for (i, template) in templates.iter().enumerate() {
+            let item = NSMenuItem::new(mtm);
+            item.setTitle(&NSString::from_str(&template.name));
+            unsafe { item.setAction(Some(sel!(openTabTemplate:))) };
+            item.setTag(i as isize);
+
+            // Add keyboard shortcut for first 9 templates (Cmd+1 through Cmd+9)
+            if i < 9 {
+                item.setKeyEquivalent(&NSString::from_str(&format!("{}", i + 1)));
+                item.setKeyEquivalentModifierMask(
+                    NSEventModifierFlags::Command.union(NSEventModifierFlags::Option),
+                );
+            }
+
+            templates_submenu.addItem(&item);
+        }
+
+        if !templates.is_empty() {
+            templates_submenu.addItem(&NSMenuItem::separatorItem(mtm));
+        }
+    }
+
+    // Manage Templates...
+    templates_submenu.addItem(&create_menu_item(
+        mtm,
+        "Manage Templates...",
+        Some(sel!(showTabTemplates:)),
+        "",
+    ));
+
+    let templates_item = NSMenuItem::new(mtm);
+    templates_item.setTitle(&NSString::from_str("Tab Templates"));
+    templates_item.setSubmenu(Some(&templates_submenu));
+    menu.addItem(&templates_item);
+
+    menu.addItem(&NSMenuItem::separatorItem(mtm));
+
     // Close Tab
     menu.addItem(&create_menu_item_with_key(
         mtm,

@@ -256,6 +256,70 @@ impl CtermWindow {
         &self.ivars().theme
     }
 
+    /// Get a reference to the active terminal view
+    pub fn active_terminal(&self) -> Option<Retained<TerminalView>> {
+        self.ivars().active_terminal.borrow().clone()
+    }
+
+    /// Create a window from a tab template
+    pub fn from_template(
+        mtm: MainThreadMarker,
+        config: &Config,
+        theme: &Theme,
+        template: &cterm_app::config::StickyTabConfig,
+    ) -> Retained<Self> {
+        // Calculate initial window size for 80x24 terminal
+        let cell_width = config.appearance.font.size * 0.6;
+        let cell_height = config.appearance.font.size * 1.2;
+        let width = cell_width * 80.0 + 20.0;
+        let height = cell_height * 24.0 + 20.0;
+
+        let content_rect = NSRect::new(NSPoint::new(200.0, 200.0), NSSize::new(width, height));
+
+        let style_mask = NSWindowStyleMask::Titled
+            | NSWindowStyleMask::Closable
+            | NSWindowStyleMask::Miniaturizable
+            | NSWindowStyleMask::Resizable;
+
+        // Allocate and initialize
+        let this = mtm.alloc::<Self>();
+        let this = this.set_ivars(CtermWindowIvars {
+            config: config.clone(),
+            theme: theme.clone(),
+            shortcuts: ShortcutManager::from_config(&config.shortcuts),
+            active_terminal: RefCell::new(None),
+        });
+
+        let this: Retained<Self> = unsafe {
+            msg_send![
+                super(this),
+                initWithContentRect: content_rect,
+                styleMask: style_mask,
+                backing: 2u64,
+                defer: false
+            ]
+        };
+
+        // Set window title from template
+        this.setTitle(&NSString::from_str(&template.name));
+
+        // Set minimum size
+        this.setMinSize(NSSize::new(400.0, 200.0));
+
+        // Enable native macOS window tabbing
+        this.setTabbingMode(NSWindowTabbingMode::Preferred);
+
+        // Set self as delegate
+        this.setDelegate(Some(ProtocolObject::from_ref(&*this)));
+
+        // Create the terminal view from template
+        let terminal_view = TerminalView::from_template(mtm, config, theme, template);
+        this.setContentView(Some(&terminal_view));
+        *this.ivars().active_terminal.borrow_mut() = Some(terminal_view);
+
+        this
+    }
+
     /// Show a confirmation dialog when closing with a running process
     fn show_close_confirmation(&self, process_name: &str) -> bool {
         use objc2_app_kit::NSAlert;

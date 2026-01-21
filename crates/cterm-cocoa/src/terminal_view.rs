@@ -42,6 +42,8 @@ pub struct TerminalViewIvars {
     state: Arc<ViewState>,
     /// Whether we're currently in a selection drag
     is_selecting: Cell<bool>,
+    /// Template name (if this view was created from a template)
+    template_name: RefCell<Option<String>>,
 }
 
 define_class!(
@@ -501,6 +503,7 @@ impl TerminalView {
             cell_height,
             state: state.clone(),
             is_selecting: Cell::new(false),
+            template_name: RefCell::new(None),
         });
 
         let this: Retained<Self> = unsafe { msg_send![super(this), initWithFrame: frame] };
@@ -511,6 +514,60 @@ impl TerminalView {
 
         // Spawn shell
         this.spawn_shell(config, state.clone());
+
+        // Start the redraw check loop
+        this.schedule_redraw_check(view_ptr, state);
+
+        this
+    }
+
+    /// Create a terminal view from a tab template
+    pub fn from_template(
+        mtm: MainThreadMarker,
+        config: &Config,
+        theme: &Theme,
+        template: &cterm_app::config::StickyTabConfig,
+    ) -> Retained<Self> {
+        // Create CoreGraphics renderer first to get cell dimensions
+        let font_name = &config.appearance.font.family;
+        let font_size = config.appearance.font.size;
+        let renderer = CGRenderer::new(mtm, font_name, font_size, theme);
+        let (cell_width, cell_height) = renderer.cell_size();
+
+        // Create terminal with default size (will resize later)
+        let terminal = Terminal::new(80, 24, ScreenConfig::default());
+        let terminal = Arc::new(Mutex::new(terminal));
+
+        // Create shared state for PTY thread communication
+        let state = Arc::new(ViewState {
+            needs_redraw: AtomicBool::new(false),
+            pty_closed: AtomicBool::new(false),
+            view_invalid: AtomicBool::new(false),
+        });
+
+        // Initial frame
+        let frame = NSRect::new(NSPoint::ZERO, NSSize::new(800.0, 600.0));
+
+        // Allocate and initialize
+        let this = mtm.alloc::<Self>();
+        let this = this.set_ivars(TerminalViewIvars {
+            terminal: terminal.clone(),
+            pty: RefCell::new(None),
+            renderer: RefCell::new(Some(renderer)),
+            cell_width,
+            cell_height,
+            state: state.clone(),
+            is_selecting: Cell::new(false),
+            template_name: RefCell::new(Some(template.name.clone())),
+        });
+
+        let this: Retained<Self> = unsafe { msg_send![super(this), initWithFrame: frame] };
+
+        // Store view pointer as usize for thread-safe passing
+        let view_ptr = &*this as *const _ as usize;
+
+        // Spawn shell from template
+        this.spawn_template_shell(config, template, state.clone());
 
         // Start the redraw check loop
         this.schedule_redraw_check(view_ptr, state);
@@ -562,6 +619,7 @@ impl TerminalView {
             cell_height,
             state: state.clone(),
             is_selecting: Cell::new(false),
+            template_name: RefCell::new(None), // TODO: restore template name from state
         });
 
         let this: Retained<Self> = unsafe { msg_send![super(this), initWithFrame: frame] };
@@ -705,6 +763,68 @@ impl TerminalView {
                 log::error!("Failed to spawn shell: {}", e);
             }
         }
+    }
+
+    /// Spawn a shell from a tab template
+    fn spawn_template_shell(
+        &self,
+        config: &Config,
+        template: &cterm_app::config::StickyTabConfig,
+        state: Arc<ViewState>,
+    ) {
+        // Get command from template (or use default shell)
+        let (shell, args) = template.get_command_args();
+        let shell = shell.unwrap_or_else(|| {
+            config.general.default_shell.clone().unwrap_or_else(|| {
+                std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".to_string())
+            })
+        });
+
+        // Get working directory from template
+        let cwd = template.working_directory.clone();
+
+        // Merge environment variables
+        let env: Vec<(String, String)> = template.env.iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+
+        let terminal = self.ivars().terminal.clone();
+
+        let pty_config = PtyConfig {
+            size: PtySize {
+                cols: 80,
+                rows: 24,
+                pixel_width: 0,
+                pixel_height: 0,
+            },
+            shell: Some(shell.clone()),
+            args,
+            cwd,
+            env,
+        };
+
+        match Pty::new(&pty_config) {
+            Ok(pty) => {
+                log::info!("Spawned template shell: {} (template: {})", shell, template.name);
+
+                // Start reading from PTY in background
+                let pty_fd = pty.raw_fd();
+
+                std::thread::spawn(move || {
+                    Self::read_pty_loop(pty_fd, terminal, state);
+                });
+
+                *self.ivars().pty.borrow_mut() = Some(pty);
+            }
+            Err(e) => {
+                log::error!("Failed to spawn template shell: {}", e);
+            }
+        }
+    }
+
+    /// Get the template name (if this view was created from a template)
+    pub fn template_name(&self) -> Option<String> {
+        self.ivars().template_name.borrow().clone()
     }
 
     /// Background thread to read from PTY

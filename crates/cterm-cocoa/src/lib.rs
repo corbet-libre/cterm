@@ -11,6 +11,7 @@ pub mod menu;
 pub mod metal_renderer;
 pub mod preferences;
 pub mod tab_bar;
+pub mod tab_templates;
 pub mod terminal_view;
 #[cfg(unix)]
 pub mod upgrade_receiver;

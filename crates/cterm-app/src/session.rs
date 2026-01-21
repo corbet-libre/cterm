@@ -157,6 +157,26 @@ impl TabState {
     pub fn is_running(&mut self) -> bool {
         self.terminal.is_running()
     }
+
+    /// Get the template name if this tab was created from a template
+    pub fn template_name(&self) -> Option<&str> {
+        self.sticky_config.as_ref().map(|c| c.name.as_str())
+    }
+
+    /// Check if this tab is a unique tab (only one instance allowed)
+    pub fn is_unique(&self) -> bool {
+        self.sticky_config.as_ref().map(|c| c.unique).unwrap_or(false)
+    }
+
+    /// Convert to session state for persistence
+    pub fn to_session_state(&self) -> TabSessionState {
+        TabSessionState {
+            template_name: self.template_name().map(|s| s.to_string()),
+            custom_title: self.custom_title.clone(),
+            cwd: self.cwd.clone(),
+            color: self.color.clone(),
+        }
+    }
 }
 
 /// Window state
@@ -280,6 +300,13 @@ impl WindowState {
         self.tabs.iter().position(|t| t.id == id)
     }
 
+    /// Find tab by template name (for unique tabs)
+    pub fn find_tab_by_template(&self, template_name: &str) -> Option<usize> {
+        self.tabs.iter().position(|t| {
+            t.template_name().map(|n| n == template_name).unwrap_or(false)
+        })
+    }
+
     /// Resize all terminals in this window
     pub fn resize(&mut self, cols: usize, rows: usize) {
         for tab in &mut self.tabs {
@@ -338,10 +365,14 @@ pub struct WindowSessionState {
 /// Tab session state (serializable)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TabSessionState {
-    /// Sticky tab name (for matching)
-    pub sticky_name: Option<String>,
+    /// Template name this tab was created from (for matching on restart)
+    pub template_name: Option<String>,
+    /// Custom title (if user renamed the tab)
+    pub custom_title: Option<String>,
     /// Working directory
     pub cwd: Option<PathBuf>,
+    /// Tab color override
+    pub color: Option<String>,
 }
 
 impl SessionState {
@@ -435,6 +466,17 @@ impl Session {
     /// Find window by ID
     pub fn find_window(&self, id: u64) -> Option<usize> {
         self.windows.iter().position(|w| w.id == id)
+    }
+
+    /// Find any tab by template name across all windows (for unique tabs)
+    /// Returns (window_index, tab_index) if found
+    pub fn find_tab_by_template(&self, template_name: &str) -> Option<(usize, usize)> {
+        for (window_idx, window) in self.windows.iter().enumerate() {
+            if let Some(tab_idx) = window.find_tab_by_template(template_name) {
+                return Some((window_idx, tab_idx));
+            }
+        }
+        None
     }
 }
 
