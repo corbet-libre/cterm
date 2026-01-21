@@ -78,11 +78,11 @@ impl CGRenderer {
 
         // Draw cells
         for row in 0..rows {
-            // Get absolute line for selection checking
+            // Get absolute line for scrollback access and selection checking
             let absolute_line = screen.visible_row_to_absolute_line(row);
 
             for col in 0..cols {
-                if let Some(cell) = screen.get_cell(row, col) {
+                if let Some(cell) = screen.get_cell_with_scrollback(absolute_line, col) {
                     let x = col as f64 * self.cell_width;
                     let y = row as f64 * self.cell_height;
 
@@ -123,9 +123,9 @@ impl CGRenderer {
             }
         }
 
-        // Draw cursor
+        // Draw cursor (only when not scrolled back)
         let cursor = &screen.cursor;
-        if cursor.visible {
+        if cursor.visible && screen.scroll_offset == 0 {
             let cursor_x = cursor.col as f64 * self.cell_width;
             let cursor_y = cursor.row as f64 * self.cell_height;
             self.draw_cursor(cursor_x, cursor_y);
