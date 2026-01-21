@@ -180,6 +180,13 @@ pub fn recv_fds(
     }
 
     // We expect a length header (8 bytes) followed by data
+    if header_len == 0 {
+        // EOF - other end closed the socket
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "Socket closed (EOF)",
+        ));
+    }
     if header_len != 8 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
