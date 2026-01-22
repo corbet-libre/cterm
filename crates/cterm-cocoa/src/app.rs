@@ -329,10 +329,20 @@ define_class!(
 
         #[unsafe(method(newWindow:))]
         fn action_new_window(&self, _sender: Option<&objc2::runtime::AnyObject>) {
+            use objc2_app_kit::NSWindowTabbingMode;
+
             let mtm = MainThreadMarker::from(self);
             let window = CtermWindow::new(mtm, &self.ivars().config, &self.ivars().theme);
+
+            // Temporarily disable tabbing to force a new window instead of a tab
+            window.setTabbingMode(NSWindowTabbingMode::Disallowed);
+
             self.ivars().windows.borrow_mut().push(window.clone());
             window.makeKeyAndOrderFront(None);
+
+            // Re-enable tabbing for future tabs in this window
+            window.setTabbingMode(NSWindowTabbingMode::Preferred);
+
             log::info!("Created new window");
         }
 
