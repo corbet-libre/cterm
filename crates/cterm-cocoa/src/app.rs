@@ -326,6 +326,15 @@ define_class!(
                 }
             }
         }
+
+        #[unsafe(method(newWindow:))]
+        fn action_new_window(&self, _sender: Option<&objc2::runtime::AnyObject>) {
+            let mtm = MainThreadMarker::from(self);
+            let window = CtermWindow::new(mtm, &self.ivars().config, &self.ivars().theme);
+            self.ivars().windows.borrow_mut().push(window.clone());
+            window.makeKeyAndOrderFront(None);
+            log::info!("Created new window");
+        }
     }
 );
 
