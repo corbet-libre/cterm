@@ -335,6 +335,46 @@ define_class!(
             window.makeKeyAndOrderFront(None);
             log::info!("Created new window");
         }
+
+        /// Called by windows when they close to remove from tracking
+        #[unsafe(method(windowDidClose:))]
+        fn window_did_close(&self, window: &CtermWindow) {
+            let mut windows = self.ivars().windows.borrow_mut();
+            let initial_count = windows.len();
+
+            // Remove the closed window from our tracking array
+            windows.retain(|w| !std::ptr::eq(&**w, window));
+
+            let removed = initial_count - windows.len();
+            log::debug!(
+                "Window closed, removed {} from tracking ({} remaining)",
+                removed,
+                windows.len()
+            );
+
+            // If no windows left, terminate the app
+            if windows.is_empty() {
+                drop(windows); // Release borrow before terminating
+                log::info!("Last window closed, terminating app");
+                let mtm = MainThreadMarker::from(self);
+                let app = NSApplication::sharedApplication(mtm);
+                app.terminate(None);
+            }
+        }
+
+        /// Register a window for tracking (called by newWindowForTab: etc.)
+        #[unsafe(method(registerWindow:))]
+        fn register_window(&self, window: &CtermWindow) {
+            // Convert raw pointer to Retained by retaining it
+            let retained: Retained<CtermWindow> = unsafe {
+                Retained::retain(window as *const _ as *mut CtermWindow).unwrap()
+            };
+            self.ivars().windows.borrow_mut().push(retained);
+            log::debug!(
+                "Registered window ({} total)",
+                self.ivars().windows.borrow().len()
+            );
+        }
     }
 );
 

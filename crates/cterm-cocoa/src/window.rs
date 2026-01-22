@@ -8,8 +8,8 @@ use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2::{define_class, msg_send, DefinedClass, MainThreadOnly};
 use objc2_app_kit::{
-    NSAlertFirstButtonReturn, NSAlertStyle, NSWindow, NSWindowDelegate, NSWindowStyleMask,
-    NSWindowTabbingMode,
+    NSAlertFirstButtonReturn, NSAlertStyle, NSApplication, NSWindow, NSWindowDelegate,
+    NSWindowStyleMask, NSWindowTabbingMode,
 };
 use objc2_foundation::{
     MainThreadMarker, NSNotification, NSObjectProtocol, NSPoint, NSRect, NSSize, NSString,
@@ -75,6 +75,14 @@ define_class!(
         #[unsafe(method(windowWillClose:))]
         fn window_will_close(&self, _notification: &NSNotification) {
             log::debug!("Window will close");
+
+            // Notify AppDelegate to remove this window from tracking
+            let mtm = MainThreadMarker::from(self);
+            let app = NSApplication::sharedApplication(mtm);
+            if let Some(delegate) = app.delegate() {
+                // Call our custom method to remove the window
+                let _: () = unsafe { msg_send![&*delegate, windowDidClose: self] };
+            }
         }
 
         #[unsafe(method(windowDidResize:))]
@@ -105,6 +113,13 @@ define_class!(
         fn new_window_for_tab(&self, _sender: Option<&objc2::runtime::AnyObject>) -> *mut NSWindow {
             let mtm = MainThreadMarker::from(self);
             let new_window = CtermWindow::new(mtm, &self.ivars().config, &self.ivars().theme);
+
+            // Register with AppDelegate for tracking
+            let app = NSApplication::sharedApplication(mtm);
+            if let Some(delegate) = app.delegate() {
+                let _: () = unsafe { msg_send![&*delegate, registerWindow: &*new_window] };
+            }
+
             log::info!("Created new default tab via newWindowForTab:");
             Retained::into_raw(Retained::into_super(new_window))
         }
