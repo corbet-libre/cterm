@@ -20,7 +20,7 @@ pub struct DrcsGlyph {
 impl DrcsGlyph {
     /// Create a new empty glyph
     pub fn new(width: usize, height: usize) -> Self {
-        let bytes_per_row = (width + 7) / 8;
+        let bytes_per_row = width.div_ceil(8);
         Self {
             data: vec![0; bytes_per_row * height],
             width,
@@ -33,7 +33,7 @@ impl DrcsGlyph {
         if x >= self.width || y >= self.height {
             return;
         }
-        let bytes_per_row = (self.width + 7) / 8;
+        let bytes_per_row = self.width.div_ceil(8);
         let byte_idx = y * bytes_per_row + x / 8;
         let bit_idx = 7 - (x % 8);
         if value {
@@ -48,7 +48,7 @@ impl DrcsGlyph {
         if x >= self.width || y >= self.height {
             return false;
         }
-        let bytes_per_row = (self.width + 7) / 8;
+        let bytes_per_row = self.width.div_ceil(8);
         let byte_idx = y * bytes_per_row + x / 8;
         let bit_idx = 7 - (x % 8);
         (self.data[byte_idx] >> bit_idx) & 1 != 0
@@ -114,7 +114,8 @@ enum DecodeState {
 pub struct DecdldDecoder {
     /// Font number (Pfn)
     font_number: u8,
-    /// Starting character (Pcn)
+    /// Starting character (Pcn) - stored for debugging, current_char tracks active position
+    #[allow(dead_code)]
     start_char: u8,
     /// Erase control (Pe)
     erase_control: u8,

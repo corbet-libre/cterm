@@ -2115,7 +2115,7 @@ impl TerminalView {
                 height as u32,
                 image::ExtendedColorType::Rgba8,
             )
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+            .map_err(std::io::Error::other)?;
 
         Ok(())
     }

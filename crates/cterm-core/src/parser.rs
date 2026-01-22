@@ -27,7 +27,7 @@ enum DcsState {
     None,
     /// Sixel graphics sequence in progress
     Sixel {
-        decoder: SixelDecoder,
+        decoder: Box<SixelDecoder>,
         start_col: usize,
         start_row: usize,
     },
@@ -36,9 +36,10 @@ enum DcsState {
 }
 
 /// State for intercepting OSC 1337 File transfers before VTE buffers them
-#[derive(Debug)]
+#[derive(Debug, Default)]
 enum Osc1337State {
     /// Not in an OSC 1337 sequence
+    #[default]
     None,
     /// Saw ESC, waiting for ]
     Escape,
@@ -50,12 +51,6 @@ enum Osc1337State {
     Osc1337Params(String),
     /// Inside OSC 1337 File= base64 data, streaming to receiver
     Osc1337Data(StreamingFileReceiver),
-}
-
-impl Default for Osc1337State {
-    fn default() -> Self {
-        Self::None
-    }
 }
 
 /// Parser wraps the vte parser and applies actions to a Screen
@@ -165,16 +160,16 @@ impl Parser {
 
                 // Check if this starts "File="
                 const FILE_PREFIX: &[u8] = b"File=";
-                if content.len() < FILE_PREFIX.len() {
-                    if FILE_PREFIX.get(content.len()) == Some(&byte) {
-                        content.push(byte);
+                if content.len() < FILE_PREFIX.len()
+                    && FILE_PREFIX.get(content.len()) == Some(&byte)
+                {
+                    content.push(byte);
 
-                        // If we've matched the full "File=" prefix, switch to params mode
-                        if content.len() == FILE_PREFIX.len() {
-                            self.osc_1337_state = Osc1337State::Osc1337Params(String::new());
-                        }
-                        return true;
+                    // If we've matched the full "File=" prefix, switch to params mode
+                    if content.len() == FILE_PREFIX.len() {
+                        self.osc_1337_state = Osc1337State::Osc1337Params(String::new());
                     }
+                    return true;
                 }
 
                 content.push(byte);
@@ -404,7 +399,7 @@ impl vte::Perform for ScreenPerformer<'_> {
 
         let params_vec: Vec<u16> = params
             .iter()
-            .flat_map(|subparams| subparams.iter().map(|&p| p))
+            .flat_map(|subparams| subparams.iter().copied())
             .collect();
 
         match action {
@@ -413,7 +408,7 @@ impl vte::Perform for ScreenPerformer<'_> {
                 log::debug!("Starting Sixel graphics sequence, params: {:?}", params_vec);
 
                 *self.dcs_state = DcsState::Sixel {
-                    decoder: SixelDecoder::with_params(&params_vec),
+                    decoder: Box::new(SixelDecoder::with_params(&params_vec)),
                     start_col: self.screen.cursor.col,
                     start_row: self.screen.cursor.row,
                 };

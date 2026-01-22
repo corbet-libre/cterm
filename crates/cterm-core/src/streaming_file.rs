@@ -117,10 +117,8 @@ impl StreamingFileReceiver {
         self.base64_buffer.push(byte);
 
         // Decode when we have enough base64 data
-        if self.base64_buffer.len() >= BASE64_CHUNK_SIZE {
-            if !self.decode_chunk() {
-                return false;
-            }
+        if self.base64_buffer.len() >= BASE64_CHUNK_SIZE && !self.decode_chunk() {
+            return false;
         }
 
         true
@@ -253,7 +251,7 @@ impl StreamingFileReceiver {
         // Decode any remaining base64 data
         if !self.base64_buffer.is_empty() {
             // Pad with '=' if needed for final chunk
-            while self.base64_buffer.len() % 4 != 0 {
+            while !self.base64_buffer.len().is_multiple_of(4) {
                 self.base64_buffer.push(b'=');
             }
             if !self.decode_chunk() {

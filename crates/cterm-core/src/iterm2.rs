@@ -19,9 +19,10 @@
 use base64::Engine;
 
 /// Dimension specification for iTerm2 images
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub enum Iterm2Dimension {
     /// Automatic sizing based on image dimensions
+    #[default]
     Auto,
     /// Size in pixels
     Pixels(usize),
@@ -29,12 +30,6 @@ pub enum Iterm2Dimension {
     Cells(usize),
     /// Size as percentage of terminal width/height
     Percent(f32),
-}
-
-impl Default for Iterm2Dimension {
-    fn default() -> Self {
-        Self::Auto
-    }
 }
 
 impl Iterm2Dimension {

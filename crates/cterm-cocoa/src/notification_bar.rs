@@ -245,6 +245,7 @@ impl NotificationBar {
     }
 
     /// Set the frame rectangle
+    #[allow(non_snake_case)]
     fn setFrame(&self, frame: NSRect) {
         unsafe {
             let _: () = msg_send![self, setFrame: frame];
@@ -252,6 +253,7 @@ impl NotificationBar {
     }
 
     /// Set hidden state
+    #[allow(non_snake_case)]
     fn setHidden(&self, hidden: bool) {
         unsafe {
             let _: () = msg_send![self, setHidden: hidden];
@@ -316,6 +318,7 @@ impl NotificationBar {
     }
 
     /// Set wants layer
+    #[allow(non_snake_case)]
     fn setWantsLayer(&self, wants: bool) {
         unsafe {
             let _: () = msg_send![self, setWantsLayer: wants];

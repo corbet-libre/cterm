@@ -116,9 +116,9 @@ impl SixelDecoder {
         palette[15] = [255, 255, 255, 255]; // Bright White
 
         // Initialize remaining colors to a basic pattern
-        for i in 16..256 {
+        for (i, color) in palette.iter_mut().enumerate().skip(16) {
             let gray = ((i - 16) * 255 / 240) as u8;
-            palette[i] = [gray, gray, gray, 255];
+            *color = [gray, gray, gray, 255];
         }
 
         palette

@@ -1336,7 +1336,7 @@ impl Screen {
     pub fn image_rows_for_height(&self, pixel_height: usize) -> usize {
         if self.cell_height_hint <= 0.0 {
             // Fallback: assume roughly 1 row per 6 pixels (one sixel band)
-            (pixel_height + 5) / 6
+            pixel_height.div_ceil(6)
         } else {
             ((pixel_height as f64) / self.cell_height_hint).ceil() as usize
         }

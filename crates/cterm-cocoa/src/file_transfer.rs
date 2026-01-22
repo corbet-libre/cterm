@@ -201,7 +201,7 @@ impl PendingFileManager {
                 path: temp_path, ..
             } => {
                 // Move or copy the temp file to the destination
-                if let Err(_) = std::fs::rename(&temp_path, path) {
+                if std::fs::rename(&temp_path, path).is_err() {
                     // rename failed (likely cross-device), fall back to copy
                     std::fs::copy(&temp_path, path)?;
                     // Clean up temp file
