@@ -691,6 +691,11 @@ impl Screen {
             return;
         }
 
+        // Save old dimensions BEFORE resizing grid, for scroll region adjustment
+        let old_height = self.height();
+        let old_scroll_bottom = self.scroll_region.bottom;
+        let old_width = self.width();
+
         self.grid.resize(width, height);
 
         if let Some(ref mut alt) = self.alternate_grid {
@@ -698,7 +703,8 @@ impl Screen {
         }
 
         // Update scroll region
-        if self.scroll_region.bottom == self.height() {
+        // If scroll region was at full screen height, extend it to new height
+        if old_scroll_bottom == old_height {
             self.scroll_region.bottom = height;
         } else {
             self.scroll_region.bottom = self.scroll_region.bottom.min(height);
@@ -708,6 +714,13 @@ impl Screen {
         // Clamp cursor position
         self.cursor.col = self.cursor.col.min(width.saturating_sub(1));
         self.cursor.row = self.cursor.row.min(height.saturating_sub(1));
+
+        // Resize tab stops array to match new width
+        self.tab_stops.resize(width, false);
+        // Set default tab stops (every 8 columns) for new columns
+        for i in old_width..width {
+            self.tab_stops[i] = i % 8 == 0;
+        }
 
         self.dirty = true;
     }

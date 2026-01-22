@@ -122,7 +122,7 @@ define_class!(
         }
 
         #[unsafe(method(drawRect:))]
-        fn draw_rect(&self, dirty_rect: NSRect) {
+        fn draw_rect(&self, _dirty_rect: NSRect) {
             // Clear the redraw flag
             self.ivars().state.needs_redraw.store(false, Ordering::Relaxed);
 
@@ -131,7 +131,10 @@ define_class!(
 
             if let Some(ref renderer) = *self.ivars().renderer.borrow() {
                 let terminal = self.ivars().terminal.lock();
-                renderer.render(&terminal, dirty_rect);
+                // Always use full view bounds for rendering to avoid artifacts
+                // from partial dirty_rect updates after resize/fullscreen
+                let bounds: NSRect = unsafe { msg_send![self, bounds] };
+                renderer.render(&terminal, bounds);
 
                 // Render IME marked text if present
                 let marked_text = self.ivars().marked_text.borrow();
