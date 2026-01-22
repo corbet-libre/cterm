@@ -1,14 +1,13 @@
 //! cterm-cocoa: Native macOS UI for cterm
 //!
 //! This crate implements the cterm terminal emulator UI using native
-//! macOS AppKit and Metal rendering.
+//! macOS AppKit and CoreGraphics rendering.
 
 pub mod app;
 pub mod cg_renderer;
 pub mod clipboard;
 pub mod dialogs;
 pub mod menu;
-pub mod metal_renderer;
 pub mod preferences;
 pub mod tab_bar;
 pub mod tab_templates;

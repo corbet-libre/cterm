@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
-description = "Native macOS UI for cterm using AppKit and Metal"
+description = "Native macOS UI for cterm using AppKit and CoreGraphics"
 
 [dependencies]
 # Internal crates
@@ -28,9 +28,7 @@ futures.workspace = true
 objc2.workspace = true
 objc2-foundation.workspace = true
 objc2-app-kit.workspace = true
-objc2-metal.workspace = true
 objc2-core-graphics.workspace = true
-objc2-quartz-core.workspace = true
 block2.workspace = true
 dispatch2.workspace = true
 
