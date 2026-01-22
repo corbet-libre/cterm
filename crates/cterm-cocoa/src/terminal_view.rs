@@ -513,6 +513,68 @@ define_class!(
             std::process::abort();
         }
 
+        /// Reset terminal to initial state
+        #[unsafe(method(resetTerminal:))]
+        fn action_reset_terminal(&self, _sender: Option<&objc2::runtime::AnyObject>) {
+            let mut terminal = self.ivars().terminal.lock();
+            terminal.screen_mut().reset();
+            drop(terminal);
+            self.set_needs_display();
+            log::debug!("Terminal reset");
+        }
+
+        /// Clear screen and reset terminal
+        #[unsafe(method(clearAndResetTerminal:))]
+        fn action_clear_and_reset_terminal(&self, _sender: Option<&objc2::runtime::AnyObject>) {
+            use cterm_core::screen::ClearMode;
+            let mut terminal = self.ivars().terminal.lock();
+            terminal.screen_mut().clear(ClearMode::All);
+            terminal.screen_mut().reset();
+            drop(terminal);
+            self.set_needs_display();
+            log::debug!("Terminal cleared and reset");
+        }
+
+        /// Set terminal title via dialog
+        #[unsafe(method(setTerminalTitle:))]
+        fn action_set_terminal_title(&self, _sender: Option<&objc2::runtime::AnyObject>) {
+            use objc2_app_kit::{NSAlert, NSAlertFirstButtonReturn, NSAlertStyle, NSTextField};
+            use objc2_foundation::{NSRect, NSString};
+
+            let mtm = objc2_foundation::MainThreadMarker::from(self);
+
+            // Create alert with text field for input
+            let alert = NSAlert::new(mtm);
+            alert.setMessageText(&NSString::from_str("Set Terminal Title"));
+            alert.setInformativeText(&NSString::from_str("Enter a new title for this terminal:"));
+            alert.setAlertStyle(NSAlertStyle::Informational);
+            alert.addButtonWithTitle(&NSString::from_str("OK"));
+            alert.addButtonWithTitle(&NSString::from_str("Cancel"));
+
+            // Create text field for input
+            let input_frame = NSRect::new(
+                objc2_foundation::NSPoint::new(0.0, 0.0),
+                objc2_foundation::NSSize::new(300.0, 24.0),
+            );
+            let input = unsafe { NSTextField::initWithFrame(mtm.alloc(), input_frame) };
+
+            // Get current title as placeholder
+            if let Some(window) = self.window() {
+                input.setStringValue(&window.title());
+            }
+
+            alert.setAccessoryView(Some(&input));
+
+            // Run modal and check result
+            let response = alert.runModal();
+            if response == NSAlertFirstButtonReturn {
+                let new_title = input.stringValue();
+                if let Some(window) = self.window() {
+                    window.setTitle(&new_title);
+                }
+            }
+        }
+
         #[unsafe(method(triggerRedraw))]
         fn trigger_redraw(&self) {
             self.set_needs_display();
@@ -782,7 +844,7 @@ impl TerminalView {
             cell_height,
             state: state.clone(),
             is_selecting: Cell::new(false),
-            template_name: RefCell::new(None), // TODO: restore template name from state
+            template_name: RefCell::new(None), // Caller should use set_template_name() if needed
             #[cfg(unix)]
             watchdog_fd_id: Cell::new(0),
         });
@@ -998,6 +1060,11 @@ impl TerminalView {
         self.ivars().template_name.borrow().clone()
     }
 
+    /// Set the template name (for restoration from saved state)
+    pub fn set_template_name(&self, name: Option<String>) {
+        *self.ivars().template_name.borrow_mut() = name;
+    }
+
     /// Background thread to read from PTY
     fn read_pty_loop(pty_fd: i32, terminal: Arc<Mutex<Terminal>>, state: Arc<ViewState>) {
         use std::io::Read;
@@ -1033,7 +1100,9 @@ impl TerminalView {
         state.pty_closed.store(true, Ordering::Relaxed);
 
         // Don't close the fd - it's owned by the Pty struct
-        std::mem::forget(file);
+        // Use into_raw_fd() to consume the File without closing the fd
+        use std::os::unix::io::IntoRawFd;
+        let _ = file.into_raw_fd();
     }
 
     /// Handle window resize

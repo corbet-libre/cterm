@@ -172,8 +172,39 @@ define_class!(
                         recovery_fds.len(),
                     );
                     if wants_report {
-                        log::info!("User wants to report crash - TODO: implement crash reporting");
-                        // TODO: Implement actual crash reporting (e.g., open GitHub issue URL)
+                        // Open GitHub issues page for crash reporting
+                        let title = format!("Crash report (signal {})", signal);
+                        let body = format!(
+                            "## Crash Details\n\n- Signal: {}\n- Previous PID: {}\n- Recovered terminals: {}\n\n## Description\n\nPlease describe what you were doing when the crash occurred:\n\n",
+                            signal, pid, recovery_fds.len()
+                        );
+                        // Simple URL encoding for the query parameters
+                        fn url_encode(s: &str) -> String {
+                            let mut result = String::with_capacity(s.len() * 3);
+                            for c in s.chars() {
+                                match c {
+                                    'A'..='Z' | 'a'..='z' | '0'..='9' | '-' | '_' | '.' | '~' => result.push(c),
+                                    ' ' => result.push('+'),
+                                    _ => {
+                                        for byte in c.to_string().as_bytes() {
+                                            result.push_str(&format!("%{:02X}", byte));
+                                        }
+                                    }
+                                }
+                            }
+                            result
+                        }
+                        let url_str = format!(
+                            "https://github.com/KarpelesLab/cterm/issues/new?title={}&body={}",
+                            url_encode(&title),
+                            url_encode(&body)
+                        );
+                        if let Some(url) = objc2_foundation::NSURL::URLWithString(&NSString::from_str(&url_str)) {
+                            unsafe {
+                                let workspace = objc2_app_kit::NSWorkspace::sharedWorkspace();
+                                workspace.openURL(&url);
+                            }
+                        }
                     }
                 }
 
@@ -190,6 +221,10 @@ define_class!(
                     if let Some(tab_state) = state_map.get(&recovered.id) {
                         if let Some(terminal_view) = window.active_terminal() {
                             terminal_view.restore_display_state(&tab_state.terminal);
+                            // Restore template name if present
+                            if tab_state.template_name.is_some() {
+                                terminal_view.set_template_name(tab_state.template_name.clone());
+                            }
                             log::info!(
                                 "Restored display state for terminal (watchdog_fd_id={})",
                                 recovered.id
@@ -373,6 +408,7 @@ impl AppDelegate {
                     );
                     tab_state.terminal = terminal_state;
                     tab_state.title = window.title().to_string();
+                    tab_state.template_name = terminal_view.template_name();
 
                     window_state.tabs.push(tab_state);
                 }
@@ -410,16 +446,14 @@ impl AppDelegate {
         let interval = 5.0;
 
         unsafe {
-            let timer = NSTimer::scheduledTimerWithTimeInterval_target_selector_userInfo_repeats(
+            // scheduledTimer... automatically adds to the current run loop which retains it
+            let _timer = NSTimer::scheduledTimerWithTimeInterval_target_selector_userInfo_repeats(
                 interval,
                 self,
                 sel!(saveStateTimer:),
                 None,
                 true,
             );
-
-            // Keep timer alive by adding to run loop (it's already added by scheduledTimer...)
-            let _ = timer;
         }
 
         log::info!("Started crash state save timer (interval: {}s)", interval);

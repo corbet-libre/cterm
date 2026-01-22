@@ -86,6 +86,8 @@ pub struct TabUpgradeState {
     pub title: String,
     /// Tab color (if sticky tab)
     pub color: Option<String>,
+    /// Template name (for sticky/unique tabs)
+    pub template_name: Option<String>,
     /// Terminal state
     pub terminal: TerminalUpgradeState,
     /// Index into the FD array for this tab's PTY
@@ -108,6 +110,7 @@ impl TabUpgradeState {
             id,
             title: String::new(),
             color: None,
+            template_name: None,
             terminal: TerminalUpgradeState::default(),
             pty_fd_index,
             child_pid,
@@ -128,6 +131,7 @@ impl TabUpgradeState {
             id,
             title: String::new(),
             color: None,
+            template_name: None,
             terminal: TerminalUpgradeState::default(),
             pty_fd_index,
             child_pid,
