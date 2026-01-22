@@ -108,6 +108,9 @@ pub struct AppDelegateIvars {
     config: Config,
     theme: Theme,
     windows: std::cell::RefCell<Vec<Retained<CtermWindow>>>,
+    /// Hash of last saved crash state (to avoid redundant writes)
+    #[cfg(unix)]
+    last_state_hash: std::cell::Cell<u64>,
 }
 
 define_class!(
@@ -333,6 +336,8 @@ impl AppDelegate {
             config,
             theme,
             windows: std::cell::RefCell::new(Vec::new()),
+            #[cfg(unix)]
+            last_state_hash: std::cell::Cell::new(0),
         });
         unsafe { msg_send![super(this), init] }
     }
@@ -424,11 +429,25 @@ impl AppDelegate {
             return;
         }
 
+        // Compute a simple hash of the state to avoid redundant writes
+        // We hash the debug representation which includes all fields
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        format!("{:?}", upgrade_state).hash(&mut hasher);
+        let state_hash = hasher.finish();
+
+        // Skip if state hasn't changed
+        let last_hash = self.ivars().last_state_hash.get();
+        if state_hash == last_hash {
+            return;
+        }
+
         let crash_state = CrashState::new(upgrade_state);
 
         if let Err(e) = write_crash_state(&crash_state) {
             log::error!("Failed to save crash state: {}", e);
         } else {
+            self.ivars().last_state_hash.set(state_hash);
             log::trace!(
                 "Saved crash state: {} windows",
                 crash_state.state.windows.len()
