@@ -297,16 +297,17 @@ impl NotificationBar {
     }
 
     /// Set the action target for all buttons (call after adding to view hierarchy)
-    pub fn set_action_target(&self, target: &NSView) {
+    /// Uses raw msg_send! to preserve the target's actual type information
+    pub fn set_action_target<T: objc2::Message>(&self, target: &T) {
         unsafe {
             if let Some(ref button) = *self.ivars().save_button.borrow() {
-                button.setTarget(Some(target));
+                let _: () = msg_send![button, setTarget: target];
             }
             if let Some(ref button) = *self.ivars().save_as_button.borrow() {
-                button.setTarget(Some(target));
+                let _: () = msg_send![button, setTarget: target];
             }
             if let Some(ref button) = *self.ivars().discard_button.borrow() {
-                button.setTarget(Some(target));
+                let _: () = msg_send![button, setTarget: target];
             }
         }
     }

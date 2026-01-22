@@ -742,10 +742,9 @@ define_class!(
         /// Notification bar save action
         #[unsafe(method(saveFile:))]
         fn save_file(&self, _sender: Option<&objc2::runtime::AnyObject>) {
-            if let Some(ref bar) = *self.ivars().notification_bar.borrow() {
-                let file_id = bar.file_id();
-                if file_id > 0 {
-                    self.handle_file_save(file_id);
+            if self.ivars().file_manager.borrow().has_pending() {
+                if let Some(ref bar) = *self.ivars().notification_bar.borrow() {
+                    self.handle_file_save(bar.file_id());
                 }
             }
         }
@@ -753,10 +752,9 @@ define_class!(
         /// Notification bar save as action
         #[unsafe(method(saveFileAs:))]
         fn save_file_as(&self, _sender: Option<&objc2::runtime::AnyObject>) {
-            if let Some(ref bar) = *self.ivars().notification_bar.borrow() {
-                let file_id = bar.file_id();
-                if file_id > 0 {
-                    self.handle_file_save_as(file_id);
+            if self.ivars().file_manager.borrow().has_pending() {
+                if let Some(ref bar) = *self.ivars().notification_bar.borrow() {
+                    self.handle_file_save_as(bar.file_id());
                 }
             }
         }
@@ -764,10 +762,9 @@ define_class!(
         /// Notification bar discard action
         #[unsafe(method(discardFile:))]
         fn discard_file(&self, _sender: Option<&objc2::runtime::AnyObject>) {
-            if let Some(ref bar) = *self.ivars().notification_bar.borrow() {
-                let file_id = bar.file_id();
-                if file_id > 0 {
-                    self.handle_file_discard(file_id);
+            if self.ivars().file_manager.borrow().has_pending() {
+                if let Some(ref bar) = *self.ivars().notification_bar.borrow() {
+                    self.handle_file_discard(bar.file_id());
                 }
             }
         }
