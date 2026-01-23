@@ -10,8 +10,8 @@ use objc2::runtime::AnyObject;
 use objc2::{define_class, msg_send, sel, DefinedClass, MainThreadOnly};
 use objc2_app_kit::{
     NSButton, NSControlTextEditingDelegate, NSLayoutAttribute, NSPopUpButton, NSStackView,
-    NSStackViewGravity, NSTextField, NSTextFieldDelegate, NSUserInterfaceLayoutOrientation,
-    NSWindow, NSWindowStyleMask,
+    NSStackViewGravity, NSTabView, NSTabViewItem, NSTextField, NSTextFieldDelegate,
+    NSUserInterfaceLayoutOrientation, NSWindow, NSWindowStyleMask,
 };
 use objc2_foundation::{
     MainThreadMarker, NSNotification, NSObjectProtocol, NSPoint, NSRect, NSSize, NSString,
@@ -173,7 +173,7 @@ define_class!(
 impl TabTemplatesWindow {
     /// Create and show the tab templates window
     pub fn new(mtm: MainThreadMarker, templates: Vec<StickyTabConfig>) -> Retained<Self> {
-        let content_rect = NSRect::new(NSPoint::new(200.0, 200.0), NSSize::new(550.0, 800.0));
+        let content_rect = NSRect::new(NSPoint::new(200.0, 200.0), NSSize::new(500.0, 480.0));
 
         let style_mask =
             NSWindowStyleMask::Titled | NSWindowStyleMask::Closable | NSWindowStyleMask::Resizable;
@@ -245,21 +245,21 @@ impl TabTemplatesWindow {
         // Create main vertical stack
         let main_stack = unsafe { NSStackView::new(mtm) };
         main_stack.setOrientation(NSUserInterfaceLayoutOrientation::Vertical);
-        main_stack.setSpacing(15.0);
+        main_stack.setSpacing(10.0);
         main_stack.setAlignment(NSLayoutAttribute::Leading);
         unsafe {
             main_stack.setEdgeInsets(objc2_foundation::NSEdgeInsets {
-                top: 20.0,
-                left: 20.0,
-                bottom: 20.0,
-                right: 20.0,
+                top: 15.0,
+                left: 15.0,
+                bottom: 15.0,
+                right: 15.0,
             });
         }
 
         // Template selector row
         let selector_row = unsafe { NSStackView::new(mtm) };
         selector_row.setOrientation(NSUserInterfaceLayoutOrientation::Horizontal);
-        selector_row.setSpacing(10.0);
+        selector_row.setSpacing(8.0);
 
         let selector_label =
             unsafe { NSTextField::labelWithString(&NSString::from_str("Template:"), mtm) };
@@ -317,239 +317,20 @@ impl TabTemplatesWindow {
 
         main_stack.addView_inGravity(&selector_row, NSStackViewGravity::Top);
 
-        // Separator
-        let separator = unsafe { objc2_app_kit::NSBox::new(mtm) };
-        unsafe { separator.setBoxType(objc2_app_kit::NSBoxType::Separator) };
-        main_stack.addView_inGravity(&separator, NSStackViewGravity::Top);
+        // Create tab view
+        let tab_view = NSTabView::new(mtm);
 
-        // Name field
-        let name_row = self.create_field_row(mtm, "Name:", 250.0);
-        main_stack.addView_inGravity(&name_row.0, NSStackViewGravity::Top);
-        *self.ivars().name_field.borrow_mut() = Some(name_row.1);
+        // Create and add tabs
+        let general_tab = self.create_general_tab(mtm);
+        tab_view.addTabViewItem(&general_tab);
 
-        // Command field
-        let command_row = self.create_field_row(mtm, "Command:", 250.0);
-        main_stack.addView_inGravity(&command_row.0, NSStackViewGravity::Top);
-        *self.ivars().command_field.borrow_mut() = Some(command_row.1);
+        let docker_tab = self.create_docker_tab(mtm);
+        tab_view.addTabViewItem(&docker_tab);
 
-        // Args field
-        let args_row = self.create_field_row(mtm, "Arguments:", 250.0);
-        main_stack.addView_inGravity(&args_row.0, NSStackViewGravity::Top);
-        *self.ivars().args_field.borrow_mut() = Some(args_row.1);
+        let remote_tab = self.create_remote_tab(mtm);
+        tab_view.addTabViewItem(&remote_tab);
 
-        // Path field
-        let path_row = self.create_field_row(mtm, "Working Dir:", 250.0);
-        main_stack.addView_inGravity(&path_row.0, NSStackViewGravity::Top);
-        *self.ivars().path_field.borrow_mut() = Some(path_row.1);
-
-        // Color field
-        let color_row = self.create_field_row(mtm, "Tab Color:", 120.0);
-        main_stack.addView_inGravity(&color_row.0, NSStackViewGravity::Top);
-        *self.ivars().color_field.borrow_mut() = Some(color_row.1);
-
-        // Theme field
-        let theme_row = self.create_field_row(mtm, "Theme:", 150.0);
-        main_stack.addView_inGravity(&theme_row.0, NSStackViewGravity::Top);
-        *self.ivars().theme_field.borrow_mut() = Some(theme_row.1);
-
-        // Checkboxes
-        let unique_cb = unsafe {
-            NSButton::checkboxWithTitle_target_action(
-                &NSString::from_str("Unique (only one instance allowed)"),
-                Some(self),
-                Some(sel!(checkboxChanged:)),
-                mtm,
-            )
-        };
-        main_stack.addView_inGravity(&unique_cb, NSStackViewGravity::Top);
-        *self.ivars().unique_checkbox.borrow_mut() = Some(unique_cb);
-
-        let auto_start_cb = unsafe {
-            NSButton::checkboxWithTitle_target_action(
-                &NSString::from_str("Auto-start on launch"),
-                Some(self),
-                Some(sel!(checkboxChanged:)),
-                mtm,
-            )
-        };
-        main_stack.addView_inGravity(&auto_start_cb, NSStackViewGravity::Top);
-        *self.ivars().auto_start_checkbox.borrow_mut() = Some(auto_start_cb);
-
-        let keep_open_cb = unsafe {
-            NSButton::checkboxWithTitle_target_action(
-                &NSString::from_str("Keep tab open after exit"),
-                Some(self),
-                Some(sel!(checkboxChanged:)),
-                mtm,
-            )
-        };
-        main_stack.addView_inGravity(&keep_open_cb, NSStackViewGravity::Top);
-        *self.ivars().keep_open_checkbox.borrow_mut() = Some(keep_open_cb);
-
-        // Docker section separator
-        let docker_separator = unsafe { objc2_app_kit::NSBox::new(mtm) };
-        unsafe { docker_separator.setBoxType(objc2_app_kit::NSBoxType::Separator) };
-        main_stack.addView_inGravity(&docker_separator, NSStackViewGravity::Top);
-
-        // Docker section label
-        let docker_label = unsafe {
-            NSTextField::labelWithString(&NSString::from_str("Docker Configuration"), mtm)
-        };
-        unsafe {
-            docker_label.setFont(Some(&objc2_app_kit::NSFont::boldSystemFontOfSize(
-                objc2_app_kit::NSFont::systemFontSize(),
-            )))
-        };
-        main_stack.addView_inGravity(&docker_label, NSStackViewGravity::Top);
-
-        // Docker mode dropdown
-        let docker_mode_row = unsafe { NSStackView::new(mtm) };
-        docker_mode_row.setOrientation(NSUserInterfaceLayoutOrientation::Horizontal);
-        docker_mode_row.setSpacing(10.0);
-
-        let docker_mode_label =
-            unsafe { NSTextField::labelWithString(&NSString::from_str("Docker Mode:"), mtm) };
-        unsafe { docker_mode_label.setFrameSize(NSSize::new(100.0, 22.0)) };
-
-        let docker_mode_popup = unsafe { NSPopUpButton::new(mtm) };
-        docker_mode_popup.removeAllItems();
-        docker_mode_popup.addItemWithTitle(&NSString::from_str("None (Regular Tab)"));
-        docker_mode_popup.addItemWithTitle(&NSString::from_str("Exec (Connect to Container)"));
-        docker_mode_popup.addItemWithTitle(&NSString::from_str("Run (Start Container)"));
-        docker_mode_popup.addItemWithTitle(&NSString::from_str("DevContainer (With Mounts)"));
-        unsafe { docker_mode_popup.setTarget(Some(self)) };
-        unsafe { docker_mode_popup.setAction(Some(sel!(dockerModeChanged:))) };
-
-        docker_mode_row.addView_inGravity(&docker_mode_label, NSStackViewGravity::Leading);
-        docker_mode_row.addView_inGravity(&docker_mode_popup, NSStackViewGravity::Leading);
-        main_stack.addView_inGravity(&docker_mode_row, NSStackViewGravity::Top);
-        *self.ivars().docker_mode_popup.borrow_mut() = Some(docker_mode_popup);
-
-        // Container field (for Exec mode)
-        let container_row = self.create_field_row(mtm, "Container:", 200.0);
-        main_stack.addView_inGravity(&container_row.0, NSStackViewGravity::Top);
-        *self.ivars().docker_container_field.borrow_mut() = Some(container_row.1);
-
-        // Image field (for Run/DevContainer modes)
-        let image_row = self.create_field_row(mtm, "Image:", 200.0);
-        main_stack.addView_inGravity(&image_row.0, NSStackViewGravity::Top);
-        *self.ivars().docker_image_field.borrow_mut() = Some(image_row.1);
-
-        // Shell field
-        let shell_row = self.create_field_row(mtm, "Shell:", 150.0);
-        main_stack.addView_inGravity(&shell_row.0, NSStackViewGravity::Top);
-        *self.ivars().docker_shell_field.borrow_mut() = Some(shell_row.1);
-
-        // Docker checkboxes
-        let docker_auto_remove_cb = unsafe {
-            NSButton::checkboxWithTitle_target_action(
-                &NSString::from_str("Auto-remove container on exit"),
-                Some(self),
-                Some(sel!(checkboxChanged:)),
-                mtm,
-            )
-        };
-        main_stack.addView_inGravity(&docker_auto_remove_cb, NSStackViewGravity::Top);
-        *self.ivars().docker_auto_remove_checkbox.borrow_mut() = Some(docker_auto_remove_cb);
-
-        // Project directory field (for DevContainer mode - reads .devcontainer/devcontainer.json)
-        let project_dir_row = self.create_field_row(mtm, "Project Dir:", 250.0);
-        main_stack.addView_inGravity(&project_dir_row.0, NSStackViewGravity::Top);
-        *self.ivars().docker_project_dir_field.borrow_mut() = Some(project_dir_row.1);
-
-        // Status label for devcontainer detection
-        let status_label = unsafe { NSTextField::labelWithString(&NSString::from_str(""), mtm) };
-        unsafe {
-            status_label.setTextColor(Some(&objc2_app_kit::NSColor::secondaryLabelColor()));
-        }
-        main_stack.addView_inGravity(&status_label, NSStackViewGravity::Top);
-        *self.ivars().docker_status_label.borrow_mut() = Some(status_label);
-
-        // SSH section separator
-        let ssh_separator = unsafe { objc2_app_kit::NSBox::new(mtm) };
-        unsafe { ssh_separator.setBoxType(objc2_app_kit::NSBoxType::Separator) };
-        main_stack.addView_inGravity(&ssh_separator, NSStackViewGravity::Top);
-
-        // SSH section label
-        let ssh_label =
-            unsafe { NSTextField::labelWithString(&NSString::from_str("SSH Configuration"), mtm) };
-        unsafe {
-            ssh_label.setFont(Some(&objc2_app_kit::NSFont::boldSystemFontOfSize(
-                objc2_app_kit::NSFont::systemFontSize(),
-            )))
-        };
-        main_stack.addView_inGravity(&ssh_label, NSStackViewGravity::Top);
-
-        // SSH enabled checkbox
-        let ssh_enabled_cb = unsafe {
-            NSButton::checkboxWithTitle_target_action(
-                &NSString::from_str("Enable SSH (remote connection)"),
-                Some(self),
-                Some(sel!(sshEnabledChanged:)),
-                mtm,
-            )
-        };
-        main_stack.addView_inGravity(&ssh_enabled_cb, NSStackViewGravity::Top);
-        *self.ivars().ssh_enabled_checkbox.borrow_mut() = Some(ssh_enabled_cb);
-
-        // SSH Host field
-        let ssh_host_row = self.create_field_row(mtm, "Host:", 200.0);
-        main_stack.addView_inGravity(&ssh_host_row.0, NSStackViewGravity::Top);
-        *self.ivars().ssh_host_field.borrow_mut() = Some(ssh_host_row.1);
-
-        // SSH Port field
-        let ssh_port_row = self.create_field_row(mtm, "Port:", 80.0);
-        main_stack.addView_inGravity(&ssh_port_row.0, NSStackViewGravity::Top);
-        *self.ivars().ssh_port_field.borrow_mut() = Some(ssh_port_row.1);
-
-        // SSH Username field
-        let ssh_username_row = self.create_field_row(mtm, "Username:", 150.0);
-        main_stack.addView_inGravity(&ssh_username_row.0, NSStackViewGravity::Top);
-        *self.ivars().ssh_username_field.borrow_mut() = Some(ssh_username_row.1);
-
-        // SSH Identity file field
-        let ssh_identity_row = self.create_field_row(mtm, "Identity File:", 250.0);
-        main_stack.addView_inGravity(&ssh_identity_row.0, NSStackViewGravity::Top);
-        *self.ivars().ssh_identity_field.borrow_mut() = Some(ssh_identity_row.1);
-
-        // SSH Jump host field
-        let ssh_jump_row = self.create_field_row(mtm, "Jump Host:", 200.0);
-        main_stack.addView_inGravity(&ssh_jump_row.0, NSStackViewGravity::Top);
-        *self.ivars().ssh_jump_host_field.borrow_mut() = Some(ssh_jump_row.1);
-
-        // SSH Local forwards field
-        let ssh_local_fwd_row = self.create_field_row(mtm, "Local Fwd:", 200.0);
-        main_stack.addView_inGravity(&ssh_local_fwd_row.0, NSStackViewGravity::Top);
-        *self.ivars().ssh_local_forward_field.borrow_mut() = Some(ssh_local_fwd_row.1);
-
-        // SSH Remote command field
-        let ssh_remote_cmd_row = self.create_field_row(mtm, "Remote Cmd:", 200.0);
-        main_stack.addView_inGravity(&ssh_remote_cmd_row.0, NSStackViewGravity::Top);
-        *self.ivars().ssh_remote_command_field.borrow_mut() = Some(ssh_remote_cmd_row.1);
-
-        // SSH X11 forwarding checkbox
-        let ssh_x11_cb = unsafe {
-            NSButton::checkboxWithTitle_target_action(
-                &NSString::from_str("X11 Forwarding (-X)"),
-                Some(self),
-                Some(sel!(checkboxChanged:)),
-                mtm,
-            )
-        };
-        main_stack.addView_inGravity(&ssh_x11_cb, NSStackViewGravity::Top);
-        *self.ivars().ssh_x11_forward_checkbox.borrow_mut() = Some(ssh_x11_cb);
-
-        // SSH Agent forwarding checkbox
-        let ssh_agent_cb = unsafe {
-            NSButton::checkboxWithTitle_target_action(
-                &NSString::from_str("Agent Forwarding (-A)"),
-                Some(self),
-                Some(sel!(checkboxChanged:)),
-                mtm,
-            )
-        };
-        main_stack.addView_inGravity(&ssh_agent_cb, NSStackViewGravity::Top);
-        *self.ivars().ssh_agent_forward_checkbox.borrow_mut() = Some(ssh_agent_cb);
+        main_stack.addView_inGravity(&tab_view, NSStackViewGravity::Top);
 
         // Bottom buttons
         let bottom_stack = unsafe { NSStackView::new(mtm) };
@@ -581,6 +362,267 @@ impl TabTemplatesWindow {
         main_stack.addView_inGravity(&bottom_stack, NSStackViewGravity::Bottom);
 
         self.setContentView(Some(&main_stack));
+    }
+
+    fn create_general_tab(&self, mtm: MainThreadMarker) -> Retained<NSTabViewItem> {
+        let tab = NSTabViewItem::new();
+        tab.setLabel(&NSString::from_str("General"));
+
+        let stack = unsafe { NSStackView::new(mtm) };
+        stack.setOrientation(NSUserInterfaceLayoutOrientation::Vertical);
+        stack.setSpacing(8.0);
+        stack.setAlignment(NSLayoutAttribute::Leading);
+        unsafe {
+            stack.setEdgeInsets(objc2_foundation::NSEdgeInsets {
+                top: 10.0,
+                left: 10.0,
+                bottom: 10.0,
+                right: 10.0,
+            });
+        }
+
+        // Name field
+        let name_row = self.create_field_row(mtm, "Name:", 250.0);
+        stack.addView_inGravity(&name_row.0, NSStackViewGravity::Top);
+        *self.ivars().name_field.borrow_mut() = Some(name_row.1);
+
+        // Command field
+        let command_row = self.create_field_row(mtm, "Command:", 250.0);
+        stack.addView_inGravity(&command_row.0, NSStackViewGravity::Top);
+        *self.ivars().command_field.borrow_mut() = Some(command_row.1);
+
+        // Args field
+        let args_row = self.create_field_row(mtm, "Arguments:", 250.0);
+        stack.addView_inGravity(&args_row.0, NSStackViewGravity::Top);
+        *self.ivars().args_field.borrow_mut() = Some(args_row.1);
+
+        // Path field
+        let path_row = self.create_field_row(mtm, "Working Dir:", 250.0);
+        stack.addView_inGravity(&path_row.0, NSStackViewGravity::Top);
+        *self.ivars().path_field.borrow_mut() = Some(path_row.1);
+
+        // Color field
+        let color_row = self.create_field_row(mtm, "Tab Color:", 120.0);
+        stack.addView_inGravity(&color_row.0, NSStackViewGravity::Top);
+        *self.ivars().color_field.borrow_mut() = Some(color_row.1);
+
+        // Theme field
+        let theme_row = self.create_field_row(mtm, "Theme:", 150.0);
+        stack.addView_inGravity(&theme_row.0, NSStackViewGravity::Top);
+        *self.ivars().theme_field.borrow_mut() = Some(theme_row.1);
+
+        // Checkboxes
+        let unique_cb = unsafe {
+            NSButton::checkboxWithTitle_target_action(
+                &NSString::from_str("Unique (only one instance allowed)"),
+                Some(self),
+                Some(sel!(checkboxChanged:)),
+                mtm,
+            )
+        };
+        stack.addView_inGravity(&unique_cb, NSStackViewGravity::Top);
+        *self.ivars().unique_checkbox.borrow_mut() = Some(unique_cb);
+
+        let auto_start_cb = unsafe {
+            NSButton::checkboxWithTitle_target_action(
+                &NSString::from_str("Auto-start on launch"),
+                Some(self),
+                Some(sel!(checkboxChanged:)),
+                mtm,
+            )
+        };
+        stack.addView_inGravity(&auto_start_cb, NSStackViewGravity::Top);
+        *self.ivars().auto_start_checkbox.borrow_mut() = Some(auto_start_cb);
+
+        let keep_open_cb = unsafe {
+            NSButton::checkboxWithTitle_target_action(
+                &NSString::from_str("Keep tab open after exit"),
+                Some(self),
+                Some(sel!(checkboxChanged:)),
+                mtm,
+            )
+        };
+        stack.addView_inGravity(&keep_open_cb, NSStackViewGravity::Top);
+        *self.ivars().keep_open_checkbox.borrow_mut() = Some(keep_open_cb);
+
+        tab.setView(Some(&stack));
+        tab
+    }
+
+    fn create_docker_tab(&self, mtm: MainThreadMarker) -> Retained<NSTabViewItem> {
+        let tab = NSTabViewItem::new();
+        tab.setLabel(&NSString::from_str("Docker"));
+
+        let stack = unsafe { NSStackView::new(mtm) };
+        stack.setOrientation(NSUserInterfaceLayoutOrientation::Vertical);
+        stack.setSpacing(8.0);
+        stack.setAlignment(NSLayoutAttribute::Leading);
+        unsafe {
+            stack.setEdgeInsets(objc2_foundation::NSEdgeInsets {
+                top: 10.0,
+                left: 10.0,
+                bottom: 10.0,
+                right: 10.0,
+            });
+        }
+
+        // Docker mode dropdown
+        let docker_mode_row = unsafe { NSStackView::new(mtm) };
+        docker_mode_row.setOrientation(NSUserInterfaceLayoutOrientation::Horizontal);
+        docker_mode_row.setSpacing(10.0);
+
+        let docker_mode_label =
+            unsafe { NSTextField::labelWithString(&NSString::from_str("Mode:"), mtm) };
+        unsafe { docker_mode_label.setFrameSize(NSSize::new(100.0, 22.0)) };
+
+        let docker_mode_popup = unsafe { NSPopUpButton::new(mtm) };
+        docker_mode_popup.removeAllItems();
+        docker_mode_popup.addItemWithTitle(&NSString::from_str("None (Regular Tab)"));
+        docker_mode_popup.addItemWithTitle(&NSString::from_str("Exec (Connect to Container)"));
+        docker_mode_popup.addItemWithTitle(&NSString::from_str("Run (Start Container)"));
+        docker_mode_popup.addItemWithTitle(&NSString::from_str("DevContainer (With Mounts)"));
+        unsafe { docker_mode_popup.setTarget(Some(self)) };
+        unsafe { docker_mode_popup.setAction(Some(sel!(dockerModeChanged:))) };
+
+        docker_mode_row.addView_inGravity(&docker_mode_label, NSStackViewGravity::Leading);
+        docker_mode_row.addView_inGravity(&docker_mode_popup, NSStackViewGravity::Leading);
+        stack.addView_inGravity(&docker_mode_row, NSStackViewGravity::Top);
+        *self.ivars().docker_mode_popup.borrow_mut() = Some(docker_mode_popup);
+
+        // Container field (for Exec mode)
+        let container_row = self.create_field_row(mtm, "Container:", 200.0);
+        stack.addView_inGravity(&container_row.0, NSStackViewGravity::Top);
+        *self.ivars().docker_container_field.borrow_mut() = Some(container_row.1);
+
+        // Image field (for Run/DevContainer modes)
+        let image_row = self.create_field_row(mtm, "Image:", 200.0);
+        stack.addView_inGravity(&image_row.0, NSStackViewGravity::Top);
+        *self.ivars().docker_image_field.borrow_mut() = Some(image_row.1);
+
+        // Shell field
+        let shell_row = self.create_field_row(mtm, "Shell:", 150.0);
+        stack.addView_inGravity(&shell_row.0, NSStackViewGravity::Top);
+        *self.ivars().docker_shell_field.borrow_mut() = Some(shell_row.1);
+
+        // Docker auto-remove checkbox
+        let docker_auto_remove_cb = unsafe {
+            NSButton::checkboxWithTitle_target_action(
+                &NSString::from_str("Auto-remove container on exit"),
+                Some(self),
+                Some(sel!(checkboxChanged:)),
+                mtm,
+            )
+        };
+        stack.addView_inGravity(&docker_auto_remove_cb, NSStackViewGravity::Top);
+        *self.ivars().docker_auto_remove_checkbox.borrow_mut() = Some(docker_auto_remove_cb);
+
+        // Project directory field (for DevContainer mode)
+        let project_dir_row = self.create_field_row(mtm, "Project Dir:", 250.0);
+        stack.addView_inGravity(&project_dir_row.0, NSStackViewGravity::Top);
+        *self.ivars().docker_project_dir_field.borrow_mut() = Some(project_dir_row.1);
+
+        // Status label for devcontainer detection
+        let status_label = unsafe { NSTextField::labelWithString(&NSString::from_str(""), mtm) };
+        unsafe {
+            status_label.setTextColor(Some(&objc2_app_kit::NSColor::secondaryLabelColor()));
+        }
+        stack.addView_inGravity(&status_label, NSStackViewGravity::Top);
+        *self.ivars().docker_status_label.borrow_mut() = Some(status_label);
+
+        tab.setView(Some(&stack));
+        tab
+    }
+
+    fn create_remote_tab(&self, mtm: MainThreadMarker) -> Retained<NSTabViewItem> {
+        let tab = NSTabViewItem::new();
+        tab.setLabel(&NSString::from_str("Remote"));
+
+        let stack = unsafe { NSStackView::new(mtm) };
+        stack.setOrientation(NSUserInterfaceLayoutOrientation::Vertical);
+        stack.setSpacing(8.0);
+        stack.setAlignment(NSLayoutAttribute::Leading);
+        unsafe {
+            stack.setEdgeInsets(objc2_foundation::NSEdgeInsets {
+                top: 10.0,
+                left: 10.0,
+                bottom: 10.0,
+                right: 10.0,
+            });
+        }
+
+        // SSH enabled checkbox
+        let ssh_enabled_cb = unsafe {
+            NSButton::checkboxWithTitle_target_action(
+                &NSString::from_str("Enable SSH (remote connection)"),
+                Some(self),
+                Some(sel!(sshEnabledChanged:)),
+                mtm,
+            )
+        };
+        stack.addView_inGravity(&ssh_enabled_cb, NSStackViewGravity::Top);
+        *self.ivars().ssh_enabled_checkbox.borrow_mut() = Some(ssh_enabled_cb);
+
+        // SSH Host field
+        let ssh_host_row = self.create_field_row(mtm, "Host:", 200.0);
+        stack.addView_inGravity(&ssh_host_row.0, NSStackViewGravity::Top);
+        *self.ivars().ssh_host_field.borrow_mut() = Some(ssh_host_row.1);
+
+        // SSH Port field
+        let ssh_port_row = self.create_field_row(mtm, "Port:", 80.0);
+        stack.addView_inGravity(&ssh_port_row.0, NSStackViewGravity::Top);
+        *self.ivars().ssh_port_field.borrow_mut() = Some(ssh_port_row.1);
+
+        // SSH Username field
+        let ssh_username_row = self.create_field_row(mtm, "Username:", 150.0);
+        stack.addView_inGravity(&ssh_username_row.0, NSStackViewGravity::Top);
+        *self.ivars().ssh_username_field.borrow_mut() = Some(ssh_username_row.1);
+
+        // SSH Identity file field
+        let ssh_identity_row = self.create_field_row(mtm, "Identity File:", 250.0);
+        stack.addView_inGravity(&ssh_identity_row.0, NSStackViewGravity::Top);
+        *self.ivars().ssh_identity_field.borrow_mut() = Some(ssh_identity_row.1);
+
+        // SSH Jump host field
+        let ssh_jump_row = self.create_field_row(mtm, "Jump Host:", 200.0);
+        stack.addView_inGravity(&ssh_jump_row.0, NSStackViewGravity::Top);
+        *self.ivars().ssh_jump_host_field.borrow_mut() = Some(ssh_jump_row.1);
+
+        // SSH Local forwards field
+        let ssh_local_fwd_row = self.create_field_row(mtm, "Local Fwd:", 200.0);
+        stack.addView_inGravity(&ssh_local_fwd_row.0, NSStackViewGravity::Top);
+        *self.ivars().ssh_local_forward_field.borrow_mut() = Some(ssh_local_fwd_row.1);
+
+        // SSH Remote command field
+        let ssh_remote_cmd_row = self.create_field_row(mtm, "Remote Cmd:", 200.0);
+        stack.addView_inGravity(&ssh_remote_cmd_row.0, NSStackViewGravity::Top);
+        *self.ivars().ssh_remote_command_field.borrow_mut() = Some(ssh_remote_cmd_row.1);
+
+        // SSH X11 forwarding checkbox
+        let ssh_x11_cb = unsafe {
+            NSButton::checkboxWithTitle_target_action(
+                &NSString::from_str("X11 Forwarding (-X)"),
+                Some(self),
+                Some(sel!(checkboxChanged:)),
+                mtm,
+            )
+        };
+        stack.addView_inGravity(&ssh_x11_cb, NSStackViewGravity::Top);
+        *self.ivars().ssh_x11_forward_checkbox.borrow_mut() = Some(ssh_x11_cb);
+
+        // SSH Agent forwarding checkbox
+        let ssh_agent_cb = unsafe {
+            NSButton::checkboxWithTitle_target_action(
+                &NSString::from_str("Agent Forwarding (-A)"),
+                Some(self),
+                Some(sel!(checkboxChanged:)),
+                mtm,
+            )
+        };
+        stack.addView_inGravity(&ssh_agent_cb, NSStackViewGravity::Top);
+        *self.ivars().ssh_agent_forward_checkbox.borrow_mut() = Some(ssh_agent_cb);
+
+        tab.setView(Some(&stack));
+        tab
     }
 
     fn create_field_row(
@@ -1346,7 +1388,7 @@ impl TabTemplatesWindow {
             .collect()
     }
 
-    /// Update visibility of SSH fields based on SSH enabled state
+    /// Update enabled state of SSH fields based on SSH enabled checkbox
     fn update_ssh_fields_visibility(&self) {
         let ssh_enabled = self
             .ivars()
@@ -1356,64 +1398,33 @@ impl TabTemplatesWindow {
             .map(|cb| cb.state() != 0)
             .unwrap_or(false);
 
-        // Show/hide all SSH fields based on enabled state
+        // Enable/disable all SSH fields based on enabled state
         if let Some(field) = self.ivars().ssh_host_field.borrow().as_ref() {
             field.setEnabled(ssh_enabled);
-            if let Some(superview) = unsafe { field.superview() } {
-                superview.setHidden(!ssh_enabled);
-            }
         }
-
         if let Some(field) = self.ivars().ssh_port_field.borrow().as_ref() {
             field.setEnabled(ssh_enabled);
-            if let Some(superview) = unsafe { field.superview() } {
-                superview.setHidden(!ssh_enabled);
-            }
         }
-
         if let Some(field) = self.ivars().ssh_username_field.borrow().as_ref() {
             field.setEnabled(ssh_enabled);
-            if let Some(superview) = unsafe { field.superview() } {
-                superview.setHidden(!ssh_enabled);
-            }
         }
-
         if let Some(field) = self.ivars().ssh_identity_field.borrow().as_ref() {
             field.setEnabled(ssh_enabled);
-            if let Some(superview) = unsafe { field.superview() } {
-                superview.setHidden(!ssh_enabled);
-            }
         }
-
         if let Some(field) = self.ivars().ssh_jump_host_field.borrow().as_ref() {
             field.setEnabled(ssh_enabled);
-            if let Some(superview) = unsafe { field.superview() } {
-                superview.setHidden(!ssh_enabled);
-            }
         }
-
         if let Some(field) = self.ivars().ssh_local_forward_field.borrow().as_ref() {
             field.setEnabled(ssh_enabled);
-            if let Some(superview) = unsafe { field.superview() } {
-                superview.setHidden(!ssh_enabled);
-            }
         }
-
         if let Some(field) = self.ivars().ssh_remote_command_field.borrow().as_ref() {
             field.setEnabled(ssh_enabled);
-            if let Some(superview) = unsafe { field.superview() } {
-                superview.setHidden(!ssh_enabled);
-            }
         }
-
         if let Some(cb) = self.ivars().ssh_x11_forward_checkbox.borrow().as_ref() {
             cb.setEnabled(ssh_enabled);
-            cb.setHidden(!ssh_enabled);
         }
-
         if let Some(cb) = self.ivars().ssh_agent_forward_checkbox.borrow().as_ref() {
             cb.setEnabled(ssh_enabled);
-            cb.setHidden(!ssh_enabled);
         }
     }
 
