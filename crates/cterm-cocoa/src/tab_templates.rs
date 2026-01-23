@@ -39,9 +39,7 @@ pub struct TabTemplatesWindowIvars {
     docker_image_field: RefCell<Option<Retained<NSTextField>>>,
     docker_shell_field: RefCell<Option<Retained<NSTextField>>>,
     docker_auto_remove_checkbox: RefCell<Option<Retained<NSButton>>>,
-    docker_mount_claude_checkbox: RefCell<Option<Retained<NSButton>>>,
-    docker_mount_ssh_checkbox: RefCell<Option<Retained<NSButton>>>,
-    docker_mount_gitconfig_checkbox: RefCell<Option<Retained<NSButton>>>,
+    docker_project_dir_field: RefCell<Option<Retained<NSTextField>>>,
 }
 
 define_class!(
@@ -161,9 +159,7 @@ impl TabTemplatesWindow {
             docker_image_field: RefCell::new(None),
             docker_shell_field: RefCell::new(None),
             docker_auto_remove_checkbox: RefCell::new(None),
-            docker_mount_claude_checkbox: RefCell::new(None),
-            docker_mount_ssh_checkbox: RefCell::new(None),
-            docker_mount_gitconfig_checkbox: RefCell::new(None),
+            docker_project_dir_field: RefCell::new(None),
         });
 
         let this: Retained<Self> = unsafe {
@@ -403,40 +399,10 @@ impl TabTemplatesWindow {
         main_stack.addView_inGravity(&docker_auto_remove_cb, NSStackViewGravity::Top);
         *self.ivars().docker_auto_remove_checkbox.borrow_mut() = Some(docker_auto_remove_cb);
 
-        // Mount checkboxes (for DevContainer mode)
-        let docker_mount_claude_cb = unsafe {
-            NSButton::checkboxWithTitle_target_action(
-                &NSString::from_str("Mount ~/.claude (Claude credentials)"),
-                Some(self),
-                Some(sel!(checkboxChanged:)),
-                mtm,
-            )
-        };
-        main_stack.addView_inGravity(&docker_mount_claude_cb, NSStackViewGravity::Top);
-        *self.ivars().docker_mount_claude_checkbox.borrow_mut() = Some(docker_mount_claude_cb);
-
-        let docker_mount_ssh_cb = unsafe {
-            NSButton::checkboxWithTitle_target_action(
-                &NSString::from_str("Mount ~/.ssh (SSH keys)"),
-                Some(self),
-                Some(sel!(checkboxChanged:)),
-                mtm,
-            )
-        };
-        main_stack.addView_inGravity(&docker_mount_ssh_cb, NSStackViewGravity::Top);
-        *self.ivars().docker_mount_ssh_checkbox.borrow_mut() = Some(docker_mount_ssh_cb);
-
-        let docker_mount_gitconfig_cb = unsafe {
-            NSButton::checkboxWithTitle_target_action(
-                &NSString::from_str("Mount ~/.gitconfig (Git config)"),
-                Some(self),
-                Some(sel!(checkboxChanged:)),
-                mtm,
-            )
-        };
-        main_stack.addView_inGravity(&docker_mount_gitconfig_cb, NSStackViewGravity::Top);
-        *self.ivars().docker_mount_gitconfig_checkbox.borrow_mut() =
-            Some(docker_mount_gitconfig_cb);
+        // Project directory field (for DevContainer mode - reads .devcontainer/devcontainer.json)
+        let project_dir_row = self.create_field_row(mtm, "Project Dir:", 250.0);
+        main_stack.addView_inGravity(&project_dir_row.0, NSStackViewGravity::Top);
+        *self.ivars().docker_project_dir_field.borrow_mut() = Some(project_dir_row.1);
 
         // Bottom buttons
         let bottom_stack = unsafe { NSStackView::new(mtm) };
@@ -588,36 +554,14 @@ impl TabTemplatesWindow {
                 cb.setState(if auto_remove { 1 } else { 0 });
             }
 
-            if let Some(cb) = self.ivars().docker_mount_claude_checkbox.borrow().as_ref() {
-                let mount = template
+            if let Some(field) = self.ivars().docker_project_dir_field.borrow().as_ref() {
+                let project_dir = template
                     .docker
                     .as_ref()
-                    .map(|d| d.mount_claude_config)
-                    .unwrap_or(true);
-                cb.setState(if mount { 1 } else { 0 });
-            }
-
-            if let Some(cb) = self.ivars().docker_mount_ssh_checkbox.borrow().as_ref() {
-                let mount = template
-                    .docker
-                    .as_ref()
-                    .map(|d| d.mount_ssh)
-                    .unwrap_or(false);
-                cb.setState(if mount { 1 } else { 0 });
-            }
-
-            if let Some(cb) = self
-                .ivars()
-                .docker_mount_gitconfig_checkbox
-                .borrow()
-                .as_ref()
-            {
-                let mount = template
-                    .docker
-                    .as_ref()
-                    .map(|d| d.mount_gitconfig)
-                    .unwrap_or(true);
-                cb.setState(if mount { 1 } else { 0 });
+                    .and_then(|d| d.project_dir.as_ref())
+                    .map(|p| p.to_string_lossy().to_string())
+                    .unwrap_or_default();
+                field.setStringValue(&NSString::from_str(&project_dir));
             }
 
             self.update_docker_fields_visibility();
@@ -670,19 +614,8 @@ impl TabTemplatesWindow {
         if let Some(cb) = self.ivars().docker_auto_remove_checkbox.borrow().as_ref() {
             cb.setState(1); // Default to true
         }
-        if let Some(cb) = self.ivars().docker_mount_claude_checkbox.borrow().as_ref() {
-            cb.setState(1); // Default to true
-        }
-        if let Some(cb) = self.ivars().docker_mount_ssh_checkbox.borrow().as_ref() {
-            cb.setState(0);
-        }
-        if let Some(cb) = self
-            .ivars()
-            .docker_mount_gitconfig_checkbox
-            .borrow()
-            .as_ref()
-        {
-            cb.setState(1); // Default to true
+        if let Some(field) = self.ivars().docker_project_dir_field.borrow().as_ref() {
+            field.setStringValue(&empty);
         }
     }
 
@@ -770,21 +703,13 @@ impl TabTemplatesWindow {
                         docker.auto_remove = cb.state() != 0;
                     }
 
-                    if let Some(cb) = self.ivars().docker_mount_claude_checkbox.borrow().as_ref() {
-                        docker.mount_claude_config = cb.state() != 0;
-                    }
-
-                    if let Some(cb) = self.ivars().docker_mount_ssh_checkbox.borrow().as_ref() {
-                        docker.mount_ssh = cb.state() != 0;
-                    }
-
-                    if let Some(cb) = self
-                        .ivars()
-                        .docker_mount_gitconfig_checkbox
-                        .borrow()
-                        .as_ref()
-                    {
-                        docker.mount_gitconfig = cb.state() != 0;
+                    if let Some(field) = self.ivars().docker_project_dir_field.borrow().as_ref() {
+                        let project_dir = field.stringValue().to_string();
+                        docker.project_dir = if project_dir.is_empty() {
+                            None
+                        } else {
+                            Some(PathBuf::from(project_dir))
+                        };
                     }
                 }
             }
@@ -913,23 +838,12 @@ impl TabTemplatesWindow {
             cb.setHidden(!is_run_or_devcontainer);
         }
 
-        // Show/hide mount checkboxes (only for DevContainer)
-        if let Some(cb) = self.ivars().docker_mount_claude_checkbox.borrow().as_ref() {
-            cb.setEnabled(is_devcontainer);
-            cb.setHidden(!is_devcontainer);
-        }
-        if let Some(cb) = self.ivars().docker_mount_ssh_checkbox.borrow().as_ref() {
-            cb.setEnabled(is_devcontainer);
-            cb.setHidden(!is_devcontainer);
-        }
-        if let Some(cb) = self
-            .ivars()
-            .docker_mount_gitconfig_checkbox
-            .borrow()
-            .as_ref()
-        {
-            cb.setEnabled(is_devcontainer);
-            cb.setHidden(!is_devcontainer);
+        // Show/hide project directory field (only for DevContainer - reads .devcontainer/devcontainer.json)
+        if let Some(field) = self.ivars().docker_project_dir_field.borrow().as_ref() {
+            field.setEnabled(is_devcontainer);
+            if let Some(superview) = unsafe { field.superview() } {
+                superview.setHidden(!is_devcontainer);
+            }
         }
     }
 

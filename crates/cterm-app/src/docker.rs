@@ -1,7 +1,10 @@
 //! Docker utility functions for container/image management
 
 use std::fmt;
+use std::path::Path;
 use std::process::Command;
+
+use serde::Deserialize;
 
 /// Error type for Docker operations
 #[derive(Debug)]
@@ -193,22 +196,178 @@ pub fn build_run_command(
     ("docker".to_string(), args)
 }
 
+/// Devcontainer.json configuration (subset of fields we support)
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct DevcontainerConfig {
+    /// Docker image to use
+    pub image: Option<String>,
+    /// Dockerfile to build (relative to .devcontainer)
+    pub dockerfile: Option<String>,
+    /// Build context (relative to .devcontainer)
+    pub context: Option<String>,
+    /// Working directory inside container
+    pub workspace_folder: Option<String>,
+    /// Container user
+    pub container_user: Option<String>,
+    /// Remote user (user to run as)
+    pub remote_user: Option<String>,
+    /// Mounts to add
+    #[serde(default)]
+    pub mounts: Vec<String>,
+    /// Docker run arguments
+    #[serde(default)]
+    pub run_args: Vec<String>,
+    /// Environment variables
+    #[serde(default)]
+    pub container_env: std::collections::HashMap<String, String>,
+    /// Features to install
+    #[serde(default)]
+    pub features: serde_json::Value,
+    /// Post-create command
+    pub post_create_command: Option<serde_json::Value>,
+    /// Post-start command
+    pub post_start_command: Option<serde_json::Value>,
+}
+
+/// Load devcontainer.json from a project directory
+pub fn load_devcontainer_config(project_dir: &Path) -> Option<DevcontainerConfig> {
+    // Try .devcontainer/devcontainer.json first
+    let devcontainer_path = project_dir.join(".devcontainer/devcontainer.json");
+    if devcontainer_path.exists() {
+        if let Ok(content) = std::fs::read_to_string(&devcontainer_path) {
+            // Strip JSON comments (// and /* */) before parsing
+            let content = strip_json_comments(&content);
+            if let Ok(config) = serde_json::from_str(&content) {
+                log::info!("Loaded devcontainer.json from {:?}", devcontainer_path);
+                return Some(config);
+            } else {
+                log::warn!(
+                    "Failed to parse devcontainer.json at {:?}",
+                    devcontainer_path
+                );
+            }
+        }
+    }
+
+    // Try .devcontainer.json in project root
+    let devcontainer_path = project_dir.join(".devcontainer.json");
+    if devcontainer_path.exists() {
+        if let Ok(content) = std::fs::read_to_string(&devcontainer_path) {
+            let content = strip_json_comments(&content);
+            if let Ok(config) = serde_json::from_str(&content) {
+                log::info!("Loaded .devcontainer.json from {:?}", devcontainer_path);
+                return Some(config);
+            }
+        }
+    }
+
+    None
+}
+
+/// Strip JSON comments (// and /* */) from content
+fn strip_json_comments(content: &str) -> String {
+    let mut result = String::with_capacity(content.len());
+    let mut chars = content.chars().peekable();
+    let mut in_string = false;
+    let mut escape_next = false;
+
+    while let Some(c) = chars.next() {
+        if escape_next {
+            result.push(c);
+            escape_next = false;
+            continue;
+        }
+
+        if c == '\\' && in_string {
+            result.push(c);
+            escape_next = true;
+            continue;
+        }
+
+        if c == '"' {
+            in_string = !in_string;
+            result.push(c);
+            continue;
+        }
+
+        if !in_string && c == '/' {
+            if let Some(&next) = chars.peek() {
+                if next == '/' {
+                    // Line comment - skip until newline
+                    chars.next();
+                    while let Some(&ch) = chars.peek() {
+                        if ch == '\n' {
+                            break;
+                        }
+                        chars.next();
+                    }
+                    continue;
+                } else if next == '*' {
+                    // Block comment - skip until */
+                    chars.next();
+                    while let Some(ch) = chars.next() {
+                        if ch == '*' {
+                            if let Some(&'/') = chars.peek() {
+                                chars.next();
+                                break;
+                            }
+                        }
+                    }
+                    continue;
+                }
+            }
+        }
+
+        result.push(c);
+    }
+
+    result
+}
+
 /// Build command and arguments for a devcontainer-style `docker run`
 ///
-/// This creates a container with:
-/// - Project directory mounted to /workspace (or custom workdir)
-/// - ~/.claude mounted for Claude credentials (optional)
-/// - ~/.ssh mounted for git SSH operations (optional)
-/// - ~/.gitconfig mounted for git configuration (optional)
-/// - Interactive terminal with specified shell
+/// This reads .devcontainer/devcontainer.json if present, otherwise uses defaults.
+/// The devcontainer.json can specify:
+/// - image: Docker image to use
+/// - workspaceFolder: Working directory inside container
+/// - mounts: Additional mounts
+/// - runArgs: Additional docker run arguments
+/// - containerEnv: Environment variables
 ///
 /// Returns (command, args) tuple suitable for PtyConfig
 pub fn build_devcontainer_command(
     config: &crate::config::DockerTabConfig,
 ) -> (String, Vec<String>) {
-    let image = config.image.as_deref().unwrap_or("node:20");
+    // Get project directory
+    let project_dir = config
+        .project_dir
+        .clone()
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+
+    // Try to load devcontainer.json
+    let devcontainer = load_devcontainer_config(&project_dir);
+
+    // Determine configuration from devcontainer.json or fallback to config/defaults
+    let image = config
+        .image
+        .as_deref()
+        .or(devcontainer.as_ref().and_then(|d| d.image.as_deref()))
+        .unwrap_or("node:20");
+
     let shell = config.shell.as_deref().unwrap_or("/bin/bash");
-    let workdir = config.workdir.as_deref().unwrap_or("/workspace");
+
+    let workdir = config
+        .workdir
+        .as_deref()
+        .or(devcontainer
+            .as_ref()
+            .and_then(|d| d.workspace_folder.as_deref()))
+        .unwrap_or("/workspace");
+
+    let remote_user = devcontainer
+        .as_ref()
+        .and_then(|d| d.remote_user.as_deref().or(d.container_user.as_deref()));
 
     let mut args = vec!["run".to_string(), "-it".to_string()];
 
@@ -223,69 +382,74 @@ pub fn build_devcontainer_command(
     }
 
     // Mount project directory
-    let project_dir = config
-        .project_dir
-        .clone()
-        .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
-
     if project_dir.exists() {
         args.push("-v".to_string());
         args.push(format!("{}:{}:delegated", project_dir.display(), workdir));
     }
 
-    // Get home directory using directories crate
-    let home_dir = directories::UserDirs::new().map(|u| u.home_dir().to_path_buf());
+    // Add mounts from devcontainer.json
+    if let Some(ref devcontainer) = devcontainer {
+        for mount in &devcontainer.mounts {
+            // Expand ${localWorkspaceFolder} variable
+            let mount = mount.replace("${localWorkspaceFolder}", &project_dir.to_string_lossy());
+            args.push("--mount".to_string());
+            args.push(mount);
+        }
 
-    // Mount ~/.claude for Claude credentials
-    if config.mount_claude_config {
-        if let Some(ref home) = home_dir {
-            let claude_dir = home.join(".claude");
-            // Create the directory if it doesn't exist
-            let _ = std::fs::create_dir_all(&claude_dir);
-            args.push("-v".to_string());
-            args.push(format!(
-                "{}:/home/node/.claude:delegated",
-                claude_dir.display()
-            ));
+        // Add run args from devcontainer.json
+        args.extend(devcontainer.run_args.iter().cloned());
+
+        // Add environment variables
+        for (key, value) in &devcontainer.container_env {
+            args.push("-e".to_string());
+            args.push(format!("{}={}", key, value));
         }
     }
 
-    // Mount ~/.ssh for git SSH operations
-    if config.mount_ssh {
-        if let Some(ref home) = home_dir {
-            let ssh_dir = home.join(".ssh");
-            if ssh_dir.exists() {
-                args.push("-v".to_string());
-                args.push(format!("{}:/home/node/.ssh:ro", ssh_dir.display()));
-            }
-        }
-    }
-
-    // Mount ~/.gitconfig for git configuration
-    if config.mount_gitconfig {
-        if let Some(ref home) = home_dir {
-            let gitconfig = home.join(".gitconfig");
-            if gitconfig.exists() {
-                args.push("-v".to_string());
-                args.push(format!("{}:/home/node/.gitconfig:ro", gitconfig.display()));
-            }
-        }
+    // Set user if specified
+    if let Some(user) = remote_user {
+        args.push("-u".to_string());
+        args.push(user.to_string());
     }
 
     // Set working directory inside container
     args.push("-w".to_string());
     args.push(workdir.to_string());
 
-    // Add any extra docker args
+    // Add any extra docker args from config
     args.extend(config.docker_args.iter().cloned());
 
     // Add the image
     args.push(image.to_string());
 
-    // Add shell command - install claude if using node image, then start shell
-    // For a proper devcontainer, we'd use a pre-built image, but this works for quick setup
-    if image.starts_with("node:") {
-        // Check if claude is installed, install if not, then run shell
+    // Determine post-create command if any
+    let post_create = devcontainer
+        .as_ref()
+        .and_then(|d| d.post_create_command.as_ref())
+        .and_then(|v| match v {
+            serde_json::Value::String(s) => Some(s.clone()),
+            serde_json::Value::Array(arr) => {
+                let parts: Vec<String> = arr
+                    .iter()
+                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                    .collect();
+                if parts.is_empty() {
+                    None
+                } else {
+                    Some(parts.join(" "))
+                }
+            }
+            _ => None,
+        });
+
+    // Build the shell command
+    if let Some(post_create) = post_create {
+        // Run post-create command then shell
+        args.push(shell.to_string());
+        args.push("-c".to_string());
+        args.push(format!("{}; exec {}", post_create, shell));
+    } else if image.starts_with("node:") {
+        // For node images without devcontainer.json, install claude-code
         args.push(shell.to_string());
         args.push("-c".to_string());
         args.push(format!(
