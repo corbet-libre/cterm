@@ -341,9 +341,33 @@ impl Terminal {
                     Some(s.as_bytes().to_vec())
                 }
             }
-            Key::Enter => Some(b"\r".to_vec()),
-            Key::Tab => Some(b"\t".to_vec()),
-            Key::Backspace => Some(b"\x7f".to_vec()),
+            Key::Enter => {
+                if modifiers.contains(Modifiers::ALT) {
+                    // Alt+Enter
+                    Some(b"\x1b\r".to_vec())
+                } else {
+                    Some(b"\r".to_vec())
+                }
+            }
+            Key::Tab => {
+                if modifiers.contains(Modifiers::SHIFT) {
+                    // Shift+Tab sends CSI Z (backtab)
+                    Some(b"\x1b[Z".to_vec())
+                } else {
+                    Some(b"\t".to_vec())
+                }
+            }
+            Key::Backspace => {
+                if modifiers.contains(Modifiers::ALT) {
+                    // Alt+Backspace
+                    Some(b"\x1b\x7f".to_vec())
+                } else if modifiers.contains(Modifiers::CTRL) {
+                    // Ctrl+Backspace - send Ctrl+W (delete word) or \x08
+                    Some(b"\x08".to_vec())
+                } else {
+                    Some(b"\x7f".to_vec())
+                }
+            }
             Key::Escape => Some(b"\x1b".to_vec()),
             Key::Up => Some(cursor_key(b'A', modifiers, app_cursor)),
             Key::Down => Some(cursor_key(b'B', modifiers, app_cursor)),
@@ -351,10 +375,10 @@ impl Terminal {
             Key::Left => Some(cursor_key(b'D', modifiers, app_cursor)),
             Key::Home => Some(cursor_key(b'H', modifiers, app_cursor)),
             Key::End => Some(cursor_key(b'F', modifiers, app_cursor)),
-            Key::PageUp => Some(b"\x1b[5~".to_vec()),
-            Key::PageDown => Some(b"\x1b[6~".to_vec()),
-            Key::Insert => Some(b"\x1b[2~".to_vec()),
-            Key::Delete => Some(b"\x1b[3~".to_vec()),
+            Key::PageUp => Some(tilde_key(5, modifiers)),
+            Key::PageDown => Some(tilde_key(6, modifiers)),
+            Key::Insert => Some(tilde_key(2, modifiers)),
+            Key::Delete => Some(tilde_key(3, modifiers)),
             Key::F(n) => Some(function_key(n, modifiers)),
         }
     }
@@ -369,6 +393,18 @@ fn cursor_key(key: u8, modifiers: Modifiers, app_cursor: bool) -> Vec<u8> {
         vec![0x1b, b'O', key]
     } else {
         vec![0x1b, b'[', key]
+    }
+}
+
+/// Generate escape sequence for tilde-style keys (PageUp, PageDown, Insert, Delete)
+/// Format: CSI code ~ or CSI code ; modifier ~ with modifiers
+fn tilde_key(code: u8, modifiers: Modifiers) -> Vec<u8> {
+    let modifier = modifier_param(modifiers);
+
+    if modifier > 1 {
+        format!("\x1b[{};{}~", code, modifier).into_bytes()
+    } else {
+        format!("\x1b[{}~", code).into_bytes()
     }
 }
 

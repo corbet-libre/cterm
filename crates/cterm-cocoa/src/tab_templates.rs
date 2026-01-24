@@ -9,8 +9,8 @@ use objc2::rc::Retained;
 use objc2::runtime::AnyObject;
 use objc2::{define_class, msg_send, sel, DefinedClass, MainThreadOnly};
 use objc2_app_kit::{
-    NSButton, NSControlTextEditingDelegate, NSLayoutAttribute, NSPopUpButton, NSStackView,
-    NSStackViewGravity, NSTabView, NSTabViewItem, NSTextField, NSTextFieldDelegate,
+    NSButton, NSColorWell, NSControlTextEditingDelegate, NSLayoutAttribute, NSPopUpButton,
+    NSStackView, NSStackViewGravity, NSTabView, NSTabViewItem, NSTextField, NSTextFieldDelegate,
     NSUserInterfaceLayoutOrientation, NSWindow, NSWindowStyleMask,
 };
 use objc2_foundation::{
@@ -30,7 +30,7 @@ pub struct TabTemplatesWindowIvars {
     command_field: RefCell<Option<Retained<NSTextField>>>,
     args_field: RefCell<Option<Retained<NSTextField>>>,
     path_field: RefCell<Option<Retained<NSTextField>>>,
-    color_field: RefCell<Option<Retained<NSTextField>>>,
+    color_well: RefCell<Option<Retained<NSColorWell>>>,
     theme_field: RefCell<Option<Retained<NSTextField>>>,
     unique_checkbox: RefCell<Option<Retained<NSButton>>>,
     auto_start_checkbox: RefCell<Option<Retained<NSButton>>>,
@@ -167,6 +167,24 @@ define_class!(
                 self.update_ssh_fields_visibility();
             }
         }
+
+        #[unsafe(method(clearColor:))]
+        fn action_clear_color(&self, _sender: Option<&AnyObject>) {
+            // Clear the color well to a transparent/no color state
+            if let Some(color_well) = self.ivars().color_well.borrow().as_ref() {
+                unsafe {
+                    use objc2::msg_send;
+                    // Set to a clear/transparent color to indicate "no color"
+                    let clear_color: *mut objc2::runtime::AnyObject =
+                        msg_send![objc2::class!(NSColor), clearColor];
+                    let _: () = msg_send![&**color_well, setColor: clear_color];
+                }
+            }
+            // Save the change
+            if let Some(index) = *self.ivars().selected_index.borrow() {
+                self.save_fields_to_template(index);
+            }
+        }
     }
 );
 
@@ -187,7 +205,7 @@ impl TabTemplatesWindow {
             command_field: RefCell::new(None),
             args_field: RefCell::new(None),
             path_field: RefCell::new(None),
-            color_field: RefCell::new(None),
+            color_well: RefCell::new(None),
             theme_field: RefCell::new(None),
             unique_checkbox: RefCell::new(None),
             auto_start_checkbox: RefCell::new(None),
@@ -401,10 +419,9 @@ impl TabTemplatesWindow {
         stack.addView_inGravity(&path_row.0, NSStackViewGravity::Top);
         *self.ivars().path_field.borrow_mut() = Some(path_row.1);
 
-        // Color field
-        let color_row = self.create_field_row(mtm, "Tab Color:", 120.0);
-        stack.addView_inGravity(&color_row.0, NSStackViewGravity::Top);
-        *self.ivars().color_field.borrow_mut() = Some(color_row.1);
+        // Color picker
+        let color_row = self.create_color_row(mtm);
+        stack.addView_inGravity(&color_row, NSStackViewGravity::Top);
 
         // Theme field
         let theme_row = self.create_field_row(mtm, "Theme:", 150.0);
@@ -656,6 +673,43 @@ impl TabTemplatesWindow {
         (stack, field)
     }
 
+    fn create_color_row(&self, mtm: MainThreadMarker) -> Retained<NSStackView> {
+        let stack = unsafe { NSStackView::new(mtm) };
+        stack.setOrientation(NSUserInterfaceLayoutOrientation::Horizontal);
+        stack.setSpacing(10.0);
+
+        let label_view =
+            unsafe { NSTextField::labelWithString(&NSString::from_str("Tab Color:"), mtm) };
+        unsafe { label_view.setFrameSize(NSSize::new(100.0, 22.0)) };
+
+        // Create color well (native macOS color picker)
+        let color_well = unsafe { NSColorWell::new(mtm) };
+        unsafe {
+            use objc2::msg_send;
+            let _: () = msg_send![&*color_well, setFrameSize: NSSize::new(44.0, 24.0)];
+            // Use the bordered style that shows/hides the color panel on click
+            let _: () = msg_send![&*color_well, setBordered: true];
+        }
+
+        // Add a "Clear" button to remove the color
+        let clear_btn = unsafe {
+            NSButton::buttonWithTitle_target_action(
+                &NSString::from_str("Clear"),
+                Some(self),
+                Some(objc2::sel!(clearColor:)),
+                mtm,
+            )
+        };
+
+        stack.addView_inGravity(&label_view, NSStackViewGravity::Leading);
+        stack.addView_inGravity(&color_well, NSStackViewGravity::Leading);
+        stack.addView_inGravity(&clear_btn, NSStackViewGravity::Leading);
+
+        *self.ivars().color_well.borrow_mut() = Some(color_well);
+
+        stack
+    }
+
     fn load_template_into_fields(&self, index: usize) {
         let templates = self.ivars().templates.borrow();
         if let Some(template) = templates.get(index) {
@@ -678,8 +732,35 @@ impl TabTemplatesWindow {
                     .unwrap_or_default();
                 field.setStringValue(&NSString::from_str(&path_str));
             }
-            if let Some(field) = self.ivars().color_field.borrow().as_ref() {
-                field.setStringValue(&NSString::from_str(template.color.as_deref().unwrap_or("")));
+            if let Some(color_well) = self.ivars().color_well.borrow().as_ref() {
+                unsafe {
+                    use objc2::msg_send;
+                    if let Some(hex) = &template.color {
+                        // Parse hex color and set it
+                        let hex = hex.trim_start_matches('#');
+                        if hex.len() == 6 {
+                            if let (Ok(r), Ok(g), Ok(b)) = (
+                                u8::from_str_radix(&hex[0..2], 16),
+                                u8::from_str_radix(&hex[2..4], 16),
+                                u8::from_str_radix(&hex[4..6], 16),
+                            ) {
+                                let ns_color: *mut objc2::runtime::AnyObject = msg_send![
+                                    objc2::class!(NSColor),
+                                    colorWithRed: (r as f64 / 255.0),
+                                    green: (g as f64 / 255.0),
+                                    blue: (b as f64 / 255.0),
+                                    alpha: 1.0f64
+                                ];
+                                let _: () = msg_send![&**color_well, setColor: ns_color];
+                            }
+                        }
+                    } else {
+                        // Set to clear color
+                        let clear_color: *mut objc2::runtime::AnyObject =
+                            msg_send![objc2::class!(NSColor), clearColor];
+                        let _: () = msg_send![&**color_well, setColor: clear_color];
+                    }
+                }
             }
             if let Some(field) = self.ivars().theme_field.borrow().as_ref() {
                 field.setStringValue(&NSString::from_str(template.theme.as_deref().unwrap_or("")));
@@ -866,8 +947,13 @@ impl TabTemplatesWindow {
         if let Some(field) = self.ivars().path_field.borrow().as_ref() {
             field.setStringValue(&empty);
         }
-        if let Some(field) = self.ivars().color_field.borrow().as_ref() {
-            field.setStringValue(&empty);
+        if let Some(color_well) = self.ivars().color_well.borrow().as_ref() {
+            unsafe {
+                use objc2::msg_send;
+                let clear_color: *mut objc2::runtime::AnyObject =
+                    msg_send![objc2::class!(NSColor), clearColor];
+                let _: () = msg_send![&**color_well, setColor: clear_color];
+            }
         }
         if let Some(field) = self.ivars().theme_field.borrow().as_ref() {
             field.setStringValue(&empty);
@@ -961,9 +1047,40 @@ impl TabTemplatesWindow {
                     Some(PathBuf::from(path_str))
                 };
             }
-            if let Some(field) = self.ivars().color_field.borrow().as_ref() {
-                let color = field.stringValue().to_string();
-                template.color = if color.is_empty() { None } else { Some(color) };
+            if let Some(color_well) = self.ivars().color_well.borrow().as_ref() {
+                template.color = unsafe {
+                    use objc2::msg_send;
+                    let color: *mut objc2::runtime::AnyObject = msg_send![&**color_well, color];
+
+                    // Get RGB components
+                    // First convert to RGB color space
+                    let color_space_name = NSString::from_str("NSCalibratedRGBColorSpace");
+                    let rgb_color: *mut objc2::runtime::AnyObject = msg_send![
+                        color,
+                        colorUsingColorSpaceName: &*color_space_name
+                    ];
+
+                    if rgb_color.is_null() {
+                        // Couldn't convert - might be clear color, treat as no color
+                        None
+                    } else {
+                        let alpha: f64 = msg_send![rgb_color, alphaComponent];
+                        if alpha < 0.1 {
+                            // Essentially transparent/clear, treat as no color
+                            None
+                        } else {
+                            let r: f64 = msg_send![rgb_color, redComponent];
+                            let g: f64 = msg_send![rgb_color, greenComponent];
+                            let b: f64 = msg_send![rgb_color, blueComponent];
+
+                            let r = (r * 255.0).round() as u8;
+                            let g = (g * 255.0).round() as u8;
+                            let b = (b * 255.0).round() as u8;
+
+                            Some(format!("#{:02X}{:02X}{:02X}", r, g, b))
+                        }
+                    }
+                };
             }
             if let Some(field) = self.ivars().theme_field.borrow().as_ref() {
                 let theme = field.stringValue().to_string();

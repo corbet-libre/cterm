@@ -19,6 +19,7 @@ struct TabEntry {
     button: Retained<NSButton>,
     active: bool,
     has_bell: bool,
+    color: Option<String>,
 }
 
 /// Tab bar state
@@ -126,6 +127,7 @@ impl TabBar {
             button: button.clone(),
             active: false,
             has_bell: false,
+            color: None,
         });
 
         self.ivars()
@@ -208,6 +210,50 @@ impl TabBar {
         self.set_bell(id, false);
     }
 
+    /// Set tab color
+    pub fn set_color(&self, id: u64, color: Option<&str>) {
+        for tab in self.ivars().tabs.borrow_mut().iter_mut() {
+            if tab.id == id {
+                tab.color = color.map(|s| s.to_string());
+
+                // Apply color to button background using layer
+                unsafe {
+                    let _: () = msg_send![&*tab.button, setWantsLayer: true];
+                    let layer: *mut objc2::runtime::AnyObject = msg_send![&*tab.button, layer];
+                    if !layer.is_null() {
+                        if let Some(hex) = color {
+                            // Parse hex color (e.g., "#E95420" or "E95420")
+                            let hex = hex.trim_start_matches('#');
+                            if hex.len() == 6 {
+                                if let (Ok(r), Ok(g), Ok(b)) = (
+                                    u8::from_str_radix(&hex[0..2], 16),
+                                    u8::from_str_radix(&hex[2..4], 16),
+                                    u8::from_str_radix(&hex[4..6], 16),
+                                ) {
+                                    let ns_color: *mut objc2::runtime::AnyObject = msg_send![
+                                        class!(NSColor),
+                                        colorWithRed: (r as f64 / 255.0),
+                                        green: (g as f64 / 255.0),
+                                        blue: (b as f64 / 255.0),
+                                        alpha: 1.0f64
+                                    ];
+                                    let cg_color: *mut objc2::runtime::AnyObject =
+                                        msg_send![ns_color, CGColor];
+                                    let _: () = msg_send![layer, setBackgroundColor: cg_color];
+                                    let _: () = msg_send![layer, setCornerRadius: 4.0f64];
+                                }
+                            }
+                        } else {
+                            // Clear the background color
+                            let _: () = msg_send![layer, setBackgroundColor: std::ptr::null::<objc2::runtime::AnyObject>()];
+                        }
+                    }
+                }
+                break;
+            }
+        }
+    }
+
     /// Get active tab ID
     pub fn active_tab(&self) -> Option<u64> {
         *self.ivars().active_tab.borrow()
@@ -244,6 +290,9 @@ impl TabBar {
 impl cterm_ui::traits::TabBar for TabBar {
     fn add_tab(&mut self, info: TabInfo) {
         TabBar::add_tab(self, info.id, &info.title);
+        if let Some(ref color) = info.color {
+            TabBar::set_color(self, info.id, Some(color));
+        }
         if info.active {
             TabBar::set_active(self, info.id);
         }
@@ -255,6 +304,7 @@ impl cterm_ui::traits::TabBar for TabBar {
 
     fn update_tab(&mut self, info: TabInfo) {
         TabBar::set_title(self, info.id, &info.title);
+        TabBar::set_color(self, info.id, info.color.as_deref());
         if info.has_unread {
             TabBar::set_bell(self, info.id, true);
         }
