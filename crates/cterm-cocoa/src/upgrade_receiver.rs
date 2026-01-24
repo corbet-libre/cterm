@@ -204,6 +204,8 @@ impl UpgradeReceiverDelegate {
         window_state: WindowUpgradeState,
         fds: &[RawFd],
     ) -> Result<Retained<CtermWindow>, Box<dyn std::error::Error>> {
+        use objc2_foundation::{NSPoint, NSRect, NSSize};
+
         // For now, we only support restoring the first tab
         // (macOS native tabbing would require multiple windows)
         if let Some(tab_state) = window_state.tabs.first() {
@@ -254,6 +256,26 @@ impl UpgradeReceiverDelegate {
                 &self.ivars().theme,
                 terminal,
             );
+
+            // Restore window position and size
+            let frame = NSRect::new(
+                NSPoint::new(window_state.x as f64, window_state.y as f64),
+                NSSize::new(window_state.width as f64, window_state.height as f64),
+            );
+            window.setFrame_display(frame, true);
+            log::info!(
+                "Restored window frame: {}x{} at ({}, {})",
+                window_state.width,
+                window_state.height,
+                window_state.x,
+                window_state.y
+            );
+
+            // Restore window title
+            if !tab_state.title.is_empty() {
+                use objc2_foundation::NSString;
+                window.setTitle(&NSString::from_str(&tab_state.title));
+            }
 
             // Restore template_name if present (needed for unique tab detection)
             if tab_state.template_name.is_some() {
