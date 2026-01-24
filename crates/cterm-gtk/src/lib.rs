@@ -5,6 +5,7 @@
 mod app;
 mod dialogs;
 mod docker_dialog;
+mod file_transfer;
 mod log_viewer;
 mod menu;
 mod notification_bar;

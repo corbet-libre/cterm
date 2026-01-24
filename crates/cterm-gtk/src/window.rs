@@ -10,6 +10,7 @@ use gtk4::{
 };
 
 use cterm_app::config::Config;
+use cterm_app::file_transfer::PendingFileManager;
 use cterm_app::shortcuts::ShortcutManager;
 use cterm_ui::events::{Action, KeyCode, Modifiers};
 use cterm_ui::theme::Theme;
@@ -17,6 +18,7 @@ use cterm_ui::theme::Theme;
 use crate::dialogs;
 use crate::docker_dialog::{self, DockerSelection};
 use crate::menu;
+use crate::notification_bar::NotificationBar;
 use crate::tab_bar::TabBar;
 use crate::terminal_widget::{CellDimensions, TerminalWidget};
 
@@ -40,6 +42,8 @@ pub struct CtermWindow {
     menu_bar: PopoverMenuBar,
     debug_menu_shown: Rc<RefCell<bool>>,
     has_bell: Rc<RefCell<bool>>,
+    notification_bar: NotificationBar,
+    file_manager: Rc<RefCell<PendingFileManager>>,
 }
 
 impl CtermWindow {
@@ -73,6 +77,10 @@ impl CtermWindow {
         let tab_bar = TabBar::new();
         main_box.append(tab_bar.widget());
 
+        // Create notification bar for file transfers (initially hidden)
+        let notification_bar = NotificationBar::new();
+        main_box.append(notification_bar.widget());
+
         // Create notebook for terminal tabs (hidden tabs, we use custom tab bar)
         let notebook = Notebook::builder()
             .show_tabs(false)
@@ -90,6 +98,7 @@ impl CtermWindow {
 
         let debug_menu_shown = Rc::new(RefCell::new(false));
         let has_bell = Rc::new(RefCell::new(false));
+        let file_manager = Rc::new(RefCell::new(PendingFileManager::new()));
 
         let cterm_window = Self {
             window: window.clone(),
@@ -103,6 +112,8 @@ impl CtermWindow {
             menu_bar,
             debug_menu_shown,
             has_bell,
+            notification_bar,
+            file_manager,
         };
 
         // Set up window actions
@@ -119,6 +130,9 @@ impl CtermWindow {
 
         // Set up terminal focus restoration after menu interactions
         cterm_window.setup_terminal_focus_restore();
+
+        // Set up notification bar callbacks for file transfers
+        cterm_window.setup_notification_bar();
 
         // Create initial tab
         cterm_window.new_tab();
@@ -153,6 +167,8 @@ impl CtermWindow {
             let tab_bar = tab_bar.clone();
             let window_clone = window.clone();
             let has_bell = Rc::clone(&has_bell);
+            let file_manager = Rc::clone(&self.file_manager);
+            let notification_bar = self.notification_bar.clone();
             let action = gio::SimpleAction::new("new-tab", None);
             action.connect_activate(move |_, _| {
                 create_new_tab(
@@ -164,6 +180,8 @@ impl CtermWindow {
                     &tab_bar,
                     &window_clone,
                     &has_bell,
+                    &file_manager,
+                    &notification_bar,
                 );
             });
             window.add_action(&action);
@@ -227,6 +245,8 @@ impl CtermWindow {
             let tab_bar = tab_bar.clone();
             let window_clone = window.clone();
             let has_bell = Rc::clone(&has_bell);
+            let file_manager = Rc::clone(&self.file_manager);
+            let notification_bar = self.notification_bar.clone();
             let action = gio::SimpleAction::new("docker-picker", None);
             action.connect_activate(move |_, _| {
                 let notebook = notebook.clone();
@@ -237,6 +257,8 @@ impl CtermWindow {
                 let tab_bar = tab_bar.clone();
                 let window_inner = window_clone.clone();
                 let has_bell = Rc::clone(&has_bell);
+                let file_manager = Rc::clone(&file_manager);
+                let notification_bar = notification_bar.clone();
 
                 docker_dialog::show_docker_picker(&window_clone, move |selection| {
                     let (command, args, title) = match &selection {
@@ -264,6 +286,8 @@ impl CtermWindow {
                         &tab_bar,
                         &window_inner,
                         &has_bell,
+                        &file_manager,
+                        &notification_bar,
                         &command,
                         &args,
                         &title,
@@ -1161,6 +1185,100 @@ impl CtermWindow {
         self.window.add_controller(focus_controller);
     }
 
+    /// Set up notification bar callbacks for file transfers
+    fn setup_notification_bar(&self) {
+        let file_manager = Rc::clone(&self.file_manager);
+        let notification_bar = self.notification_bar.clone();
+        let window = self.window.clone();
+
+        // Save button - save to default location (Downloads or last saved dir)
+        let file_manager_save = Rc::clone(&file_manager);
+        let notification_bar_save = notification_bar.clone();
+        notification_bar.set_on_save(move |id| {
+            let mut manager = file_manager_save.borrow_mut();
+            if let Some(path) = manager.default_save_path() {
+                match manager.save_to_path(id, &path) {
+                    Ok(size) => {
+                        log::info!("Saved file to {:?} ({} bytes)", path, size);
+                    }
+                    Err(e) => {
+                        log::error!("Failed to save file: {}", e);
+                    }
+                }
+            }
+            drop(manager);
+            notification_bar_save.hide();
+        });
+
+        // Save As button - show file chooser dialog
+        let file_manager_save_as = Rc::clone(&file_manager);
+        let notification_bar_save_as = notification_bar.clone();
+        notification_bar.set_on_save_as(move |id| {
+            let manager = file_manager_save_as.borrow();
+            let suggested_name = manager.suggested_filename().map(|s| s.to_string());
+            let initial_dir = manager.last_save_dir().cloned();
+            drop(manager);
+
+            let file_chooser = gtk4::FileChooserDialog::new(
+                Some("Save File As"),
+                Some(&window),
+                gtk4::FileChooserAction::Save,
+                &[
+                    ("Cancel", gtk4::ResponseType::Cancel),
+                    ("Save", gtk4::ResponseType::Accept),
+                ],
+            );
+
+            // Set suggested filename
+            if let Some(name) = suggested_name {
+                file_chooser.set_current_name(&name);
+            }
+
+            // Set initial folder
+            if let Some(dir) = initial_dir {
+                let file = gio::File::for_path(&dir);
+                file_chooser.set_current_folder(Some(&file)).ok();
+            } else if let Some(downloads) = cterm_app::file_transfer::dirs::download_dir() {
+                let file = gio::File::for_path(&downloads);
+                file_chooser.set_current_folder(Some(&file)).ok();
+            }
+
+            let file_manager_dialog = Rc::clone(&file_manager_save_as);
+            let notification_bar_dialog = notification_bar_save_as.clone();
+
+            file_chooser.connect_response(move |dialog, response| {
+                if response == gtk4::ResponseType::Accept {
+                    if let Some(file) = dialog.file() {
+                        if let Some(path) = file.path() {
+                            let mut manager = file_manager_dialog.borrow_mut();
+                            match manager.save_to_path(id, &path) {
+                                Ok(size) => {
+                                    log::info!("Saved file to {:?} ({} bytes)", path, size);
+                                }
+                                Err(e) => {
+                                    log::error!("Failed to save file: {}", e);
+                                }
+                            }
+                        }
+                    }
+                }
+                notification_bar_dialog.hide();
+                dialog.close();
+            });
+
+            file_chooser.present();
+        });
+
+        // Discard button - discard the pending file
+        let file_manager_discard = Rc::clone(&file_manager);
+        let notification_bar_discard = notification_bar.clone();
+        notification_bar.set_on_discard(move |id| {
+            file_manager_discard.borrow_mut().discard(id);
+            notification_bar_discard.hide();
+            log::debug!("Discarded pending file {}", id);
+        });
+    }
+
     /// Set up tab bar callbacks
     fn setup_tab_bar_callbacks(&self) {
         let notebook = self.notebook.clone();
@@ -1171,6 +1289,8 @@ impl CtermWindow {
         let tab_bar = self.tab_bar.clone();
         let window = self.window.clone();
         let has_bell = Rc::clone(&self.has_bell);
+        let file_manager = Rc::clone(&self.file_manager);
+        let notification_bar = self.notification_bar.clone();
 
         // New tab button
         self.tab_bar.set_on_new_tab(move || {
@@ -1183,6 +1303,8 @@ impl CtermWindow {
                 &tab_bar,
                 &window,
                 &has_bell,
+                &file_manager,
+                &notification_bar,
             );
         });
     }
@@ -1198,6 +1320,8 @@ impl CtermWindow {
             &self.tab_bar,
             &self.window,
             &self.has_bell,
+            &self.file_manager,
+            &self.notification_bar,
         );
     }
 }
@@ -1213,6 +1337,8 @@ fn create_new_tab(
     tab_bar: &TabBar,
     window: &ApplicationWindow,
     has_bell: &Rc<RefCell<bool>>,
+    file_manager: &Rc<RefCell<PendingFileManager>>,
+    notification_bar: &NotificationBar,
 ) {
     // Create terminal widget
     let cfg = config.borrow();
@@ -1351,6 +1477,43 @@ fn create_new_tab(
         }
     });
 
+    // Set up file transfer callback to handle received files
+    let file_manager_transfer = Rc::clone(file_manager);
+    let notification_bar_transfer = notification_bar.clone();
+    terminal.set_on_file_transfer(move |transfer| {
+        use cterm_core::FileTransferOperation;
+
+        match transfer {
+            FileTransferOperation::FileReceived { id, name, data } => {
+                log::info!(
+                    "File received: id={}, name={:?}, size={}",
+                    id,
+                    name,
+                    data.len()
+                );
+                let size = data.len();
+                let mut manager = file_manager_transfer.borrow_mut();
+                manager.set_pending(id, name.clone(), data);
+                drop(manager);
+                notification_bar_transfer.show_file(id, name.as_deref(), size);
+            }
+            FileTransferOperation::StreamingFileReceived { id, result } => {
+                log::info!(
+                    "Streaming file received: id={}, name={:?}, size={}",
+                    id,
+                    result.name,
+                    result.size
+                );
+                let size = result.size;
+                let name = result.name.clone();
+                let mut manager = file_manager_transfer.borrow_mut();
+                manager.set_pending_streaming(id, name.clone(), result.data);
+                drop(manager);
+                notification_bar_transfer.show_file(id, name.as_deref(), size);
+            }
+        }
+    });
+
     // Store terminal with its ID
     tabs.borrow_mut().push(TabEntry {
         id: tab_id,
@@ -1382,6 +1545,8 @@ fn create_docker_tab(
     tab_bar: &TabBar,
     window: &ApplicationWindow,
     has_bell: &Rc<RefCell<bool>>,
+    file_manager: &Rc<RefCell<PendingFileManager>>,
+    notification_bar: &NotificationBar,
     command: &str,
     args: &[String],
     title: &str,
@@ -1520,6 +1685,43 @@ fn create_docker_tab(
                 // Clear bell indicator from window title
                 *has_bell_title.borrow_mut() = false;
                 window_title.set_title(Some(title));
+            }
+        }
+    });
+
+    // Set up file transfer callback to handle received files
+    let file_manager_transfer = Rc::clone(file_manager);
+    let notification_bar_transfer = notification_bar.clone();
+    terminal.set_on_file_transfer(move |transfer| {
+        use cterm_core::FileTransferOperation;
+
+        match transfer {
+            FileTransferOperation::FileReceived { id, name, data } => {
+                log::info!(
+                    "File received: id={}, name={:?}, size={}",
+                    id,
+                    name,
+                    data.len()
+                );
+                let size = data.len();
+                let mut manager = file_manager_transfer.borrow_mut();
+                manager.set_pending(id, name.clone(), data);
+                drop(manager);
+                notification_bar_transfer.show_file(id, name.as_deref(), size);
+            }
+            FileTransferOperation::StreamingFileReceived { id, result } => {
+                log::info!(
+                    "Streaming file received: id={}, name={:?}, size={}",
+                    id,
+                    result.name,
+                    result.size
+                );
+                let size = result.size;
+                let name = result.name.clone();
+                let mut manager = file_manager_transfer.borrow_mut();
+                manager.set_pending_streaming(id, name.clone(), result.data);
+                drop(manager);
+                notification_bar_transfer.show_file(id, name.as_deref(), size);
             }
         }
     });

@@ -541,11 +541,43 @@ fn create_docker_tab() -> (
     project_row.append(&project_entry);
     page.append(&project_row);
 
-    // Status label
+    // Status label - shows Docker availability status
     let status_label = Label::new(None);
     status_label.set_halign(Align::Start);
     status_label.set_margin_start(112);
+    status_label.set_visible(false);
     page.append(&status_label);
+
+    // Check Docker status and update label
+    fn update_docker_status(label: &Label, show: bool) {
+        if !show {
+            label.set_visible(false);
+            return;
+        }
+
+        match cterm_app::docker::check_docker_available() {
+            Ok(()) => {
+                // Docker is available, show container/image count
+                // list_containers() returns running containers from `docker ps`
+                let running = cterm_app::docker::list_containers()
+                    .unwrap_or_default()
+                    .len();
+                let images = cterm_app::docker::list_images().unwrap_or_default().len();
+                label.set_text(&format!(
+                    "✓ Docker: {} running containers, {} images",
+                    running, images
+                ));
+                label.remove_css_class("error");
+                label.add_css_class("success");
+            }
+            Err(e) => {
+                label.set_text(&format!("✗ Docker: {}", e));
+                label.remove_css_class("success");
+                label.add_css_class("error");
+            }
+        }
+        label.set_visible(true);
+    }
 
     // Connect mode combo to visibility updates
     let container_row_clone = container_row.clone();
@@ -553,6 +585,7 @@ fn create_docker_tab() -> (
     let shell_row_clone = shell_row.clone();
     let project_row_clone = project_row.clone();
     let auto_remove_check_clone = auto_remove_check.clone();
+    let status_label_clone = status_label.clone();
     mode_combo.connect_changed(move |combo| {
         let mode_index = combo.active().unwrap_or(0);
         let is_docker = mode_index > 0;
@@ -565,6 +598,9 @@ fn create_docker_tab() -> (
         shell_row_clone.set_visible(is_docker);
         auto_remove_check_clone.set_visible(is_run_or_dev);
         project_row_clone.set_visible(is_devcontainer);
+
+        // Update Docker status when mode changes
+        update_docker_status(&status_label_clone, is_docker);
     });
 
     // Initial visibility

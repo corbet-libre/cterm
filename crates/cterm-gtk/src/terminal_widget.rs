@@ -32,6 +32,8 @@ pub struct CellDimensions {
 type EventCallback = Rc<RefCell<Option<Box<dyn Fn()>>>>;
 /// Callback type for title change events
 type TitleCallback = Rc<RefCell<Option<Box<dyn Fn(&str)>>>>;
+/// Callback type for file transfer events
+type FileTransferCallback = Rc<RefCell<Option<Box<dyn Fn(cterm_core::FileTransferOperation)>>>>;
 
 /// Terminal widget wrapping GTK drawing area
 pub struct TerminalWidget {
@@ -45,6 +47,7 @@ pub struct TerminalWidget {
     on_exit: EventCallback,
     on_bell: EventCallback,
     on_title_change: TitleCallback,
+    on_file_transfer: FileTransferCallback,
 }
 
 impl TerminalWidget {
@@ -108,6 +111,7 @@ impl TerminalWidget {
             on_exit: Rc::new(RefCell::new(None)),
             on_bell: Rc::new(RefCell::new(None)),
             on_title_change: Rc::new(RefCell::new(None)),
+            on_file_transfer: Rc::new(RefCell::new(None)),
         };
 
         // Set up drawing
@@ -165,6 +169,7 @@ impl TerminalWidget {
             on_exit: Rc::new(RefCell::new(None)),
             on_bell: Rc::new(RefCell::new(None)),
             on_title_change: Rc::new(RefCell::new(None)),
+            on_file_transfer: Rc::new(RefCell::new(None)),
         };
 
         // Set up drawing
@@ -209,12 +214,6 @@ impl TerminalWidget {
         }
     }
 
-    /// Get the underlying terminal (for upgrade operations)
-    #[cfg(unix)]
-    pub fn terminal(&self) -> &Arc<Mutex<Terminal>> {
-        &self.terminal
-    }
-
     /// Get the widget for adding to containers
     pub fn widget(&self) -> &DrawingArea {
         &self.drawing_area
@@ -239,6 +238,19 @@ impl TerminalWidget {
     /// Set callback for when the terminal title changes
     pub fn set_on_title_change<F: Fn(&str) + 'static>(&self, callback: F) {
         *self.on_title_change.borrow_mut() = Some(Box::new(callback));
+    }
+
+    /// Set callback for when a file is received
+    pub fn set_on_file_transfer<F: Fn(cterm_core::FileTransferOperation) + 'static>(
+        &self,
+        callback: F,
+    ) {
+        *self.on_file_transfer.borrow_mut() = Some(Box::new(callback));
+    }
+
+    /// Get the terminal for file transfer operations
+    pub fn terminal(&self) -> &Arc<Mutex<Terminal>> {
+        &self.terminal
     }
 
     /// Write a string to the terminal (for paste operations)
@@ -783,6 +795,7 @@ impl TerminalWidget {
         let on_exit = Rc::clone(&self.on_exit);
         let on_bell = Rc::clone(&self.on_bell);
         let on_title_change = Rc::clone(&self.on_title_change);
+        let on_file_transfer = Rc::clone(&self.on_file_transfer);
         glib::timeout_add_local(Duration::from_millis(10), move || {
             // Process all pending messages
             while let Ok(msg) = rx.try_recv() {
@@ -847,7 +860,18 @@ impl TerminalWidget {
                             }
                         }
 
-                        term.screen_mut().dirty = false;
+                        // Check for file transfers
+                        let transfers = term.screen_mut().take_file_transfers();
+                        drop(term); // Release lock before callbacks
+
+                        for transfer in transfers {
+                            if let Some(ref callback) = *on_file_transfer.borrow() {
+                                callback(transfer);
+                            }
+                        }
+
+                        // Re-acquire lock to clear dirty flag
+                        terminal_main.lock().screen_mut().dirty = false;
                         drawing_area.queue_draw();
                     }
                     PtyMessage::Exited => {
