@@ -412,7 +412,6 @@ fn create_general_tab() -> (
     let theme_entry = Entry::new();
     theme_entry.set_placeholder_text(Some("(default)"));
     grid.attach(&theme_entry, 1, row, 1, 1);
-    row += 1;
 
     page.append(&grid);
 

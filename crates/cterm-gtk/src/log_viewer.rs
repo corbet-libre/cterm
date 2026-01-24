@@ -3,7 +3,7 @@
 //! Simple debug window showing application logs.
 
 use gtk4::prelude::*;
-use gtk4::{ScrolledWindow, TextView, Window, WindowType};
+use gtk4::{ScrolledWindow, TextView, Window};
 
 /// Show the log viewer window
 pub fn show_log_viewer(parent: &impl IsA<Window>) {
