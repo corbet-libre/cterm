@@ -81,7 +81,30 @@ where
     label.set_halign(Align::Start);
     content.append(&label);
 
+    // Color picker row with ColorButton and hex entry
+    let picker_box = GtkBox::new(Orientation::Horizontal, 12);
+
+    let color_button = gtk4::ColorButton::new();
+    color_button.set_tooltip_text(Some("Choose custom color"));
+    picker_box.append(&color_button);
+
+    let hex_label = Label::new(Some("Hex:"));
+    picker_box.append(&hex_label);
+
+    let hex_entry = Entry::new();
+    hex_entry.set_placeholder_text(Some("#RRGGBB"));
+    hex_entry.set_max_length(7);
+    hex_entry.set_width_request(100);
+    picker_box.append(&hex_entry);
+
+    content.append(&picker_box);
+
     // Preset color buttons
+    let presets_label = Label::new(Some("Presets:"));
+    presets_label.set_halign(Align::Start);
+    presets_label.set_margin_top(8);
+    content.append(&presets_label);
+
     let colors_box = GtkBox::new(Orientation::Horizontal, 8);
     let colors = [
         ("#e74c3c", "Red"),
@@ -95,6 +118,32 @@ where
     ];
 
     let selected_color: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
+
+    // Sync color button changes to hex entry and selected color
+    let hex_entry_clone = hex_entry.clone();
+    let selected_for_button = Rc::clone(&selected_color);
+    color_button.connect_rgba_notify(move |btn| {
+        let rgba = btn.rgba();
+        let hex = format!(
+            "#{:02X}{:02X}{:02X}",
+            (rgba.red() * 255.0) as u8,
+            (rgba.green() * 255.0) as u8,
+            (rgba.blue() * 255.0) as u8
+        );
+        hex_entry_clone.set_text(&hex);
+        *selected_for_button.borrow_mut() = Some(hex);
+    });
+
+    // Sync hex entry changes to color button and selected color
+    let color_button_clone = color_button.clone();
+    let selected_for_entry = Rc::clone(&selected_color);
+    hex_entry.connect_changed(move |entry| {
+        let text = entry.text();
+        if let Some(rgba) = parse_hex_to_rgba(&text) {
+            color_button_clone.set_rgba(&rgba);
+            *selected_for_entry.borrow_mut() = Some(text.to_string());
+        }
+    });
 
     for (color, name) in colors {
         let btn = Button::new();
@@ -112,7 +161,13 @@ where
 
         let color_str = color.to_string();
         let selected = Rc::clone(&selected_color);
+        let hex_entry = hex_entry.clone();
+        let color_button = color_button.clone();
         btn.connect_clicked(move |_| {
+            hex_entry.set_text(&color_str);
+            if let Some(rgba) = parse_hex_to_rgba(&color_str) {
+                color_button.set_rgba(&rgba);
+            }
             *selected.borrow_mut() = Some(color_str.clone());
         });
 
@@ -136,6 +191,20 @@ where
     });
 
     dialog.present();
+}
+
+/// Parse hex color string to RGBA
+fn parse_hex_to_rgba(hex: &str) -> Option<gtk4::gdk::RGBA> {
+    let hex = hex.trim_start_matches('#');
+    if hex.len() != 6 {
+        return None;
+    }
+
+    let r = u8::from_str_radix(&hex[0..2], 16).ok()? as f32 / 255.0;
+    let g = u8::from_str_radix(&hex[2..4], 16).ok()? as f32 / 255.0;
+    let b = u8::from_str_radix(&hex[4..6], 16).ok()? as f32 / 255.0;
+
+    Some(gtk4::gdk::RGBA::new(r, g, b, 1.0))
 }
 
 /// Show the "Find" dialog

@@ -24,6 +24,7 @@ pub fn create_menu_model_with_options(show_debug: bool) -> gio::Menu {
     docker_menu.append(Some("Docker Terminal..."), Some("win.docker-picker"));
     file_menu.append_submenu(Some("Docker"), &docker_menu);
 
+    file_menu.append(Some("Tab Templates..."), Some("win.tab-templates"));
     file_menu.append(Some("Close Tab"), Some("win.close-tab"));
     file_menu.append(Some("Close Other Tabs"), Some("win.close-other-tabs"));
     file_menu.append(Some("Quit"), Some("win.quit"));
@@ -81,6 +82,7 @@ pub fn create_menu_model_with_options(show_debug: bool) -> gio::Menu {
     // Debug submenu (hidden unless Shift is held when opening menu)
     if show_debug {
         let debug_menu = gio::Menu::new();
+        debug_menu.append(Some("View Logs"), Some("win.view-logs"));
         debug_menu.append(Some("Re-launch cterm"), Some("win.debug-relaunch"));
         debug_menu.append(Some("Dump State"), Some("win.debug-dump-state"));
         help_menu.append_submenu(Some("Debug"), &debug_menu);

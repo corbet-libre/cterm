@@ -731,6 +731,28 @@ impl CtermWindow {
             window.add_action(&action);
         }
 
+        // Tab Templates action
+        {
+            let window_clone = window.clone();
+            let action = gio::SimpleAction::new("tab-templates", None);
+            action.connect_activate(move |_, _| {
+                crate::tab_templates_dialog::show_tab_templates_dialog(&window_clone, || {
+                    log::info!("Tab templates saved");
+                });
+            });
+            window.add_action(&action);
+        }
+
+        // View Logs action (debug menu)
+        {
+            let window_clone = window.clone();
+            let action = gio::SimpleAction::new("view-logs", None);
+            action.connect_activate(move |_, _| {
+                crate::log_viewer::show_log_viewer(&window_clone);
+            });
+            window.add_action(&action);
+        }
+
         // Debug menu actions (hidden unless Shift is held when opening Help menu)
         {
             // Re-launch cterm - triggers seamless upgrade to the same binary (for testing)

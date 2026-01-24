@@ -5,8 +5,11 @@
 mod app;
 mod dialogs;
 mod docker_dialog;
+mod log_viewer;
 mod menu;
+mod notification_bar;
 mod tab_bar;
+mod tab_templates_dialog;
 mod terminal_widget;
 mod update_dialog;
 #[cfg(unix)]
@@ -64,8 +67,8 @@ pub fn run() {
     // Parse command-line arguments first (before GTK consumes them)
     let args = Args::parse();
 
-    // Initialize logging
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+    // Initialize logging with capture for in-app viewing
+    cterm_app::log_capture::init();
 
     log::info!("Starting cterm");
 

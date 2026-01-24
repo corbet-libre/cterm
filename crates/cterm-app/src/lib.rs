@@ -8,6 +8,8 @@ pub mod config;
 #[cfg(unix)]
 pub mod crash_recovery;
 pub mod docker;
+pub mod file_transfer;
+pub mod log_capture;
 pub mod session;
 pub mod shortcuts;
 pub mod upgrade;
