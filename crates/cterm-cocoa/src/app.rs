@@ -86,10 +86,37 @@ thread_local! {
         const { std::cell::RefCell::new(Vec::new()) };
 }
 
+/// Thread-local storage for upgrade state (used during seamless upgrade)
+#[cfg(unix)]
+thread_local! {
+    static UPGRADE_STATE: std::cell::RefCell<Option<(cterm_app::upgrade::UpgradeState, Vec<std::os::unix::io::RawFd>)>> =
+        const { std::cell::RefCell::new(None) };
+}
+
 /// Take recovery FDs (consumes them)
 #[cfg(unix)]
 pub fn take_recovery_fds() -> Vec<cterm_app::RecoveredFd> {
     RECOVERY_FDS.with(|r| std::mem::take(&mut *r.borrow_mut()))
+}
+
+/// Take upgrade state (consumes it)
+#[cfg(unix)]
+pub fn take_upgrade_state() -> Option<(
+    cterm_app::upgrade::UpgradeState,
+    Vec<std::os::unix::io::RawFd>,
+)> {
+    UPGRADE_STATE.with(|s| s.borrow_mut().take())
+}
+
+/// Store upgrade state for use during app launch
+#[cfg(unix)]
+pub fn set_upgrade_state(
+    state: cterm_app::upgrade::UpgradeState,
+    fds: Vec<std::os::unix::io::RawFd>,
+) {
+    UPGRADE_STATE.with(|s| {
+        *s.borrow_mut() = Some((state, fds));
+    });
 }
 
 /// Check if we're in crash recovery mode
@@ -259,6 +286,22 @@ define_class!(
 
                 // Start periodic state saving
                 self.start_state_save_timer(mtm);
+
+                // Activate the app to bring window to front
+                #[allow(deprecated)]
+                NSApplication::sharedApplication(mtm).activateIgnoringOtherApps(true);
+
+                return;
+            }
+
+            // Check for seamless upgrade state
+            #[cfg(unix)]
+            if let Some((upgrade_state, fds)) = take_upgrade_state() {
+                log::info!(
+                    "Restoring {} windows from seamless upgrade",
+                    upgrade_state.windows.len()
+                );
+                self.restore_from_upgrade(mtm, upgrade_state, fds);
 
                 // Activate the app to bring window to front
                 #[allow(deprecated)]
@@ -461,6 +504,109 @@ impl AppDelegate {
         self.ivars().windows.borrow_mut().push(window.clone());
         window.makeKeyAndOrderFront(None);
         log::info!("Created new tab from template: {}", template.name);
+    }
+
+    /// Restore windows from seamless upgrade state
+    #[cfg(unix)]
+    fn restore_from_upgrade(
+        &self,
+        mtm: MainThreadMarker,
+        state: cterm_app::upgrade::UpgradeState,
+        fds: Vec<std::os::unix::io::RawFd>,
+    ) {
+        use cterm_core::screen::{Screen, ScreenConfig};
+        use cterm_core::term::Terminal;
+        use cterm_core::Pty;
+        use objc2_foundation::{NSPoint, NSRect, NSSize};
+
+        log::info!("Reconstructing {} windows", state.windows.len());
+
+        for (window_idx, window_state) in state.windows.into_iter().enumerate() {
+            log::info!(
+                "Window {}: {}x{} at ({}, {}), {} tabs",
+                window_idx,
+                window_state.width,
+                window_state.height,
+                window_state.x,
+                window_state.y,
+                window_state.tabs.len()
+            );
+
+            // For now, we only support restoring the first tab
+            if let Some(tab_state) = window_state.tabs.first() {
+                // Get the PTY FD for this tab
+                if tab_state.pty_fd_index >= fds.len() {
+                    log::error!(
+                        "PTY FD index {} out of range (max {})",
+                        tab_state.pty_fd_index,
+                        fds.len()
+                    );
+                    continue;
+                }
+
+                let pty_fd = fds[tab_state.pty_fd_index];
+
+                // Reconstruct Pty from the FD and child PID
+                let pty = unsafe { Pty::from_raw_fd(pty_fd, tab_state.child_pid) };
+
+                // Reconstruct Screen from the terminal state
+                let term_state = &tab_state.terminal;
+                let screen_config = ScreenConfig {
+                    scrollback_lines: self.ivars().config.general.scrollback_lines,
+                };
+
+                let screen = Screen::from_upgrade_state(
+                    term_state.grid.clone(),
+                    term_state.scrollback.clone(),
+                    term_state.alternate_grid.clone(),
+                    term_state.cursor.clone(),
+                    term_state.saved_cursor.clone(),
+                    term_state.alt_saved_cursor.clone(),
+                    term_state.scroll_region,
+                    term_state.style.clone(),
+                    term_state.modes.clone(),
+                    term_state.title.clone(),
+                    term_state.scroll_offset,
+                    term_state.tab_stops.clone(),
+                    screen_config,
+                );
+
+                // Create Terminal with the restored screen and PTY
+                let terminal = Terminal::from_restored(screen, pty);
+
+                // Create the window with the restored terminal
+                let window = CtermWindow::from_restored(
+                    mtm,
+                    &self.ivars().config,
+                    &self.ivars().theme,
+                    terminal,
+                );
+
+                // Restore window position and size
+                let frame = NSRect::new(
+                    NSPoint::new(window_state.x as f64, window_state.y as f64),
+                    NSSize::new(window_state.width as f64, window_state.height as f64),
+                );
+                window.setFrame_display(frame, true);
+
+                // Restore window title
+                if !tab_state.title.is_empty() {
+                    window.setTitle(&NSString::from_str(&tab_state.title));
+                }
+
+                // Restore template_name if present
+                if tab_state.template_name.is_some() {
+                    if let Some(terminal_view) = window.active_terminal() {
+                        terminal_view.set_template_name(tab_state.template_name.clone());
+                    }
+                }
+
+                self.ivars().windows.borrow_mut().push(window.clone());
+                window.makeKeyAndOrderFront(None);
+
+                log::info!("Window {} restored successfully", window_idx);
+            }
+        }
     }
 
     /// Save crash recovery state to disk
@@ -777,6 +923,12 @@ pub fn run() {
     // Store args for later access
     let _ = APP_ARGS.set(args);
 
+    run_app_internal();
+}
+
+/// Internal function to run the Cocoa application
+/// Called by both run() and upgrade_receiver after setup
+pub fn run_app_internal() {
     // Get main thread marker - this must be called on the main thread
     let mtm = MainThreadMarker::new().expect("Must be called on main thread");
 
