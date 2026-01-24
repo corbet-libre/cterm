@@ -11,8 +11,22 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  lint:
-    name: Lint (rustfmt & clippy)
+  format:
+    name: Check formatting
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+  lint-linux:
+    name: Clippy (Linux)
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
@@ -30,21 +44,52 @@ jobs:
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
         with:
-          components: rustfmt, clippy
+          components: clippy
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
 
-      - name: Check formatting
-        run: cargo fmt --all -- --check
+      - name: Run clippy
+        run: cargo clippy --workspace --exclude cterm-cocoa --exclude cterm-win32 --all-targets -- -D warnings
+
+  lint-macos:
+    name: Clippy (macOS)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
 
       - name: Run clippy
-        run: cargo clippy --workspace --exclude cterm-cocoa --all-targets --all-features -- -D warnings
+        run: cargo clippy --workspace --exclude cterm-gtk --exclude cterm-win32 --all-targets -- -D warnings
+
+  lint-windows:
+    name: Clippy (Windows)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Run clippy
+        run: cargo clippy --workspace --exclude cterm-cocoa --exclude cterm-gtk --all-targets -- -D warnings
 
   test-linux:
     name: Test (Linux)
     runs-on: ubuntu-22.04
-    needs: lint
+    needs: [format, lint-linux]
     steps:
       - uses: actions/checkout@v4
 
@@ -65,18 +110,14 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: Run tests
-        run: cargo test --workspace --exclude cterm-cocoa
+        run: cargo test --workspace --exclude cterm-cocoa --exclude cterm-win32
 
   test-macos:
     name: Test (macOS)
     runs-on: macos-latest
-    needs: lint
+    needs: [format, lint-macos]
     steps:
       - uses: actions/checkout@v4
-
-      - name: Install dependencies
-        run: |
-          brew install gtk4 libadwaita pango cairo glib pkg-config
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
@@ -85,7 +126,7 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: Run tests
-        run: cargo test --all
+        run: cargo test --workspace --exclude cterm-gtk --exclude cterm-win32
 
   build-linux:
     name: Build Linux (Ubuntu 22.04)
@@ -168,49 +209,31 @@ jobs:
   test-windows:
     name: Test (Windows)
     runs-on: windows-latest
-    needs: lint
-    defaults:
-      run:
-        shell: msys2 {0}
+    needs: [format, lint-windows]
     steps:
       - uses: actions/checkout@v4
 
-      - name: Setup MSYS2
-        uses: msys2/setup-msys2@v2
-        with:
-          msystem: UCRT64
-          update: true
-          install: >-
-            mingw-w64-ucrt-x86_64-gtk4
-            mingw-w64-ucrt-x86_64-libadwaita
-            mingw-w64-ucrt-x86_64-rust
-            mingw-w64-ucrt-x86_64-pkgconf
-            base-devel
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
 
       - name: Run tests
-        run: cargo test --workspace --exclude cterm-cocoa
+        run: cargo test --workspace --exclude cterm-cocoa --exclude cterm-gtk
 
   build-windows:
     name: Build Windows
     runs-on: windows-latest
     needs: test-windows
-    defaults:
-      run:
-        shell: msys2 {0}
     steps:
       - uses: actions/checkout@v4
 
-      - name: Setup MSYS2
-        uses: msys2/setup-msys2@v2
-        with:
-          msystem: UCRT64
-          update: true
-          install: >-
-            mingw-w64-ucrt-x86_64-gtk4
-            mingw-w64-ucrt-x86_64-libadwaita
-            mingw-w64-ucrt-x86_64-rust
-            mingw-w64-ucrt-x86_64-pkgconf
-            base-devel
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
 
       - name: Build
         run: cargo build --release
@@ -222,57 +245,6 @@ jobs:
           Copy-Item target/release/cterm.exe release/cterm-windows-x86_64/
           Copy-Item README.md release/cterm-windows-x86_64/
           Copy-Item LICENSE release/cterm-windows-x86_64/
-          # Copy required DLLs
-          $msysPath = "D:/a/_temp/msys64/ucrt64/bin"
-          $dlls = @(
-            "libgtk-4-1.dll",
-            "libadwaita-1-0.dll",
-            "libgio-2.0-0.dll",
-            "libglib-2.0-0.dll",
-            "libgobject-2.0-0.dll",
-            "libgmodule-2.0-0.dll",
-            "libcairo-2.dll",
-            "libcairo-gobject-2.dll",
-            "libpango-1.0-0.dll",
-            "libpangocairo-1.0-0.dll",
-            "libgdk_pixbuf-2.0-0.dll",
-            "libepoxy-0.dll",
-            "libfribidi-0.dll",
-            "libharfbuzz-0.dll",
-            "libpangowin32-1.0-0.dll",
-            "libpangoft2-1.0-0.dll",
-            "libfontconfig-1.dll",
-            "libfreetype-6.dll",
-            "libpng16-16.dll",
-            "zlib1.dll",
-            "libintl-8.dll",
-            "libiconv-2.dll",
-            "libpcre2-8-0.dll",
-            "libffi-8.dll",
-            "libgraphene-1.0-0.dll",
-            "libjpeg-8.dll",
-            "libtiff-6.dll",
-            "libxml2-2.dll",
-            "liblzma-5.dll",
-            "libzstd.dll",
-            "libbz2-1.dll",
-            "libbrotlidec.dll",
-            "libbrotlicommon.dll",
-            "libexpat-1.dll",
-            "libgcc_s_seh-1.dll",
-            "libstdc++-6.dll",
-            "libwinpthread-1.dll",
-            "libpixman-1-0.dll",
-            "libthai-0.dll",
-            "libgraphite2.dll",
-            "libdatrie-1.dll"
-          )
-          foreach ($dll in $dlls) {
-            $src = Join-Path $msysPath $dll
-            if (Test-Path $src) {
-              Copy-Item $src release/cterm-windows-x86_64/
-            }
-          }
 
       - name: Install NSIS
         shell: pwsh
