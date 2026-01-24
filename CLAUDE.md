@@ -72,3 +72,21 @@ Config locations:
 - Windows: `%APPDATA%\cterm\`
 
 Files: `config.toml`, `sticky_tabs.toml`, `themes/*.toml`
+
+## Workflow
+
+### Before Committing
+
+Always run `cargo fmt --all` before committing to ensure consistent formatting.
+
+### Release Process
+
+When creating a new release:
+
+1. Update `version` in `Cargo.toml` (under `[workspace.package]`)
+2. Run `cargo fmt --all`
+3. Commit the version bump
+4. Tag the commit: `git tag vX.Y.Z`
+5. Push commit and tag: `git push && git push origin vX.Y.Z`
+
+Tags trigger GitHub Actions to build release binaries. Never delete/recreate tags once pushed—they become releases with published artifacts.
