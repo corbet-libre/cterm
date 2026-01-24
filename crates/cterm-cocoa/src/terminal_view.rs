@@ -1813,6 +1813,11 @@ impl TerminalView {
         &self.ivars().terminal
     }
 
+    /// Get the cell size (width, height) for grid snapping
+    pub fn cell_size(&self) -> (f64, f64) {
+        (self.ivars().cell_width, self.ivars().cell_height)
+    }
+
     /// Check if there's a foreground process running (other than the shell)
     #[cfg(unix)]
     pub fn has_foreground_process(&self) -> bool {

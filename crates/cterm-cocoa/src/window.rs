@@ -184,6 +184,11 @@ impl CtermWindow {
         // Create the terminal view
         let terminal = TerminalView::new(mtm, config, theme);
         this.setContentView(Some(&terminal));
+
+        // Set content resize increments to snap to character grid
+        let (cell_width, cell_height) = terminal.cell_size();
+        this.setContentResizeIncrements(NSSize::new(cell_width, cell_height));
+
         *this.ivars().active_terminal.borrow_mut() = Some(terminal);
 
         this
@@ -255,6 +260,11 @@ impl CtermWindow {
         // Create the terminal view from the restored terminal
         let terminal_view = TerminalView::from_restored(mtm, config, theme, terminal);
         this.setContentView(Some(&terminal_view));
+
+        // Set content resize increments to snap to character grid
+        let (cell_width, cell_height) = terminal_view.cell_size();
+        this.setContentResizeIncrements(NSSize::new(cell_width, cell_height));
+
         *this.ivars().active_terminal.borrow_mut() = Some(terminal_view);
 
         this
@@ -318,6 +328,11 @@ impl CtermWindow {
         // Create the terminal view from the recovered FD
         let terminal_view = TerminalView::from_recovered_fd(mtm, config, theme, recovered);
         this.setContentView(Some(&terminal_view));
+
+        // Set content resize increments to snap to character grid
+        let (cell_width, cell_height) = terminal_view.cell_size();
+        this.setContentResizeIncrements(NSSize::new(cell_width, cell_height));
+
         *this.ivars().active_terminal.borrow_mut() = Some(terminal_view);
 
         this
@@ -418,6 +433,11 @@ impl CtermWindow {
         // Create the terminal view from template
         let terminal_view = TerminalView::from_template(mtm, config, theme, template);
         this.setContentView(Some(&terminal_view));
+
+        // Set content resize increments to snap to character grid
+        let (cell_width, cell_height) = terminal_view.cell_size();
+        this.setContentResizeIncrements(NSSize::new(cell_width, cell_height));
+
         *this.ivars().active_terminal.borrow_mut() = Some(terminal_view);
 
         this
