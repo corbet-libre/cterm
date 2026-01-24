@@ -28,6 +28,8 @@ pub mod cg_renderer;
 pub mod clipboard;
 pub mod dialogs;
 pub mod file_transfer;
+pub mod log_capture;
+pub mod log_viewer;
 pub mod menu;
 pub mod notification_bar;
 pub mod preferences;

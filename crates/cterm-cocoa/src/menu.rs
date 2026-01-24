@@ -476,6 +476,13 @@ fn create_help_menu(mtm: MainThreadMarker) -> Retained<NSMenuItem> {
         "",
     ));
 
+    debug_menu.addItem(&create_menu_item(
+        mtm,
+        "View Logs",
+        Some(sel!(showLogs:)),
+        "",
+    ));
+
     debug_menu.addItem(&NSMenuItem::separatorItem(mtm));
 
     debug_menu.addItem(&create_menu_item(

@@ -461,6 +461,13 @@ define_class!(
         fn action_debug_relaunch(&self, _sender: Option<&objc2::runtime::AnyObject>) {
             self.perform_relaunch();
         }
+
+        /// Debug menu: Show application logs
+        #[unsafe(method(showLogs:))]
+        fn action_show_logs(&self, _sender: Option<&objc2::runtime::AnyObject>) {
+            let mtm = MainThreadMarker::from(self);
+            crate::log_viewer::show_log_viewer(mtm);
+        }
     }
 );
 
@@ -840,8 +847,8 @@ pub fn run() {
     // Parse command-line arguments first
     let args = Args::parse();
 
-    // Initialize logging
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+    // Initialize logging with capture buffer for in-app log viewing
+    crate::log_capture::init();
 
     // Install signal handler for better crash debugging
     #[cfg(unix)]
