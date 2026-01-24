@@ -188,8 +188,10 @@ impl NotificationBar {
             (self.theme.ui.tab_bar_background.g as u16 + 20).min(255) as u8,
             (self.theme.ui.tab_bar_background.b as u16 + 30).min(255) as u8,
         );
-        let bg_brush = unsafe { rt.CreateSolidColorBrush(&rgb_to_d2d_color(bg_color), None)? };
-        unsafe { rt.FillRectangle(&bg_rect, &bg_brush) };
+        let bg_brush = unsafe {
+            ID2D1RenderTarget::CreateSolidColorBrush(rt, &rgb_to_d2d_color(bg_color), None)?
+        };
+        unsafe { ID2D1RenderTarget::FillRectangle(rt, &bg_rect, &bg_brush) };
 
         // Draw message text
         if let Some(ref file) = self.pending_file {
@@ -200,8 +202,9 @@ impl NotificationBar {
             );
 
             let text_color = self.theme.ui.tab_active_text;
-            let text_brush =
-                unsafe { rt.CreateSolidColorBrush(&rgb_to_d2d_color(text_color), None)? };
+            let text_brush = unsafe {
+                ID2D1RenderTarget::CreateSolidColorBrush(rt, &rgb_to_d2d_color(text_color), None)?
+            };
 
             let text_wide: Vec<u16> = message.encode_utf16().collect();
             let text_width = self.save_button_rect.left - self.dpi.scale_f32(BUTTON_MARGIN * 2.0);
@@ -217,7 +220,15 @@ impl NotificationBar {
                 x: self.dpi.scale_f32(BUTTON_MARGIN),
                 y: 0.0,
             };
-            unsafe { rt.DrawTextLayout(text_origin, &layout, &text_brush, Default::default()) };
+            unsafe {
+                ID2D1RenderTarget::DrawTextLayout(
+                    rt,
+                    text_origin,
+                    &layout,
+                    &text_brush,
+                    Default::default(),
+                )
+            };
         }
 
         // Draw buttons
@@ -248,9 +259,11 @@ impl NotificationBar {
 
         // Draw bottom border
         let border_color = rgb_to_d2d_color(self.theme.ui.border);
-        let border_brush = unsafe { rt.CreateSolidColorBrush(&border_color, None)? };
+        let border_brush =
+            unsafe { ID2D1RenderTarget::CreateSolidColorBrush(rt, &border_color, None)? };
         unsafe {
-            rt.DrawLine(
+            ID2D1RenderTarget::DrawLine(
+                rt,
                 D2D_POINT_2F { x: 0.0, y: height },
                 D2D_POINT_2F {
                     x: width,
@@ -282,12 +295,16 @@ impl NotificationBar {
         };
 
         // Button background
-        let bg_brush = unsafe { rt.CreateSolidColorBrush(&rgb_to_d2d_color(bg_color), None)? };
-        unsafe { rt.FillRoundedRectangle(&rounded_rect, &bg_brush) };
+        let bg_brush = unsafe {
+            ID2D1RenderTarget::CreateSolidColorBrush(rt, &rgb_to_d2d_color(bg_color), None)?
+        };
+        unsafe { ID2D1RenderTarget::FillRoundedRectangle(rt, &rounded_rect, &bg_brush) };
 
         // Button text
         let text_color = Rgb::new(255, 255, 255);
-        let text_brush = unsafe { rt.CreateSolidColorBrush(&rgb_to_d2d_color(text_color), None)? };
+        let text_brush = unsafe {
+            ID2D1RenderTarget::CreateSolidColorBrush(rt, &rgb_to_d2d_color(text_color), None)?
+        };
 
         let text_wide: Vec<u16> = label.encode_utf16().collect();
         let layout: IDWriteTextLayout = unsafe {
@@ -310,7 +327,15 @@ impl NotificationBar {
             x: rect.left,
             y: rect.top,
         };
-        unsafe { rt.DrawTextLayout(text_origin, &layout, &text_brush, Default::default()) };
+        unsafe {
+            ID2D1RenderTarget::DrawTextLayout(
+                rt,
+                text_origin,
+                &layout,
+                &text_brush,
+                Default::default(),
+            )
+        };
 
         Ok(())
     }
