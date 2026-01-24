@@ -539,8 +539,10 @@ impl AppDelegate {
                 window_state.tabs.len()
             );
 
-            // For now, we only support restoring the first tab
-            if let Some(tab_state) = window_state.tabs.first() {
+            // Restore all tabs in this window
+            let mut first_window: Option<Retained<CtermWindow>> = None;
+
+            for (tab_idx, tab_state) in window_state.tabs.into_iter().enumerate() {
                 // Get the PTY FD for this tab
                 if tab_state.pty_fd_index >= fds.len() {
                     log::error!(
@@ -589,13 +591,6 @@ impl AppDelegate {
                     terminal,
                 );
 
-                // Restore window position and size
-                let frame = NSRect::new(
-                    NSPoint::new(window_state.x as f64, window_state.y as f64),
-                    NSSize::new(window_state.width as f64, window_state.height as f64),
-                );
-                window.setFrame_display(frame, true);
-
                 // Restore window title
                 if !tab_state.title.is_empty() {
                     window.setTitle(&NSString::from_str(&tab_state.title));
@@ -608,9 +603,27 @@ impl AppDelegate {
                     }
                 }
 
+                // Track this window
                 self.ivars().windows.borrow_mut().push(window.clone());
-                window.makeKeyAndOrderFront(None);
 
+                if let Some(ref first) = first_window {
+                    // Add as a tab to the first window
+                    first.addTabbedWindow_ordered(&window, objc2_app_kit::NSWindowOrderingMode::Above);
+                    log::info!("Window {}, tab {} restored as tabbed window", window_idx, tab_idx);
+                } else {
+                    // First tab - restore window position and size, then show it
+                    let frame = NSRect::new(
+                        NSPoint::new(window_state.x as f64, window_state.y as f64),
+                        NSSize::new(window_state.width as f64, window_state.height as f64),
+                    );
+                    window.setFrame_display(frame, true);
+                    window.makeKeyAndOrderFront(None);
+                    first_window = Some(window.clone());
+                    log::info!("Window {}, tab {} restored as main window", window_idx, tab_idx);
+                }
+            }
+
+            if first_window.is_some() {
                 log::info!("Window {} restored successfully", window_idx);
             }
         }
