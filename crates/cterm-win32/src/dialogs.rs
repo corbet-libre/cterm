@@ -2,8 +2,6 @@
 //!
 //! Provides dialog boxes for preferences, about, find, set title/color, etc.
 
-use std::ffi::OsStr;
-use std::os::windows::ffi::OsStrExt;
 use std::ptr;
 
 use winapi::shared::minwindef::{LPARAM, LRESULT, UINT, WPARAM};
@@ -12,10 +10,7 @@ use winapi::um::winuser::*;
 
 /// Convert a Rust string to a null-terminated wide string
 fn to_wide(s: &str) -> Vec<u16> {
-    OsStr::new(s)
-        .encode_utf16()
-        .chain(std::iter::once(0))
-        .collect()
+    s.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
 /// Show an About dialog

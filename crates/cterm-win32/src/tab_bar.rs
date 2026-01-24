@@ -6,7 +6,7 @@ use std::collections::HashMap;
 
 use cterm_core::color::Rgb;
 use cterm_ui::theme::Theme;
-use windows::core::PCWSTR;
+use windows::core::{Interface, PCWSTR};
 use windows::Win32::Foundation::{HWND, RECT};
 use windows::Win32::Graphics::Direct2D::Common::{D2D1_COLOR_F, D2D_POINT_2F, D2D_RECT_F};
 use windows::Win32::Graphics::Direct2D::{
