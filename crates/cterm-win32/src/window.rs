@@ -199,7 +199,7 @@ impl WindowState {
                     // Handle events
                     for event in events {
                         match event {
-                            TerminalEvent::TitleChanged(title) => {
+                            TerminalEvent::TitleChanged(_title) => {
                                 // Post title change message
                                 // Note: We'd need to pass the title somehow
                                 unsafe {
@@ -378,23 +378,20 @@ impl WindowState {
 
     /// Render the window
     pub fn render(&mut self) -> windows::core::Result<()> {
-        let renderer = match self.renderer.as_mut() {
-            Some(r) => r,
-            None => return Ok(()),
-        };
+        if self.renderer.is_none() {
+            return Ok(());
+        }
 
-        // Get window size
-        let mut rect = RECT::default();
-        unsafe { GetClientRect(self.hwnd, &mut rect)? };
-        let width = (rect.right - rect.left) as f32;
-
-        // Get the render target and factories for rendering UI components
-        // This is a simplified render - in full implementation, we'd render all components
+        // Get the active terminal first (before borrowing renderer)
+        let terminal = self.active_terminal();
 
         // Render active terminal
-        if let Some(terminal) = self.active_terminal() {
+        if let Some(terminal) = terminal {
             let term = terminal.lock().unwrap();
-            renderer.render(term.screen())?;
+            // Now get the renderer and render
+            if let Some(renderer) = self.renderer.as_mut() {
+                renderer.render(term.screen())?;
+            }
         }
 
         Ok(())
@@ -664,7 +661,7 @@ impl WindowState {
                     self.save_file(file_id, true);
                 }
                 NotificationAction::Discard => {
-                    self.file_manager.discard();
+                    self.file_manager.discard(file_id);
                     self.notification_bar.hide();
                     self.invalidate();
                 }
@@ -674,20 +671,23 @@ impl WindowState {
 
     /// Save file (optionally with dialog)
     fn save_file(&mut self, file_id: u64, show_dialog: bool) {
-        // Get default path
-        let default_name = self.file_manager.pending_name().unwrap_or_default();
-        let default_path = self.file_manager.default_save_path(&default_name);
+        // Get default path from file manager
+        let default_path = self.file_manager.default_save_path();
 
         let save_path = if show_dialog {
-            // Show save dialog
-            crate::dialogs::show_save_dialog(self.hwnd, &default_path)
+            // Show save dialog - need a path or empty path
+            if let Some(ref path) = default_path {
+                crate::dialogs::show_save_dialog(self.hwnd, path)
+            } else {
+                crate::dialogs::show_save_dialog(self.hwnd, std::path::Path::new("download"))
+            }
         } else {
-            Some(default_path)
+            default_path
         };
 
         if let Some(path) = save_path {
-            match self.file_manager.save_to_path(&path) {
-                Ok(()) => {
+            match self.file_manager.save_to_path(file_id, &path) {
+                Ok(_size) => {
                     log::info!("File saved to {:?}", path);
                 }
                 Err(e) => {

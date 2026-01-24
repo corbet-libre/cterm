@@ -72,8 +72,8 @@ pub enum InputDialogResult {
 
 /// Show an input dialog using a custom dialog template
 pub fn show_input_dialog(
-    parent: HWND,
-    title: &str,
+    _parent: HWND,
+    _title: &str,
     prompt: &str,
     initial_value: &str,
 ) -> InputDialogResult {
@@ -81,7 +81,7 @@ pub fn show_input_dialog(
     // In a full implementation, this would use a proper dialog template
 
     // Create dialog data
-    let mut data = InputDialogData {
+    let data = InputDialogData {
         prompt: prompt.to_string(),
         value: initial_value.to_string(),
         result: None,

@@ -259,29 +259,34 @@ impl TerminalRenderer {
 
     /// Render the terminal screen
     pub fn render(&mut self, screen: &Screen) -> windows::core::Result<()> {
-        let rt = match self.render_target.as_ref() {
-            Some(rt) => rt,
-            None => return Ok(()),
-        };
+        if self.render_target.is_none() {
+            return Ok(());
+        }
 
+        // Begin drawing
         unsafe {
+            let rt = self.render_target.as_ref().unwrap();
             rt.BeginDraw();
 
             // Clear with background color
             let bg_color = rgb_to_d2d_color(self.theme.colors.background);
             rt.Clear(Some(&bg_color));
+        }
 
-            // Draw grid cells
-            self.draw_grid(screen)?;
+        // Draw grid cells
+        self.draw_grid(screen)?;
 
-            // Draw selection
-            if let Some(selection) = &screen.selection {
-                self.draw_selection(screen, selection)?;
-            }
+        // Draw selection
+        if let Some(selection) = screen.selection.clone() {
+            self.draw_selection(screen, &selection)?;
+        }
 
-            // Draw cursor
-            self.draw_cursor(screen)?;
+        // Draw cursor
+        self.draw_cursor(screen)?;
 
+        // End drawing
+        unsafe {
+            let rt = self.render_target.as_ref().unwrap();
             rt.EndDraw(None, None)?;
         }
 
