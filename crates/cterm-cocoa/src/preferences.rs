@@ -133,22 +133,18 @@ impl PreferencesWindow {
     }
 
     fn setup_ui(&self, mtm: MainThreadMarker, config: &Config) {
-        // Create main vertical stack
-        let main_stack = unsafe {
-            let stack = NSStackView::new(mtm);
-            stack.setOrientation(objc2_app_kit::NSUserInterfaceLayoutOrientation::Vertical);
-            stack.setSpacing(12.0);
-            stack.setEdgeInsets(objc2_foundation::NSEdgeInsets {
-                top: 12.0,
-                left: 12.0,
-                bottom: 12.0,
-                right: 12.0,
-            });
-            stack
+        // Create a container view for manual layout
+        let container = unsafe {
+            let view = objc2_app_kit::NSView::new(mtm);
+            view.setTranslatesAutoresizingMaskIntoConstraints(false);
+            view
         };
 
         // Create tab view
         let tab_view = NSTabView::new(mtm);
+        unsafe {
+            tab_view.setTranslatesAutoresizingMaskIntoConstraints(false);
+        }
 
         // Add tabs
         let general_tab = self.create_general_tab(mtm, config);
@@ -161,7 +157,7 @@ impl PreferencesWindow {
         tab_view.addTabViewItem(&tabs_tab);
 
         unsafe {
-            main_stack.addArrangedSubview(&tab_view);
+            container.addSubview(&tab_view);
         }
 
         // Create button row
@@ -169,6 +165,7 @@ impl PreferencesWindow {
             let stack = NSStackView::new(mtm);
             stack.setOrientation(objc2_app_kit::NSUserInterfaceLayoutOrientation::Horizontal);
             stack.setSpacing(8.0);
+            stack.setTranslatesAutoresizingMaskIntoConstraints(false);
             stack
         };
 
@@ -229,10 +226,46 @@ impl PreferencesWindow {
         }
 
         unsafe {
-            main_stack.addArrangedSubview(&button_stack);
+            container.addSubview(&button_stack);
         }
 
-        self.setContentView(Some(&main_stack));
+        // Set up Auto Layout constraints
+        unsafe {
+            use objc2_app_kit::NSLayoutConstraint;
+
+            // Tab view: pin to top, left, right with margins
+            let c1 = tab_view
+                .topAnchor()
+                .constraintEqualToAnchor_constant(&container.topAnchor(), 12.0);
+            let c2 = tab_view
+                .leadingAnchor()
+                .constraintEqualToAnchor_constant(&container.leadingAnchor(), 12.0);
+            let c3 = tab_view
+                .trailingAnchor()
+                .constraintEqualToAnchor_constant(&container.trailingAnchor(), -12.0);
+
+            // Button stack: pin to bottom, left, right with margins
+            let c4 = button_stack
+                .leadingAnchor()
+                .constraintEqualToAnchor_constant(&container.leadingAnchor(), 12.0);
+            let c5 = button_stack
+                .trailingAnchor()
+                .constraintEqualToAnchor_constant(&container.trailingAnchor(), -12.0);
+            let c6 = button_stack
+                .bottomAnchor()
+                .constraintEqualToAnchor_constant(&container.bottomAnchor(), -12.0);
+
+            // Connect tab view bottom to button stack top
+            let c7 = tab_view
+                .bottomAnchor()
+                .constraintEqualToAnchor_constant(&button_stack.topAnchor(), -12.0);
+
+            NSLayoutConstraint::activateConstraints(&objc2_foundation::NSArray::from_slice(&[
+                &*c1, &*c2, &*c3, &*c4, &*c5, &*c6, &*c7,
+            ]));
+        }
+
+        self.setContentView(Some(&container));
     }
 
     fn create_general_tab(
