@@ -297,25 +297,24 @@ impl TerminalRenderer {
     fn draw_grid(&mut self, screen: &Screen) -> windows::core::Result<()> {
         let grid = screen.grid();
         let scroll_offset = screen.scroll_offset;
+        let rows = grid.height();
+        let cols = grid.width();
 
-        for row in 0..screen.rows {
+        for row in 0..rows {
             let grid_row = if scroll_offset > 0 {
                 row.saturating_sub(scroll_offset)
             } else {
                 row
             };
 
-            if grid_row >= grid.rows() {
+            if grid_row >= rows {
                 continue;
             }
 
-            for col in 0..screen.cols {
-                if col >= grid.cols() {
-                    continue;
+            for col in 0..cols {
+                if let Some(cell) = grid.get(grid_row, col) {
+                    self.draw_cell(row, col, cell)?;
                 }
-
-                let cell = grid.cell(grid_row, col);
-                self.draw_cell(row, col, cell)?;
             }
         }
 
@@ -449,9 +448,11 @@ impl TerminalRenderer {
         let brush = self.get_brush(selection_color)?;
 
         let (start, end) = selection.normalized();
+        let rows = screen.grid().height();
+        let cols = screen.grid().width();
 
         for row in start.row..=end.row {
-            if row >= screen.rows {
+            if row >= rows {
                 continue;
             }
 
@@ -459,7 +460,7 @@ impl TerminalRenderer {
             let end_col = if row == end.row {
                 end.col
             } else {
-                screen.cols - 1
+                cols.saturating_sub(1)
             };
 
             let x = start_col as f32 * self.cell_dims.width;
@@ -506,8 +507,7 @@ impl TerminalRenderer {
 
         // Draw the character under cursor with inverted color
         let grid = screen.grid();
-        if cursor.row < grid.rows() && cursor.col < grid.cols() {
-            let cell = grid.cell(cursor.row, cursor.col);
+        if let Some(cell) = grid.get(cursor.row, cursor.col) {
             let c = cell.c;
 
             if c != ' ' && c != '\0' {

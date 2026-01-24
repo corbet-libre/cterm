@@ -136,8 +136,14 @@ impl WindowState {
             },
             shell: self.config.general.default_shell.clone(),
             args: self.config.general.shell_args.clone(),
-            env: self.config.general.env.clone(),
-            working_dir: self.config.general.working_directory.clone(),
+            cwd: self.config.general.working_directory.clone(),
+            env: self
+                .config
+                .general
+                .env
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect(),
         };
 
         let terminal = Terminal::with_shell(cols, rows, screen_config, &pty_config)?;
@@ -347,16 +353,7 @@ impl WindowState {
         let (cols, rows) = self.terminal_size();
         for tab in &self.tabs {
             let mut term = tab.terminal.lock().unwrap();
-            term.screen_mut().resize(cols, rows);
-            if let Some(pty) = term.pty_mut() {
-                pty.resize(PtySize {
-                    cols: cols as u16,
-                    rows: rows as u16,
-                    pixel_width: 0,
-                    pixel_height: 0,
-                })
-                .ok();
-            }
+            term.resize(cols, rows);
         }
     }
 
@@ -404,7 +401,7 @@ impl WindowState {
         // Check for shortcuts first
         if let Some(key) = keycode::vk_to_keycode(vk) {
             if let Some(action) = self.shortcuts.match_event(key, modifiers) {
-                self.handle_action(action);
+                self.handle_action(action.clone());
                 return true;
             }
         }
@@ -417,7 +414,7 @@ impl WindowState {
         // Send to terminal
         if let Some(terminal) = self.active_terminal() {
             let mut term = terminal.lock().unwrap();
-            let app_cursor = term.screen().modes.application_cursor_keys;
+            let app_cursor = term.screen().modes.application_cursor;
 
             // Get terminal sequence for special keys
             if let Some(seq) = keycode::vk_to_terminal_seq(vk, modifiers, app_cursor) {
@@ -549,7 +546,7 @@ impl WindowState {
                 MenuAction::ClearReset => {
                     if let Some(terminal) = self.active_terminal() {
                         let mut term = terminal.lock().unwrap();
-                        term.screen_mut().clear_scrollback();
+                        // reset() clears scrollback as well as screen
                         term.screen_mut().reset();
                         self.invalidate();
                     }
@@ -563,7 +560,7 @@ impl WindowState {
     fn copy_selection(&mut self) {
         if let Some(terminal) = self.active_terminal() {
             let term = terminal.lock().unwrap();
-            if let Some(text) = term.screen().selected_text() {
+            if let Some(text) = term.screen().get_selected_text() {
                 clipboard::copy_to_clipboard(&text).ok();
             }
         }
