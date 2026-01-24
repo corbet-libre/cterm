@@ -121,11 +121,13 @@ define_class!(
         #[unsafe(method(saveAndClose:))]
         fn action_save_and_close(&self, _sender: Option<&AnyObject>) {
             self.save_templates();
+            self.close_color_panel();
             self.close();
         }
 
         #[unsafe(method(cancelClose:))]
         fn action_cancel(&self, _sender: Option<&AnyObject>) {
+            self.close_color_panel();
             self.close();
         }
 
@@ -1288,6 +1290,22 @@ impl TabTemplatesWindow {
                 "Tab templates saved successfully ({} templates)",
                 templates.len()
             );
+        }
+    }
+
+    /// Close the shared color panel if it's open
+    fn close_color_panel(&self) {
+        unsafe {
+            use objc2_app_kit::NSColorPanel;
+            // Get the main thread marker from self (TabTemplatesWindow is MainThreadOnly)
+            let mtm = MainThreadMarker::from(self);
+            // Check if the color panel exists and is visible before closing
+            if NSColorPanel::sharedColorPanelExists(mtm) {
+                let panel = NSColorPanel::sharedColorPanel(mtm);
+                if panel.isVisible() {
+                    panel.orderOut(None);
+                }
+            }
         }
     }
 
