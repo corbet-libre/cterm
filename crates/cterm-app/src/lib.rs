@@ -26,7 +26,10 @@ pub use crash_recovery::{
     run_watchdog, unregister_fd_with_watchdog, write_crash_state, CrashState, RecoveredFd,
     WatchdogError,
 };
-pub use git_sync::{get_remote_url, init_with_remote, is_git_repo, GitError, InitResult};
+pub use git_sync::{
+    clone_repo, get_directory_remote_url, get_remote_url, init_with_remote, is_git_repo,
+    prepare_working_directory, GitError, InitResult,
+};
 pub use session::{Session, TabState, WindowState};
 pub use shortcuts::ShortcutManager;
 #[cfg(windows)]

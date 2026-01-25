@@ -496,6 +496,8 @@ pub struct StickyTabConfig {
     pub args: Vec<String>,
     /// Working directory
     pub working_directory: Option<PathBuf>,
+    /// Git remote URL for the working directory (if set and directory doesn't exist, clone it)
+    pub git_remote: Option<String>,
     /// Tab color (hex)
     pub color: Option<String>,
     /// Theme override for this tab (None = use default theme)
@@ -527,6 +529,7 @@ impl Default for StickyTabConfig {
             command: None,
             args: Vec::new(),
             working_directory: None,
+            git_remote: None,
             color: None,
             theme: None,
             background_color: None,

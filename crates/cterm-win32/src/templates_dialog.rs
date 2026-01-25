@@ -30,6 +30,7 @@ const IDC_TMPL_NAME: i32 = 1020;
 const IDC_TMPL_COMMAND: i32 = 1021;
 const IDC_TMPL_ARGS: i32 = 1022;
 const IDC_TMPL_WORKDIR: i32 = 1023;
+const IDC_TMPL_GIT_REMOTE: i32 = 1029;
 const IDC_TMPL_COLOR: i32 = 1024;
 const IDC_TMPL_COLOR_BTN: i32 = 1025;
 const IDC_TMPL_UNIQUE: i32 = 1026;
@@ -454,6 +455,26 @@ unsafe fn create_general_controls(hwnd: HWND, x: i32, y: i32, w: i32, _h: i32) {
         22,
     ));
 
+    // Git remote
+    cy += row_height + 5;
+    controls.push(create_label(
+        hwnd,
+        -1,
+        "Git remote:",
+        x,
+        cy + 3,
+        label_width,
+        18,
+    ));
+    controls.push(create_edit(
+        hwnd,
+        IDC_TMPL_GIT_REMOTE,
+        x + label_width + 10,
+        cy,
+        control_width,
+        22,
+    ));
+
     // Color
     cy += row_height + 5;
     controls.push(create_label(hwnd, -1, "Color:", x, cy + 3, label_width, 18));
@@ -832,15 +853,18 @@ fn load_current_template() {
                 );
             }
             if let Some(&edit) = state.general_controls.get(9) {
+                set_edit_text(edit, template.git_remote.as_deref().unwrap_or(""));
+            }
+            if let Some(&edit) = state.general_controls.get(11) {
                 set_edit_text(edit, template.color.as_deref().unwrap_or(""));
             }
-            if let Some(&checkbox) = state.general_controls.get(11) {
+            if let Some(&checkbox) = state.general_controls.get(13) {
                 set_checkbox_state(checkbox, template.unique);
             }
-            if let Some(&checkbox) = state.general_controls.get(12) {
+            if let Some(&checkbox) = state.general_controls.get(14) {
                 set_checkbox_state(checkbox, template.auto_start);
             }
-            if let Some(&checkbox) = state.general_controls.get(13) {
+            if let Some(&checkbox) = state.general_controls.get(15) {
                 set_checkbox_state(checkbox, template.keep_open);
             }
 
@@ -970,16 +994,24 @@ fn save_current_template() {
                 };
             }
             if let Some(&edit) = state.general_controls.get(9) {
+                let git_remote = get_edit_text(edit);
+                template.git_remote = if git_remote.is_empty() {
+                    None
+                } else {
+                    Some(git_remote)
+                };
+            }
+            if let Some(&edit) = state.general_controls.get(11) {
                 let color = get_edit_text(edit);
                 template.color = if color.is_empty() { None } else { Some(color) };
             }
-            if let Some(&checkbox) = state.general_controls.get(11) {
+            if let Some(&checkbox) = state.general_controls.get(13) {
                 template.unique = get_checkbox_state(checkbox);
             }
-            if let Some(&checkbox) = state.general_controls.get(12) {
+            if let Some(&checkbox) = state.general_controls.get(14) {
                 template.auto_start = get_checkbox_state(checkbox);
             }
-            if let Some(&checkbox) = state.general_controls.get(13) {
+            if let Some(&checkbox) = state.general_controls.get(15) {
                 template.keep_open = get_checkbox_state(checkbox);
             }
 

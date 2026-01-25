@@ -1814,6 +1814,15 @@ fn create_tab_from_template(
     notification_bar: &NotificationBar,
     template: &cterm_app::config::StickyTabConfig,
 ) {
+    // Prepare working directory (clone from git if needed)
+    if let Some(ref working_dir) = template.working_directory {
+        if let Err(e) =
+            cterm_app::prepare_working_directory(working_dir, template.git_remote.as_deref())
+        {
+            log::error!("Failed to prepare working directory: {}", e);
+        }
+    }
+
     // Create terminal widget from template
     let cfg = config.borrow();
     let terminal = match TerminalWidget::from_template(&cfg, theme, template) {

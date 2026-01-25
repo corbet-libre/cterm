@@ -207,6 +207,93 @@ fn ensure_git_user(config_dir: &Path) -> Result<(), GitError> {
     Ok(())
 }
 
+/// Clone a git repository to the specified directory
+/// Creates parent directories if needed
+pub fn clone_repo(remote_url: &str, target_dir: &Path) -> Result<(), GitError> {
+    // Create parent directory if it doesn't exist
+    if let Some(parent) = target_dir.parent() {
+        if !parent.exists() {
+            std::fs::create_dir_all(parent).map_err(GitError::Io)?;
+            log::info!("Created parent directory: {}", parent.display());
+        }
+    }
+
+    // Clone the repository
+    let output = Command::new("git")
+        .args(["clone", remote_url])
+        .arg(target_dir)
+        .output()
+        .map_err(GitError::Io)?;
+
+    if output.status.success() {
+        log::info!(
+            "Cloned repository {} to {}",
+            remote_url,
+            target_dir.display()
+        );
+        Ok(())
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+        log::error!("Git clone failed: {}", stderr);
+        Err(GitError::CommandFailed(stderr))
+    }
+}
+
+/// Prepare a template's working directory
+/// If the directory doesn't exist but a git remote is configured, clone it
+/// Returns Ok(true) if cloning was performed, Ok(false) if directory already existed
+pub fn prepare_working_directory(
+    working_dir: &Path,
+    git_remote: Option<&str>,
+) -> Result<bool, GitError> {
+    if working_dir.exists() {
+        return Ok(false);
+    }
+
+    match git_remote {
+        Some(remote) if !remote.is_empty() => {
+            log::info!(
+                "Working directory {} does not exist, cloning from {}",
+                working_dir.display(),
+                remote
+            );
+            clone_repo(remote, working_dir)?;
+            Ok(true)
+        }
+        _ => {
+            // No git remote, just create the directory
+            std::fs::create_dir_all(working_dir).map_err(GitError::Io)?;
+            log::info!("Created working directory: {}", working_dir.display());
+            Ok(false)
+        }
+    }
+}
+
+/// Get the git remote URL for any directory (not just config dir)
+/// Works on any directory that contains a .git subdirectory
+pub fn get_directory_remote_url(dir: &Path) -> Option<String> {
+    if !dir.join(".git").exists() {
+        return None;
+    }
+
+    let output = Command::new("git")
+        .args(["remote", "get-url", "origin"])
+        .current_dir(dir)
+        .output()
+        .ok()?;
+
+    if output.status.success() {
+        let url = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if url.is_empty() {
+            None
+        } else {
+            Some(url)
+        }
+    } else {
+        None
+    }
+}
+
 /// Run a git command and return stdout
 fn run_git(dir: &Path, args: &[&str]) -> Result<String, GitError> {
     log::trace!("Running git {:?} in {}", args, dir.display());
@@ -404,5 +491,69 @@ mod tests {
 
         let err = GitError::InvalidPath;
         assert_eq!(format!("{}", err), "Invalid path");
+    }
+
+    #[test]
+    fn test_get_directory_remote_url_no_git() {
+        let temp = TempDir::new().unwrap();
+        assert!(get_directory_remote_url(temp.path()).is_none());
+    }
+
+    #[test]
+    fn test_get_directory_remote_url_with_remote() {
+        let temp = TempDir::new().unwrap();
+        run_git(temp.path(), &["init"]).unwrap();
+        // Use example.com to avoid git URL rewriting that may be configured for github.com
+        run_git(
+            temp.path(),
+            &[
+                "remote",
+                "add",
+                "origin",
+                "https://example.com/test/repo.git",
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            get_directory_remote_url(temp.path()),
+            Some("https://example.com/test/repo.git".to_string())
+        );
+    }
+
+    #[test]
+    fn test_prepare_working_directory_exists() {
+        let temp = TempDir::new().unwrap();
+        // Directory already exists, should return Ok(false)
+        let result = prepare_working_directory(temp.path(), None).unwrap();
+        assert!(!result);
+    }
+
+    #[test]
+    fn test_prepare_working_directory_create_no_remote() {
+        let temp = TempDir::new().unwrap();
+        let new_dir = temp.path().join("subdir");
+        // Directory doesn't exist, no remote, should create it
+        let result = prepare_working_directory(&new_dir, None).unwrap();
+        assert!(!result); // false because no cloning was done
+        assert!(new_dir.exists());
+    }
+
+    #[test]
+    fn test_prepare_working_directory_clone_fails_invalid_remote() {
+        let temp = TempDir::new().unwrap();
+        let new_dir = temp.path().join("cloned");
+        // Invalid remote URL should fail
+        let result = prepare_working_directory(&new_dir, Some("not-a-valid-url"));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_clone_repo_creates_parent_dirs() {
+        let temp = TempDir::new().unwrap();
+        let deep_path = temp.path().join("a").join("b").join("c");
+        // Clone will fail because of invalid URL, but parent dirs should be created
+        let _ = clone_repo("not-a-valid-url", &deep_path);
+        // Parent should exist even if clone failed
+        assert!(temp.path().join("a").join("b").exists());
     }
 }

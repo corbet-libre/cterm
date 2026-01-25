@@ -480,6 +480,15 @@ impl CtermWindow {
         // Set self as delegate
         this.setDelegate(Some(ProtocolObject::from_ref(&*this)));
 
+        // Prepare working directory (clone from git if needed)
+        if let Some(ref working_dir) = template.working_directory {
+            if let Err(e) =
+                cterm_app::prepare_working_directory(working_dir, template.git_remote.as_deref())
+            {
+                log::error!("Failed to prepare working directory: {}", e);
+            }
+        }
+
         // Create the terminal view from template
         let terminal_view = TerminalView::from_template(mtm, config, theme, template);
         this.setContentView(Some(&terminal_view));

@@ -26,6 +26,7 @@ struct TemplateWidgets {
     command_entry: Entry,
     args_entry: Entry,
     path_entry: Entry,
+    git_remote_entry: Entry,
     color_button: ColorButton,
     theme_entry: Entry,
     unique_check: CheckButton,
@@ -272,6 +273,7 @@ fn create_widgets(notebook: &Notebook) -> TemplateWidgets {
         command_entry,
         args_entry,
         path_entry,
+        git_remote_entry,
         color_button,
         theme_entry,
         unique_check,
@@ -323,6 +325,7 @@ fn create_widgets(notebook: &Notebook) -> TemplateWidgets {
         command_entry,
         args_entry,
         path_entry,
+        git_remote_entry,
         color_button,
         theme_entry,
         unique_check,
@@ -352,8 +355,10 @@ fn create_widgets(notebook: &Notebook) -> TemplateWidgets {
     }
 }
 
+#[allow(clippy::type_complexity)]
 fn create_general_tab() -> (
     ScrolledWindow,
+    Entry,
     Entry,
     Entry,
     Entry,
@@ -414,6 +419,18 @@ fn create_general_tab() -> (
     grid.attach(&path_entry, 1, row, 1, 1);
     row += 1;
 
+    // Git remote (for auto-cloning working directory)
+    let git_remote_label = Label::new(Some("Git Remote:"));
+    git_remote_label.set_halign(Align::End);
+    grid.attach(&git_remote_label, 0, row, 1, 1);
+    let git_remote_entry = Entry::new();
+    git_remote_entry.set_placeholder_text(Some("auto-clone if dir missing"));
+    git_remote_entry.set_tooltip_text(Some(
+        "If working directory doesn't exist, clone from this git URL",
+    ));
+    grid.attach(&git_remote_entry, 1, row, 1, 1);
+    row += 1;
+
     // Color
     let color_label = Label::new(Some("Tab Color:"));
     color_label.set_halign(Align::End);
@@ -463,6 +480,7 @@ fn create_general_tab() -> (
         command_entry,
         args_entry,
         path_entry,
+        git_remote_entry,
         color_button,
         theme_entry,
         unique_check,
@@ -805,6 +823,9 @@ fn load_template_into_widgets(widgets: &TemplateWidgets, template: &StickyTabCon
             .map(|p| p.to_string_lossy().to_string())
             .unwrap_or_default(),
     );
+    widgets
+        .git_remote_entry
+        .set_text(template.git_remote.as_deref().unwrap_or(""));
 
     // Color
     if let Some(hex) = &template.color {
@@ -938,6 +959,12 @@ fn save_widgets_to_template(widgets: &TemplateWidgets, template: &mut StickyTabC
     } else {
         Some(PathBuf::from(path))
     };
+    let git_remote = widgets.git_remote_entry.text().to_string();
+    template.git_remote = if git_remote.is_empty() {
+        None
+    } else {
+        Some(git_remote)
+    };
 
     // Color
     let rgba = widgets.color_button.rgba();
@@ -1043,6 +1070,23 @@ fn connect_field_signals(
             let mut templates = templates_clone.borrow_mut();
             if let Some(template) = templates.get_mut(index as usize) {
                 template.name = name;
+            }
+        }
+    });
+
+    // Connect path entry to auto-detect git remote
+    let widgets_clone = Rc::clone(widgets);
+    widgets.path_entry.connect_changed(move |entry| {
+        let path_text = entry.text().to_string();
+        if path_text.is_empty() {
+            return;
+        }
+
+        let path = std::path::Path::new(&path_text);
+        // Only auto-fill if git_remote is currently empty and path has a .git directory
+        if widgets_clone.git_remote_entry.text().is_empty() {
+            if let Some(remote) = cterm_app::get_directory_remote_url(path) {
+                widgets_clone.git_remote_entry.set_text(&remote);
             }
         }
     });

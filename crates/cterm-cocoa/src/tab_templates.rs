@@ -30,6 +30,7 @@ pub struct TabTemplatesWindowIvars {
     command_field: RefCell<Option<Retained<NSTextField>>>,
     args_field: RefCell<Option<Retained<NSTextField>>>,
     path_field: RefCell<Option<Retained<NSTextField>>>,
+    git_remote_field: RefCell<Option<Retained<NSTextField>>>,
     color_well: RefCell<Option<Retained<NSColorWell>>>,
     background_color_well: RefCell<Option<Retained<NSColorWell>>>,
     theme_field: RefCell<Option<Retained<NSTextField>>>,
@@ -77,18 +78,27 @@ define_class!(
                 // Update popup button title if name changed
                 self.update_popup_item_title(index);
 
-                // Check if the changed field is the project directory field
-                // and auto-detect devcontainer.json
+                // Check which field changed and auto-detect where appropriate
                 if let Some(changed_field) = notification.object() {
+                    // Check if it's the project directory field for devcontainer detection
                     if let Some(project_dir_field) =
                         self.ivars().docker_project_dir_field.borrow().as_ref()
                     {
-                        // Compare object pointers to see if it's the project dir field
                         let changed_ptr: *const AnyObject = &*changed_field;
                         let project_ptr: *const AnyObject =
                             (project_dir_field as &AnyObject) as *const AnyObject;
                         if changed_ptr == project_ptr {
                             self.auto_detect_devcontainer();
+                        }
+                    }
+
+                    // Check if it's the path field for git remote auto-detection
+                    if let Some(path_field) = self.ivars().path_field.borrow().as_ref() {
+                        let changed_ptr: *const AnyObject = &*changed_field;
+                        let path_ptr: *const AnyObject =
+                            (path_field as &AnyObject) as *const AnyObject;
+                        if changed_ptr == path_ptr {
+                            self.auto_detect_git_remote();
                         }
                     }
                 }
@@ -230,6 +240,7 @@ impl TabTemplatesWindow {
             command_field: RefCell::new(None),
             args_field: RefCell::new(None),
             path_field: RefCell::new(None),
+            git_remote_field: RefCell::new(None),
             color_well: RefCell::new(None),
             background_color_well: RefCell::new(None),
             theme_field: RefCell::new(None),
@@ -444,6 +455,11 @@ impl TabTemplatesWindow {
         let path_row = self.create_field_row(mtm, "Working Dir:", 250.0);
         stack.addView_inGravity(&path_row.0, NSStackViewGravity::Top);
         *self.ivars().path_field.borrow_mut() = Some(path_row.1);
+
+        // Git remote field
+        let git_remote_row = self.create_field_row(mtm, "Git Remote:", 250.0);
+        stack.addView_inGravity(&git_remote_row.0, NSStackViewGravity::Top);
+        *self.ivars().git_remote_field.borrow_mut() = Some(git_remote_row.1);
 
         // Color picker
         let color_row = self.create_color_row(mtm);
@@ -799,6 +815,11 @@ impl TabTemplatesWindow {
                     .unwrap_or_default();
                 field.setStringValue(&NSString::from_str(&path_str));
             }
+            if let Some(field) = self.ivars().git_remote_field.borrow().as_ref() {
+                field.setStringValue(&NSString::from_str(
+                    template.git_remote.as_deref().unwrap_or(""),
+                ));
+            }
             if let Some(color_well) = self.ivars().color_well.borrow().as_ref() {
                 unsafe {
                     use objc2::msg_send;
@@ -1044,6 +1065,9 @@ impl TabTemplatesWindow {
         if let Some(field) = self.ivars().path_field.borrow().as_ref() {
             field.setStringValue(&empty);
         }
+        if let Some(field) = self.ivars().git_remote_field.borrow().as_ref() {
+            field.setStringValue(&empty);
+        }
         if let Some(color_well) = self.ivars().color_well.borrow().as_ref() {
             unsafe {
                 use objc2::msg_send;
@@ -1142,6 +1166,14 @@ impl TabTemplatesWindow {
                     None
                 } else {
                     Some(PathBuf::from(path_str))
+                };
+            }
+            if let Some(field) = self.ivars().git_remote_field.borrow().as_ref() {
+                let git_remote = field.stringValue().to_string();
+                template.git_remote = if git_remote.is_empty() {
+                    None
+                } else {
+                    Some(git_remote)
                 };
             }
             if let Some(color_well) = self.ivars().color_well.borrow().as_ref() {
@@ -1646,6 +1678,42 @@ impl TabTemplatesWindow {
         }
         if let Some(cb) = self.ivars().ssh_agent_forward_checkbox.borrow().as_ref() {
             cb.setEnabled(ssh_enabled);
+        }
+    }
+
+    /// Auto-detect git remote when working directory changes
+    fn auto_detect_git_remote(&self) {
+        // Get the path from the field
+        let path_str = self
+            .ivars()
+            .path_field
+            .borrow()
+            .as_ref()
+            .map(|f| f.stringValue().to_string())
+            .unwrap_or_default();
+
+        if path_str.is_empty() {
+            return;
+        }
+
+        // Only auto-fill if git remote field is currently empty
+        let git_remote_is_empty = self
+            .ivars()
+            .git_remote_field
+            .borrow()
+            .as_ref()
+            .map(|f| f.stringValue().to_string().is_empty())
+            .unwrap_or(true);
+
+        if !git_remote_is_empty {
+            return;
+        }
+
+        let path = std::path::Path::new(&path_str);
+        if let Some(remote) = cterm_app::get_directory_remote_url(path) {
+            if let Some(field) = self.ivars().git_remote_field.borrow().as_ref() {
+                field.setStringValue(&NSString::from_str(&remote));
+            }
         }
     }
 
