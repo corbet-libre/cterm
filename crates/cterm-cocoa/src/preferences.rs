@@ -16,8 +16,10 @@ use objc2_foundation::{
 };
 
 use cterm_app::config::{
-    save_config, Config, CursorStyleConfig, NewTabPosition, TabBarPosition, TabBarVisibility,
+    config_dir, save_config, Config, CursorStyleConfig, NewTabPosition, TabBarPosition,
+    TabBarVisibility,
 };
+use cterm_app::git_sync;
 
 /// Preferences window ivars
 pub struct PreferencesWindowIvars {
@@ -27,6 +29,8 @@ pub struct PreferencesWindowIvars {
     scrollback_field: RefCell<Option<Retained<NSTextField>>>,
     confirm_close_checkbox: RefCell<Option<Retained<NSButton>>>,
     copy_on_select_checkbox: RefCell<Option<Retained<NSButton>>>,
+    git_remote_field: RefCell<Option<Retained<NSTextField>>>,
+    git_status_label: RefCell<Option<Retained<NSTextField>>>,
     // Appearance tab controls
     theme_popup: RefCell<Option<Retained<NSPopUpButton>>>,
     font_field: RefCell<Option<Retained<NSTextField>>>,
@@ -98,6 +102,8 @@ impl PreferencesWindow {
             scrollback_field: RefCell::new(None),
             confirm_close_checkbox: RefCell::new(None),
             copy_on_select_checkbox: RefCell::new(None),
+            git_remote_field: RefCell::new(None),
+            git_status_label: RefCell::new(None),
             theme_popup: RefCell::new(None),
             font_field: RefCell::new(None),
             font_size_field: RefCell::new(None),
@@ -318,6 +324,52 @@ impl PreferencesWindow {
         *self.ivars().copy_on_select_checkbox.borrow_mut() = Some(copy_checkbox.clone());
         unsafe {
             stack.addArrangedSubview(&copy_checkbox);
+        }
+
+        // Separator for Git Sync section
+        let separator = NSTextField::labelWithString(&NSString::from_str(""), mtm);
+        unsafe {
+            stack.addArrangedSubview(&separator);
+        }
+
+        // Git Sync section header
+        let git_header = NSTextField::labelWithString(&NSString::from_str("Git Sync"), mtm);
+        unsafe {
+            stack.addArrangedSubview(&git_header);
+        }
+
+        // Git remote URL - load existing value if available
+        let existing_remote = config_dir()
+            .and_then(|dir| git_sync::get_remote_url(&dir))
+            .unwrap_or_default();
+
+        let git_remote_row = self.create_label_field_row(mtm, "Git Remote URL:", &existing_remote);
+        *self.ivars().git_remote_field.borrow_mut() = Some(git_remote_row.1.clone());
+        unsafe {
+            stack.addArrangedSubview(&git_remote_row.0);
+        }
+
+        // Git sync status label
+        let status_text = if let Some(dir) = config_dir() {
+            if git_sync::is_git_repo(&dir) {
+                if git_sync::get_remote_url(&dir).is_some() {
+                    "Configured"
+                } else {
+                    "No remote set"
+                }
+            } else {
+                "Not initialized"
+            }
+        } else {
+            "Config dir not found"
+        };
+        let status_row = self.create_label_field_row(mtm, "Status:", status_text);
+        status_row.1.setEditable(false);
+        status_row.1.setDrawsBackground(false);
+        status_row.1.setBordered(false);
+        *self.ivars().git_status_label.borrow_mut() = Some(status_row.1.clone());
+        unsafe {
+            stack.addArrangedSubview(&status_row.0);
         }
 
         tab.setView(Some(&stack));
@@ -734,9 +786,55 @@ impl PreferencesWindow {
             config.tabs.show_close_button = checkbox.state() == 1;
         }
 
-        // Save to file
-        if let Err(e) = save_config(&config) {
-            log::error!("Failed to save config: {}", e);
+        // Handle git remote URL
+        let mut should_sync = false;
+        let mut pulled_remote = false;
+        if let Some(ref field) = *self.ivars().git_remote_field.borrow() {
+            let remote_url = field.stringValue().to_string();
+            if let Some(dir) = config_dir() {
+                if !remote_url.is_empty() {
+                    // Initialize repo with remote if needed
+                    match git_sync::init_with_remote(&dir, &remote_url) {
+                        Ok(git_sync::InitResult::PulledRemote) => {
+                            // Remote config was pulled - reload it instead of saving current
+                            log::info!("Pulled config from remote, reloading");
+                            pulled_remote = true;
+                        }
+                        Ok(_) => {
+                            should_sync = true;
+                        }
+                        Err(e) => {
+                            log::error!("Failed to set git remote: {}", e);
+                        }
+                    }
+                }
+            }
+        }
+
+        // If we pulled from remote, reload config and update the callback
+        // Otherwise save current config to file
+        if pulled_remote {
+            // Reload config from the pulled files
+            if let Ok(new_config) = cterm_app::load_config() {
+                config = new_config;
+                log::info!("Reloaded config from git remote");
+            }
+        } else {
+            // Save to file
+            if let Err(e) = save_config(&config) {
+                log::error!("Failed to save config: {}", e);
+            }
+
+            // Commit and push if git sync is enabled
+            if should_sync {
+                if let Some(dir) = config_dir() {
+                    if git_sync::is_git_repo(&dir) {
+                        if let Err(e) = git_sync::commit_and_push(&dir, "Update configuration") {
+                            log::error!("Failed to push config: {}", e);
+                        }
+                    }
+                }
+            }
         }
 
         // Call the on_save callback

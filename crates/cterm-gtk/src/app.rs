@@ -9,6 +9,11 @@ use crate::window::CtermWindow;
 
 /// Build the main UI
 pub fn build_ui(app: &Application) {
+    // Perform background git sync before loading config
+    if cterm_app::background_sync() {
+        log::info!("Configuration was updated from git remote");
+    }
+
     // Load configuration
     let config = load_config().unwrap_or_else(|e| {
         log::warn!("Failed to load config, using defaults: {}", e);

@@ -10,8 +10,9 @@ use gtk4::{
 };
 
 use cterm_app::config::{
-    Config, CursorStyleConfig, NewTabPosition, TabBarPosition, TabBarVisibility,
+    config_dir, Config, CursorStyleConfig, NewTabPosition, TabBarPosition, TabBarVisibility,
 };
+use cterm_app::git_sync;
 
 /// Show the "Set Title" dialog
 pub fn show_set_title_dialog<F>(parent: &impl IsA<Window>, current_title: &str, callback: F)
@@ -289,6 +290,7 @@ struct PreferencesWidgets {
     scrollback_spin: SpinButton,
     confirm_switch: Switch,
     copy_select_switch: Switch,
+    git_remote_entry: Entry,
     // Appearance
     theme_combo: ComboBoxText,
     font_entry: Entry,
@@ -307,6 +309,34 @@ struct PreferencesWidgets {
 }
 
 impl PreferencesWidgets {
+    /// Handle git remote setup and sync.
+    /// Returns true if remote config was pulled and should be reloaded.
+    fn handle_git_sync(&self) -> bool {
+        let remote_url = self.git_remote_entry.text().to_string();
+        if let Some(dir) = config_dir() {
+            if !remote_url.is_empty() {
+                // Initialize repo with remote if needed
+                match git_sync::init_with_remote(&dir, &remote_url) {
+                    Ok(git_sync::InitResult::PulledRemote) => {
+                        // Remote config was pulled - caller should reload
+                        log::info!("Pulled config from remote");
+                        return true;
+                    }
+                    Ok(_) => {
+                        // Commit and push changes
+                        if let Err(e) = git_sync::commit_and_push(&dir, "Update configuration") {
+                            log::error!("Failed to push config: {}", e);
+                        }
+                    }
+                    Err(e) => {
+                        log::error!("Failed to set git remote: {}", e);
+                    }
+                }
+            }
+        }
+        false
+    }
+
     fn collect_config(&self, base_config: &Config) -> Config {
         let mut config = base_config.clone();
 
@@ -399,7 +429,7 @@ pub fn show_preferences_dialog(
     content.append(&notebook);
 
     // General tab
-    let (general_page, scrollback_spin, confirm_switch, copy_select_switch) =
+    let (general_page, scrollback_spin, confirm_switch, copy_select_switch, git_remote_entry) =
         create_general_preferences(config);
     notebook.append_page(&general_page, Some(&Label::new(Some("General"))));
 
@@ -429,6 +459,7 @@ pub fn show_preferences_dialog(
         scrollback_spin,
         confirm_switch,
         copy_select_switch,
+        git_remote_entry,
         theme_combo,
         font_entry,
         size_spin,
@@ -446,8 +477,20 @@ pub fn show_preferences_dialog(
     let base_config = config.clone();
     dialog.connect_response(move |dialog, response| match response {
         ResponseType::Ok | ResponseType::Apply => {
-            let new_config = widgets.collect_config(&base_config);
-            on_save(new_config);
+            // Handle git sync first to see if we should reload
+            let pulled_remote = widgets.handle_git_sync();
+
+            let final_config = if pulled_remote {
+                // Reload config from the pulled files
+                cterm_app::load_config().unwrap_or_else(|e| {
+                    log::warn!("Failed to reload config after git pull: {}", e);
+                    widgets.collect_config(&base_config)
+                })
+            } else {
+                widgets.collect_config(&base_config)
+            };
+
+            on_save(final_config);
             if response == ResponseType::Ok {
                 dialog.close();
             }
@@ -460,7 +503,7 @@ pub fn show_preferences_dialog(
     dialog.present();
 }
 
-fn create_general_preferences(config: &Config) -> (GtkBox, SpinButton, Switch, Switch) {
+fn create_general_preferences(config: &Config) -> (GtkBox, SpinButton, Switch, Switch, Entry) {
     let page = GtkBox::new(Orientation::Vertical, 12);
     page.set_margin_top(12);
     page.set_margin_bottom(12);
@@ -500,8 +543,59 @@ fn create_general_preferences(config: &Config) -> (GtkBox, SpinButton, Switch, S
     copy_select_switch.set_halign(Align::Start);
     grid.attach(&copy_select_switch, 1, 2, 1, 1);
 
+    // Git Sync section separator
+    let git_header = Label::new(Some("Git Sync"));
+    git_header.set_halign(Align::Start);
+    git_header.set_margin_top(12);
+    git_header.add_css_class("heading");
+    grid.attach(&git_header, 0, 3, 2, 1);
+
+    // Git remote URL
+    let git_label = Label::new(Some("Git Remote URL:"));
+    git_label.set_halign(Align::End);
+    grid.attach(&git_label, 0, 4, 1, 1);
+
+    let git_entry = Entry::new();
+    git_entry.set_placeholder_text(Some("https://github.com/user/cterm-config.git"));
+    git_entry.set_hexpand(true);
+    // Load existing remote if present
+    if let Some(dir) = config_dir() {
+        if let Some(url) = git_sync::get_remote_url(&dir) {
+            git_entry.set_text(&url);
+        }
+    }
+    grid.attach(&git_entry, 1, 4, 1, 1);
+
+    // Git status label
+    let status_label = Label::new(Some("Status:"));
+    status_label.set_halign(Align::End);
+    grid.attach(&status_label, 0, 5, 1, 1);
+
+    let status_text = if let Some(dir) = config_dir() {
+        if git_sync::is_git_repo(&dir) {
+            if git_sync::get_remote_url(&dir).is_some() {
+                "Configured"
+            } else {
+                "No remote set"
+            }
+        } else {
+            "Not initialized"
+        }
+    } else {
+        "Config dir not found"
+    };
+    let status_value = Label::new(Some(status_text));
+    status_value.set_halign(Align::Start);
+    grid.attach(&status_value, 1, 5, 1, 1);
+
     page.append(&grid);
-    (page, scrollback_spin, confirm_switch, copy_select_switch)
+    (
+        page,
+        scrollback_spin,
+        confirm_switch,
+        copy_select_switch,
+        git_entry,
+    )
 }
 
 fn create_appearance_preferences(

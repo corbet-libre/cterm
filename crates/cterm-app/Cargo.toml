@@ -34,3 +34,6 @@ winapi = { version = "0.3", features = [
     "winbase",
     "winnt",
 ] }
+
+[dev-dependencies]
+tempfile = "3"

@@ -854,6 +854,52 @@ pub fn save_sticky_tabs(tabs: &[StickyTabConfig]) -> Result<(), ConfigError> {
     Ok(())
 }
 
+/// Perform background git pull if config is a git repo.
+/// Returns true if config was updated and should be reloaded.
+pub fn background_sync() -> bool {
+    let Some(dir) = config_dir() else {
+        return false;
+    };
+
+    if !crate::git_sync::is_git_repo(&dir) {
+        return false;
+    }
+
+    match crate::git_sync::pull(&dir) {
+        Ok(true) => {
+            log::info!("Config updated from git remote");
+            true
+        }
+        Ok(false) => {
+            log::debug!("Config already up to date with git remote");
+            false
+        }
+        Err(e) => {
+            log::warn!("Git pull failed: {}", e);
+            false
+        }
+    }
+}
+
+/// Save configuration to file with optional git sync.
+/// If sync is true and config dir is a git repo, commits and pushes changes.
+pub fn save_config_with_sync(config: &Config, sync: bool) -> Result<(), ConfigError> {
+    // Save to file first
+    save_config(config)?;
+
+    if sync {
+        if let Some(dir) = config_dir() {
+            if crate::git_sync::is_git_repo(&dir) {
+                if let Err(e) = crate::git_sync::commit_and_push(&dir, "Update configuration") {
+                    log::warn!("Failed to sync config to git: {}", e);
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

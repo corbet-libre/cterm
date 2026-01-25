@@ -9,12 +9,16 @@ pub mod config;
 pub mod crash_recovery;
 pub mod docker;
 pub mod file_transfer;
+pub mod git_sync;
 pub mod log_capture;
 pub mod session;
 pub mod shortcuts;
 pub mod upgrade;
 
-pub use config::{load_config, load_sticky_tabs, save_config, save_sticky_tabs, Config};
+pub use config::{
+    background_sync, load_config, load_sticky_tabs, save_config, save_config_with_sync,
+    save_sticky_tabs, Config,
+};
 #[cfg(unix)]
 pub use crash_recovery::{
     clear_crash_state, crash_marker_path, crash_state_path, notify_watchdog_shutdown,
@@ -22,6 +26,7 @@ pub use crash_recovery::{
     run_watchdog, unregister_fd_with_watchdog, write_crash_state, CrashState, RecoveredFd,
     WatchdogError,
 };
+pub use git_sync::{get_remote_url, init_with_remote, is_git_repo, GitError, InitResult};
 pub use session::{Session, TabState, WindowState};
 pub use shortcuts::ShortcutManager;
 #[cfg(windows)]

@@ -1056,6 +1056,11 @@ pub fn run_app_internal() {
     // Get main thread marker - this must be called on the main thread
     let mtm = MainThreadMarker::new().expect("Must be called on main thread");
 
+    // Perform background git sync before loading config
+    if cterm_app::background_sync() {
+        log::info!("Configuration was updated from git remote");
+    }
+
     // Load configuration
     let config = load_config().unwrap_or_else(|e| {
         log::warn!("Failed to load config, using defaults: {}", e);
