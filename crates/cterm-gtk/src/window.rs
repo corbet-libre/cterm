@@ -1801,7 +1801,7 @@ fn create_docker_tab(
 
 /// Create a new terminal tab from a template
 #[allow(clippy::too_many_arguments)]
-pub fn create_tab_from_template(
+fn create_tab_from_template(
     notebook: &Notebook,
     tabs: &Rc<RefCell<Vec<TabEntry>>>,
     next_tab_id: &Rc<RefCell<u64>>,

@@ -189,19 +189,6 @@ impl TerminalWidget {
 
         let cell_dims = Rc::new(RefCell::new(cell_dims));
 
-        // Parse background color override from template
-        let background_override = template.background_color.as_ref().and_then(|hex| {
-            let hex = hex.trim_start_matches('#');
-            if hex.len() == 6 {
-                let r = u8::from_str_radix(&hex[0..2], 16).ok()?;
-                let g = u8::from_str_radix(&hex[2..4], 16).ok()?;
-                let b = u8::from_str_radix(&hex[4..6], 16).ok()?;
-                Some(Rgb::new(r, g, b))
-            } else {
-                None
-            }
-        });
-
         let widget = Self {
             drawing_area: drawing_area.clone(),
             terminal: Arc::clone(&terminal),
@@ -210,7 +197,7 @@ impl TerminalWidget {
             font_size: Rc::new(RefCell::new(font_size)),
             default_font_size: font_size,
             cell_dims,
-            background_override: Rc::new(RefCell::new(background_override)),
+            background_override: Rc::new(RefCell::new(None)),
             on_exit: Rc::new(RefCell::new(None)),
             on_bell: Rc::new(RefCell::new(None)),
             on_title_change: Rc::new(RefCell::new(None)),
@@ -228,6 +215,11 @@ impl TerminalWidget {
 
         // Set up resize handling
         widget.setup_resize();
+
+        // Apply background color override from template
+        if let Some(ref color) = template.background_color {
+            widget.set_background_override(Some(color));
+        }
 
         Ok(widget)
     }

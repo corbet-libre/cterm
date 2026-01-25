@@ -58,11 +58,6 @@ struct TemplateWidgets {
     ssh_agent_check: CheckButton,
 }
 
-/// Show the tab templates dialog
-pub fn show_tab_templates_dialog(parent: &impl IsA<Window>, on_save: impl Fn() + 'static) {
-    show_tab_templates_dialog_with_open(parent, on_save, |_| {});
-}
-
 /// Show the tab templates dialog with an "Open" callback
 pub fn show_tab_templates_dialog_with_open<F, G>(parent: &impl IsA<Window>, on_save: F, on_open: G)
 where
