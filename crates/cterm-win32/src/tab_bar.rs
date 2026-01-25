@@ -2,23 +2,17 @@
 //!
 //! Provides a tab bar similar to modern browsers with close buttons and indicators.
 
-use std::collections::HashMap;
+use std::ops::Deref;
 
 use cterm_core::color::Rgb;
 use cterm_ui::theme::Theme;
-use windows::core::{Interface, PCWSTR};
-use windows::Win32::Foundation::{HWND, RECT};
 use windows::Win32::Graphics::Direct2D::Common::{D2D1_COLOR_F, D2D_POINT_2F, D2D_RECT_F};
 use windows::Win32::Graphics::Direct2D::{
-    ID2D1Factory, ID2D1HwndRenderTarget, ID2D1RenderTarget, ID2D1SolidColorBrush, D2D1_ROUNDED_RECT,
+    ID2D1HwndRenderTarget, ID2D1RenderTarget, D2D1_ROUNDED_RECT,
 };
 use windows::Win32::Graphics::DirectWrite::{
-    IDWriteFactory, IDWriteTextFormat, IDWriteTextLayout, DWRITE_FONT_STRETCH_NORMAL,
-    DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_PARAGRAPH_ALIGNMENT_CENTER,
-    DWRITE_TEXT_ALIGNMENT_CENTER, DWRITE_TEXT_METRICS, DWRITE_TRIMMING,
-    DWRITE_TRIMMING_GRANULARITY_CHARACTER,
+    IDWriteFactory, IDWriteTextFormat, IDWriteTextLayout, DWRITE_PARAGRAPH_ALIGNMENT_CENTER,
 };
-use windows::Win32::UI::WindowsAndMessaging::GetClientRect;
 
 use crate::dpi::DpiInfo;
 
@@ -278,6 +272,9 @@ impl TabBar {
 
         let height = self.dpi.scale_f32(TAB_BAR_HEIGHT as f32);
 
+        // Cast to parent type for method access
+        let base: &ID2D1RenderTarget = rt.deref();
+
         // Draw background
         let bg_rect = D2D_RECT_F {
             left: 0.0,
@@ -286,8 +283,8 @@ impl TabBar {
             bottom: height,
         };
         let bg_color = rgb_to_d2d_color(self.theme.ui.tab_bar_background);
-        let bg_brush = unsafe { rt.CreateSolidColorBrush(&bg_color, None)? };
-        unsafe { rt.FillRectangle(&bg_rect, &bg_brush) };
+        let bg_brush = unsafe { base.CreateSolidColorBrush(&bg_color, None)? };
+        unsafe { base.FillRectangle(&bg_rect, &bg_brush) };
 
         // Draw each tab
         for tab in &self.tabs {
@@ -299,9 +296,9 @@ impl TabBar {
 
         // Draw bottom border
         let border_color = rgb_to_d2d_color(self.theme.ui.border);
-        let border_brush = unsafe { rt.CreateSolidColorBrush(&border_color, None)? };
+        let border_brush = unsafe { base.CreateSolidColorBrush(&border_color, None)? };
         unsafe {
-            rt.DrawLine(
+            base.DrawLine(
                 D2D_POINT_2F { x: 0.0, y: height },
                 D2D_POINT_2F {
                     x: width,
@@ -324,6 +321,8 @@ impl TabBar {
         tab: &TabInfo,
         text_format: &IDWriteTextFormat,
     ) -> windows::core::Result<()> {
+        let base: &ID2D1RenderTarget = rt.deref();
+
         let (_, rect) = self
             .tab_rects
             .iter()
@@ -354,8 +353,8 @@ impl TabBar {
             radiusY: self.dpi.scale_f32(TAB_CORNER_RADIUS),
         };
 
-        let bg_brush = unsafe { rt.CreateSolidColorBrush(&rgb_to_d2d_color(bg_color), None)? };
-        unsafe { rt.FillRoundedRectangle(&rounded_rect, &bg_brush) };
+        let bg_brush = unsafe { base.CreateSolidColorBrush(&rgb_to_d2d_color(bg_color), None)? };
+        unsafe { base.FillRoundedRectangle(&rounded_rect, &bg_brush) };
 
         // Tab indicator bar for custom color
         if let Some(color) = tab.color {
@@ -366,8 +365,8 @@ impl TabBar {
                 bottom: rect.bounds.bottom - 1.0,
             };
             let indicator_brush =
-                unsafe { rt.CreateSolidColorBrush(&rgb_to_d2d_color(color), None)? };
-            unsafe { rt.FillRectangle(&indicator_rect, &indicator_brush) };
+                unsafe { base.CreateSolidColorBrush(&rgb_to_d2d_color(color), None)? };
+            unsafe { base.FillRectangle(&indicator_rect, &indicator_brush) };
         }
 
         // Title text
@@ -377,7 +376,8 @@ impl TabBar {
             self.theme.ui.tab_inactive_text
         };
 
-        let text_brush = unsafe { rt.CreateSolidColorBrush(&rgb_to_d2d_color(text_color), None)? };
+        let text_brush =
+            unsafe { base.CreateSolidColorBrush(&rgb_to_d2d_color(text_color), None)? };
 
         // Create text with bell indicator if needed
         let display_title = if tab.has_bell {
@@ -409,7 +409,7 @@ impl TabBar {
             x: rect.bounds.left + 8.0,
             y: rect.bounds.top,
         };
-        unsafe { rt.DrawTextLayout(text_origin, &layout, &text_brush, Default::default()) };
+        unsafe { base.DrawTextLayout(text_origin, &layout, &text_brush, Default::default()) };
 
         // Close button
         let close_hover = self.hover_tab_id == Some(tab.id) && self.hover_close_button;
@@ -419,12 +419,12 @@ impl TabBar {
             text_color
         };
         let close_brush =
-            unsafe { rt.CreateSolidColorBrush(&rgb_to_d2d_color(close_color), None)? };
+            unsafe { base.CreateSolidColorBrush(&rgb_to_d2d_color(close_color), None)? };
 
         // Draw X
         let padding = 4.0;
         unsafe {
-            rt.DrawLine(
+            base.DrawLine(
                 D2D_POINT_2F {
                     x: rect.close_button.left + padding,
                     y: rect.close_button.top + padding,
@@ -437,7 +437,7 @@ impl TabBar {
                 1.5,
                 None,
             );
-            rt.DrawLine(
+            base.DrawLine(
                 D2D_POINT_2F {
                     x: rect.close_button.right - padding,
                     y: rect.close_button.top + padding,
@@ -457,8 +457,10 @@ impl TabBar {
 
     /// Render the new tab button
     fn render_new_tab_button(&self, rt: &ID2D1HwndRenderTarget) -> windows::core::Result<()> {
+        let base: &ID2D1RenderTarget = rt.deref();
+
         let text_color = self.theme.ui.tab_inactive_text;
-        let brush = unsafe { rt.CreateSolidColorBrush(&rgb_to_d2d_color(text_color), None)? };
+        let brush = unsafe { base.CreateSolidColorBrush(&rgb_to_d2d_color(text_color), None)? };
 
         // Draw + sign
         let cx = (self.new_tab_rect.left + self.new_tab_rect.right) / 2.0;
@@ -467,7 +469,7 @@ impl TabBar {
 
         unsafe {
             // Horizontal line
-            rt.DrawLine(
+            base.DrawLine(
                 D2D_POINT_2F {
                     x: cx - size,
                     y: cy,
@@ -481,7 +483,7 @@ impl TabBar {
                 None,
             );
             // Vertical line
-            rt.DrawLine(
+            base.DrawLine(
                 D2D_POINT_2F {
                     x: cx,
                     y: cy - size,

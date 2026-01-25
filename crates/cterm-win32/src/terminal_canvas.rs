@@ -3,19 +3,19 @@
 //! Hardware-accelerated terminal rendering using Direct2D and DirectWrite.
 
 use std::collections::HashMap;
-use std::ptr;
+use std::ops::Deref;
 
 use cterm_core::color::{Color, Rgb};
-use cterm_core::{Cell, CellAttrs, Grid, Screen, Selection};
+use cterm_core::{Cell, CellAttrs, Screen, Selection};
 use cterm_ui::theme::Theme;
-use windows::core::{Interface, PCWSTR};
+use windows::core::PCWSTR;
 use windows::Win32::Foundation::{HWND, RECT};
 use windows::Win32::Graphics::Direct2D::Common::{
     D2D1_ALPHA_MODE_PREMULTIPLIED, D2D1_COLOR_F, D2D1_PIXEL_FORMAT, D2D_POINT_2F, D2D_RECT_F,
-    D2D_SIZE_F, D2D_SIZE_U,
+    D2D_SIZE_U,
 };
 use windows::Win32::Graphics::Direct2D::{
-    D2D1CreateFactory, ID2D1Brush, ID2D1Factory, ID2D1HwndRenderTarget, ID2D1RenderTarget,
+    D2D1CreateFactory, ID2D1Factory, ID2D1HwndRenderTarget, ID2D1RenderTarget,
     ID2D1SolidColorBrush, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE, D2D1_FACTORY_OPTIONS,
     D2D1_FACTORY_TYPE_SINGLE_THREADED, D2D1_FEATURE_LEVEL_DEFAULT,
     D2D1_HWND_RENDER_TARGET_PROPERTIES, D2D1_PRESENT_OPTIONS_NONE, D2D1_RENDER_TARGET_PROPERTIES,
@@ -224,8 +224,9 @@ impl TerminalRenderer {
         }
 
         let rt = self.render_target.as_ref().unwrap();
+        let base: &ID2D1RenderTarget = rt.deref();
         let d2d_color = rgb_to_d2d_color(color);
-        let brush = unsafe { rt.CreateSolidColorBrush(&d2d_color, None)? };
+        let brush = unsafe { base.CreateSolidColorBrush(&d2d_color, None)? };
 
         self.brush_cache.insert(key, brush.clone());
         Ok(brush)
@@ -330,6 +331,9 @@ impl TerminalRenderer {
         let attrs = cell.attrs;
         let (fg, bg) = self.resolve_colors(cell);
 
+        let rt = self.render_target.as_ref().unwrap();
+        let base: &ID2D1RenderTarget = rt.deref();
+
         // Draw background if not default
         if bg != self.theme.colors.background {
             let rect = D2D_RECT_F {
@@ -339,8 +343,7 @@ impl TerminalRenderer {
                 bottom: y + self.cell_dims.height,
             };
             let brush = self.get_brush(bg)?;
-            let rt = self.render_target.as_ref().unwrap();
-            unsafe { rt.FillRectangle(&rect, &brush) };
+            unsafe { base.FillRectangle(&rect, &brush) };
         }
 
         // Draw character
@@ -367,17 +370,15 @@ impl TerminalRenderer {
             };
 
             let origin = D2D_POINT_2F { x, y };
-            let rt = self.render_target.as_ref().unwrap();
-            unsafe { rt.DrawTextLayout(origin, &layout, &fg_brush, Default::default()) };
+            unsafe { base.DrawTextLayout(origin, &layout, &fg_brush, Default::default()) };
         }
 
         // Draw underline
         if attrs.has_underline() {
             let fg_brush = self.get_brush(fg)?;
             let underline_y = y + self.cell_dims.baseline + 2.0;
-            let rt = self.render_target.as_ref().unwrap();
             unsafe {
-                rt.DrawLine(
+                base.DrawLine(
                     D2D_POINT_2F { x, y: underline_y },
                     D2D_POINT_2F {
                         x: x + self.cell_dims.width,
@@ -394,9 +395,8 @@ impl TerminalRenderer {
         if attrs.contains(CellAttrs::STRIKETHROUGH) {
             let fg_brush = self.get_brush(fg)?;
             let strike_y = y + self.cell_dims.height / 2.0;
-            let rt = self.render_target.as_ref().unwrap();
             unsafe {
-                rt.DrawLine(
+                base.DrawLine(
                     D2D_POINT_2F { x, y: strike_y },
                     D2D_POINT_2F {
                         x: x + self.cell_dims.width,
@@ -449,6 +449,9 @@ impl TerminalRenderer {
         let rows = screen.grid().height();
         let cols = screen.grid().width();
 
+        let rt = self.render_target.as_ref().unwrap();
+        let base: &ID2D1RenderTarget = rt.deref();
+
         for line in start.line..=end.line {
             if line >= rows {
                 continue;
@@ -472,8 +475,7 @@ impl TerminalRenderer {
                 bottom: y + self.cell_dims.height,
             };
 
-            let rt = self.render_target.as_ref().unwrap();
-            unsafe { rt.FillRectangle(&rect, &brush) };
+            unsafe { base.FillRectangle(&rect, &brush) };
         }
 
         Ok(())
@@ -500,10 +502,12 @@ impl TerminalRenderer {
             bottom: y + self.cell_dims.height,
         };
 
+        let rt = self.render_target.as_ref().unwrap();
+        let base: &ID2D1RenderTarget = rt.deref();
+
         // Draw filled block cursor
         unsafe {
-            let rt = self.render_target.as_ref().unwrap();
-            rt.FillRectangle(&rect, &brush);
+            base.FillRectangle(&rect, &brush);
         }
 
         // Draw the character under cursor with inverted color
@@ -530,8 +534,7 @@ impl TerminalRenderer {
 
                 let origin = D2D_POINT_2F { x, y };
                 unsafe {
-                    let rt = self.render_target.as_ref().unwrap();
-                    rt.DrawTextLayout(origin, &layout, &text_brush, Default::default());
+                    base.DrawTextLayout(origin, &layout, &text_brush, Default::default());
                 }
             }
         }
