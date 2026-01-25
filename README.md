@@ -121,8 +121,8 @@ See [docs/configuration.md](docs/configuration.md) for detailed configuration op
 | Zoom In | Cmd++ | Ctrl++ |
 | Zoom Out | Cmd+- | Ctrl+- |
 | Reset Zoom | Cmd+0 | Ctrl+0 |
-| Scroll Up | Fn+Up | Shift+PageUp |
-| Scroll Down | Fn+Down | Shift+PageDown |
+
+**Scrollback:** Use mouse wheel or trackpad to scroll through terminal history.
 
 ## Terminal Compatibility
 
