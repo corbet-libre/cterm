@@ -339,12 +339,10 @@ impl TabBar {
             }
         } else if self.hover_tab_id == Some(tab.id) {
             self.theme.ui.tab_active_background
+        } else if let Some(color) = tab.color {
+            blend_colors(color, self.theme.ui.tab_inactive_background, 0.2)
         } else {
-            if let Some(color) = tab.color {
-                blend_colors(color, self.theme.ui.tab_inactive_background, 0.2)
-            } else {
-                self.theme.ui.tab_inactive_background
-            }
+            self.theme.ui.tab_inactive_background
         };
 
         let rounded_rect = D2D1_ROUNDED_RECT {

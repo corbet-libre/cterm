@@ -2,17 +2,12 @@
 //!
 //! Manages the main window, tabs, terminal rendering, and message handling.
 
-use std::collections::HashMap;
-use std::ptr;
-use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
-use parking_lot::RwLock;
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
-use windows::Win32::Graphics::Direct2D::Common::D2D_SIZE_U;
 use windows::Win32::Graphics::Gdi::{BeginPaint, EndPaint, InvalidateRect, HBRUSH, PAINTSTRUCT};
 use windows::Win32::UI::WindowsAndMessaging::GetClientRect;
 use windows::Win32::UI::WindowsAndMessaging::*;
@@ -20,10 +15,10 @@ use windows::Win32::UI::WindowsAndMessaging::*;
 use cterm_app::config::Config;
 use cterm_app::file_transfer::PendingFileManager;
 use cterm_app::shortcuts::ShortcutManager;
-use cterm_core::pty::{Pty, PtyConfig, PtySize};
+use cterm_core::pty::{PtyConfig, PtySize};
 use cterm_core::screen::{FileTransferOperation, ScreenConfig};
 use cterm_core::term::{Terminal, TerminalEvent};
-use cterm_ui::events::{Action, KeyCode, Modifiers};
+use cterm_ui::events::Action;
 use cterm_ui::theme::Theme;
 
 use crate::clipboard;
@@ -33,7 +28,7 @@ use crate::menu::{self, MenuAction};
 use crate::mouse::MouseState;
 use crate::notification_bar::{NotificationAction, NotificationBar};
 use crate::tab_bar::{TabBar, TAB_BAR_HEIGHT};
-use crate::terminal_canvas::{CellDimensions, TerminalRenderer};
+use crate::terminal_canvas::TerminalRenderer;
 
 /// Custom window messages
 pub const WM_APP_PTY_DATA: u32 = WM_APP + 1;
@@ -48,6 +43,7 @@ pub struct TabEntry {
     pub terminal: Arc<Mutex<Terminal>>,
     pub color: Option<String>,
     pub has_bell: bool,
+    #[allow(dead_code)]
     reader_handle: Option<thread::JoinHandle<()>>,
 }
 
@@ -66,6 +62,7 @@ pub struct WindowState {
     pub file_manager: PendingFileManager,
     pub dpi: DpiInfo,
     pub mouse_state: MouseState,
+    #[allow(dead_code)]
     menu_handle: winapi::shared::windef::HMENU,
 }
 
@@ -123,7 +120,6 @@ impl WindowState {
         // Create terminal
         let screen_config = ScreenConfig {
             scrollback_lines: self.config.general.scrollback_lines,
-            ..Default::default()
         };
 
         let pty_config = PtyConfig {
@@ -208,7 +204,7 @@ impl WindowState {
                                 // Post title change message
                                 // Note: We'd need to pass the title somehow
                                 unsafe {
-                                    PostMessageW(
+                                    let _ = PostMessageW(
                                         Some(HWND(hwnd as *mut _)),
                                         WM_APP_TITLE_CHANGED,
                                         WPARAM(tab_id as usize),
@@ -217,7 +213,7 @@ impl WindowState {
                                 }
                             }
                             TerminalEvent::Bell => unsafe {
-                                PostMessageW(
+                                let _ = PostMessageW(
                                     Some(HWND(hwnd as *mut _)),
                                     WM_APP_BELL,
                                     WPARAM(tab_id as usize),
@@ -226,7 +222,7 @@ impl WindowState {
                             },
                             TerminalEvent::ProcessExited(_) => {
                                 unsafe {
-                                    PostMessageW(
+                                    let _ = PostMessageW(
                                         Some(HWND(hwnd as *mut _)),
                                         WM_APP_PTY_EXIT,
                                         WPARAM(tab_id as usize),
@@ -242,7 +238,7 @@ impl WindowState {
 
                 // Request redraw
                 unsafe {
-                    PostMessageW(
+                    let _ = PostMessageW(
                         Some(HWND(hwnd as *mut _)),
                         WM_APP_PTY_DATA,
                         WPARAM(tab_id as usize),
@@ -253,7 +249,7 @@ impl WindowState {
 
             // Process exited
             unsafe {
-                PostMessageW(
+                let _ = PostMessageW(
                     Some(HWND(hwnd as *mut _)),
                     WM_APP_PTY_EXIT,
                     WPARAM(tab_id as usize),
@@ -271,7 +267,9 @@ impl WindowState {
 
             if self.tabs.is_empty() {
                 // Close window
-                unsafe { PostMessageW(Some(self.hwnd), WM_CLOSE, WPARAM(0), LPARAM(0)) };
+                unsafe {
+                    let _ = PostMessageW(Some(self.hwnd), WM_CLOSE, WPARAM(0), LPARAM(0));
+                };
             } else {
                 // Adjust active tab index
                 if self.active_tab_index >= self.tabs.len() {
@@ -369,7 +367,9 @@ impl WindowState {
 
     /// Invalidate and request redraw
     pub fn invalidate(&self) {
-        unsafe { InvalidateRect(Some(self.hwnd), None, false) };
+        unsafe {
+            let _ = InvalidateRect(Some(self.hwnd), None, false);
+        };
     }
 
     /// Render the window
@@ -468,7 +468,9 @@ impl WindowState {
                 // TODO: Implement zoom reset
             }
             Action::CloseWindow => {
-                unsafe { PostMessageW(Some(self.hwnd), WM_CLOSE, WPARAM(0), LPARAM(0)) };
+                unsafe {
+                    let _ = PostMessageW(Some(self.hwnd), WM_CLOSE, WPARAM(0), LPARAM(0));
+                };
             }
             Action::NewWindow => {
                 // TODO: Implement new window
@@ -517,7 +519,9 @@ impl WindowState {
                     }
                 }
                 MenuAction::Quit => {
-                    unsafe { PostMessageW(Some(self.hwnd), WM_CLOSE, WPARAM(0), LPARAM(0)) };
+                    unsafe {
+                        let _ = PostMessageW(Some(self.hwnd), WM_CLOSE, WPARAM(0), LPARAM(0));
+                    };
                 }
                 MenuAction::Copy => self.copy_selection(),
                 MenuAction::Paste => self.paste(),
@@ -793,9 +797,9 @@ extern "system" fn window_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPA
     match msg {
         WM_PAINT => {
             let mut ps = PAINTSTRUCT::default();
-            unsafe { BeginPaint(hwnd, &mut ps) };
+            let _ = unsafe { BeginPaint(hwnd, &mut ps) };
             state.render().ok();
-            unsafe { EndPaint(hwnd, &ps) };
+            let _ = unsafe { EndPaint(hwnd, &ps) };
             LRESULT(0)
         }
 

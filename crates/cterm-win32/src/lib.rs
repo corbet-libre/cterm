@@ -3,6 +3,9 @@
 //! This crate implements the cterm terminal emulator UI using native Windows APIs,
 //! Direct2D for rendering, and DirectWrite for text.
 
+// Allow raw pointer handling - this is a Windows GUI crate
+#![allow(clippy::not_unsafe_ptr_arg_deref)]
+
 pub mod clipboard;
 pub mod dialogs;
 pub mod dpi;
@@ -146,7 +149,7 @@ fn run_main_loop(
         }
 
         unsafe {
-            TranslateMessage(&msg);
+            let _ = TranslateMessage(&msg);
             DispatchMessageW(&msg);
         }
     }

@@ -89,8 +89,10 @@ pub fn show_input_dialog(
 
 /// Internal data for input dialog
 struct InputDialogData {
+    #[allow(dead_code)]
     prompt: String,
     value: String,
+    #[allow(dead_code)]
     result: Option<String>,
 }
 
