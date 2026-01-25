@@ -16,12 +16,12 @@ mod protocol;
 mod state;
 mod updater;
 
-#[cfg(unix)]
-pub use protocol::{execute_upgrade, receive_upgrade, UpgradeError, MAX_FDS, MAX_STATE_SIZE};
 #[cfg(windows)]
 pub use protocol::{
     execute_upgrade, receive_upgrade, HandleInfo, UpgradeError, WindowsUpgradeData, MAX_FDS,
     MAX_STATE_SIZE,
 };
+#[cfg(unix)]
+pub use protocol::{execute_upgrade, receive_upgrade, UpgradeError, MAX_FDS, MAX_STATE_SIZE};
 pub use state::{TabUpgradeState, TerminalUpgradeState, UpgradeState, WindowUpgradeState};
 pub use updater::{UpdateError, UpdateInfo, Updater};

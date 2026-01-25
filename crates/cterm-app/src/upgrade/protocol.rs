@@ -265,7 +265,11 @@ pub fn execute_upgrade(
             SetHandleInformation(*hpc as HANDLE, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT);
             SetHandleInformation(*read_h as HANDLE, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT);
             SetHandleInformation(*write_h as HANDLE, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT);
-            SetHandleInformation(*process_h as HANDLE, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT);
+            SetHandleInformation(
+                *process_h as HANDLE,
+                HANDLE_FLAG_INHERIT,
+                HANDLE_FLAG_INHERIT,
+            );
         }
         inheritable_handles.push(*hpc as HANDLE);
         inheritable_handles.push(*read_h as HANDLE);
@@ -374,10 +378,7 @@ pub fn execute_upgrade(
         )));
     }
 
-    log::info!(
-        "New process spawned with PID: {}",
-        process_info.dwProcessId
-    );
+    log::info!("New process spawned with PID: {}", process_info.dwProcessId);
 
     // Close handle to the new process thread (we don't need it)
     unsafe {
@@ -407,8 +408,8 @@ pub fn execute_upgrade(
     };
 
     // Serialize and send the upgrade data
-    let data_bytes =
-        bincode::serialize(&upgrade_data).map_err(|e| UpgradeError::Serialization(e.to_string()))?;
+    let data_bytes = bincode::serialize(&upgrade_data)
+        .map_err(|e| UpgradeError::Serialization(e.to_string()))?;
 
     // Write length prefix then data
     let mut write_file = unsafe { std::fs::File::from_raw_handle(write_pipe as RawHandle) };
@@ -517,7 +518,13 @@ pub fn receive_upgrade(fd: RawFd) -> Result<(UpgradeState, Vec<RawFd>), UpgradeE
 #[cfg(windows)]
 pub fn receive_upgrade(
     handle: usize,
-) -> Result<(UpgradeState, Vec<(RawHandle, RawHandle, RawHandle, RawHandle, u32)>), UpgradeError> {
+) -> Result<
+    (
+        UpgradeState,
+        Vec<(RawHandle, RawHandle, RawHandle, RawHandle, u32)>,
+    ),
+    UpgradeError,
+> {
     use std::io::{Read, Write};
     use std::os::windows::io::FromRawHandle;
     use winapi::um::winnt::HANDLE;
@@ -551,10 +558,7 @@ pub fn receive_upgrade(
     let upgrade_data: WindowsUpgradeData = bincode::deserialize(&data_bytes)
         .map_err(|e| UpgradeError::Deserialization(e.to_string()))?;
 
-    log::info!(
-        "Received {} handle sets",
-        upgrade_data.handles.len()
-    );
+    log::info!("Received {} handle sets", upgrade_data.handles.len());
 
     // Deserialize the state
     let state: UpgradeState = bincode::deserialize(&upgrade_data.state_bytes)

@@ -708,7 +708,11 @@ mod windows {
         ///
         /// # Returns
         /// The duplicated handle value in the target process
-        pub fn duplicate_handle_to_process(
+        ///
+        /// # Safety
+        /// The caller must ensure `target_process` is a valid process handle
+        /// with PROCESS_DUP_HANDLE access.
+        pub unsafe fn duplicate_handle_to_process(
             handle: RawHandle,
             target_process: HANDLE,
         ) -> io::Result<RawHandle> {
@@ -716,17 +720,15 @@ mod windows {
             use winapi::um::processthreadsapi::GetCurrentProcess;
 
             let mut new_handle: HANDLE = INVALID_HANDLE_VALUE;
-            let result = unsafe {
-                DuplicateHandle(
-                    GetCurrentProcess(),
-                    handle as HANDLE,
-                    target_process,
-                    &mut new_handle,
-                    0,
-                    FALSE,
-                    winapi::um::winnt::DUPLICATE_SAME_ACCESS,
-                )
-            };
+            let result = DuplicateHandle(
+                GetCurrentProcess(),
+                handle as HANDLE,
+                target_process,
+                &mut new_handle,
+                0,
+                FALSE,
+                winapi::um::winnt::DUPLICATE_SAME_ACCESS,
+            );
 
             if result == FALSE {
                 Err(io::Error::last_os_error())
