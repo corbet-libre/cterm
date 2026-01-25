@@ -17,7 +17,7 @@ use cterm_app::file_transfer::PendingFileManager;
 use cterm_app::shortcuts::ShortcutManager;
 use cterm_core::color::Rgb;
 use cterm_core::pty::{PtyConfig, PtySize};
-use cterm_core::screen::{FileTransferOperation, ScreenConfig, SelectionMode};
+use cterm_core::screen::{FileTransferOperation, ScreenConfig};
 use cterm_core::term::{Terminal, TerminalEvent};
 use cterm_ui::events::Action;
 use cterm_ui::theme::Theme;
@@ -611,8 +611,8 @@ impl WindowState {
                 }
                 MenuAction::ViewLogs => {
                     // Open the log file location
-                    if let Some(dir) = cterm_app::config::get_config_dir() {
-                        let logs_dir = dir.join("logs");
+                    if let Some(dir) = cterm_app::config::config_dir() {
+                        let logs_dir: std::path::PathBuf = dir.join("logs");
                         if logs_dir.exists() {
                             std::process::Command::new("explorer")
                                 .arg(logs_dir)
@@ -791,7 +791,7 @@ impl WindowState {
             }
             let _ = SetWindowPos(
                 self.hwnd,
-                HWND_TOP,
+                Some(HWND_TOP),
                 0,
                 0,
                 0,
