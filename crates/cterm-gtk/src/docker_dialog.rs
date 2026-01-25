@@ -9,7 +9,10 @@ use gtk4::{
     ResponseType, ScrolledWindow, Window,
 };
 
-use cterm_app::docker::{self, ContainerInfo, DockerSelection, ImageInfo};
+use cterm_app::docker::{self, ContainerInfo, ImageInfo};
+
+// Re-export DockerSelection for use by window.rs
+pub use cterm_app::docker::DockerSelection;
 
 /// Show the Docker picker dialog
 ///

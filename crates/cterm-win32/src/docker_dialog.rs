@@ -13,7 +13,10 @@ use winapi::um::commctrl::*;
 use winapi::um::winuser::*;
 
 use crate::dialog_utils::*;
-use cterm_app::docker::{self, ContainerInfo, DockerSelection, ImageInfo};
+use cterm_app::docker::{self, ContainerInfo, ImageInfo};
+
+// Re-export DockerSelection for use by window.rs
+pub use cterm_app::docker::DockerSelection;
 
 // Control IDs
 const IDC_TABS: i32 = 1001;

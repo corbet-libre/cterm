@@ -14,7 +14,7 @@ pub mod session;
 pub mod shortcuts;
 pub mod upgrade;
 
-pub use config::{load_config, save_config, Config};
+pub use config::{load_config, load_sticky_tabs, save_config, save_sticky_tabs, Config};
 #[cfg(unix)]
 pub use crash_recovery::{
     clear_crash_state, crash_marker_path, crash_state_path, notify_watchdog_shutdown,
