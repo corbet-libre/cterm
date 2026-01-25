@@ -1199,7 +1199,7 @@ impl TabTemplatesWindow {
 
                 if let Some(field) = self.ivars().ssh_local_forward_field.borrow().as_ref() {
                     let fwd_str = field.stringValue().to_string();
-                    ssh.local_forwards = Self::parse_port_forwards(&fwd_str);
+                    ssh.local_forwards = cterm_app::config::SshPortForward::parse_list(&fwd_str);
                 }
 
                 if let Some(field) = self.ivars().ssh_remote_command_field.borrow().as_ref() {
@@ -1483,46 +1483,6 @@ impl TabTemplatesWindow {
 
         *self.ivars().selected_index.borrow_mut() = Some(new_index);
         self.load_template_into_fields(new_index);
-    }
-
-    /// Parse port forward string (format: "local_port:host:remote_port" comma-separated)
-    fn parse_port_forwards(input: &str) -> Vec<cterm_app::config::SshPortForward> {
-        use cterm_app::config::SshPortForward;
-
-        if input.is_empty() {
-            return Vec::new();
-        }
-
-        input
-            .split(',')
-            .filter_map(|part| {
-                let parts: Vec<&str> = part.trim().split(':').collect();
-                match parts.len() {
-                    2 => {
-                        // local_port:remote_port (assume localhost)
-                        let local_port = parts[0].parse().ok()?;
-                        let remote_port = parts[1].parse().ok()?;
-                        Some(SshPortForward {
-                            local_port,
-                            remote_host: "localhost".to_string(),
-                            remote_port,
-                        })
-                    }
-                    3 => {
-                        // local_port:host:remote_port
-                        let local_port = parts[0].parse().ok()?;
-                        let remote_host = parts[1].to_string();
-                        let remote_port = parts[2].parse().ok()?;
-                        Some(SshPortForward {
-                            local_port,
-                            remote_host,
-                            remote_port,
-                        })
-                    }
-                    _ => None,
-                }
-            })
-            .collect()
     }
 
     /// Update enabled state of SSH fields based on SSH enabled checkbox

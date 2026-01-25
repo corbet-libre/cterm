@@ -247,6 +247,52 @@ pub struct SshPortForward {
     pub remote_port: u16,
 }
 
+impl SshPortForward {
+    /// Parse port forwards from a comma-separated string.
+    ///
+    /// Supports two formats:
+    /// - `local_port:remote_port` (assumes remote_host is "localhost")
+    /// - `local_port:remote_host:remote_port`
+    ///
+    /// Example: "8080:80,3000:localhost:3000,5432:db.example.com:5432"
+    pub fn parse_list(input: &str) -> Vec<SshPortForward> {
+        if input.is_empty() {
+            return Vec::new();
+        }
+
+        input
+            .split(',')
+            .filter_map(|part| {
+                let parts: Vec<&str> = part.trim().split(':').collect();
+                match parts.len() {
+                    2 => {
+                        // local_port:remote_port (assume localhost)
+                        let local_port = parts[0].parse().ok()?;
+                        let remote_port = parts[1].parse().ok()?;
+                        Some(SshPortForward {
+                            local_port,
+                            remote_host: "localhost".to_string(),
+                            remote_port,
+                        })
+                    }
+                    3 => {
+                        // local_port:host:remote_port
+                        let local_port = parts[0].parse().ok()?;
+                        let remote_host = parts[1].to_string();
+                        let remote_port = parts[2].parse().ok()?;
+                        Some(SshPortForward {
+                            local_port,
+                            remote_host,
+                            remote_port,
+                        })
+                    }
+                    _ => None,
+                }
+            })
+            .collect()
+    }
+}
+
 fn default_localhost() -> String {
     "localhost".to_string()
 }
@@ -622,6 +668,74 @@ impl StickyTabConfig {
         }
     }
 
+    /// Create an Ubuntu container tab configuration
+    pub fn ubuntu() -> Self {
+        Self {
+            name: "Ubuntu".into(),
+            color: Some("#E95420".into()), // Ubuntu orange
+            keep_open: true,
+            docker: Some(DockerTabConfig {
+                mode: DockerMode::Run,
+                image: Some("ubuntu:latest".into()),
+                shell: Some("/bin/bash".into()),
+                auto_remove: true,
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    /// Create an Alpine container tab configuration
+    pub fn alpine() -> Self {
+        Self {
+            name: "Alpine".into(),
+            color: Some("#0D597F".into()), // Alpine blue
+            keep_open: true,
+            docker: Some(DockerTabConfig {
+                mode: DockerMode::Run,
+                image: Some("alpine:latest".into()),
+                shell: Some("/bin/sh".into()),
+                auto_remove: true,
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    /// Create a Node.js container tab configuration
+    pub fn nodejs() -> Self {
+        Self {
+            name: "Node.js".into(),
+            color: Some("#339933".into()), // Node.js green
+            keep_open: true,
+            docker: Some(DockerTabConfig {
+                mode: DockerMode::Run,
+                image: Some("node:20".into()),
+                shell: Some("/bin/bash".into()),
+                auto_remove: true,
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    /// Create a Python container tab configuration
+    pub fn python() -> Self {
+        Self {
+            name: "Python".into(),
+            color: Some("#3776AB".into()), // Python blue
+            keep_open: true,
+            docker: Some(DockerTabConfig {
+                mode: DockerMode::Run,
+                image: Some("python:3.12".into()),
+                shell: Some("/bin/bash".into()),
+                auto_remove: true,
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
     /// Create an SSH remote connection tab configuration
     pub fn ssh(name: &str, host: &str, username: Option<&str>) -> Self {
         Self {
@@ -631,6 +745,22 @@ impl StickyTabConfig {
             ssh: Some(SshTabConfig {
                 host: host.to_string(),
                 username: username.map(|s| s.to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    /// Create an SSH with agent forwarding tab configuration
+    pub fn ssh_with_agent(name: &str, host: &str, username: Option<&str>) -> Self {
+        Self {
+            name: name.to_string(),
+            color: Some("#22c55e".into()), // Green for remote connections
+            keep_open: true,
+            ssh: Some(SshTabConfig {
+                host: host.to_string(),
+                username: username.map(|s| s.to_string()),
+                agent_forward: true,
                 ..Default::default()
             }),
             ..Default::default()
@@ -742,5 +872,38 @@ mod tests {
         assert_eq!(tab.name, "Claude");
         assert_eq!(tab.command, Some("claude".into()));
         assert!(tab.keep_open);
+    }
+
+    #[test]
+    fn test_parse_port_forwards_empty() {
+        let forwards = SshPortForward::parse_list("");
+        assert!(forwards.is_empty());
+    }
+
+    #[test]
+    fn test_parse_port_forwards_simple() {
+        let forwards = SshPortForward::parse_list("8080:80");
+        assert_eq!(forwards.len(), 1);
+        assert_eq!(forwards[0].local_port, 8080);
+        assert_eq!(forwards[0].remote_host, "localhost");
+        assert_eq!(forwards[0].remote_port, 80);
+    }
+
+    #[test]
+    fn test_parse_port_forwards_with_host() {
+        let forwards = SshPortForward::parse_list("5432:db.example.com:5432");
+        assert_eq!(forwards.len(), 1);
+        assert_eq!(forwards[0].local_port, 5432);
+        assert_eq!(forwards[0].remote_host, "db.example.com");
+        assert_eq!(forwards[0].remote_port, 5432);
+    }
+
+    #[test]
+    fn test_parse_port_forwards_multiple() {
+        let forwards = SshPortForward::parse_list("8080:80, 3000:localhost:3000");
+        assert_eq!(forwards.len(), 2);
+        assert_eq!(forwards[0].local_port, 8080);
+        assert_eq!(forwards[1].local_port, 3000);
+        assert_eq!(forwards[1].remote_host, "localhost");
     }
 }

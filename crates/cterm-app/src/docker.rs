@@ -58,6 +58,18 @@ pub struct ImageInfo {
     pub size: String,
 }
 
+/// Result from the Docker picker dialog
+///
+/// This enum represents the user's selection from a Docker picker UI:
+/// either connecting to an existing container or running a new one from an image.
+#[derive(Debug, Clone)]
+pub enum DockerSelection {
+    /// User selected a running container to exec into
+    ExecContainer(ContainerInfo),
+    /// User selected an image to run a new container
+    RunImage(ImageInfo),
+}
+
 /// Check if Docker is available and the daemon is running
 pub fn check_docker_available() -> Result<(), DockerError> {
     let output = Command::new("docker")

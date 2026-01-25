@@ -13,7 +13,7 @@ use winapi::um::commctrl::*;
 use winapi::um::winuser::*;
 
 use crate::dialog_utils::*;
-use cterm_app::docker::{self, ContainerInfo, ImageInfo};
+use cterm_app::docker::{self, ContainerInfo, DockerSelection, ImageInfo};
 
 // Control IDs
 const IDC_TABS: i32 = 1001;
@@ -24,15 +24,6 @@ const IDC_STATUS: i32 = 1004;
 // Tab indices
 const TAB_CONTAINERS: i32 = 0;
 const TAB_IMAGES: i32 = 1;
-
-/// Result from the Docker picker dialog
-#[derive(Debug, Clone)]
-pub enum DockerSelection {
-    /// User selected a running container to exec into
-    ExecContainer(ContainerInfo),
-    /// User selected an image to run
-    RunImage(ImageInfo),
-}
 
 /// Dialog state
 struct DialogState {

@@ -9,15 +9,7 @@ use gtk4::{
     ResponseType, ScrolledWindow, Window,
 };
 
-use cterm_app::docker::{self, ContainerInfo, ImageInfo};
-
-/// Selection result from the Docker picker dialog
-pub enum DockerSelection {
-    /// Connect to an existing container with docker exec
-    ExecContainer(ContainerInfo),
-    /// Run a new container from an image
-    RunImage(ImageInfo),
-}
+use cterm_app::docker::{self, ContainerInfo, DockerSelection, ImageInfo};
 
 /// Show the Docker picker dialog
 ///

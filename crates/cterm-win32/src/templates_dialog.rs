@@ -81,19 +81,19 @@ fn preset_claude_devcontainer() -> StickyTabConfig {
 }
 
 fn preset_ubuntu() -> StickyTabConfig {
-    StickyTabConfig::docker_run("Ubuntu", "ubuntu:latest")
+    StickyTabConfig::ubuntu()
 }
 
 fn preset_alpine() -> StickyTabConfig {
-    StickyTabConfig::docker_run("Alpine", "alpine:latest")
+    StickyTabConfig::alpine()
 }
 
 fn preset_nodejs() -> StickyTabConfig {
-    StickyTabConfig::docker_run("Node.js", "node:20")
+    StickyTabConfig::nodejs()
 }
 
 fn preset_python() -> StickyTabConfig {
-    StickyTabConfig::docker_run("Python", "python:3.12")
+    StickyTabConfig::python()
 }
 
 fn preset_ssh() -> StickyTabConfig {
@@ -101,11 +101,7 @@ fn preset_ssh() -> StickyTabConfig {
 }
 
 fn preset_ssh_agent() -> StickyTabConfig {
-    let mut tab = StickyTabConfig::ssh("SSH with Agent", "example.com", None);
-    if let Some(ref mut ssh) = tab.ssh {
-        ssh.agent_forward = true;
-    }
-    tab
+    StickyTabConfig::ssh_with_agent("SSH with Agent", "example.com", None)
 }
 
 /// Dialog state

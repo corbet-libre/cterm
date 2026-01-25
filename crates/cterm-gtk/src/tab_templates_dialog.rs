@@ -986,7 +986,7 @@ fn save_widgets_to_template(widgets: &TemplateWidgets, template: &mut StickyTabC
         };
         let jump = widgets.ssh_jump_host_entry.text().to_string();
         ssh.jump_host = if jump.is_empty() { None } else { Some(jump) };
-        ssh.local_forwards = parse_port_forwards(&widgets.ssh_local_forward_entry.text());
+        ssh.local_forwards = SshPortForward::parse_list(&widgets.ssh_local_forward_entry.text());
         let remote_cmd = widgets.ssh_remote_command_entry.text().to_string();
         ssh.remote_command = if remote_cmd.is_empty() {
             None
@@ -1028,79 +1028,16 @@ fn create_preset_template(preset_index: usize) -> Option<StickyTabConfig> {
     match preset_index {
         1 => Some(StickyTabConfig::claude()),
         2 => Some(StickyTabConfig::claude_devcontainer(None)),
-        3 => Some(StickyTabConfig {
-            name: "Ubuntu".into(),
-            color: Some("#E95420".into()),
-            keep_open: true,
-            docker: Some(DockerTabConfig {
-                mode: DockerMode::Run,
-                image: Some("ubuntu:latest".into()),
-                shell: Some("/bin/bash".into()),
-                auto_remove: true,
-                ..Default::default()
-            }),
-            ..Default::default()
-        }),
-        4 => Some(StickyTabConfig {
-            name: "Alpine".into(),
-            color: Some("#0D597F".into()),
-            keep_open: true,
-            docker: Some(DockerTabConfig {
-                mode: DockerMode::Run,
-                image: Some("alpine:latest".into()),
-                shell: Some("/bin/sh".into()),
-                auto_remove: true,
-                ..Default::default()
-            }),
-            ..Default::default()
-        }),
-        5 => Some(StickyTabConfig {
-            name: "Node.js".into(),
-            color: Some("#339933".into()),
-            keep_open: true,
-            docker: Some(DockerTabConfig {
-                mode: DockerMode::Run,
-                image: Some("node:20".into()),
-                shell: Some("/bin/bash".into()),
-                auto_remove: true,
-                ..Default::default()
-            }),
-            ..Default::default()
-        }),
-        6 => Some(StickyTabConfig {
-            name: "Python".into(),
-            color: Some("#3776AB".into()),
-            keep_open: true,
-            docker: Some(DockerTabConfig {
-                mode: DockerMode::Run,
-                image: Some("python:3.12".into()),
-                shell: Some("/bin/bash".into()),
-                auto_remove: true,
-                ..Default::default()
-            }),
-            ..Default::default()
-        }),
-        7 => Some(StickyTabConfig {
-            name: "SSH Server".into(),
-            color: Some("#22c55e".into()),
-            keep_open: true,
-            ssh: Some(SshTabConfig {
-                host: "hostname".into(),
-                ..Default::default()
-            }),
-            ..Default::default()
-        }),
-        8 => Some(StickyTabConfig {
-            name: "SSH (Agent Fwd)".into(),
-            color: Some("#22c55e".into()),
-            keep_open: true,
-            ssh: Some(SshTabConfig {
-                host: "hostname".into(),
-                agent_forward: true,
-                ..Default::default()
-            }),
-            ..Default::default()
-        }),
+        3 => Some(StickyTabConfig::ubuntu()),
+        4 => Some(StickyTabConfig::alpine()),
+        5 => Some(StickyTabConfig::nodejs()),
+        6 => Some(StickyTabConfig::python()),
+        7 => Some(StickyTabConfig::ssh("SSH Server", "hostname", None)),
+        8 => Some(StickyTabConfig::ssh_with_agent(
+            "SSH (Agent Fwd)",
+            "hostname",
+            None,
+        )),
         _ => None,
     }
 }
@@ -1118,37 +1055,4 @@ fn parse_hex_color(hex: &str) -> Option<gtk4::gdk::RGBA> {
     Some(gtk4::gdk::RGBA::new(r, g, b, 1.0))
 }
 
-fn parse_port_forwards(input: &str) -> Vec<SshPortForward> {
-    if input.is_empty() {
-        return Vec::new();
-    }
-
-    input
-        .split(',')
-        .filter_map(|part| {
-            let parts: Vec<&str> = part.trim().split(':').collect();
-            match parts.len() {
-                2 => {
-                    let local_port = parts[0].parse().ok()?;
-                    let remote_port = parts[1].parse().ok()?;
-                    Some(SshPortForward {
-                        local_port,
-                        remote_host: "localhost".to_string(),
-                        remote_port,
-                    })
-                }
-                3 => {
-                    let local_port = parts[0].parse().ok()?;
-                    let remote_host = parts[1].to_string();
-                    let remote_port = parts[2].parse().ok()?;
-                    Some(SshPortForward {
-                        local_port,
-                        remote_host,
-                        remote_port,
-                    })
-                }
-                _ => None,
-            }
-        })
-        .collect()
-}
+// Port forward parsing is handled by SshPortForward::parse_list in cterm_app
