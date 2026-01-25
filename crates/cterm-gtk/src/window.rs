@@ -1069,6 +1069,7 @@ impl CtermWindow {
     }
 
     /// Set up window focus handler to clear bell when window becomes active
+    /// and send focus events to the terminal (DECSET 1004)
     fn setup_focus_handler(&self) {
         let has_bell = Rc::clone(&self.has_bell);
         let window = self.window.clone();
@@ -1077,7 +1078,17 @@ impl CtermWindow {
         let notebook = self.notebook.clone();
 
         self.window.connect_is_active_notify(move |win| {
-            if win.is_active() {
+            let is_active = win.is_active();
+
+            // Send focus event to the active terminal (DECSET 1004)
+            if let Some(page_idx) = notebook.current_page() {
+                let tabs_borrowed = tabs.borrow();
+                if let Some(tab) = tabs_borrowed.get(page_idx as usize) {
+                    tab.terminal.send_focus_event(is_active);
+                }
+            }
+
+            if is_active {
                 // Window became active, clear bell indicator
                 let mut bell = has_bell.borrow_mut();
                 if *bell {

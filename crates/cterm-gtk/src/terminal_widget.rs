@@ -92,6 +92,7 @@ impl TerminalWidget {
                 .iter()
                 .map(|(k, v)| (k.clone(), v.clone()))
                 .collect(),
+            term: config.general.term.clone(),
             ..Default::default()
         };
 
@@ -325,6 +326,18 @@ impl TerminalWidget {
         let term = self.terminal.lock();
         if let Err(e) = term.send_signal(signal) {
             log::error!("Failed to send signal {}: {}", signal, e);
+        }
+    }
+
+    /// Send focus event to terminal if focus events mode is enabled (DECSET 1004)
+    /// `focused`: true for focus in (\x1b[I), false for focus out (\x1b[O)
+    pub fn send_focus_event(&self, focused: bool) {
+        let mut term = self.terminal.lock();
+        if term.screen().modes.focus_events {
+            let sequence = if focused { b"\x1b[I" } else { b"\x1b[O" };
+            if let Err(e) = term.write(sequence) {
+                log::error!("Failed to send focus event: {}", e);
+            }
         }
     }
 

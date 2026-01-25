@@ -48,6 +48,8 @@ define_class!(
             // Make the terminal view first responder so it can receive keyboard input
             if let Some(terminal) = self.ivars().active_terminal.borrow().as_ref() {
                 self.makeFirstResponder(Some(terminal));
+                // Send focus in event if DECSET 1004 is enabled
+                terminal.send_focus_event(true);
             }
 
             // Apply pending tab color if any (tab property becomes available after joining tab group)
@@ -60,6 +62,10 @@ define_class!(
         #[unsafe(method(windowDidResignKey:))]
         fn window_did_resign_key(&self, _notification: &NSNotification) {
             log::debug!("Window resigned key");
+            // Send focus out event if DECSET 1004 is enabled
+            if let Some(terminal) = self.ivars().active_terminal.borrow().as_ref() {
+                terminal.send_focus_event(false);
+            }
         }
 
         #[unsafe(method(windowShouldClose:))]

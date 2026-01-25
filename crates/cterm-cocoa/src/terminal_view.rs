@@ -1583,6 +1583,7 @@ impl TerminalView {
             args,
             cwd: None,
             env: Vec::new(),
+            term: config.general.term.clone(),
         };
 
         match Pty::new(&pty_config) {
@@ -1643,6 +1644,7 @@ impl TerminalView {
             args,
             cwd,
             env,
+            term: config.general.term.clone(),
         };
 
         match Pty::new(&pty_config) {
@@ -1769,6 +1771,18 @@ impl TerminalView {
     /// Get the cell size (width, height) for grid snapping
     pub fn cell_size(&self) -> (f64, f64) {
         (self.ivars().cell_width, self.ivars().cell_height)
+    }
+
+    /// Send focus event to terminal if focus events mode is enabled (DECSET 1004)
+    /// `focused`: true for focus in (\x1b[I), false for focus out (\x1b[O)
+    pub fn send_focus_event(&self, focused: bool) {
+        let mut terminal = self.ivars().terminal.lock();
+        if terminal.screen().modes.focus_events {
+            let sequence = if focused { b"\x1b[I" } else { b"\x1b[O" };
+            if let Err(e) = terminal.write(sequence) {
+                log::error!("Failed to send focus event: {}", e);
+            }
+        }
     }
 
     /// Check if there's a foreground process running (other than the shell)

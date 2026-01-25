@@ -140,6 +140,7 @@ impl WindowState {
                 .iter()
                 .map(|(k, v)| (k.clone(), v.clone()))
                 .collect(),
+            term: self.config.general.term.clone(),
         };
 
         let terminal = Terminal::with_shell(cols, rows, screen_config, &pty_config)?;
@@ -319,6 +320,20 @@ impl WindowState {
         self.tabs
             .get(self.active_tab_index)
             .map(|t| Arc::clone(&t.terminal))
+    }
+
+    /// Send focus event to the active terminal if focus events mode is enabled (DECSET 1004)
+    /// `focused`: true for focus in (\x1b[I), false for focus out (\x1b[O)
+    pub fn send_focus_event(&self, focused: bool) {
+        if let Some(terminal) = self.active_terminal() {
+            let mut term = terminal.lock().unwrap();
+            if term.screen().modes.focus_events {
+                let sequence = if focused { b"\x1b[I" } else { b"\x1b[O" };
+                if let Err(e) = term.write(sequence) {
+                    log::error!("Failed to send focus event: {}", e);
+                }
+            }
+        }
     }
 
     /// Get terminal size in cells
@@ -1129,6 +1144,18 @@ extern "system" fn window_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPA
         WM_APP_BELL => {
             let tab_id = wparam.0 as u64;
             state.on_bell(tab_id);
+            LRESULT(0)
+        }
+
+        WM_SETFOCUS => {
+            // Send focus in event to terminal if DECSET 1004 is enabled
+            state.send_focus_event(true);
+            LRESULT(0)
+        }
+
+        WM_KILLFOCUS => {
+            // Send focus out event to terminal if DECSET 1004 is enabled
+            state.send_focus_event(false);
             LRESULT(0)
         }
 

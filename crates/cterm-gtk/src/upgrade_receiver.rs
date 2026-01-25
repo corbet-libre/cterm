@@ -300,6 +300,7 @@ fn create_restored_window(
     tab_bar.update_visibility();
 
     // Set up window focus handler to clear bell when window becomes active
+    // and send focus events to the terminal (DECSET 1004)
     {
         let has_bell_focus = Rc::clone(&has_bell);
         let window_focus = window.clone();
@@ -307,7 +308,17 @@ fn create_restored_window(
         let tabs_focus = Rc::clone(&tabs);
         let notebook_focus = notebook.clone();
         window.connect_is_active_notify(move |win| {
-            if win.is_active() {
+            let is_active = win.is_active();
+
+            // Send focus event to the active terminal (DECSET 1004)
+            if let Some(page_idx) = notebook_focus.current_page() {
+                let tabs_borrowed = tabs_focus.borrow();
+                if let Some((_, _, terminal)) = tabs_borrowed.get(page_idx as usize) {
+                    terminal.send_focus_event(is_active);
+                }
+            }
+
+            if is_active {
                 let mut bell = has_bell_focus.borrow_mut();
                 if *bell {
                     *bell = false;

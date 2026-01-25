@@ -48,6 +48,8 @@ pub struct PtyConfig {
     pub cwd: Option<PathBuf>,
     /// Environment variables to set
     pub env: Vec<(String, String)>,
+    /// TERM environment variable value (default: xterm-256color)
+    pub term: Option<String>,
 }
 
 // ============================================================================
@@ -402,7 +404,9 @@ mod unix {
 
             // Set TERM environment variable
             let term = CString::new("TERM").unwrap();
-            let term_value = CString::new("xterm-256color").unwrap();
+            let term_value = config.term.as_deref().unwrap_or("xterm-256color");
+            let term_value = CString::new(term_value)
+                .unwrap_or_else(|_| CString::new("xterm-256color").unwrap());
             libc::setenv(term.as_ptr(), term_value.as_ptr(), 1);
 
             // Determine the shell to execute

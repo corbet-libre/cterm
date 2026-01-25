@@ -61,6 +61,9 @@ pub struct GeneralConfig {
     pub working_directory: Option<PathBuf>,
     /// Environment variables to set
     pub env: HashMap<String, String>,
+    /// TERM environment variable (default: xterm-256color)
+    /// Common values: xterm-256color, xterm-direct, screen-256color
+    pub term: Option<String>,
 }
 
 impl Default for GeneralConfig {
@@ -73,6 +76,7 @@ impl Default for GeneralConfig {
             copy_on_select: false,
             working_directory: None,
             env: HashMap::new(),
+            term: None,
         }
     }
 }
