@@ -109,8 +109,14 @@ jobs:
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
 
-      - name: Run tests
-        run: cargo test --workspace --exclude cterm-cocoa --exclude cterm-win32
+      - name: Run unit tests
+        run: cargo test --workspace --exclude cterm-cocoa --exclude cterm-win32 --lib
+
+      - name: Build ctermd for integration tests
+        run: cargo build -p cterm-headless
+
+      - name: Run ctermd integration tests
+        run: cargo test -p cterm-headless --test grpc_integration -- --test-threads=1
 
   test-macos:
     name: Test (macOS)
@@ -125,8 +131,14 @@ jobs:
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
 
-      - name: Run tests
-        run: cargo test --workspace --exclude cterm-gtk --exclude cterm-win32
+      - name: Run unit tests
+        run: cargo test --workspace --exclude cterm-gtk --exclude cterm-win32 --lib
+
+      - name: Build ctermd for integration tests
+        run: cargo build -p cterm-headless
+
+      - name: Run ctermd integration tests
+        run: cargo test -p cterm-headless --test grpc_integration -- --test-threads=1
 
   build-linux:
     name: Build Linux (Ubuntu 22.04)
@@ -245,8 +257,14 @@ jobs:
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
 
-      - name: Run tests
-        run: cargo test --workspace --exclude cterm-cocoa --exclude cterm-gtk
+      - name: Run unit tests
+        run: cargo test --workspace --exclude cterm-cocoa --exclude cterm-gtk --lib
+
+      - name: Build ctermd for integration tests
+        run: cargo build -p cterm-headless
+
+      - name: Run ctermd integration tests
+        run: cargo test -p cterm-headless --test grpc_integration -- --test-threads=1
 
   build-windows:
     name: Build Windows
