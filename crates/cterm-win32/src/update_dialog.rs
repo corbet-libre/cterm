@@ -22,7 +22,6 @@ const WM_UPDATE_RESULT: UINT = WM_USER + 100;
 
 // Control IDs
 const IDC_CURRENT_VERSION_LABEL: i32 = 1001;
-const IDC_NEW_VERSION_LABEL: i32 = 1002;
 const IDC_RELEASE_NOTES_EDIT: i32 = 1003;
 const IDC_OPEN_RELEASES_BTN: i32 = 1004;
 const IDC_CLOSE_BTN: i32 = 1005;
@@ -33,7 +32,6 @@ const GITHUB_REPO: &str = "KarpelesLab/cterm";
 
 /// Update check result passed via window message
 enum UpdateResult {
-    Checking,
     NoUpdate,
     UpdateAvailable(Box<cterm_app::upgrade::UpdateInfo>),
     Error(String),
@@ -236,12 +234,7 @@ unsafe fn init_window(hwnd: HWND) {
         WS_EX_CLIENTEDGE,
         edit_class.as_ptr(),
         ptr::null(),
-        WS_CHILD
-            | WS_VISIBLE
-            | WS_VSCROLL
-            | ES_MULTILINE as u32
-            | ES_AUTOVSCROLL as u32
-            | ES_READONLY as u32,
+        WS_CHILD | WS_VISIBLE | WS_VSCROLL | ES_MULTILINE | ES_AUTOVSCROLL | ES_READONLY,
         margin,
         y,
         width - margin * 2,
@@ -264,7 +257,7 @@ unsafe fn init_window(hwnd: HWND) {
         0,
         0,
         0,
-        FW_NORMAL as i32,
+        FW_NORMAL,
         0,
         0,
         0,
@@ -390,10 +383,6 @@ unsafe fn handle_update_result(hwnd: HWND) {
     let notes_edit = GetDlgItem(hwnd, IDC_RELEASE_NOTES_EDIT);
 
     match result {
-        UpdateResult::Checking => {
-            // Should not happen, but handle gracefully
-            set_label_text(status_label, "Checking for updates...");
-        }
         UpdateResult::NoUpdate => {
             set_label_text(status_label, "You are running the latest version!");
             set_edit_text(notes_edit, "No updates available.");

@@ -157,10 +157,10 @@ unsafe fn init_window(hwnd: HWND) {
             | WS_VISIBLE
             | WS_VSCROLL
             | WS_HSCROLL
-            | ES_MULTILINE as u32
-            | ES_AUTOVSCROLL as u32
-            | ES_AUTOHSCROLL as u32
-            | ES_READONLY as u32,
+            | ES_MULTILINE
+            | ES_AUTOVSCROLL
+            | ES_AUTOHSCROLL
+            | ES_READONLY,
         margin,
         margin,
         width - margin * 2,
@@ -183,7 +183,7 @@ unsafe fn init_window(hwnd: HWND) {
         0,
         0,
         0,
-        FW_NORMAL as i32,
+        FW_NORMAL,
         0,
         0,
         0,
