@@ -259,6 +259,7 @@ pub fn create_editable_combobox(parent: HWND, id: i32, x: i32, y: i32, w: i32, h
 
 /// Create a spinner (up-down) control paired with an edit control
 /// Returns (edit_hwnd, spinner_hwnd)
+#[allow(clippy::too_many_arguments)]
 pub fn create_spinner(
     parent: HWND,
     edit_id: i32,
@@ -395,6 +396,7 @@ pub fn create_groupbox(parent: HWND, id: i32, text: &str, x: i32, y: i32, w: i32
 }
 
 /// Create a trackbar (slider) control
+#[allow(clippy::too_many_arguments)]
 pub fn create_trackbar(
     parent: HWND,
     id: i32,

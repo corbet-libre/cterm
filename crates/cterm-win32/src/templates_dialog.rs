@@ -14,7 +14,7 @@ use winapi::um::commctrl::*;
 use winapi::um::winuser::*;
 
 use crate::dialog_utils::*;
-use cterm_app::config::{DockerMode, DockerTabConfig, SshTabConfig, StickyTabConfig};
+use cterm_app::config::{DockerMode, StickyTabConfig};
 
 // Control IDs - Top bar
 const IDC_TEMPLATE_LIST: i32 = 1001;
@@ -61,6 +61,7 @@ const TAB_DOCKER: i32 = 1;
 const TAB_SSH: i32 = 2;
 
 /// Preset templates
+#[allow(clippy::type_complexity)]
 const PRESETS: &[(&str, fn() -> StickyTabConfig)] = &[
     ("Claude Code", preset_claude),
     ("Claude DevContainer", preset_claude_devcontainer),
