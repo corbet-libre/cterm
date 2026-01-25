@@ -397,7 +397,7 @@ unsafe fn handle_update_result(hwnd: HWND) {
             set_edit_text(notes_edit, &notes);
         }
         UpdateResult::Error(msg) => {
-            set_label_text(status_label, &format!("Error checking for updates"));
+            set_label_text(status_label, "Error checking for updates");
             set_edit_text(
                 notes_edit,
                 &format!("Failed to check for updates:\r\n\r\n{}", msg),
