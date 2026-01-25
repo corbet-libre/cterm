@@ -72,7 +72,7 @@ impl TabBar {
             dpi: DpiInfo::default(),
             hover_tab_id: None,
             hover_close_button: false,
-            visible: true,
+            visible: false, // Initially hidden, shown when there are multiple tabs
         }
     }
 

@@ -156,6 +156,7 @@ mod tests {
     use super::*;
 
     #[test]
+    #[ignore] // Requires desktop environment with clipboard access
     fn test_clipboard_roundtrip() {
         let test_text = "Hello, clipboard!";
 
@@ -171,6 +172,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore] // Requires desktop environment with clipboard access
     fn test_clipboard_unicode() {
         let test_text = "Hello \u{1F600} World \u{4E2D}\u{6587}"; // emoji and Chinese
 
