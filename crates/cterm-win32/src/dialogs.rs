@@ -552,43 +552,9 @@ pub fn show_error_msg(hwnd: windows::Win32::Foundation::HWND, message: &str) {
     show_error(parent, "Error", message);
 }
 
-/// Show a simple preferences placeholder dialog
-pub fn show_preferences_dialog(parent: HWND) {
-    let title = to_wide("Preferences");
-    let message = to_wide(
-        "Preferences can be edited in the configuration file:\n\n\
-        Windows: %APPDATA%\\cterm\\config.toml\n\n\
-        A full preferences dialog will be available in a future version.",
-    );
-
-    unsafe {
-        MessageBoxW(
-            parent,
-            message.as_ptr(),
-            title.as_ptr(),
-            MB_OK | MB_ICONINFORMATION,
-        );
-    }
-}
-
-/// Show tab templates placeholder dialog
-pub fn show_tab_templates_dialog(parent: HWND) {
-    let title = to_wide("Tab Templates");
-    let message = to_wide(
-        "Tab templates can be configured in:\n\n\
-        Windows: %APPDATA%\\cterm\\sticky_tabs.toml\n\n\
-        A visual template editor will be available in a future version.",
-    );
-
-    unsafe {
-        MessageBoxW(
-            parent,
-            message.as_ptr(),
-            title.as_ptr(),
-            MB_OK | MB_ICONINFORMATION,
-        );
-    }
-}
+// Note: Full preferences dialog is now in preferences_dialog.rs
+// Note: Full tab templates dialog is now in templates_dialog.rs
+// Note: Docker picker dialog is now in docker_dialog.rs
 
 /// Show check for updates dialog
 pub fn show_check_updates_dialog(parent: HWND) {

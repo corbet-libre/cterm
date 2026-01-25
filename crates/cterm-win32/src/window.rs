@@ -525,13 +525,22 @@ impl WindowState {
                     }
                 }
                 MenuAction::DockerPicker => {
-                    // Docker is not typically available on Windows in the same way
-                    crate::dialogs::show_message(
-                        self.hwnd.0 as *mut _,
-                        "Docker",
-                        "Docker container support requires Docker Desktop.\n\nThis feature will be available in a future version.",
-                        winapi::um::winuser::MB_OK | winapi::um::winuser::MB_ICONINFORMATION,
-                    );
+                    // Show Docker picker dialog
+                    if let Some(selection) =
+                        crate::docker_dialog::show_docker_picker(self.hwnd.0 as *mut _)
+                    {
+                        // Create a new tab with the selected Docker configuration
+                        match selection {
+                            crate::docker_dialog::DockerSelection::ExecContainer(container) => {
+                                log::info!("Docker exec into container: {}", container.name);
+                                // TODO: Create new tab with docker exec command
+                            }
+                            crate::docker_dialog::DockerSelection::RunImage(image) => {
+                                log::info!("Docker run image: {}:{}", image.repository, image.tag);
+                                // TODO: Create new tab with docker run command
+                            }
+                        }
+                    }
                 }
                 MenuAction::Quit => {
                     unsafe {
@@ -579,10 +588,19 @@ impl WindowState {
                 MenuAction::Tab8 => self.switch_to_tab(7),
                 MenuAction::Tab9 => self.switch_to_tab(8),
                 MenuAction::Preferences => {
-                    crate::dialogs::show_preferences_dialog(self.hwnd.0 as *mut _);
+                    if crate::preferences_dialog::show_preferences_dialog(self.hwnd.0 as *mut _) {
+                        // Reload config and apply changes
+                        if let Ok(config) = cterm_app::load_config() {
+                            self.config = config;
+                            // TODO: Apply theme and other changes without restart
+                            log::info!("Preferences saved and reloaded");
+                        }
+                    }
                 }
                 MenuAction::TabTemplates => {
-                    crate::dialogs::show_tab_templates_dialog(self.hwnd.0 as *mut _);
+                    if crate::templates_dialog::show_templates_dialog(self.hwnd.0 as *mut _) {
+                        log::info!("Tab templates saved");
+                    }
                 }
                 MenuAction::CheckUpdates => {
                     crate::dialogs::show_check_updates_dialog(self.hwnd.0 as *mut _);

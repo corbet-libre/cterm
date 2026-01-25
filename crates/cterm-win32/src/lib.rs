@@ -7,13 +7,17 @@
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 pub mod clipboard;
+pub mod dialog_utils;
 pub mod dialogs;
+pub mod docker_dialog;
 pub mod dpi;
 pub mod keycode;
 pub mod menu;
 pub mod mouse;
 pub mod notification_bar;
+pub mod preferences_dialog;
 pub mod tab_bar;
+pub mod templates_dialog;
 pub mod terminal_canvas;
 pub mod window;
 
@@ -76,6 +80,9 @@ pub fn run() {
 
     // Set up DPI awareness
     dpi::setup_dpi_awareness();
+
+    // Initialize common controls for dialogs
+    dialog_utils::init_common_controls();
 
     // Load configuration
     let config = match cterm_app::load_config() {
