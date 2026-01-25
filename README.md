@@ -1,6 +1,6 @@
 # cterm
 
-A high-performance, customizable terminal emulator built in pure Rust. Features native UI on macOS (AppKit/CoreGraphics) and GTK4 on Linux, with a modular architecture and optimizations for running AI coding assistants like Claude Code.
+A high-performance, customizable terminal emulator built in pure Rust. Features native UI on macOS (AppKit/CoreGraphics), GTK4 on Linux, and native Win32 on Windows, with a modular architecture and optimizations for running AI coding assistants like Claude Code.
 
 ## Features
 
@@ -18,6 +18,8 @@ A high-performance, customizable terminal emulator built in pure Rust. Features 
 - **Themes**: Built-in themes (Tokyo Night, Dracula, Nord, and more) plus custom TOML themes
 - **Keyboard Shortcuts**: Fully configurable shortcuts for all actions
 - **Zoom**: Adjustable font size with Ctrl+/Ctrl-
+- **Copy as HTML**: Copy terminal content with colors and formatting preserved (macOS)
+- **Send Signal**: Send Unix signals (SIGHUP, SIGINT, SIGTERM, etc.) to terminal processes (macOS/Linux)
 
 ### Terminal Features
 - **Hyperlinks**: Clickable URLs with OSC 8 support
@@ -30,10 +32,11 @@ A high-performance, customizable terminal emulator built in pure Rust. Features 
 - **DRCS Fonts**: Soft font support via DECDLD for custom character sets
 
 ### System Integration
-- **Native PTY**: Cross-platform PTY implementation (Unix openpty, Windows ConPTY ready)
-- **Crash Recovery**: Automatic recovery from crashes - a watchdog process preserves terminal sessions and restores them after unexpected termination (macOS)
-- **Seamless Upgrades**: Update cterm without losing terminal sessions (Unix)
-- **Auto-Update**: Built-in update checker with GitHub releases integration
+- **Native PTY**: Cross-platform PTY implementation (Unix openpty, Windows ConPTY)
+- **Crash Recovery**: Automatic recovery from crashes - a watchdog process preserves terminal sessions and restores them after unexpected termination (macOS/Linux)
+- **Seamless Upgrades**: Update cterm without losing terminal sessions (macOS/Linux/Windows)
+- **Auto-Update**: Built-in update checker with GitHub releases integration and release notes display
+- **Debug Log Viewer**: In-app log viewer for troubleshooting (Windows)
 
 ## Installation
 
@@ -67,6 +70,9 @@ sudo pacman -S gtk4
 **macOS:**
 No additional dependencies required - uses native AppKit/CoreGraphics.
 
+**Windows:**
+No additional dependencies required - uses native Win32/Direct2D.
+
 #### Build
 
 ```bash
@@ -93,21 +99,23 @@ See [docs/configuration.md](docs/configuration.md) for detailed configuration op
 
 ## Keyboard Shortcuts
 
-| Action | Default Shortcut |
-|--------|------------------|
-| New Tab | Ctrl+Shift+T |
-| Close Tab | Ctrl+Shift+W |
-| Next Tab | Ctrl+Tab |
-| Previous Tab | Ctrl+Shift+Tab |
-| Switch to Tab 1-9 | Ctrl+1-9 |
-| Copy | Ctrl+Shift+C |
-| Paste | Ctrl+Shift+V |
-| Find | Ctrl+Shift+F |
-| Zoom In | Ctrl++ |
-| Zoom Out | Ctrl+- |
-| Reset Zoom | Ctrl+0 |
-| Scroll Up | Shift+PageUp |
-| Scroll Down | Shift+PageDown |
+| Action | macOS | Linux/Windows |
+|--------|-------|---------------|
+| New Tab | Cmd+T | Ctrl+Shift+T |
+| Close Tab | Cmd+W | Ctrl+Shift+W |
+| Close Other Tabs | — | — |
+| Next Tab | Cmd+Shift+] | Ctrl+Tab |
+| Previous Tab | Cmd+Shift+[ | Ctrl+Shift+Tab |
+| Switch to Tab 1-9 | Cmd+1-9 | Ctrl+1-9 |
+| Copy | Cmd+C | Ctrl+Shift+C |
+| Copy as HTML | Cmd+Shift+C | — |
+| Paste | Cmd+V | Ctrl+Shift+V |
+| Find | Cmd+F | Ctrl+Shift+F |
+| Zoom In | Cmd++ | Ctrl++ |
+| Zoom Out | Cmd+- | Ctrl+- |
+| Reset Zoom | Cmd+0 | Ctrl+0 |
+| Scroll Up | Fn+Up | Shift+PageUp |
+| Scroll Down | Fn+Down | Shift+PageDown |
 
 ## Terminal Compatibility
 
@@ -206,8 +214,9 @@ cterm/
 │   ├── cterm-core/     # Core terminal emulation (parser, screen, PTY)
 │   ├── cterm-ui/       # UI abstraction traits
 │   ├── cterm-app/      # Application logic (config, sessions, upgrades, crash recovery)
+│   ├── cterm-cocoa/    # Native macOS UI using AppKit/CoreGraphics
 │   ├── cterm-gtk/      # GTK4 UI implementation (Linux)
-│   └── cterm-cocoa/    # Native macOS UI using AppKit/CoreGraphics
+│   └── cterm-win32/    # Native Windows UI using Win32/Direct2D
 └── docs/               # Documentation
 ```
 
@@ -215,8 +224,9 @@ The modular architecture enables:
 - **cterm-core**: Pure Rust terminal emulation, reusable in other projects
 - **cterm-ui**: UI-agnostic traits for toolkit abstraction
 - **cterm-app**: Shared application logic between UI implementations
-- **cterm-gtk**: GTK4-specific rendering and widgets (Linux, cross-platform)
 - **cterm-cocoa**: Native macOS implementation using AppKit and CoreGraphics
+- **cterm-gtk**: GTK4-specific rendering and widgets (Linux)
+- **cterm-win32**: Native Windows implementation using Win32 and Direct2D
 
 ## Built-in Themes
 
@@ -231,12 +241,14 @@ Custom themes can be added as TOML files in the `themes/` configuration subdirec
 ## Roadmap
 
 - [x] Text selection and copy/paste
-- [x] Crash recovery (macOS)
+- [x] Crash recovery (macOS/Linux)
 - [x] Sixel graphics support
 - [x] iTerm2 graphics protocol (OSC 1337)
 - [x] DRCS soft font support
+- [x] Windows native UI (Win32/Direct2D)
+- [x] Seamless upgrades (macOS/Linux/Windows)
+- [x] Copy as HTML with formatting
 - [ ] Split panes
-- [ ] Qt backend
 - [ ] Session save/restore across restarts
 - [ ] Plugin system
 
