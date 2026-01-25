@@ -209,7 +209,7 @@ impl WindowState {
                                 // Note: We'd need to pass the title somehow
                                 unsafe {
                                     PostMessageW(
-                                        HWND(hwnd as *mut _),
+                                        Some(HWND(hwnd as *mut _)),
                                         WM_APP_TITLE_CHANGED,
                                         WPARAM(tab_id as usize),
                                         LPARAM(0),
@@ -218,7 +218,7 @@ impl WindowState {
                             }
                             TerminalEvent::Bell => unsafe {
                                 PostMessageW(
-                                    HWND(hwnd as *mut _),
+                                    Some(HWND(hwnd as *mut _)),
                                     WM_APP_BELL,
                                     WPARAM(tab_id as usize),
                                     LPARAM(0),
@@ -227,7 +227,7 @@ impl WindowState {
                             TerminalEvent::ProcessExited(_) => {
                                 unsafe {
                                     PostMessageW(
-                                        HWND(hwnd as *mut _),
+                                        Some(HWND(hwnd as *mut _)),
                                         WM_APP_PTY_EXIT,
                                         WPARAM(tab_id as usize),
                                         LPARAM(0),
@@ -243,7 +243,7 @@ impl WindowState {
                 // Request redraw
                 unsafe {
                     PostMessageW(
-                        HWND(hwnd as *mut _),
+                        Some(HWND(hwnd as *mut _)),
                         WM_APP_PTY_DATA,
                         WPARAM(tab_id as usize),
                         LPARAM(0),
@@ -254,7 +254,7 @@ impl WindowState {
             // Process exited
             unsafe {
                 PostMessageW(
-                    HWND(hwnd as *mut _),
+                    Some(HWND(hwnd as *mut _)),
                     WM_APP_PTY_EXIT,
                     WPARAM(tab_id as usize),
                     LPARAM(0),
@@ -271,7 +271,7 @@ impl WindowState {
 
             if self.tabs.is_empty() {
                 // Close window
-                unsafe { PostMessageW(self.hwnd, WM_CLOSE, WPARAM(0), LPARAM(0)) };
+                unsafe { PostMessageW(Some(self.hwnd), WM_CLOSE, WPARAM(0), LPARAM(0)) };
             } else {
                 // Adjust active tab index
                 if self.active_tab_index >= self.tabs.len() {
@@ -369,7 +369,7 @@ impl WindowState {
 
     /// Invalidate and request redraw
     pub fn invalidate(&self) {
-        unsafe { InvalidateRect(self.hwnd, None, false) };
+        unsafe { InvalidateRect(Some(self.hwnd), None, false) };
     }
 
     /// Render the window
@@ -468,7 +468,7 @@ impl WindowState {
                 // TODO: Implement zoom reset
             }
             Action::CloseWindow => {
-                unsafe { PostMessageW(self.hwnd, WM_CLOSE, WPARAM(0), LPARAM(0)) };
+                unsafe { PostMessageW(Some(self.hwnd), WM_CLOSE, WPARAM(0), LPARAM(0)) };
             }
             Action::NewWindow => {
                 // TODO: Implement new window
@@ -517,7 +517,7 @@ impl WindowState {
                     }
                 }
                 MenuAction::Quit => {
-                    unsafe { PostMessageW(self.hwnd, WM_CLOSE, WPARAM(0), LPARAM(0)) };
+                    unsafe { PostMessageW(Some(self.hwnd), WM_CLOSE, WPARAM(0), LPARAM(0)) };
                 }
                 MenuAction::Copy => self.copy_selection(),
                 MenuAction::Paste => self.paste(),
