@@ -24,6 +24,25 @@ pub fn set_text(text: &str) {
     }
 }
 
+/// Set both HTML and plain text to the system clipboard
+///
+/// This allows rich text editors to paste the HTML version while
+/// plain text editors get the plain text version.
+pub fn set_html(html: &str, plain_text: &str) {
+    use objc2_app_kit::NSPasteboardTypeHTML;
+
+    let pasteboard = unsafe { NSPasteboard::generalPasteboard() };
+
+    // Clear and set both content types
+    unsafe {
+        pasteboard.clearContents();
+        // Set HTML content
+        pasteboard.setString_forType(&NSString::from_str(html), NSPasteboardTypeHTML);
+        // Also set plain text as fallback
+        pasteboard.setString_forType(&NSString::from_str(plain_text), NSPasteboardTypeString);
+    }
+}
+
 /// Clipboard wrapper implementing cterm-ui traits
 pub struct Clipboard;
 

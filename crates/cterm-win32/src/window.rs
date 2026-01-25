@@ -628,16 +628,8 @@ impl WindowState {
                     log::info!("========================");
                 }
                 MenuAction::ViewLogs => {
-                    // Open the log file location
-                    if let Some(dir) = cterm_app::config::config_dir() {
-                        let logs_dir: std::path::PathBuf = dir.join("logs");
-                        if logs_dir.exists() {
-                            std::process::Command::new("explorer")
-                                .arg(logs_dir)
-                                .spawn()
-                                .ok();
-                        }
-                    }
+                    // Show the in-app log viewer
+                    crate::log_viewer::show_log_viewer(self.hwnd.0 as *mut _);
                 }
             }
         }

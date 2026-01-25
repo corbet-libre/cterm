@@ -229,6 +229,14 @@ fn create_file_menu(mtm: MainThreadMarker) -> Retained<NSMenuItem> {
         NSEventModifierFlags::Command,
     ));
 
+    // Close Other Tabs
+    menu.addItem(&create_menu_item(
+        mtm,
+        "Close Other Tabs",
+        Some(sel!(closeOtherTabs:)),
+        "",
+    ));
+
     // Close Window
     menu.addItem(&create_menu_item_with_key(
         mtm,
@@ -281,6 +289,14 @@ fn create_edit_menu(mtm: MainThreadMarker) -> Retained<NSMenuItem> {
         Some(sel!(copy:)),
         "c",
         NSEventModifierFlags::Command,
+    ));
+
+    menu.addItem(&create_menu_item_with_key(
+        mtm,
+        "Copy as HTML",
+        Some(sel!(copyAsHTML:)),
+        "c",
+        NSEventModifierFlags::Command.union(NSEventModifierFlags::Shift),
     ));
 
     menu.addItem(&create_menu_item_with_key(
@@ -388,6 +404,69 @@ fn create_terminal_menu(mtm: MainThreadMarker) -> Retained<NSMenuItem> {
         Some(sel!(setTerminalTitle:)),
         "",
     ));
+
+    // Set Tab Color
+    menu.addItem(&create_menu_item(
+        mtm,
+        "Set Tab Color...",
+        Some(sel!(setTabColor:)),
+        "",
+    ));
+
+    menu.addItem(&NSMenuItem::separatorItem(mtm));
+
+    // Send Signal submenu
+    let signal_menu = NSMenu::new(mtm);
+    signal_menu.setTitle(&NSString::from_str("Send Signal"));
+
+    signal_menu.addItem(&create_menu_item(
+        mtm,
+        "SIGHUP (1) - Hangup",
+        Some(sel!(sendSignalHup:)),
+        "",
+    ));
+    signal_menu.addItem(&create_menu_item(
+        mtm,
+        "SIGINT (2) - Interrupt",
+        Some(sel!(sendSignalInt:)),
+        "",
+    ));
+    signal_menu.addItem(&create_menu_item(
+        mtm,
+        "SIGQUIT (3) - Quit",
+        Some(sel!(sendSignalQuit:)),
+        "",
+    ));
+    signal_menu.addItem(&create_menu_item(
+        mtm,
+        "SIGTERM (15) - Terminate",
+        Some(sel!(sendSignalTerm:)),
+        "",
+    ));
+    signal_menu.addItem(&create_menu_item(
+        mtm,
+        "SIGKILL (9) - Kill",
+        Some(sel!(sendSignalKill:)),
+        "",
+    ));
+    signal_menu.addItem(&NSMenuItem::separatorItem(mtm));
+    signal_menu.addItem(&create_menu_item(
+        mtm,
+        "SIGUSR1 (10)",
+        Some(sel!(sendSignalUsr1:)),
+        "",
+    ));
+    signal_menu.addItem(&create_menu_item(
+        mtm,
+        "SIGUSR2 (12)",
+        Some(sel!(sendSignalUsr2:)),
+        "",
+    ));
+
+    let signal_item = NSMenuItem::new(mtm);
+    signal_item.setTitle(&NSString::from_str("Send Signal"));
+    signal_item.setSubmenu(Some(&signal_menu));
+    menu.addItem(&signal_item);
 
     let menu_item = NSMenuItem::new(mtm);
     menu_item.setSubmenu(Some(&menu));

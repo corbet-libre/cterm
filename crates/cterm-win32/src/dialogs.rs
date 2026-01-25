@@ -558,22 +558,7 @@ pub fn show_error_msg(hwnd: windows::Win32::Foundation::HWND, message: &str) {
 
 /// Show check for updates dialog
 pub fn show_check_updates_dialog(parent: HWND) {
-    let title = to_wide("Check for Updates");
-    let message = to_wide(&format!(
-        "Current version: {}\n\n\
-        Visit https://github.com/KarpelesLab/cterm/releases\n\
-        to check for the latest version.",
-        env!("CARGO_PKG_VERSION")
-    ));
-
-    unsafe {
-        MessageBoxW(
-            parent,
-            message.as_ptr(),
-            title.as_ptr(),
-            MB_OK | MB_ICONINFORMATION,
-        );
-    }
+    crate::update_dialog::show_update_dialog(parent);
 }
 
 #[cfg(test)]

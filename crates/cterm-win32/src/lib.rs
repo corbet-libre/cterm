@@ -12,6 +12,7 @@ pub mod dialogs;
 pub mod docker_dialog;
 pub mod dpi;
 pub mod keycode;
+pub mod log_viewer;
 pub mod menu;
 pub mod mouse;
 pub mod notification_bar;
@@ -19,6 +20,7 @@ pub mod preferences_dialog;
 pub mod tab_bar;
 pub mod templates_dialog;
 pub mod terminal_canvas;
+pub mod update_dialog;
 pub mod window;
 
 use clap::Parser;

@@ -6,7 +6,9 @@ use clap::Parser;
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2::{define_class, msg_send, DefinedClass, MainThreadOnly};
-use objc2_app_kit::{NSApplication, NSApplicationActivationPolicy, NSApplicationDelegate};
+use objc2_app_kit::{
+    NSApplication, NSApplicationActivationPolicy, NSApplicationDelegate, NSWindow,
+};
 use objc2_foundation::{MainThreadMarker, NSNotification, NSObject, NSObjectProtocol, NSString};
 use std::path::PathBuf;
 
@@ -401,6 +403,33 @@ define_class!(
             window.setTabbingMode(NSWindowTabbingMode::Preferred);
 
             log::info!("Created new window");
+        }
+
+        /// Close all tabs except the current one
+        #[unsafe(method(closeOtherTabs:))]
+        fn action_close_other_tabs(&self, _sender: Option<&objc2::runtime::AnyObject>) {
+            let mtm = MainThreadMarker::from(self);
+            let app = NSApplication::sharedApplication(mtm);
+
+            // Get current key window
+            if let Some(key_window) = app.keyWindow() {
+                // Get all tabbed windows
+                let tabbed_windows: Option<objc2::rc::Retained<objc2_foundation::NSArray<NSWindow>>> =
+                    unsafe { msg_send![&key_window, tabbedWindows] };
+
+                if let Some(windows) = tabbed_windows {
+                    let current_ptr = objc2::rc::Retained::as_ptr(&key_window);
+                    let windows_to_close: Vec<_> = windows
+                        .iter()
+                        .filter(|w| objc2::rc::Retained::as_ptr(w) != current_ptr)
+                        .collect();
+
+                    for window in windows_to_close {
+                        window.close();
+                    }
+                    log::info!("Closed other tabs");
+                }
+            }
         }
 
         /// Open a new tab running in a Docker devcontainer

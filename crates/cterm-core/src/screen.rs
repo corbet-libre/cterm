@@ -1713,6 +1713,196 @@ impl Screen {
         }
     }
 
+    /// Get the selected text as HTML with styling
+    ///
+    /// Returns HTML with inline styles for colors and attributes.
+    /// The color palette is used to convert ANSI colors to RGB.
+    pub fn get_selected_html(&self, palette: &crate::color::ColorPalette) -> Option<String> {
+        use crate::cell::CellAttrs;
+        use crate::color::Color;
+
+        let selection = self.selection.as_ref()?;
+        let (start, end) = selection.ordered();
+
+        // Clamp to valid range
+        let total = self.total_lines();
+        if start.line >= total {
+            return None;
+        }
+
+        let mut result = String::new();
+        result.push_str("<pre style=\"font-family: monospace; background-color: ");
+        result.push_str(&format!(
+            "#{:02X}{:02X}{:02X}",
+            palette.background.r, palette.background.g, palette.background.b
+        ));
+        result.push_str("; color: ");
+        result.push_str(&format!(
+            "#{:02X}{:02X}{:02X}",
+            palette.foreground.r, palette.foreground.g, palette.foreground.b
+        ));
+        result.push_str("; padding: 8px;\">");
+
+        let end_line = end.line.min(total - 1);
+
+        // For block selection, use consistent column range across all lines
+        let is_block = selection.mode == SelectionMode::Block;
+        let (block_start_col, block_end_col) = if is_block {
+            let (min_col, max_col) = if selection.anchor.col <= selection.end.col {
+                (selection.anchor.col, selection.end.col)
+            } else {
+                (selection.end.col, selection.anchor.col)
+            };
+            (min_col, max_col)
+        } else {
+            (0, 0) // Not used for non-block selection
+        };
+
+        // Track last cell properties to minimize span changes
+        let mut last_fg: Option<Color> = None;
+        let mut last_bg: Option<Color> = None;
+        let mut last_attrs: Option<CellAttrs> = None;
+        let mut current_span_open = false;
+
+        for line_idx in start.line..=end_line {
+            let row = match self.get_row_by_absolute_line(line_idx) {
+                Some(r) => r,
+                None => continue,
+            };
+
+            let (start_col, end_col) = if is_block {
+                (
+                    block_start_col,
+                    block_end_col.min(row.len().saturating_sub(1)),
+                )
+            } else {
+                let sc = if line_idx == start.line { start.col } else { 0 };
+                let ec = if line_idx == end.line {
+                    end.col.min(row.len().saturating_sub(1))
+                } else {
+                    row.len().saturating_sub(1)
+                };
+                (sc, ec)
+            };
+
+            for col in start_col..=end_col {
+                if let Some(cell) = row.get(col) {
+                    // Skip wide character spacers
+                    if cell.attrs.contains(CellAttrs::WIDE_SPACER) {
+                        continue;
+                    }
+
+                    // Check if we need a new span
+                    let needs_new_span = last_fg != Some(cell.fg)
+                        || last_bg != Some(cell.bg)
+                        || last_attrs != Some(cell.attrs);
+
+                    if needs_new_span {
+                        if current_span_open {
+                            result.push_str("</span>");
+                            current_span_open = false;
+                        }
+
+                        // Build style string
+                        let mut style_parts = Vec::new();
+
+                        // Foreground color (skip if default)
+                        if !cell.fg.is_default() {
+                            let rgb = cell.fg.to_rgb(palette);
+                            style_parts
+                                .push(format!("color: #{:02X}{:02X}{:02X}", rgb.r, rgb.g, rgb.b));
+                        }
+
+                        // Background color (skip if default)
+                        if !cell.bg.is_default() {
+                            let rgb = cell.bg.to_rgb(palette);
+                            style_parts.push(format!(
+                                "background-color: #{:02X}{:02X}{:02X}",
+                                rgb.r, rgb.g, rgb.b
+                            ));
+                        }
+
+                        // Bold
+                        if cell.attrs.contains(CellAttrs::BOLD) {
+                            style_parts.push("font-weight: bold".to_string());
+                        }
+
+                        // Dim
+                        if cell.attrs.contains(CellAttrs::DIM) {
+                            style_parts.push("opacity: 0.5".to_string());
+                        }
+
+                        // Italic
+                        if cell.attrs.contains(CellAttrs::ITALIC) {
+                            style_parts.push("font-style: italic".to_string());
+                        }
+
+                        // Text decorations
+                        let has_underline = cell.attrs.has_underline();
+                        let has_strikethrough = cell.attrs.contains(CellAttrs::STRIKETHROUGH);
+                        let has_overline = cell.attrs.contains(CellAttrs::OVERLINE);
+
+                        if has_underline || has_strikethrough || has_overline {
+                            let mut decorations = Vec::new();
+                            if has_underline {
+                                decorations.push("underline");
+                            }
+                            if has_strikethrough {
+                                decorations.push("line-through");
+                            }
+                            if has_overline {
+                                decorations.push("overline");
+                            }
+                            style_parts.push(format!("text-decoration: {}", decorations.join(" ")));
+                        }
+
+                        if !style_parts.is_empty() {
+                            result.push_str("<span style=\"");
+                            result.push_str(&style_parts.join("; "));
+                            result.push_str("\">");
+                            current_span_open = true;
+                        }
+
+                        last_fg = Some(cell.fg);
+                        last_bg = Some(cell.bg);
+                        last_attrs = Some(cell.attrs);
+                    }
+
+                    // Append character (HTML-escaped)
+                    match cell.c {
+                        '<' => result.push_str("&lt;"),
+                        '>' => result.push_str("&gt;"),
+                        '&' => result.push_str("&amp;"),
+                        '"' => result.push_str("&quot;"),
+                        '\'' => result.push_str("&#39;"),
+                        c => result.push(c),
+                    }
+                }
+            }
+
+            if current_span_open {
+                result.push_str("</span>");
+                current_span_open = false;
+                last_fg = None;
+                last_bg = None;
+                last_attrs = None;
+            }
+
+            // Add newline between lines
+            if line_idx < end_line && (is_block || !row.wrapped) {
+                result.push('\n');
+            }
+        }
+
+        result.push_str("</pre>");
+
+        if result.len() > "<pre style=\"\"></pre>".len() + 100 {
+            Some(result)
+        } else {
+            None
+        }
+    }
+
     /// Get a row by absolute line index (0 = oldest scrollback line)
     fn get_row_by_absolute_line(&self, line: usize) -> Option<&Row> {
         let scrollback_len = self.scrollback.len();

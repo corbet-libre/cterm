@@ -59,6 +59,8 @@ pub struct TerminalViewIvars {
     notification_bar: RefCell<Option<Retained<NotificationBar>>>,
     /// Pending file manager for file transfers
     file_manager: RefCell<PendingFileManager>,
+    /// Color palette for HTML export
+    color_palette: cterm_core::color::ColorPalette,
 }
 
 define_class!(
@@ -623,6 +625,19 @@ define_class!(
             }
         }
 
+        /// Copy selection to clipboard as HTML (Command+Shift+C)
+        #[unsafe(method(copyAsHTML:))]
+        fn action_copy_as_html(&self, _sender: Option<&objc2::runtime::AnyObject>) {
+            let terminal = self.ivars().terminal.lock();
+            let palette = &self.ivars().color_palette;
+            if let Some(html) = terminal.screen().get_selected_html(palette) {
+                let plain_text = terminal.screen().get_selected_text().unwrap_or_default();
+                drop(terminal);
+                clipboard::set_html(&html, &plain_text);
+                log::debug!("Copied {} chars as HTML to clipboard", html.len());
+            }
+        }
+
         /// Paste from clipboard (Command+V)
         #[unsafe(method(paste:))]
         fn action_paste(&self, _sender: Option<&objc2::runtime::AnyObject>) {
@@ -761,6 +776,42 @@ define_class!(
         #[unsafe(method(triggerRedraw))]
         fn trigger_redraw(&self) {
             self.set_needs_display();
+        }
+
+        // Signal action handlers
+        #[unsafe(method(sendSignalHup:))]
+        fn action_send_signal_hup(&self, _sender: Option<&objc2::runtime::AnyObject>) {
+            TerminalView::do_send_signal(self, 1); // SIGHUP
+        }
+
+        #[unsafe(method(sendSignalInt:))]
+        fn action_send_signal_int(&self, _sender: Option<&objc2::runtime::AnyObject>) {
+            TerminalView::do_send_signal(self, 2); // SIGINT
+        }
+
+        #[unsafe(method(sendSignalQuit:))]
+        fn action_send_signal_quit(&self, _sender: Option<&objc2::runtime::AnyObject>) {
+            TerminalView::do_send_signal(self, 3); // SIGQUIT
+        }
+
+        #[unsafe(method(sendSignalTerm:))]
+        fn action_send_signal_term(&self, _sender: Option<&objc2::runtime::AnyObject>) {
+            TerminalView::do_send_signal(self, 15); // SIGTERM
+        }
+
+        #[unsafe(method(sendSignalKill:))]
+        fn action_send_signal_kill(&self, _sender: Option<&objc2::runtime::AnyObject>) {
+            TerminalView::do_send_signal(self, 9); // SIGKILL
+        }
+
+        #[unsafe(method(sendSignalUsr1:))]
+        fn action_send_signal_usr1(&self, _sender: Option<&objc2::runtime::AnyObject>) {
+            TerminalView::do_send_signal(self, 10); // SIGUSR1
+        }
+
+        #[unsafe(method(sendSignalUsr2:))]
+        fn action_send_signal_usr2(&self, _sender: Option<&objc2::runtime::AnyObject>) {
+            TerminalView::do_send_signal(self, 12); // SIGUSR2
         }
 
         /// Notification bar save action
@@ -1147,6 +1198,7 @@ impl TerminalView {
             marked_text: RefCell::new(String::new()),
             notification_bar: RefCell::new(None),
             file_manager: RefCell::new(PendingFileManager::new()),
+            color_palette: theme.colors.clone(),
         });
 
         let this: Retained<Self> = unsafe { msg_send![super(this), initWithFrame: frame] };
@@ -1213,6 +1265,7 @@ impl TerminalView {
             marked_text: RefCell::new(String::new()),
             notification_bar: RefCell::new(None),
             file_manager: RefCell::new(PendingFileManager::new()),
+            color_palette: theme.colors.clone(),
         });
 
         let this: Retained<Self> = unsafe { msg_send![super(this), initWithFrame: frame] };
@@ -1293,6 +1346,7 @@ impl TerminalView {
             marked_text: RefCell::new(String::new()),
             notification_bar: RefCell::new(None),
             file_manager: RefCell::new(PendingFileManager::new()),
+            color_palette: theme.colors.clone(),
         });
 
         let this: Retained<Self> = unsafe { msg_send![super(this), initWithFrame: frame] };
@@ -1401,6 +1455,7 @@ impl TerminalView {
             marked_text: RefCell::new(String::new()),
             notification_bar: RefCell::new(None),
             file_manager: RefCell::new(PendingFileManager::new()),
+            color_palette: theme.colors.clone(),
         });
 
         let this: Retained<Self> = unsafe { msg_send![super(this), initWithFrame: frame] };
@@ -1779,6 +1834,17 @@ impl TerminalView {
         terminal.screen_mut().clear_selection();
         drop(terminal);
         self.set_needs_display();
+    }
+
+    /// Send a signal to the terminal's child process
+    #[cfg(unix)]
+    fn do_send_signal(&self, signal: i32) {
+        let terminal = self.ivars().terminal.lock();
+        if let Err(e) = terminal.send_signal(signal) {
+            log::error!("Failed to send signal {}: {}", signal, e);
+        } else {
+            log::info!("Sent signal {} to terminal process", signal);
+        }
     }
 
     /// Export terminal state for seamless upgrade

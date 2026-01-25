@@ -145,6 +145,24 @@ define_class!(
                 self.schedule_tab_color_retry();
             }
         }
+
+        /// Set tab color via color picker dialog
+        #[unsafe(method(setTabColor:))]
+        fn action_set_tab_color(&self, _sender: Option<&objc2::runtime::AnyObject>) {
+            let mtm = MainThreadMarker::from(self);
+            let current = self.ivars().pending_tab_color.borrow().clone();
+            match crate::dialogs::show_color_picker_dialog(mtm, current.as_deref()) {
+                crate::dialogs::ColorPickerResult::Color(color) => {
+                    self.set_tab_color(Some(&color));
+                }
+                crate::dialogs::ColorPickerResult::Clear => {
+                    self.set_tab_color(None);
+                }
+                crate::dialogs::ColorPickerResult::Cancel => {
+                    // Do nothing
+                }
+            }
+        }
     }
 );
 
