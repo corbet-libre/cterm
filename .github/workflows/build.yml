@@ -630,12 +630,11 @@ jobs:
           # Rename to standard name for artifact
           mv "release/cterm-macos-$VERSION.dmg" "release/cterm-macos-universal.dmg"
 
-      - name: Create tar.gz for auto-update
+      - name: Create tar.gz for auto-update (app bundle)
         run: |
-          mkdir -p release/cterm-macos-universal
-          cp universal-binary/cterm release/cterm-macos-universal/
-          cp README.md LICENSE release/cterm-macos-universal/
-          cd release && tar -czvf cterm-macos-universal.tar.gz cterm-macos-universal
+          # Create tar.gz of the full app bundle for auto-update
+          # This includes the icon, Info.plist, and binary
+          cd release && tar -czvf cterm-macos-universal.tar.gz cterm.app
 
       - name: Create ctermd tar.gz
         run: |

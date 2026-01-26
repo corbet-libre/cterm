@@ -114,7 +114,8 @@ fn show_update_available(mtm: MainThreadMarker, info: UpdateInfo) {
         "A new version of cterm is available!\n\n\
         Current version: {}\n\
         New version: {}\n\n\
-        Would you like to open the releases page to download the update?",
+        Would you like to download and install the update?\n\
+        The application will restart automatically.",
         CURRENT_VERSION, info.version
     );
     alert.setInformativeText(&NSString::from_str(&message));
@@ -125,12 +126,236 @@ fn show_update_available(mtm: MainThreadMarker, info: UpdateInfo) {
         alert.setAccessoryView(Some(&scroll_view));
     }
 
+    alert.addButtonWithTitle(&NSString::from_str("Install Update"));
     alert.addButtonWithTitle(&NSString::from_str("Open Releases"));
     alert.addButtonWithTitle(&NSString::from_str("Later"));
 
     let response = alert.runModal();
     if response == objc2_app_kit::NSAlertFirstButtonReturn {
+        // Install update automatically
+        download_and_install_update(mtm, info);
+    } else if response == objc2_app_kit::NSAlertSecondButtonReturn {
+        // Open releases page
         open_releases_page();
+    }
+}
+
+/// Download, install, and restart the application
+fn download_and_install_update(mtm: MainThreadMarker, info: UpdateInfo) {
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::sync::Arc;
+
+    // Show download progress dialog
+    let alert = NSAlert::new(mtm);
+    alert.setAlertStyle(NSAlertStyle::Informational);
+    alert.setMessageText(&NSString::from_str("Downloading Update"));
+    alert.setInformativeText(&NSString::from_str("Starting download..."));
+
+    // Add progress indicator
+    let progress = unsafe {
+        let p = NSProgressIndicator::new(mtm);
+        p.setStyle(NSProgressIndicatorStyle::Bar);
+        p.setControlSize(objc2_app_kit::NSControlSize::Regular);
+        p.setFrameSize(NSSize::new(300.0, 20.0));
+        p.setIndeterminate(false);
+        p.setMinValue(0.0);
+        p.setMaxValue(100.0);
+        p
+    };
+    alert.setAccessoryView(Some(&progress));
+    alert.addButtonWithTitle(&NSString::from_str("Cancel"));
+
+    let window = unsafe { alert.window() };
+    window.makeKeyAndOrderFront(None);
+
+    // Shared state for progress
+    let downloaded = Arc::new(AtomicU64::new(0));
+    let total = Arc::new(AtomicU64::new(info.size));
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let finished = Arc::new(AtomicBool::new(false));
+    let error_msg = Arc::new(parking_lot::Mutex::new(None::<String>));
+    let download_path = Arc::new(parking_lot::Mutex::new(None::<std::path::PathBuf>));
+
+    let downloaded_clone = Arc::clone(&downloaded);
+    let total_clone = Arc::clone(&total);
+    let cancelled_clone = Arc::clone(&cancelled);
+    let finished_clone = Arc::clone(&finished);
+    let error_clone = Arc::clone(&error_msg);
+    let path_clone = Arc::clone(&download_path);
+
+    // Start download in background thread
+    std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("Failed to create runtime");
+
+        let result = runtime.block_on(async {
+            let updater = Updater::new(GITHUB_REPO, CURRENT_VERSION)?;
+
+            // Download with progress callback
+            let downloaded_cb = Arc::clone(&downloaded_clone);
+            let total_cb = Arc::clone(&total_clone);
+            let cancelled_cb = Arc::clone(&cancelled_clone);
+
+            let path = updater
+                .download(&info, |dl, tot| {
+                    downloaded_cb.store(dl, Ordering::Relaxed);
+                    total_cb.store(tot, Ordering::Relaxed);
+
+                    // Check for cancellation
+                    if cancelled_cb.load(Ordering::Relaxed) {
+                        // Can't really cancel mid-download, but we'll handle it
+                    }
+                })
+                .await?;
+
+            // Verify checksum
+            updater.verify(&path, &info).await?;
+
+            Ok::<_, UpdateError>(path)
+        });
+
+        match result {
+            Ok(path) => {
+                *path_clone.lock() = Some(path);
+            }
+            Err(e) => {
+                *error_clone.lock() = Some(e.to_string());
+            }
+        }
+        finished_clone.store(true, Ordering::Relaxed);
+    });
+
+    // Poll for progress updates
+    loop {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+
+        let dl = downloaded.load(Ordering::Relaxed);
+        let tot = total.load(Ordering::Relaxed);
+
+        if tot > 0 {
+            let percent = (dl as f64 / tot as f64) * 100.0;
+            progress.setDoubleValue(percent);
+
+            let mb_dl = dl as f64 / 1_048_576.0;
+            let mb_tot = tot as f64 / 1_048_576.0;
+            let text = format!("Downloading... {:.1} / {:.1} MB", mb_dl, mb_tot);
+            alert.setInformativeText(&NSString::from_str(&text));
+        }
+
+        // Process events
+        unsafe {
+            use objc2_app_kit::NSApplication;
+            let app = NSApplication::sharedApplication(mtm);
+            while let Some(event) = app.nextEventMatchingMask_untilDate_inMode_dequeue(
+                objc2_app_kit::NSEventMask::Any,
+                None,
+                objc2_foundation::NSDefaultRunLoopMode,
+                true,
+            ) {
+                app.sendEvent(&event);
+            }
+        }
+
+        if finished.load(Ordering::Relaxed) {
+            break;
+        }
+    }
+
+    window.close();
+
+    // Check for errors
+    if let Some(err) = error_msg.lock().take() {
+        show_install_error(mtm, &err);
+        return;
+    }
+
+    // Get download path
+    let archive_path = match download_path.lock().take() {
+        Some(p) => p,
+        None => {
+            show_install_error(mtm, "Download failed: no file path");
+            return;
+        }
+    };
+
+    // Extract and install
+    match install_update(mtm, &archive_path) {
+        Ok(new_binary) => {
+            // Show success and restart
+            let alert = NSAlert::new(mtm);
+            alert.setAlertStyle(NSAlertStyle::Informational);
+            alert.setMessageText(&NSString::from_str("Update Installed"));
+            alert.setInformativeText(&NSString::from_str(
+                "The update has been installed successfully.\n\n\
+                 Click Restart to launch the new version.",
+            ));
+            alert.addButtonWithTitle(&NSString::from_str("Restart Now"));
+            alert.runModal();
+
+            // Perform relaunch with the new binary
+            perform_relaunch_with_binary(mtm, &new_binary);
+        }
+        Err(e) => {
+            show_install_error(mtm, &e);
+        }
+    }
+}
+
+/// Extract archive and install the update
+fn install_update(
+    _mtm: MainThreadMarker,
+    archive_path: &std::path::Path,
+) -> Result<std::path::PathBuf, String> {
+    // Extract the archive
+    let extracted_dir =
+        Updater::extract_archive(archive_path).map_err(|e| format!("Extract failed: {}", e))?;
+
+    // Install the app bundle
+    let new_binary = Updater::install_macos_update(&extracted_dir)
+        .map_err(|e| format!("Install failed: {}", e))?;
+
+    // Clean up extracted directory (optional, will be cleaned up on reboot anyway)
+    let _ = std::fs::remove_dir_all(&extracted_dir);
+    let _ = std::fs::remove_file(archive_path);
+
+    Ok(new_binary)
+}
+
+/// Show installation error dialog
+fn show_install_error(mtm: MainThreadMarker, error: &str) {
+    let alert = NSAlert::new(mtm);
+    alert.setAlertStyle(NSAlertStyle::Critical);
+    alert.setMessageText(&NSString::from_str("Update Failed"));
+    alert.setInformativeText(&NSString::from_str(&format!(
+        "Could not install the update:\n\n{}\n\n\
+         You can try downloading the update manually from the releases page.",
+        error
+    )));
+    alert.addButtonWithTitle(&NSString::from_str("Open Releases"));
+    alert.addButtonWithTitle(&NSString::from_str("OK"));
+
+    let response = alert.runModal();
+    if response == objc2_app_kit::NSAlertFirstButtonReturn {
+        open_releases_page();
+    }
+}
+
+/// Perform relaunch with a specific binary path
+fn perform_relaunch_with_binary(mtm: MainThreadMarker, binary_path: &std::path::Path) {
+    use objc2_app_kit::NSApplication;
+
+    log::info!("Relaunching with new binary: {}", binary_path.display());
+
+    // Get the app delegate and call perform_relaunch
+    // This will use the new binary since we've replaced the app bundle
+    let app = NSApplication::sharedApplication(mtm);
+    if let Some(delegate) = app.delegate() {
+        // Call our perform_relaunch method
+        let _: () = unsafe {
+            objc2::msg_send![&*delegate, debugRelaunch: std::ptr::null::<objc2::runtime::AnyObject>()]
+        };
     }
 }
 

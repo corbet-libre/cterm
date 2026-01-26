@@ -280,9 +280,9 @@ impl Updater {
 
         file.flush()?;
 
-        // Make executable on Unix
+        // Make executable on Unix (for non-tar.gz downloads)
         #[cfg(unix)]
-        {
+        if !file_path.to_string_lossy().ends_with(".tar.gz") {
             use std::os::unix::fs::PermissionsExt;
             let mut perms = std::fs::metadata(&file_path)?.permissions();
             perms.set_mode(0o755);
@@ -290,6 +290,106 @@ impl Updater {
         }
 
         Ok(file_path)
+    }
+
+    /// Extract a downloaded tar.gz archive
+    ///
+    /// # Arguments
+    /// * `archive_path` - Path to the downloaded tar.gz file
+    ///
+    /// # Returns
+    /// Path to the extracted directory
+    pub fn extract_archive(archive_path: &Path) -> Result<PathBuf, UpdateError> {
+        use flate2::read::GzDecoder;
+        use std::fs::File;
+        use tar::Archive;
+
+        let file = File::open(archive_path)?;
+        let decoder = GzDecoder::new(file);
+        let mut archive = Archive::new(decoder);
+
+        // Extract to a temp directory next to the archive
+        let extract_dir = archive_path.with_extension("extracted");
+        if extract_dir.exists() {
+            std::fs::remove_dir_all(&extract_dir)?;
+        }
+        std::fs::create_dir_all(&extract_dir)?;
+
+        archive.unpack(&extract_dir)?;
+
+        Ok(extract_dir)
+    }
+
+    /// Install the update on macOS by replacing the app bundle
+    ///
+    /// # Arguments
+    /// * `extracted_dir` - Path to the extracted update directory containing cterm.app
+    ///
+    /// # Returns
+    /// Path to the installed app bundle's binary
+    #[cfg(target_os = "macos")]
+    pub fn install_macos_update(extracted_dir: &Path) -> Result<PathBuf, UpdateError> {
+        let new_app = extracted_dir.join("cterm.app");
+        if !new_app.exists() {
+            return Err(UpdateError::Io(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "cterm.app not found in extracted archive",
+            )));
+        }
+
+        // Get the current app bundle location
+        let current_exe = std::env::current_exe()?;
+
+        // Check if we're running from an app bundle
+        // The path would be like: /Applications/cterm.app/Contents/MacOS/cterm
+        let current_app = if let Some(macos_dir) = current_exe.parent() {
+            if macos_dir.ends_with("MacOS") {
+                if let Some(contents_dir) = macos_dir.parent() {
+                    if contents_dir.ends_with("Contents") {
+                        contents_dir.parent().map(|p| p.to_path_buf())
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        let target_app = match current_app {
+            Some(app) => app,
+            None => {
+                // Not running from an app bundle, install to /Applications
+                PathBuf::from("/Applications/cterm.app")
+            }
+        };
+
+        log::info!(
+            "Installing update: {} -> {}",
+            new_app.display(),
+            target_app.display()
+        );
+
+        // Remove old app bundle if it exists
+        if target_app.exists() {
+            // Move to trash or backup instead of deleting
+            let backup_path = target_app.with_extension("app.backup");
+            if backup_path.exists() {
+                std::fs::remove_dir_all(&backup_path)?;
+            }
+            std::fs::rename(&target_app, &backup_path)?;
+        }
+
+        // Move new app bundle into place
+        std::fs::rename(&new_app, &target_app)?;
+
+        // Return path to the new binary
+        let new_binary = target_app.join("Contents/MacOS/cterm");
+        Ok(new_binary)
     }
 
     /// Verify the downloaded file against its SHA256 checksum

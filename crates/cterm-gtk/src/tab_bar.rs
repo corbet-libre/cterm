@@ -191,12 +191,8 @@ impl TabBar {
         gesture.connect_pressed(move |gesture, _, x, y| {
             *context_menu_tab_id_gesture.borrow_mut() = Some(tab_id);
             // Position the popover at click location
-            popover_clone.set_pointing_to(Some(&gtk4::gdk::Rectangle::new(
-                x as i32,
-                y as i32,
-                1,
-                1,
-            )));
+            popover_clone
+                .set_pointing_to(Some(&gtk4::gdk::Rectangle::new(x as i32, y as i32, 1, 1)));
             popover_clone.popup();
             gesture.set_state(gtk4::EventSequenceState::Claimed);
         });

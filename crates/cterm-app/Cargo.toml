@@ -21,6 +21,8 @@ bincode.workspace = true
 serde_json.workspace = true
 futures-util.workspace = true
 env_logger.workspace = true
+tar.workspace = true
+flate2.workspace = true
 
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true
