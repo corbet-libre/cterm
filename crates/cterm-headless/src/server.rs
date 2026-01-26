@@ -18,6 +18,8 @@ pub struct ServerConfig {
     pub port: u16,
     /// Unix socket path (default: /tmp/ctermd.sock)
     pub socket_path: String,
+    /// Default scrollback lines for new sessions
+    pub scrollback_lines: usize,
 }
 
 impl Default for ServerConfig {
@@ -27,13 +29,14 @@ impl Default for ServerConfig {
             bind_addr: "127.0.0.1".to_string(),
             port: 50051,
             socket_path: "/tmp/ctermd.sock".to_string(),
+            scrollback_lines: 10000,
         }
     }
 }
 
 /// Run the gRPC server with the given configuration
 pub async fn run_server(config: ServerConfig) -> anyhow::Result<()> {
-    let session_manager = Arc::new(SessionManager::new());
+    let session_manager = Arc::new(SessionManager::with_scrollback(config.scrollback_lines));
     let service = TerminalServiceImpl::new(session_manager);
 
     if config.use_tcp {
@@ -109,5 +112,6 @@ mod tests {
         assert_eq!(config.bind_addr, "127.0.0.1");
         assert_eq!(config.port, 50051);
         assert_eq!(config.socket_path, "/tmp/ctermd.sock");
+        assert_eq!(config.scrollback_lines, 10000);
     }
 }

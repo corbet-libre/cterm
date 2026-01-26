@@ -32,6 +32,10 @@ pub struct Cli {
     /// Run in foreground (don't daemonize)
     #[arg(short = 'f', long = "foreground")]
     pub foreground: bool,
+
+    /// Default scrollback lines for new sessions (0 = no scrollback)
+    #[arg(long = "scrollback", default_value = "10000")]
+    pub scrollback_lines: usize,
 }
 
 impl Cli {
@@ -47,6 +51,7 @@ impl Cli {
             bind_addr: self.bind_addr.clone(),
             port: self.port,
             socket_path: self.socket_path.clone(),
+            scrollback_lines: self.scrollback_lines,
         }
     }
 }
@@ -64,6 +69,7 @@ mod tests {
         assert_eq!(cli.bind_addr, "127.0.0.1");
         assert_eq!(cli.log_level, "info");
         assert!(!cli.foreground);
+        assert_eq!(cli.scrollback_lines, 10000);
     }
 
     #[test]
@@ -77,5 +83,17 @@ mod tests {
     fn test_custom_socket() {
         let cli = Cli::parse_from(["ctermd", "-l", "/var/run/ctermd.sock"]);
         assert_eq!(cli.socket_path, "/var/run/ctermd.sock");
+    }
+
+    #[test]
+    fn test_custom_scrollback() {
+        let cli = Cli::parse_from(["ctermd", "--scrollback", "5000"]);
+        assert_eq!(cli.scrollback_lines, 5000);
+    }
+
+    #[test]
+    fn test_no_scrollback() {
+        let cli = Cli::parse_from(["ctermd", "--scrollback", "0"]);
+        assert_eq!(cli.scrollback_lines, 0);
     }
 }

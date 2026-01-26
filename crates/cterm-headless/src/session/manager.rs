@@ -10,13 +10,21 @@ use std::sync::Arc;
 /// Thread-safe manager for terminal sessions
 pub struct SessionManager {
     sessions: RwLock<HashMap<String, Arc<SessionState>>>,
+    /// Default scrollback lines for new sessions
+    scrollback_lines: usize,
 }
 
 impl SessionManager {
-    /// Create a new session manager
+    /// Create a new session manager with default scrollback (10000 lines)
     pub fn new() -> Self {
+        Self::with_scrollback(10000)
+    }
+
+    /// Create a new session manager with custom scrollback
+    pub fn with_scrollback(scrollback_lines: usize) -> Self {
         Self {
             sessions: RwLock::new(HashMap::new()),
+            scrollback_lines,
         }
     }
 
@@ -39,7 +47,17 @@ impl SessionManager {
             return Err(HeadlessError::SessionAlreadyExists(id));
         }
 
-        let state = SessionState::new(id.clone(), cols, rows, shell, args, cwd, env, term)?;
+        let state = SessionState::new(
+            id.clone(),
+            cols,
+            rows,
+            shell,
+            args,
+            cwd,
+            env,
+            term,
+            self.scrollback_lines,
+        )?;
 
         // Start the PTY reader task
         let state = state.start_reader()?;

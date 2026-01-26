@@ -43,6 +43,7 @@ impl SessionState {
         cwd: Option<std::path::PathBuf>,
         env: Vec<(String, String)>,
         term: Option<String>,
+        scrollback_lines: usize,
     ) -> Result<Arc<Self>> {
         let pty_config = PtyConfig {
             size: PtySize {
@@ -57,7 +58,8 @@ impl SessionState {
             term,
         };
 
-        let terminal = Terminal::with_shell(cols, rows, ScreenConfig::default(), &pty_config)?;
+        let screen_config = ScreenConfig { scrollback_lines };
+        let terminal = Terminal::with_shell(cols, rows, screen_config, &pty_config)?;
 
         // Create broadcast channels
         let (output_tx, _) = broadcast::channel(1024);
