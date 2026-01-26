@@ -33,8 +33,6 @@ pub struct Cursor {
     pub col: usize,
     /// Row position (0-indexed)
     pub row: usize,
-    /// Whether cursor is visible
-    pub visible: bool,
     /// Cursor style
     pub style: CursorStyle,
     /// Whether cursor should blink
@@ -453,7 +451,6 @@ impl Screen {
             alternate_grid: None,
             config,
             cursor: Cursor {
-                visible: true,
                 blink: true,
                 ..Default::default()
             },
@@ -909,7 +906,6 @@ impl Screen {
         self.alternate_grid = Some(std::mem::replace(&mut self.grid, alt));
 
         self.cursor = Cursor::default();
-        self.cursor.visible = true;
         self.dirty = true;
     }
 
@@ -1051,7 +1047,6 @@ impl Screen {
         self.scrollback.clear();
         self.alternate_grid = None;
         self.cursor = Cursor {
-            visible: true,
             blink: true,
             ..Default::default()
         };
