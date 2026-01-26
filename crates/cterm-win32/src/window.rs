@@ -945,7 +945,7 @@ impl WindowState {
 
             // Add menu items
             let rename_text: Vec<u16> = "Rename Tab...\0".encode_utf16().collect();
-            InsertMenuW(
+            let _ = InsertMenuW(
                 menu,
                 0,
                 MF_STRING,
@@ -954,7 +954,7 @@ impl WindowState {
             );
 
             let color_text: Vec<u16> = "Set Tab Color...\0".encode_utf16().collect();
-            InsertMenuW(
+            let _ = InsertMenuW(
                 menu,
                 1,
                 MF_STRING,
@@ -964,7 +964,7 @@ impl WindowState {
 
             // Get screen coordinates
             let mut pt = windows::Win32::Foundation::POINT { x, y };
-            windows::Win32::Graphics::Gdi::ClientToScreen(self.hwnd, &mut pt);
+            let _ = windows::Win32::Graphics::Gdi::ClientToScreen(self.hwnd, &mut pt);
 
             // Show the menu
             let cmd = TrackPopupMenu(
@@ -992,7 +992,7 @@ impl WindowState {
                 }
             }
 
-            windows::Win32::UI::WindowsAndMessaging::DestroyMenu(menu);
+            let _ = windows::Win32::UI::WindowsAndMessaging::DestroyMenu(menu);
         }
     }
 

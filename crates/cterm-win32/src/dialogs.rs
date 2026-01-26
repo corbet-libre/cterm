@@ -567,9 +567,7 @@ pub fn show_input_dialog_win(
 }
 
 /// Show a set color dialog (wrapper that takes windows crate HWND)
-pub fn show_set_color_dialog_win(
-    hwnd: windows::Win32::Foundation::HWND,
-) -> Option<Option<String>> {
+pub fn show_set_color_dialog_win(hwnd: windows::Win32::Foundation::HWND) -> Option<Option<String>> {
     let parent = hwnd.0 as *mut _;
     show_set_color_dialog(parent)
 }
