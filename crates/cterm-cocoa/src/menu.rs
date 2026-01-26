@@ -168,6 +168,17 @@ fn create_file_menu(mtm: MainThreadMarker) -> Retained<NSMenuItem> {
 
     menu.addItem(&NSMenuItem::separatorItem(mtm));
 
+    // Quick Open Template
+    menu.addItem(&create_menu_item_with_key(
+        mtm,
+        "Quick Open Template...",
+        Some(sel!(showQuickOpen:)),
+        "g",
+        NSEventModifierFlags::Command,
+    ));
+
+    menu.addItem(&NSMenuItem::separatorItem(mtm));
+
     // Tab Templates submenu
     let templates_submenu = NSMenu::new(mtm);
     templates_submenu.setTitle(&NSString::from_str("Tab Templates"));

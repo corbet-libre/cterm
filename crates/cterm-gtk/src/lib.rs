@@ -9,6 +9,7 @@ mod file_transfer;
 mod log_viewer;
 mod menu;
 mod notification_bar;
+mod quick_open;
 mod tab_bar;
 mod tab_templates_dialog;
 mod terminal_widget;

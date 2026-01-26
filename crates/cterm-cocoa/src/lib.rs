@@ -33,6 +33,7 @@ pub mod log_viewer;
 pub mod menu;
 pub mod notification_bar;
 pub mod preferences;
+pub mod quick_open;
 pub mod tab_bar;
 pub mod tab_templates;
 pub mod terminal_view;

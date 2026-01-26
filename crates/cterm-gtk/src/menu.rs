@@ -18,6 +18,7 @@ pub fn create_menu_model_with_options(show_debug: bool) -> gio::Menu {
     let file_menu = gio::Menu::new();
     file_menu.append(Some("New Tab"), Some("win.new-tab"));
     file_menu.append(Some("New Window"), Some("win.new-window"));
+    file_menu.append(Some("Quick Open Template..."), Some("win.quick-open"));
 
     // Docker submenu
     let docker_menu = gio::Menu::new();

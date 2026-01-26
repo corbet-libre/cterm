@@ -108,6 +108,15 @@ impl ShortcutManager {
         // Other shortcuts
         self.bind(Shortcut::ctrl(KeyCode::Comma), Action::OpenPreferences);
         self.bind(Shortcut::ctrl_shift(KeyCode::F), Action::FindText);
+
+        // Quick open (Cmd+G on macOS, Ctrl+Shift+G on Linux/Windows)
+        #[cfg(target_os = "macos")]
+        self.bind(
+            Shortcut::new(KeyCode::G, Modifiers::SUPER),
+            Action::QuickOpenTemplate,
+        );
+        #[cfg(not(target_os = "macos"))]
+        self.bind(Shortcut::ctrl_shift(KeyCode::G), Action::QuickOpenTemplate);
     }
 
     /// Bind a shortcut to an action

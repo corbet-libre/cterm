@@ -21,6 +21,7 @@ use cterm_ui::theme::Theme;
 
 use cterm_core::Terminal;
 
+use crate::quick_open::{QuickOpenOverlay, QUICK_OPEN_HEIGHT};
 use crate::terminal_view::TerminalView;
 
 /// Window state stored in ivars
@@ -30,6 +31,7 @@ pub struct CtermWindowIvars {
     shortcuts: ShortcutManager,
     active_terminal: RefCell<Option<Retained<TerminalView>>>,
     pending_tab_color: RefCell<Option<String>>,
+    quick_open: RefCell<Option<Retained<QuickOpenOverlay>>>,
 }
 
 define_class!(
@@ -104,6 +106,12 @@ define_class!(
             // Update terminal dimensions
             if let Some(terminal) = self.ivars().active_terminal.borrow().as_ref() {
                 terminal.handle_resize();
+            }
+
+            // Update Quick Open overlay width
+            if let Some(ref overlay) = *self.ivars().quick_open.borrow() {
+                let width = self.frame().size.width;
+                overlay.update_width(width);
             }
         }
     }
@@ -208,6 +216,7 @@ impl CtermWindow {
             shortcuts: ShortcutManager::from_config(&config.shortcuts),
             active_terminal: RefCell::new(None),
             pending_tab_color: RefCell::new(None),
+            quick_open: RefCell::new(None),
         });
 
         let this: Retained<Self> = unsafe {
@@ -276,6 +285,7 @@ impl CtermWindow {
             shortcuts: ShortcutManager::from_config(&config.shortcuts),
             active_terminal: RefCell::new(None),
             pending_tab_color: RefCell::new(None),
+            quick_open: RefCell::new(None),
         });
 
         let this: Retained<Self> = unsafe {
@@ -345,6 +355,7 @@ impl CtermWindow {
             shortcuts: ShortcutManager::from_config(&config.shortcuts),
             active_terminal: RefCell::new(None),
             pending_tab_color: RefCell::new(None),
+            quick_open: RefCell::new(None),
         });
 
         let this: Retained<Self> = unsafe {
@@ -422,6 +433,7 @@ impl CtermWindow {
             shortcuts: ShortcutManager::from_config(&config.shortcuts),
             active_terminal: RefCell::new(None),
             pending_tab_color: RefCell::new(None),
+            quick_open: RefCell::new(None),
         });
 
         let this: Retained<Self> = unsafe {
@@ -518,6 +530,84 @@ impl CtermWindow {
         self.ivars().active_terminal.borrow().clone()
     }
 
+    /// Show the Quick Open overlay for template selection
+    pub fn show_quick_open(&self) {
+        let mtm = MainThreadMarker::from(self);
+
+        // Load templates
+        let templates = cterm_app::config::load_sticky_tabs().unwrap_or_default();
+
+        // Create the overlay if it doesn't exist
+        if self.ivars().quick_open.borrow().is_none() {
+            let width = self.frame().size.width;
+            let overlay = QuickOpenOverlay::new(mtm, width, templates.clone());
+
+            // Set up the callback to open the selected template
+            let window_ptr = self as *const Self;
+            overlay.set_on_select(move |template| unsafe {
+                let window = &*window_ptr;
+                window.open_template_tab(&template);
+            });
+
+            // Add to window content view
+            if let Some(content_view) = self.contentView() {
+                unsafe {
+                    content_view.addSubview(&overlay);
+                }
+
+                // Position at top of window
+                let content_bounds = content_view.bounds();
+                let overlay_frame = NSRect::new(
+                    NSPoint::new(0.0, 0.0),
+                    NSSize::new(content_bounds.size.width, QUICK_OPEN_HEIGHT),
+                );
+                unsafe {
+                    let _: () = msg_send![&*overlay, setFrame: overlay_frame];
+                }
+            }
+
+            *self.ivars().quick_open.borrow_mut() = Some(overlay);
+        } else {
+            // Update templates in case they changed
+            if let Some(ref overlay) = *self.ivars().quick_open.borrow() {
+                overlay.set_templates(templates);
+            }
+        }
+
+        // Show the overlay
+        if let Some(ref overlay) = *self.ivars().quick_open.borrow() {
+            overlay.show();
+        }
+    }
+
+    /// Open a new tab from a template (helper for Quick Open)
+    fn open_template_tab(&self, template: &cterm_app::config::StickyTabConfig) {
+        let mtm = MainThreadMarker::from(self);
+
+        // Create a new window from the template
+        let new_window =
+            CtermWindow::from_template(mtm, &self.ivars().config, &self.ivars().theme, template);
+
+        // Register with AppDelegate for tracking
+        let app = NSApplication::sharedApplication(mtm);
+        if let Some(delegate) = app.delegate() {
+            let _: () = unsafe { msg_send![&*delegate, registerWindow: &*new_window] };
+        }
+
+        // Add as a tab to this window
+        self.addTabbedWindow_ordered(&new_window, objc2_app_kit::NSWindowOrderingMode::Above);
+
+        // Make the new tab key
+        new_window.makeKeyAndOrderFront(None);
+
+        // Apply tab color after window is visible
+        if let Some(ref color) = template.color {
+            new_window.set_tab_color(Some(color));
+        }
+
+        log::info!("Opened template tab from Quick Open: {}", template.name);
+    }
+
     /// Create a window from a tab template
     pub fn from_template(
         mtm: MainThreadMarker,
@@ -546,6 +636,7 @@ impl CtermWindow {
             shortcuts: ShortcutManager::from_config(&config.shortcuts),
             active_terminal: RefCell::new(None),
             pending_tab_color: RefCell::new(template.color.clone()),
+            quick_open: RefCell::new(None),
         });
 
         let this: Retained<Self> = unsafe {

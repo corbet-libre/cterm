@@ -362,6 +362,7 @@ pub enum Action {
     OpenPreferences,
     FindText,
     ResetTerminal,
+    QuickOpenTemplate,
 }
 
 /// A keyboard shortcut

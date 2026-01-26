@@ -19,6 +19,7 @@ use crate::dialogs;
 use crate::docker_dialog::{self, DockerSelection};
 use crate::menu;
 use crate::notification_bar::NotificationBar;
+use crate::quick_open::QuickOpenOverlay;
 use crate::tab_bar::TabBar;
 use crate::terminal_widget::{CellDimensions, TerminalWidget};
 
@@ -44,6 +45,7 @@ pub struct CtermWindow {
     has_bell: Rc<RefCell<bool>>,
     notification_bar: NotificationBar,
     file_manager: Rc<RefCell<PendingFileManager>>,
+    quick_open: QuickOpenOverlay,
 }
 
 impl CtermWindow {
@@ -81,6 +83,10 @@ impl CtermWindow {
         let notification_bar = NotificationBar::new();
         main_box.append(notification_bar.widget());
 
+        // Create Quick Open overlay (initially hidden)
+        let quick_open = QuickOpenOverlay::new();
+        main_box.append(quick_open.widget());
+
         // Create notebook for terminal tabs (hidden tabs, we use custom tab bar)
         let notebook = Notebook::builder()
             .show_tabs(false)
@@ -114,10 +120,14 @@ impl CtermWindow {
             has_bell,
             notification_bar,
             file_manager,
+            quick_open,
         };
 
         // Set up window actions
         cterm_window.setup_actions();
+
+        // Set up Quick Open callback
+        cterm_window.setup_quick_open();
 
         // Set up key event handling
         cterm_window.setup_key_handler();
@@ -247,6 +257,19 @@ impl CtermWindow {
             let action = gio::SimpleAction::new("quit", None);
             action.connect_activate(move |_, _| {
                 window_clone.close();
+            });
+            window.add_action(&action);
+        }
+
+        // Quick Open Template action
+        {
+            let quick_open = self.quick_open.clone();
+            let action = gio::SimpleAction::new("quick-open", None);
+            action.connect_activate(move |_, _| {
+                // Load templates and show overlay
+                let templates = cterm_app::config::load_sticky_tabs().unwrap_or_default();
+                quick_open.set_templates(templates);
+                quick_open.show();
             });
             window.add_action(&action);
         }
@@ -1056,6 +1079,11 @@ impl CtermWindow {
                             window.close();
                             return glib::Propagation::Stop;
                         }
+                        Action::QuickOpenTemplate => {
+                            // Activate the quick-open action
+                            window.activate_action("quick-open", None);
+                            return glib::Propagation::Stop;
+                        }
                         _ => {}
                     }
                 }
@@ -1360,6 +1388,37 @@ impl CtermWindow {
             file_manager_discard.borrow_mut().discard(id);
             notification_bar_discard.hide();
             log::debug!("Discarded pending file {}", id);
+        });
+    }
+
+    /// Set up Quick Open overlay callback
+    fn setup_quick_open(&self) {
+        let notebook = self.notebook.clone();
+        let tabs = Rc::clone(&self.tabs);
+        let next_tab_id = Rc::clone(&self.next_tab_id);
+        let config = Rc::clone(&self.config);
+        let theme = self.theme.clone();
+        let tab_bar = self.tab_bar.clone();
+        let window = self.window.clone();
+        let has_bell = Rc::clone(&self.has_bell);
+        let file_manager = Rc::clone(&self.file_manager);
+        let notification_bar = self.notification_bar.clone();
+
+        self.quick_open.set_on_select(move |template| {
+            create_tab_from_template(
+                &notebook,
+                &tabs,
+                &next_tab_id,
+                &config,
+                &theme,
+                &tab_bar,
+                &window,
+                &has_bell,
+                &file_manager,
+                &notification_bar,
+                &template,
+            );
+            log::info!("Opened template tab from Quick Open: {}", template.name);
         });
     }
 
