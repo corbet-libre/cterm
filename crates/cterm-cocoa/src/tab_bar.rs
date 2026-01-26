@@ -6,8 +6,12 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 
 use objc2::rc::Retained;
-use objc2::{class, define_class, msg_send, AllocAnyThread, DefinedClass, MainThreadOnly};
-use objc2_app_kit::{NSButton, NSStackView, NSStackViewGravity, NSUserInterfaceLayoutOrientation};
+use objc2::runtime::Sel;
+use objc2::{class, define_class, msg_send, sel, AllocAnyThread, DefinedClass, MainThreadOnly};
+use objc2_app_kit::{
+    NSButton, NSEvent, NSMenu, NSMenuItem, NSStackView, NSStackViewGravity,
+    NSUserInterfaceLayoutOrientation,
+};
 use objc2_foundation::{MainThreadMarker, NSObjectProtocol, NSPoint, NSRect, NSSize, NSString};
 
 use cterm_ui::traits::TabInfo;
@@ -30,6 +34,10 @@ pub struct TabBarIvars {
     on_tab_click: RefCell<Option<Box<dyn Fn(u64)>>>,
     on_tab_close: RefCell<Option<Box<dyn Fn(u64)>>>,
     on_new_tab: RefCell<Option<Box<dyn Fn()>>>,
+    on_tab_rename: RefCell<Option<Box<dyn Fn(u64)>>>,
+    on_tab_set_color: RefCell<Option<Box<dyn Fn(u64)>>>,
+    /// Tab ID for context menu actions
+    context_menu_tab_id: RefCell<Option<u64>>,
 }
 
 define_class!(
@@ -40,6 +48,29 @@ define_class!(
     pub struct TabBar;
 
     unsafe impl NSObjectProtocol for TabBar {}
+
+    impl TabBar {
+        /// Handle right-click on the tab bar
+        #[unsafe(method(rightMouseDown:))]
+        fn right_mouse_down(&self, event: &NSEvent) {
+            let location = unsafe { self.convertPoint_fromView(event.locationInWindow(), None) };
+            if let Some(tab_id) = self.tab_at_point(location) {
+                self.show_context_menu(tab_id, location);
+            }
+        }
+
+        /// Context menu action: Rename tab
+        #[unsafe(method(contextMenuRenameTab:))]
+        fn context_menu_rename_tab(&self, _sender: Option<&objc2::runtime::AnyObject>) {
+            self.handle_context_menu_rename();
+        }
+
+        /// Context menu action: Set tab color
+        #[unsafe(method(contextMenuSetTabColor:))]
+        fn context_menu_set_tab_color(&self, _sender: Option<&objc2::runtime::AnyObject>) {
+            self.handle_context_menu_set_color();
+        }
+    }
 );
 
 impl TabBar {
@@ -55,6 +86,9 @@ impl TabBar {
             on_tab_click: RefCell::new(None),
             on_tab_close: RefCell::new(None),
             on_new_tab: RefCell::new(None),
+            on_tab_rename: RefCell::new(None),
+            on_tab_set_color: RefCell::new(None),
+            context_menu_tab_id: RefCell::new(None),
         });
 
         let this: Retained<Self> = unsafe { msg_send![super(this), initWithFrame: frame] };
@@ -277,6 +311,87 @@ impl TabBar {
     /// Set callback for new tab
     pub fn set_on_new_tab<F: Fn() + 'static>(&self, callback: F) {
         *self.ivars().on_new_tab.borrow_mut() = Some(Box::new(callback));
+    }
+
+    /// Set callback for tab rename request
+    pub fn set_on_rename<F: Fn(u64) + 'static>(&self, callback: F) {
+        *self.ivars().on_tab_rename.borrow_mut() = Some(Box::new(callback));
+    }
+
+    /// Set callback for tab set color request
+    pub fn set_on_set_color<F: Fn(u64) + 'static>(&self, callback: F) {
+        *self.ivars().on_tab_set_color.borrow_mut() = Some(Box::new(callback));
+    }
+
+    /// Find which tab contains the given point (in tab bar coordinates)
+    fn tab_at_point(&self, point: NSPoint) -> Option<u64> {
+        for tab in self.ivars().tabs.borrow().iter() {
+            let frame = tab.button.frame();
+            if point.x >= frame.origin.x
+                && point.x <= frame.origin.x + frame.size.width
+                && point.y >= frame.origin.y
+                && point.y <= frame.origin.y + frame.size.height
+            {
+                return Some(tab.id);
+            }
+        }
+        None
+    }
+
+    /// Show context menu for a tab
+    pub fn show_context_menu(&self, tab_id: u64, location: NSPoint) {
+        let mtm = MainThreadMarker::from(self);
+
+        // Store the tab ID for the menu action
+        *self.ivars().context_menu_tab_id.borrow_mut() = Some(tab_id);
+
+        // Create context menu
+        let menu = NSMenu::new(mtm);
+
+        // Rename item
+        let rename_item = unsafe {
+            NSMenuItem::initWithTitle_action_keyEquivalent(
+                mtm.alloc(),
+                &NSString::from_str("Rename Tab..."),
+                Some(sel!(contextMenuRenameTab:)),
+                &NSString::from_str(""),
+            )
+        };
+        unsafe { rename_item.setTarget(Some(self)) };
+        menu.addItem(&rename_item);
+
+        // Set Color item
+        let color_item = unsafe {
+            NSMenuItem::initWithTitle_action_keyEquivalent(
+                mtm.alloc(),
+                &NSString::from_str("Set Tab Color..."),
+                Some(sel!(contextMenuSetTabColor:)),
+                &NSString::from_str(""),
+            )
+        };
+        unsafe { color_item.setTarget(Some(self)) };
+        menu.addItem(&color_item);
+
+        // Show the menu
+        menu.popUpMenuPositioningItem_atLocation_inView(None, location, Some(self));
+    }
+
+    /// Handle rename tab from context menu
+    fn handle_context_menu_rename(&self) {
+        if let Some(tab_id) = *self.ivars().context_menu_tab_id.borrow() {
+            if let Some(ref callback) = *self.ivars().on_tab_rename.borrow() {
+                callback(tab_id);
+            }
+        }
+    }
+
+    /// Handle set tab color from context menu
+    fn handle_context_menu_set_color(&self) {
+        if let Some(tab_id) = *self.ivars().context_menu_tab_id.borrow() {
+            if let Some(ref callback) = *self.ivars().on_tab_set_color.borrow() {
+                callback(tab_id);
+            }
+        }
     }
 
     /// Update visibility based on tab count

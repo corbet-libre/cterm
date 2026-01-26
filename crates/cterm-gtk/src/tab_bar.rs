@@ -4,13 +4,17 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
 
+use gtk4::gio::{Menu, MenuItem, SimpleAction, SimpleActionGroup};
+use gtk4::glib;
 use gtk4::prelude::*;
-use gtk4::{Box as GtkBox, Button, Label, Orientation};
+use gtk4::{Box as GtkBox, Button, GestureClick, Label, Orientation, PopoverMenu};
 
 /// Callback type for tab bar events
 type TabCallback = Rc<RefCell<Option<Box<dyn Fn()>>>>;
 /// Callback map type for per-tab callbacks
 type TabCallbackMap = Rc<RefCell<HashMap<u64, Box<dyn Fn()>>>>;
+/// Callback type for tab-specific events with tab ID
+type TabIdCallback = Rc<RefCell<Option<Box<dyn Fn(u64)>>>>;
 
 /// Tab bar widget
 #[derive(Clone)]
@@ -24,6 +28,10 @@ pub struct TabBar {
     on_new_tab: TabCallback,
     on_close_callbacks: TabCallbackMap,
     on_click_callbacks: TabCallbackMap,
+    on_rename: TabIdCallback,
+    on_set_color: TabIdCallback,
+    /// Current tab ID for context menu actions
+    context_menu_tab_id: Rc<RefCell<Option<u64>>>,
 }
 
 struct TabInfo {
@@ -65,6 +73,9 @@ impl TabBar {
             on_new_tab: Rc::new(RefCell::new(None)),
             on_close_callbacks: Rc::new(RefCell::new(HashMap::new())),
             on_click_callbacks: Rc::new(RefCell::new(HashMap::new())),
+            on_rename: Rc::new(RefCell::new(None)),
+            on_set_color: Rc::new(RefCell::new(None)),
+            context_menu_tab_id: Rc::new(RefCell::new(None)),
         };
 
         // Set up new tab button click
@@ -128,6 +139,68 @@ impl TabBar {
                 callback();
             }
         });
+
+        // Set up right-click context menu
+        let context_menu_tab_id = Rc::clone(&self.context_menu_tab_id);
+        let on_rename = Rc::clone(&self.on_rename);
+        let on_set_color = Rc::clone(&self.on_set_color);
+
+        // Create action group for this tab's context menu
+        let action_group = SimpleActionGroup::new();
+
+        let rename_action = SimpleAction::new("rename", None);
+        let context_id_rename = Rc::clone(&context_menu_tab_id);
+        let on_rename_clone = Rc::clone(&on_rename);
+        rename_action.connect_activate(move |_, _| {
+            if let Some(id) = *context_id_rename.borrow() {
+                if let Some(ref callback) = *on_rename_clone.borrow() {
+                    callback(id);
+                }
+            }
+        });
+        action_group.add_action(&rename_action);
+
+        let color_action = SimpleAction::new("set-color", None);
+        let context_id_color = Rc::clone(&context_menu_tab_id);
+        let on_set_color_clone = Rc::clone(&on_set_color);
+        color_action.connect_activate(move |_, _| {
+            if let Some(id) = *context_id_color.borrow() {
+                if let Some(ref callback) = *on_set_color_clone.borrow() {
+                    callback(id);
+                }
+            }
+        });
+        action_group.add_action(&color_action);
+
+        button.insert_action_group("tab", Some(&action_group));
+
+        // Create context menu
+        let menu = Menu::new();
+        menu.append(Some("Rename Tab..."), Some("tab.rename"));
+        menu.append(Some("Set Tab Color..."), Some("tab.set-color"));
+
+        let popover = PopoverMenu::from_model(Some(&menu));
+        popover.set_parent(&button);
+        popover.set_has_arrow(false);
+
+        // Right-click gesture
+        let gesture = GestureClick::new();
+        gesture.set_button(3); // Right mouse button
+        let popover_clone = popover.clone();
+        let context_menu_tab_id_gesture = Rc::clone(&context_menu_tab_id);
+        gesture.connect_pressed(move |gesture, _, x, y| {
+            *context_menu_tab_id_gesture.borrow_mut() = Some(tab_id);
+            // Position the popover at click location
+            popover_clone.set_pointing_to(Some(&gtk4::gdk::Rectangle::new(
+                x as i32,
+                y as i32,
+                1,
+                1,
+            )));
+            popover_clone.popup();
+            gesture.set_state(gtk4::EventSequenceState::Claimed);
+        });
+        button.add_controller(gesture);
 
         self.tabs_box.append(&button);
 
@@ -267,6 +340,16 @@ impl TabBar {
         self.on_click_callbacks
             .borrow_mut()
             .insert(id, Box::new(callback));
+    }
+
+    /// Set callback for tab rename (from context menu)
+    pub fn set_on_rename<F: Fn(u64) + 'static>(&self, callback: F) {
+        *self.on_rename.borrow_mut() = Some(Box::new(callback));
+    }
+
+    /// Set callback for tab set color (from context menu)
+    pub fn set_on_set_color<F: Fn(u64) + 'static>(&self, callback: F) {
+        *self.on_set_color.borrow_mut() = Some(Box::new(callback));
     }
 
     /// Get number of tabs

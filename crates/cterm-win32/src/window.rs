@@ -917,6 +917,111 @@ impl WindowState {
         }
     }
 
+    /// Handle right-click for context menu
+    pub fn on_right_click(&mut self, x: f32, y: f32) {
+        // Check if click is in tab bar area
+        let tab_bar_height = self.dpi.scale_f32(TAB_BAR_HEIGHT as f32);
+
+        if y < tab_bar_height && self.tab_bar.is_visible() {
+            // Hit test the tab bar
+            let (tab_id, _is_close, _is_new) = self.tab_bar.hit_test(x, y);
+            if let Some(tab_id) = tab_id {
+                self.show_tab_context_menu(tab_id, x as i32, y as i32);
+            }
+        }
+    }
+
+    /// Show context menu for a tab
+    fn show_tab_context_menu(&mut self, tab_id: u64, x: i32, y: i32) {
+        use windows::Win32::UI::WindowsAndMessaging::{
+            CreatePopupMenu, InsertMenuW, TrackPopupMenu, MF_STRING, TPM_LEFTALIGN, TPM_TOPALIGN,
+        };
+
+        const CMD_RENAME: u32 = 10001;
+        const CMD_SET_COLOR: u32 = 10002;
+
+        unsafe {
+            let menu = CreatePopupMenu().unwrap();
+
+            // Add menu items
+            let rename_text: Vec<u16> = "Rename Tab...\0".encode_utf16().collect();
+            InsertMenuW(menu, 0, MF_STRING, CMD_RENAME as usize, PCWSTR(rename_text.as_ptr()));
+
+            let color_text: Vec<u16> = "Set Tab Color...\0".encode_utf16().collect();
+            InsertMenuW(menu, 1, MF_STRING, CMD_SET_COLOR as usize, PCWSTR(color_text.as_ptr()));
+
+            // Get screen coordinates
+            let mut pt = windows::Win32::Foundation::POINT { x, y };
+            windows::Win32::Graphics::Gdi::ClientToScreen(self.hwnd, &mut pt);
+
+            // Show the menu
+            let cmd = TrackPopupMenu(
+                menu,
+                TPM_LEFTALIGN | TPM_TOPALIGN | windows::Win32::UI::WindowsAndMessaging::TPM_RETURNCMD,
+                pt.x,
+                pt.y,
+                0,
+                self.hwnd,
+                None,
+            );
+
+            // Handle the selected command
+            if cmd.as_bool() {
+                match cmd.0 as u32 {
+                    CMD_RENAME => {
+                        self.handle_tab_rename(tab_id);
+                    }
+                    CMD_SET_COLOR => {
+                        self.handle_tab_set_color(tab_id);
+                    }
+                    _ => {}
+                }
+            }
+
+            windows::Win32::UI::WindowsAndMessaging::DestroyMenu(menu);
+        }
+    }
+
+    /// Handle tab rename from context menu
+    fn handle_tab_rename(&mut self, tab_id: u64) {
+        // Get current title
+        let current_title = self
+            .tabs
+            .iter()
+            .find(|t| t.id == tab_id)
+            .map(|t| t.title.clone())
+            .unwrap_or_default();
+
+        // Show input dialog
+        if let Some(new_title) = crate::dialogs::show_input_dialog(
+            self.hwnd,
+            "Rename Tab",
+            "Enter new tab name:",
+            &current_title,
+        ) {
+            // Update tab title
+            if let Some(tab) = self.tabs.iter_mut().find(|t| t.id == tab_id) {
+                tab.title = new_title.clone();
+            }
+            self.tab_bar.set_title(tab_id, &new_title);
+            self.invalidate();
+        }
+    }
+
+    /// Handle tab set color from context menu
+    fn handle_tab_set_color(&mut self, tab_id: u64) {
+        // Show color picker dialog
+        if let Some(color_opt) = crate::dialogs::show_set_color_dialog(self.hwnd) {
+            // Update tab color
+            let rgb = color_opt.as_ref().and_then(|hex| parse_hex_color(hex));
+            if let Some(tab) = self.tabs.iter_mut().find(|t| t.id == tab_id) {
+                tab.color = color_opt;
+            }
+            self.tab_bar.set_color(tab_id, rgb);
+            self.invalidate();
+        }
+    }
+
     /// Handle notification bar action
     fn handle_notification_action(&mut self, action: NotificationAction) {
         if let Some(file_id) = self.notification_bar.pending_file_id() {
@@ -1120,6 +1225,13 @@ extern "system" fn window_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPA
             let x = (lparam.0 & 0xFFFF) as i16 as f32;
             let y = ((lparam.0 >> 16) & 0xFFFF) as i16 as f32;
             state.on_mouse_down(x, y);
+            LRESULT(0)
+        }
+
+        WM_RBUTTONDOWN => {
+            let x = (lparam.0 & 0xFFFF) as i16 as f32;
+            let y = ((lparam.0 >> 16) & 0xFFFF) as i16 as f32;
+            state.on_right_click(x, y);
             LRESULT(0)
         }
 
