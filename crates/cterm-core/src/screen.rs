@@ -772,6 +772,9 @@ impl Screen {
             self.insert_cells(width);
         }
 
+        // Clear selection if writing to a selected row
+        self.clear_selection_if_row_selected(self.cursor.row);
+
         // Write the character
         if let Some(cell) = self.grid.get_mut(self.cursor.row, self.cursor.col) {
             cell.c = c;
@@ -857,6 +860,21 @@ impl Screen {
                 self.scroll_offset += net_change;
                 // Cap at scrollback length (in case viewed content was removed)
                 self.scroll_offset = self.scroll_offset.min(self.scrollback.len());
+            }
+
+            // Handle selection when lines are removed from scrollback
+            if lines_removed > 0 {
+                if let Some(ref mut selection) = self.selection {
+                    let (start, _end) = selection.ordered();
+                    // If any part of the selection is in the removed lines, clear it
+                    if start.line < lines_removed {
+                        self.selection = None;
+                    } else {
+                        // Adjust selection indices to account for removed lines
+                        selection.anchor.line -= lines_removed;
+                        selection.end.line -= lines_removed;
+                    }
+                }
             }
         }
 
@@ -949,6 +967,23 @@ impl Screen {
         let width = self.width();
         let height = self.height();
 
+        // Clear selection if it overlaps with the cleared area
+        match mode {
+            ClearMode::Below => {
+                self.clear_selection_if_rows_selected(cursor_row, height.saturating_sub(1));
+            }
+            ClearMode::Above => {
+                self.clear_selection_if_rows_selected(0, cursor_row);
+            }
+            ClearMode::All => {
+                self.clear_selection_if_rows_selected(0, height.saturating_sub(1));
+            }
+            ClearMode::Scrollback => {
+                // Clearing scrollback invalidates all absolute line indices in the selection
+                self.selection = None;
+            }
+        }
+
         match mode {
             ClearMode::Below => {
                 // Clear from cursor to end of line
@@ -994,6 +1029,9 @@ impl Screen {
         let cursor_col = self.cursor.col;
         let width = self.width();
 
+        // Clear selection if it overlaps with the cleared line
+        self.clear_selection_if_row_selected(cursor_row);
+
         let (start, end) = match mode {
             LineClearMode::Right => (cursor_col, width),
             LineClearMode::Left => (0, cursor_col + 1),
@@ -1015,6 +1053,9 @@ impl Screen {
         let width = self.width();
         let count = count.min(width.saturating_sub(cursor_col));
 
+        // Clear selection if it overlaps with the modified row
+        self.clear_selection_if_row_selected(cursor_row);
+
         if let Some(row) = self.grid.row_mut(cursor_row) {
             // Shift characters left
             for col in cursor_col..width.saturating_sub(count) {
@@ -1035,6 +1076,9 @@ impl Screen {
             return;
         }
 
+        // Clear selection if it overlaps with the affected region
+        self.clear_selection_if_rows_selected(self.cursor.row, self.scroll_region.bottom);
+
         // Scroll the region below cursor down
         let region_bottom = self.scroll_region.bottom;
         self.grid.scroll_down(count, self.cursor.row, region_bottom);
@@ -1047,6 +1091,9 @@ impl Screen {
         if !self.scroll_region.contains(self.cursor.row) {
             return;
         }
+
+        // Clear selection if it overlaps with the affected region
+        self.clear_selection_if_rows_selected(self.cursor.row, self.scroll_region.bottom);
 
         // Scroll the region from cursor up
         let region_bottom = self.scroll_region.bottom;
@@ -1620,6 +1667,32 @@ impl Screen {
         if self.selection.is_some() {
             self.selection = None;
             self.dirty = true;
+        }
+    }
+
+    /// Clear selection if the given grid row is within the selection
+    /// Used when content is modified to invalidate affected selections
+    fn clear_selection_if_row_selected(&mut self, grid_row: usize) {
+        if let Some(ref selection) = self.selection {
+            let abs_line = self.scrollback.len() + grid_row;
+            let (start, end) = selection.ordered();
+            if abs_line >= start.line && abs_line <= end.line {
+                self.selection = None;
+            }
+        }
+    }
+
+    /// Clear selection if any row in the given grid row range is selected
+    fn clear_selection_if_rows_selected(&mut self, start_row: usize, end_row: usize) {
+        if let Some(ref selection) = self.selection {
+            let scrollback_len = self.scrollback.len();
+            let abs_start = scrollback_len + start_row;
+            let abs_end = scrollback_len + end_row;
+            let (sel_start, sel_end) = selection.ordered();
+            // Check if ranges overlap
+            if abs_start <= sel_end.line && abs_end >= sel_start.line {
+                self.selection = None;
+            }
         }
     }
 
