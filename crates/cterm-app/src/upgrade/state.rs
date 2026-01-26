@@ -232,11 +232,11 @@ mod tests {
     fn test_upgrade_state_serialization() {
         let state = UpgradeState::new("0.1.0");
 
-        // Serialize with bincode
-        let bytes = bincode::serialize(&state).expect("Failed to serialize");
+        // Serialize with JSON
+        let bytes = serde_json::to_vec(&state).expect("Failed to serialize");
 
         // Deserialize
-        let restored: UpgradeState = bincode::deserialize(&bytes).expect("Failed to deserialize");
+        let restored: UpgradeState = serde_json::from_slice(&bytes).expect("Failed to deserialize");
 
         assert_eq!(restored.format_version, UpgradeState::FORMAT_VERSION);
         assert_eq!(restored.cterm_version, "0.1.0");
@@ -256,8 +256,8 @@ mod tests {
 
         state.windows.push(window);
 
-        let bytes = bincode::serialize(&state).expect("Failed to serialize");
-        let restored: UpgradeState = bincode::deserialize(&bytes).expect("Failed to deserialize");
+        let bytes = serde_json::to_vec(&state).expect("Failed to serialize");
+        let restored: UpgradeState = serde_json::from_slice(&bytes).expect("Failed to deserialize");
 
         assert_eq!(restored.windows.len(), 1);
         assert_eq!(restored.windows[0].x, 100);
@@ -272,9 +272,9 @@ mod tests {
             ..Default::default()
         };
 
-        let bytes = bincode::serialize(&terminal).expect("Failed to serialize");
+        let bytes = serde_json::to_vec(&terminal).expect("Failed to serialize");
         let restored: TerminalUpgradeState =
-            bincode::deserialize(&bytes).expect("Failed to deserialize");
+            serde_json::from_slice(&bytes).expect("Failed to deserialize");
 
         assert_eq!(restored.cols, 120);
         assert_eq!(restored.rows, 40);

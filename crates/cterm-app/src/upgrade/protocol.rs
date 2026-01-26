@@ -33,12 +33,6 @@ pub const MAX_STATE_SIZE: usize = 64 * 1024 * 1024;
 /// Maximum number of file descriptors to transfer
 pub const MAX_FDS: usize = 256;
 
-/// Magic number for upgrade protocol header (ASCII "CTRM")
-pub const UPGRADE_MAGIC: u32 = 0x4D525443;
-
-/// Header size: magic (4 bytes) + version (4 bytes)
-pub const HEADER_SIZE: usize = 8;
-
 /// Errors that can occur during upgrade
 #[derive(Debug, thiserror::Error)]
 pub enum UpgradeError {
@@ -62,12 +56,6 @@ pub enum UpgradeError {
 
     #[error("Too many file descriptors: {0} (max: {1})")]
     TooManyFds(usize, usize),
-
-    #[error("Invalid magic number in upgrade data")]
-    InvalidMagic,
-
-    #[error("Unsupported format version: got {0}, max supported {1}")]
-    UnsupportedVersion(u32, u32),
 }
 
 /// Execute an upgrade by sending state to a new process
@@ -101,19 +89,13 @@ pub fn execute_upgrade(
 
     log::info!("Created socketpair, child FD: {}", child_fd);
 
-    // Serialize the state with version header
+    // Serialize the state as JSON for forward/backward compatibility
     let state_bytes =
-        bincode::serialize(state).map_err(|e| UpgradeError::Serialization(e.to_string()))?;
-
-    // Prepend magic and version header
-    let mut data_with_header = Vec::with_capacity(HEADER_SIZE + state_bytes.len());
-    data_with_header.extend_from_slice(&UPGRADE_MAGIC.to_le_bytes());
-    data_with_header.extend_from_slice(&UpgradeState::FORMAT_VERSION.to_le_bytes());
-    data_with_header.extend_from_slice(&state_bytes);
+        serde_json::to_vec(state).map_err(|e| UpgradeError::Serialization(e.to_string()))?;
 
     log::info!(
         "State serialized: {} bytes, {} FDs",
-        data_with_header.len(),
+        state_bytes.len(),
         fds.len()
     );
 
@@ -148,7 +130,7 @@ pub fn execute_upgrade(
     drop(child_sock);
 
     // Send the state and FDs over the parent socket
-    fd_passing::send_fds(&parent_sock, fds, &data_with_header)?;
+    fd_passing::send_fds(&parent_sock, fds, &state_bytes)?;
 
     log::info!("State and FDs sent");
 
@@ -235,19 +217,13 @@ pub fn execute_upgrade(
         return Err(UpgradeError::TooManyFds(handles.len(), MAX_FDS));
     }
 
-    // Serialize the state with version header
+    // Serialize the state as JSON for forward/backward compatibility
     let state_bytes =
-        bincode::serialize(state).map_err(|e| UpgradeError::Serialization(e.to_string()))?;
-
-    // Prepend magic and version header
-    let mut data_with_header = Vec::with_capacity(HEADER_SIZE + state_bytes.len());
-    data_with_header.extend_from_slice(&UPGRADE_MAGIC.to_le_bytes());
-    data_with_header.extend_from_slice(&UpgradeState::FORMAT_VERSION.to_le_bytes());
-    data_with_header.extend_from_slice(&state_bytes);
+        serde_json::to_vec(state).map_err(|e| UpgradeError::Serialization(e.to_string()))?;
 
     log::info!(
         "State serialized: {} bytes, {} handle sets",
-        data_with_header.len(),
+        state_bytes.len(),
         handles.len()
     );
 
@@ -428,7 +404,7 @@ pub fn execute_upgrade(
 
     let upgrade_data = WindowsUpgradeData {
         handles: handle_infos,
-        state_bytes: data_with_header,
+        state_bytes,
     };
 
     // Serialize and send the upgrade data
@@ -494,34 +470,18 @@ pub fn receive_upgrade(fd: RawFd) -> Result<(UpgradeState, Vec<RawFd>), UpgradeE
         fds.len()
     );
 
-    // Check for version header (v2+) or legacy format (v1)
-    let (state_data, detected_version) = if data_len >= HEADER_SIZE {
-        let magic = u32::from_le_bytes(buf[0..4].try_into().unwrap());
-        if magic == UPGRADE_MAGIC {
-            // New format with header
-            let version = u32::from_le_bytes(buf[4..8].try_into().unwrap());
-            if version > UpgradeState::FORMAT_VERSION {
-                return Err(UpgradeError::UnsupportedVersion(
-                    version,
-                    UpgradeState::FORMAT_VERSION,
-                ));
-            }
-            log::info!("Detected upgrade format version {}", version);
-            (&buf[HEADER_SIZE..data_len], version)
-        } else {
-            // Legacy format (v1) - no header
-            log::info!("Detected legacy upgrade format (v1)");
-            (&buf[..data_len], 1)
-        }
-    } else {
-        // Too short for header, assume legacy
-        log::info!("Detected legacy upgrade format (v1, short data)");
-        (&buf[..data_len], 1)
-    };
+    let state_data = &buf[..data_len];
 
-    // Deserialize the state
-    let state: UpgradeState = bincode::deserialize(state_data)
-        .map_err(|e| UpgradeError::Deserialization(format!("v{}: {}", detected_version, e)))?;
+    // Try JSON first (new format), fall back to bincode (legacy)
+    let state: UpgradeState = if state_data.first() == Some(&b'{') {
+        log::info!("Detected JSON upgrade format");
+        serde_json::from_slice(state_data)
+            .map_err(|e| UpgradeError::Deserialization(e.to_string()))?
+    } else {
+        log::info!("Detected legacy bincode upgrade format");
+        bincode::deserialize(state_data)
+            .map_err(|e| UpgradeError::Deserialization(e.to_string()))?
+    };
 
     log::info!(
         "State deserialized: format_version={}, cterm_version={}, windows={}",
@@ -605,35 +565,18 @@ pub fn receive_upgrade(
 
     log::info!("Received {} handle sets", upgrade_data.handles.len());
 
-    // Check for version header (v2+) or legacy format (v1)
     let state_bytes = &upgrade_data.state_bytes;
-    let (state_data, detected_version): (&[u8], u32) = if state_bytes.len() >= HEADER_SIZE {
-        let magic = u32::from_le_bytes(state_bytes[0..4].try_into().unwrap());
-        if magic == UPGRADE_MAGIC {
-            // New format with header
-            let version = u32::from_le_bytes(state_bytes[4..8].try_into().unwrap());
-            if version > UpgradeState::FORMAT_VERSION {
-                return Err(UpgradeError::UnsupportedVersion(
-                    version,
-                    UpgradeState::FORMAT_VERSION,
-                ));
-            }
-            log::info!("Detected upgrade format version {}", version);
-            (&state_bytes[HEADER_SIZE..], version)
-        } else {
-            // Legacy format (v1) - no header
-            log::info!("Detected legacy upgrade format (v1)");
-            (state_bytes.as_slice(), 1)
-        }
-    } else {
-        // Too short for header, assume legacy
-        log::info!("Detected legacy upgrade format (v1, short data)");
-        (state_bytes.as_slice(), 1)
-    };
 
-    // Deserialize the state
-    let state: UpgradeState = bincode::deserialize(state_data)
-        .map_err(|e| UpgradeError::Deserialization(format!("v{}: {}", detected_version, e)))?;
+    // Try JSON first (new format), fall back to bincode (legacy)
+    let state: UpgradeState = if state_bytes.first() == Some(&b'{') {
+        log::info!("Detected JSON upgrade format");
+        serde_json::from_slice(state_bytes)
+            .map_err(|e| UpgradeError::Deserialization(e.to_string()))?
+    } else {
+        log::info!("Detected legacy bincode upgrade format");
+        bincode::deserialize(state_bytes)
+            .map_err(|e| UpgradeError::Deserialization(e.to_string()))?
+    };
 
     log::info!(
         "State deserialized: format_version={}, cterm_version={}, windows={}",
@@ -682,8 +625,9 @@ mod tests {
         window.height = 768;
         state.windows.push(window);
 
-        let bytes = bincode::serialize(&state).expect("Serialize failed");
-        let restored: UpgradeState = bincode::deserialize(&bytes).expect("Deserialize failed");
+        // Test JSON serialization (new format)
+        let bytes = serde_json::to_vec(&state).expect("Serialize failed");
+        let restored: UpgradeState = serde_json::from_slice(&bytes).expect("Deserialize failed");
 
         assert_eq!(restored.windows.len(), 1);
         assert_eq!(restored.windows[0].width, 1024);
