@@ -66,8 +66,8 @@ pub enum UpgradeError {
     #[error("Invalid magic number in upgrade data")]
     InvalidMagic,
 
-    #[error("Incompatible format version: got {0}, expected {1}")]
-    VersionMismatch(u32, u32),
+    #[error("Unsupported format version: got {0}, max supported {1}")]
+    UnsupportedVersion(u32, u32),
 }
 
 /// Execute an upgrade by sending state to a new process
@@ -494,30 +494,34 @@ pub fn receive_upgrade(fd: RawFd) -> Result<(UpgradeState, Vec<RawFd>), UpgradeE
         fds.len()
     );
 
-    // Validate header
-    if data_len < HEADER_SIZE {
-        return Err(UpgradeError::Deserialization(
-            "Data too short for header".to_string(),
-        ));
-    }
+    // Check for version header (v2+) or legacy format (v1)
+    let (state_data, detected_version) = if data_len >= HEADER_SIZE {
+        let magic = u32::from_le_bytes(buf[0..4].try_into().unwrap());
+        if magic == UPGRADE_MAGIC {
+            // New format with header
+            let version = u32::from_le_bytes(buf[4..8].try_into().unwrap());
+            if version > UpgradeState::FORMAT_VERSION {
+                return Err(UpgradeError::UnsupportedVersion(
+                    version,
+                    UpgradeState::FORMAT_VERSION,
+                ));
+            }
+            log::info!("Detected upgrade format version {}", version);
+            (&buf[HEADER_SIZE..data_len], version)
+        } else {
+            // Legacy format (v1) - no header
+            log::info!("Detected legacy upgrade format (v1)");
+            (&buf[..data_len], 1)
+        }
+    } else {
+        // Too short for header, assume legacy
+        log::info!("Detected legacy upgrade format (v1, short data)");
+        (&buf[..data_len], 1)
+    };
 
-    let magic = u32::from_le_bytes(buf[0..4].try_into().unwrap());
-    let version = u32::from_le_bytes(buf[4..8].try_into().unwrap());
-
-    if magic != UPGRADE_MAGIC {
-        return Err(UpgradeError::InvalidMagic);
-    }
-
-    if version != UpgradeState::FORMAT_VERSION {
-        return Err(UpgradeError::VersionMismatch(
-            version,
-            UpgradeState::FORMAT_VERSION,
-        ));
-    }
-
-    // Deserialize the state (after header)
-    let state: UpgradeState = bincode::deserialize(&buf[HEADER_SIZE..data_len])
-        .map_err(|e| UpgradeError::Deserialization(e.to_string()))?;
+    // Deserialize the state
+    let state: UpgradeState = bincode::deserialize(state_data)
+        .map_err(|e| UpgradeError::Deserialization(format!("v{}: {}", detected_version, e)))?;
 
     log::info!(
         "State deserialized: format_version={}, cterm_version={}, windows={}",
@@ -601,30 +605,35 @@ pub fn receive_upgrade(
 
     log::info!("Received {} handle sets", upgrade_data.handles.len());
 
-    // Validate header
-    if upgrade_data.state_bytes.len() < HEADER_SIZE {
-        return Err(UpgradeError::Deserialization(
-            "State data too short for header".to_string(),
-        ));
-    }
+    // Check for version header (v2+) or legacy format (v1)
+    let state_bytes = &upgrade_data.state_bytes;
+    let (state_data, detected_version): (&[u8], u32) = if state_bytes.len() >= HEADER_SIZE {
+        let magic = u32::from_le_bytes(state_bytes[0..4].try_into().unwrap());
+        if magic == UPGRADE_MAGIC {
+            // New format with header
+            let version = u32::from_le_bytes(state_bytes[4..8].try_into().unwrap());
+            if version > UpgradeState::FORMAT_VERSION {
+                return Err(UpgradeError::UnsupportedVersion(
+                    version,
+                    UpgradeState::FORMAT_VERSION,
+                ));
+            }
+            log::info!("Detected upgrade format version {}", version);
+            (&state_bytes[HEADER_SIZE..], version)
+        } else {
+            // Legacy format (v1) - no header
+            log::info!("Detected legacy upgrade format (v1)");
+            (state_bytes.as_slice(), 1)
+        }
+    } else {
+        // Too short for header, assume legacy
+        log::info!("Detected legacy upgrade format (v1, short data)");
+        (state_bytes.as_slice(), 1)
+    };
 
-    let magic = u32::from_le_bytes(upgrade_data.state_bytes[0..4].try_into().unwrap());
-    let version = u32::from_le_bytes(upgrade_data.state_bytes[4..8].try_into().unwrap());
-
-    if magic != UPGRADE_MAGIC {
-        return Err(UpgradeError::InvalidMagic);
-    }
-
-    if version != UpgradeState::FORMAT_VERSION {
-        return Err(UpgradeError::VersionMismatch(
-            version,
-            UpgradeState::FORMAT_VERSION,
-        ));
-    }
-
-    // Deserialize the state (after header)
-    let state: UpgradeState = bincode::deserialize(&upgrade_data.state_bytes[HEADER_SIZE..])
-        .map_err(|e| UpgradeError::Deserialization(e.to_string()))?;
+    // Deserialize the state
+    let state: UpgradeState = bincode::deserialize(state_data)
+        .map_err(|e| UpgradeError::Deserialization(format!("v{}: {}", detected_version, e)))?;
 
     log::info!(
         "State deserialized: format_version={}, cterm_version={}, windows={}",
