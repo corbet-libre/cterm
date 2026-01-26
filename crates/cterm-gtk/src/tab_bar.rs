@@ -4,8 +4,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
 
-use gtk4::gio::{Menu, MenuItem, SimpleAction, SimpleActionGroup};
-use gtk4::glib;
+use gtk4::gio::{Menu, SimpleAction, SimpleActionGroup};
 use gtk4::prelude::*;
 use gtk4::{Box as GtkBox, Button, GestureClick, Label, Orientation, PopoverMenu};
 
@@ -339,11 +338,13 @@ impl TabBar {
     }
 
     /// Set callback for tab rename (from context menu)
+    #[allow(dead_code)]
     pub fn set_on_rename<F: Fn(u64) + 'static>(&self, callback: F) {
         *self.on_rename.borrow_mut() = Some(Box::new(callback));
     }
 
     /// Set callback for tab set color (from context menu)
+    #[allow(dead_code)]
     pub fn set_on_set_color<F: Fn(u64) + 'static>(&self, callback: F) {
         *self.on_set_color.borrow_mut() = Some(Box::new(callback));
     }

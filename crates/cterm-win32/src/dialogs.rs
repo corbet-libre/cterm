@@ -552,6 +552,28 @@ pub fn show_error_msg(hwnd: windows::Win32::Foundation::HWND, message: &str) {
     show_error(parent, "Error", message);
 }
 
+/// Show an input dialog (wrapper that takes windows crate HWND)
+pub fn show_input_dialog_win(
+    hwnd: windows::Win32::Foundation::HWND,
+    title: &str,
+    prompt: &str,
+    initial_value: &str,
+) -> Option<String> {
+    let parent = hwnd.0 as *mut _;
+    match show_input_dialog(parent, title, prompt, initial_value) {
+        InputDialogResult::Ok(text) => Some(text),
+        InputDialogResult::Cancel => None,
+    }
+}
+
+/// Show a set color dialog (wrapper that takes windows crate HWND)
+pub fn show_set_color_dialog_win(
+    hwnd: windows::Win32::Foundation::HWND,
+) -> Option<Option<String>> {
+    let parent = hwnd.0 as *mut _;
+    show_set_color_dialog(parent)
+}
+
 // Note: Full preferences dialog is now in preferences_dialog.rs
 // Note: Full tab templates dialog is now in templates_dialog.rs
 // Note: Docker picker dialog is now in docker_dialog.rs

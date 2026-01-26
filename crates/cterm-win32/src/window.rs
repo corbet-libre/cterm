@@ -974,7 +974,7 @@ impl WindowState {
                     | windows::Win32::UI::WindowsAndMessaging::TPM_RETURNCMD,
                 pt.x,
                 pt.y,
-                0,
+                None,
                 self.hwnd,
                 None,
             );
@@ -1007,7 +1007,7 @@ impl WindowState {
             .unwrap_or_default();
 
         // Show input dialog
-        if let Some(new_title) = crate::dialogs::show_input_dialog(
+        if let Some(new_title) = crate::dialogs::show_input_dialog_win(
             self.hwnd,
             "Rename Tab",
             "Enter new tab name:",
@@ -1025,7 +1025,7 @@ impl WindowState {
     /// Handle tab set color from context menu
     fn handle_tab_set_color(&mut self, tab_id: u64) {
         // Show color picker dialog
-        if let Some(color_opt) = crate::dialogs::show_set_color_dialog(self.hwnd) {
+        if let Some(color_opt) = crate::dialogs::show_set_color_dialog_win(self.hwnd) {
             // Update tab color
             let rgb = color_opt.as_ref().and_then(|hex| parse_hex_color(hex));
             if let Some(tab) = self.tabs.iter_mut().find(|t| t.id == tab_id) {
