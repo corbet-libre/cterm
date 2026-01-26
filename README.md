@@ -258,6 +258,8 @@ Custom themes can be added as TOML files in the `themes/` configuration subdirec
 
 ### Future
 
+- Native SSH client
+- ctermd client (connect to headless terminal daemon)
 - Split panes
 - Plugin system
 
