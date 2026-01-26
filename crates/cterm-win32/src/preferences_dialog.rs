@@ -12,10 +12,13 @@ use winapi::shared::windef::HWND;
 use winapi::um::commctrl::*;
 use winapi::um::winuser::*;
 
+use std::time::{SystemTime, UNIX_EPOCH};
+
 use crate::dialog_utils::*;
 use cterm_app::config::{
-    Config, CursorStyleConfig, NewTabPosition, TabBarPosition, TabBarVisibility,
+    config_dir, Config, CursorStyleConfig, NewTabPosition, TabBarPosition, TabBarVisibility,
 };
+use cterm_app::{git_sync, PullResult};
 
 // Control IDs - General tab
 const IDC_TABS: i32 = 1001;
@@ -44,6 +47,14 @@ const IDC_SHOW_CLOSE_BTN: i32 = 1033;
 // Control IDs - Shortcuts tab
 const IDC_SHORTCUTS_LIST: i32 = 1040;
 
+// Control IDs - Git Sync tab
+const IDC_GIT_REMOTE: i32 = 1050;
+const IDC_GIT_STATUS: i32 = 1051;
+const IDC_GIT_BRANCH: i32 = 1052;
+const IDC_GIT_LAST_SYNC: i32 = 1053;
+const IDC_GIT_CHANGES: i32 = 1054;
+const IDC_GIT_SYNC_NOW: i32 = 1055;
+
 // Button IDs
 const IDC_APPLY: i32 = 1099;
 
@@ -52,6 +63,7 @@ const TAB_GENERAL: i32 = 0;
 const TAB_APPEARANCE: i32 = 1;
 const TAB_TABS: i32 = 2;
 const TAB_SHORTCUTS: i32 = 3;
+const TAB_GIT_SYNC: i32 = 4;
 
 /// Dialog state
 struct DialogState {
@@ -62,6 +74,7 @@ struct DialogState {
     appearance_controls: Vec<HWND>,
     tabs_controls: Vec<HWND>,
     shortcuts_controls: Vec<HWND>,
+    git_sync_controls: Vec<HWND>,
 }
 
 // Thread-local storage for dialog state
@@ -84,6 +97,7 @@ pub fn show_preferences_dialog(parent: HWND) -> bool {
             appearance_controls: Vec::new(),
             tabs_controls: Vec::new(),
             shortcuts_controls: Vec::new(),
+            git_sync_controls: Vec::new(),
         });
     });
 
@@ -221,6 +235,7 @@ unsafe fn init_dialog(hwnd: HWND) {
     add_tab(tab_ctrl, TAB_APPEARANCE, "Appearance");
     add_tab(tab_ctrl, TAB_TABS, "Tabs");
     add_tab(tab_ctrl, TAB_SHORTCUTS, "Shortcuts");
+    add_tab(tab_ctrl, TAB_GIT_SYNC, "Git Sync");
 
     // Content area
     let content_top = margin + tab_height + 5;
@@ -249,6 +264,13 @@ unsafe fn init_dialog(hwnd: HWND) {
         content_height,
     );
     create_shortcuts_controls(
+        hwnd,
+        margin,
+        content_top,
+        dlg_width - margin * 2,
+        content_height,
+    );
+    create_git_sync_controls(
         hwnd,
         margin,
         content_top,
@@ -634,6 +656,310 @@ unsafe fn create_shortcuts_controls(hwnd: HWND, x: i32, y: i32, w: i32, h: i32) 
     });
 }
 
+/// Create controls for the Git Sync tab
+unsafe fn create_git_sync_controls(hwnd: HWND, x: i32, y: i32, _w: i32, _h: i32) {
+    let mut controls = Vec::new();
+    let row_height = 26;
+    let label_width = 100;
+    let control_width = 200;
+
+    // Get sync status
+    let status = config_dir()
+        .map(|dir| git_sync::get_sync_status(&dir))
+        .unwrap_or_default();
+
+    // Section: Remote Repository
+    let mut cy = y;
+    controls.push(create_label(hwnd, -1, "Remote Repository", x, cy, 200, 18));
+
+    // Git remote URL
+    cy += row_height;
+    controls.push(create_label(
+        hwnd,
+        -1,
+        "Git Remote URL:",
+        x,
+        cy + 3,
+        label_width,
+        18,
+    ));
+    let git_edit = create_edit(
+        hwnd,
+        IDC_GIT_REMOTE,
+        x + label_width + 10,
+        cy,
+        control_width,
+        22,
+    );
+    if let Some(url) = &status.remote_url {
+        set_edit_text(git_edit, url);
+    }
+    controls.push(git_edit);
+
+    // Section: Sync Status
+    cy += row_height + 15;
+    controls.push(create_label(hwnd, -1, "Sync Status", x, cy, 200, 18));
+
+    // Status
+    cy += row_height;
+    controls.push(create_label(
+        hwnd,
+        -1,
+        "Status:",
+        x,
+        cy + 3,
+        label_width,
+        18,
+    ));
+    let status_text = if !status.is_repo {
+        "Not initialized"
+    } else if status.remote_url.is_none() {
+        "No remote configured"
+    } else {
+        "Configured"
+    };
+    controls.push(create_label(
+        hwnd,
+        IDC_GIT_STATUS,
+        status_text,
+        x + label_width + 10,
+        cy + 3,
+        control_width,
+        18,
+    ));
+
+    // Branch
+    cy += row_height;
+    controls.push(create_label(
+        hwnd,
+        -1,
+        "Branch:",
+        x,
+        cy + 3,
+        label_width,
+        18,
+    ));
+    let branch_text = status.branch.clone().unwrap_or_else(|| "-".to_string());
+    controls.push(create_label(
+        hwnd,
+        IDC_GIT_BRANCH,
+        &branch_text,
+        x + label_width + 10,
+        cy + 3,
+        control_width,
+        18,
+    ));
+
+    // Last sync
+    cy += row_height;
+    controls.push(create_label(
+        hwnd,
+        -1,
+        "Last sync:",
+        x,
+        cy + 3,
+        label_width,
+        18,
+    ));
+    let last_sync_text = if let Some(ts) = status.last_commit_time {
+        format_timestamp(ts)
+    } else {
+        "-".to_string()
+    };
+    controls.push(create_label(
+        hwnd,
+        IDC_GIT_LAST_SYNC,
+        &last_sync_text,
+        x + label_width + 10,
+        cy + 3,
+        control_width,
+        18,
+    ));
+
+    // Changes
+    cy += row_height;
+    controls.push(create_label(
+        hwnd,
+        -1,
+        "Changes:",
+        x,
+        cy + 3,
+        label_width,
+        18,
+    ));
+    let changes_text = if status.has_local_changes {
+        "Uncommitted changes"
+    } else if status.commits_ahead > 0 && status.commits_behind > 0 {
+        "Diverged from remote"
+    } else if status.commits_ahead > 0 {
+        "Ahead of remote"
+    } else if status.commits_behind > 0 {
+        "Behind remote"
+    } else {
+        "Up to date"
+    };
+    controls.push(create_label(
+        hwnd,
+        IDC_GIT_CHANGES,
+        changes_text,
+        x + label_width + 10,
+        cy + 3,
+        control_width,
+        18,
+    ));
+
+    // Sync Now button
+    cy += row_height + 10;
+    controls.push(create_button(
+        hwnd,
+        IDC_GIT_SYNC_NOW,
+        "Sync Now",
+        x,
+        cy,
+        100,
+        25,
+    ));
+
+    DIALOG_STATE.with(|s| {
+        if let Some(ref mut state) = *s.borrow_mut() {
+            state.git_sync_controls = controls;
+        }
+    });
+}
+
+/// Format a Unix timestamp as a human-readable relative time
+fn format_timestamp(ts: i64) -> String {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+
+    let diff = now - ts;
+
+    if diff < 60 {
+        "Just now".to_string()
+    } else if diff < 3600 {
+        let mins = diff / 60;
+        format!("{} minute{} ago", mins, if mins == 1 { "" } else { "s" })
+    } else if diff < 86400 {
+        let hours = diff / 3600;
+        format!("{} hour{} ago", hours, if hours == 1 { "" } else { "s" })
+    } else if diff < 604800 {
+        let days = diff / 86400;
+        format!("{} day{} ago", days, if days == 1 { "" } else { "s" })
+    } else {
+        let weeks = diff / 604800;
+        format!("{} week{} ago", weeks, if weeks == 1 { "" } else { "s" })
+    }
+}
+
+/// Update Git Sync status labels
+fn update_git_status_display(hwnd: HWND) {
+    let status = config_dir()
+        .map(|dir| git_sync::get_sync_status(&dir))
+        .unwrap_or_default();
+
+    let status_label = get_dialog_item(hwnd, IDC_GIT_STATUS);
+    let status_text = if !status.is_repo {
+        "Not initialized"
+    } else if status.remote_url.is_none() {
+        "No remote configured"
+    } else {
+        "Configured"
+    };
+    set_edit_text(status_label, status_text);
+
+    let branch_label = get_dialog_item(hwnd, IDC_GIT_BRANCH);
+    let branch_text = status.branch.clone().unwrap_or_else(|| "-".to_string());
+    set_edit_text(branch_label, &branch_text);
+
+    let last_sync_label = get_dialog_item(hwnd, IDC_GIT_LAST_SYNC);
+    let last_sync_text = if let Some(ts) = status.last_commit_time {
+        format_timestamp(ts)
+    } else {
+        "-".to_string()
+    };
+    set_edit_text(last_sync_label, &last_sync_text);
+
+    let changes_label = get_dialog_item(hwnd, IDC_GIT_CHANGES);
+    let changes_text = if status.has_local_changes {
+        "Uncommitted changes"
+    } else if status.commits_ahead > 0 && status.commits_behind > 0 {
+        "Diverged from remote"
+    } else if status.commits_ahead > 0 {
+        "Ahead of remote"
+    } else if status.commits_behind > 0 {
+        "Behind remote"
+    } else {
+        "Up to date"
+    };
+    set_edit_text(changes_label, changes_text);
+}
+
+/// Perform git sync now
+fn perform_sync_now(hwnd: HWND) {
+    let Some(dir) = config_dir() else {
+        log::error!("No config directory found");
+        return;
+    };
+
+    // Get remote URL from the edit field
+    let remote_edit = get_dialog_item(hwnd, IDC_GIT_REMOTE);
+    let remote_url = get_edit_text(remote_edit);
+
+    // First, check if we need to initialize with remote
+    if !remote_url.is_empty() && git_sync::get_remote_url(&dir).is_none() {
+        match git_sync::init_with_remote(&dir, &remote_url) {
+            Ok(git_sync::InitResult::PulledRemote) => {
+                log::info!("Pulled config from remote");
+                update_git_status_display(hwnd);
+                return;
+            }
+            Ok(_) => {
+                log::info!("Git remote initialized");
+            }
+            Err(e) => {
+                log::error!("Failed to initialize git remote: {}", e);
+                crate::dialogs::show_error(
+                    hwnd,
+                    "Git Sync",
+                    &format!("Failed to initialize: {}", e),
+                );
+                return;
+            }
+        }
+    }
+
+    // Perform sync: pull then push
+    match git_sync::pull_with_conflict_resolution(&dir) {
+        Ok(PullResult::Updated) => {
+            log::info!("Pulled updates from remote");
+        }
+        Ok(PullResult::ConflictsResolved(files)) => {
+            log::info!("Pulled with conflicts resolved: {:?}", files);
+        }
+        Ok(PullResult::UpToDate) => {
+            log::info!("Already up to date");
+        }
+        Ok(PullResult::NoRemote) | Ok(PullResult::NotARepo) => {
+            log::info!("No remote configured or not a repo");
+        }
+        Err(e) => {
+            log::error!("Sync failed: {}", e);
+            crate::dialogs::show_error(hwnd, "Git Sync", &format!("Sync failed: {}", e));
+        }
+    }
+
+    // Push any local changes
+    if git_sync::is_git_repo(&dir) {
+        if let Err(e) = git_sync::commit_and_push(&dir, "Sync configuration") {
+            log::error!("Failed to push: {}", e);
+        }
+    }
+
+    update_git_status_display(hwnd);
+}
+
 /// Show controls for a specific tab, hide others
 fn show_tab(tab_index: i32) {
     DIALOG_STATE.with(|s| {
@@ -651,6 +977,9 @@ fn show_tab(tab_index: i32) {
             for hwnd in &state.shortcuts_controls {
                 show_control(*hwnd, false);
             }
+            for hwnd in &state.git_sync_controls {
+                show_control(*hwnd, false);
+            }
 
             // Show the selected tab's controls
             let controls = match tab_index {
@@ -658,6 +987,7 @@ fn show_tab(tab_index: i32) {
                 TAB_APPEARANCE => &state.appearance_controls,
                 TAB_TABS => &state.tabs_controls,
                 TAB_SHORTCUTS => &state.shortcuts_controls,
+                TAB_GIT_SYNC => &state.git_sync_controls,
                 _ => &state.general_controls,
             };
             for hwnd in controls {
@@ -874,25 +1204,39 @@ fn collect_config() -> Config {
 }
 
 /// Save the current config
-fn save_config() -> Result<(), cterm_app::config::ConfigError> {
+fn save_config(_hwnd: HWND) -> Result<(), cterm_app::config::ConfigError> {
     let config = collect_config();
-    cterm_app::save_config(&config)
+    cterm_app::save_config(&config)?;
+
+    // If git sync is configured, commit and push
+    if let Some(dir) = config_dir() {
+        if git_sync::is_git_repo(&dir) && git_sync::get_remote_url(&dir).is_some() {
+            if let Err(e) = git_sync::commit_and_push(&dir, "Update configuration") {
+                log::error!("Failed to push config: {}", e);
+            }
+        }
+    }
+
+    Ok(())
 }
 
 /// Handle WM_COMMAND
 fn handle_command(hwnd: HWND, id: i32) {
     match id {
         IDOK => {
-            if save_config().is_ok() {
+            if save_config(hwnd).is_ok() {
                 unsafe { EndDialog(hwnd, IDOK as isize) };
             } else {
                 crate::dialogs::show_error(hwnd, "Error", "Failed to save configuration");
             }
         }
         IDC_APPLY => {
-            if save_config().is_err() {
+            if save_config(hwnd).is_err() {
                 crate::dialogs::show_error(hwnd, "Error", "Failed to save configuration");
             }
+        }
+        IDC_GIT_SYNC_NOW => {
+            perform_sync_now(hwnd);
         }
         IDCANCEL => {
             unsafe { EndDialog(hwnd, IDCANCEL as isize) };
