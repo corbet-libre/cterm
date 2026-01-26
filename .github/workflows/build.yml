@@ -181,11 +181,35 @@ jobs:
       - name: List built binaries
         run: ls -la target/release/cterm* || true
 
+      - name: Generate app icon
+        run: |
+          # Install librsvg for SVG to PNG conversion
+          sudo apt-get install -y librsvg2-bin
+
+          # Get version from Cargo.toml
+          VERSION=$(grep '^version = ' Cargo.toml | head -1 | sed 's/version = "\(.*\)"/\1/')
+          echo "Building icon for version: $VERSION"
+
+          # Generate SVG with version substituted
+          sed "s/{{VERSION}}/$VERSION/g" packaging/icon_template.svg > /tmp/cterm_icon.svg
+
+          # Generate PNG icons at standard sizes
+          mkdir -p /tmp/icons
+          for size in 16 24 32 48 64 128 256 512; do
+            rsvg-convert -w $size -h $size /tmp/cterm_icon.svg > "/tmp/icons/cterm_${size}x${size}.png"
+          done
+
+          # Copy SVG as well
+          cp /tmp/cterm_icon.svg /tmp/icons/cterm.svg
+          echo "Generated icons:"
+          ls -la /tmp/icons/
+
       - name: Create release archive
         run: |
-          mkdir -p release/cterm-linux-x86_64
+          mkdir -p release/cterm-linux-x86_64/icons
           cp target/release/cterm release/cterm-linux-x86_64/
           cp README.md LICENSE release/cterm-linux-x86_64/
+          cp /tmp/icons/* release/cterm-linux-x86_64/icons/
           cd release && tar -czvf cterm-linux-x86_64.tar.gz cterm-linux-x86_64
 
       - name: Create ctermd release archive
@@ -237,11 +261,35 @@ jobs:
       - name: List built binaries
         run: ls -la target/release/cterm* || true
 
+      - name: Generate app icon
+        run: |
+          # Install librsvg for SVG to PNG conversion
+          sudo apt-get install -y librsvg2-bin
+
+          # Get version from Cargo.toml
+          VERSION=$(grep '^version = ' Cargo.toml | head -1 | sed 's/version = "\(.*\)"/\1/')
+          echo "Building icon for version: $VERSION"
+
+          # Generate SVG with version substituted
+          sed "s/{{VERSION}}/$VERSION/g" packaging/icon_template.svg > /tmp/cterm_icon.svg
+
+          # Generate PNG icons at standard sizes
+          mkdir -p /tmp/icons
+          for size in 16 24 32 48 64 128 256 512; do
+            rsvg-convert -w $size -h $size /tmp/cterm_icon.svg > "/tmp/icons/cterm_${size}x${size}.png"
+          done
+
+          # Copy SVG as well
+          cp /tmp/cterm_icon.svg /tmp/icons/cterm.svg
+          echo "Generated icons:"
+          ls -la /tmp/icons/
+
       - name: Create release archive
         run: |
-          mkdir -p release/cterm-linux-arm64
+          mkdir -p release/cterm-linux-arm64/icons
           cp target/release/cterm release/cterm-linux-arm64/
           cp README.md LICENSE release/cterm-linux-arm64/
+          cp /tmp/icons/* release/cterm-linux-arm64/icons/
           cd release && tar -czvf cterm-linux-arm64.tar.gz cterm-linux-arm64
 
       - name: Create ctermd release archive
@@ -327,10 +375,37 @@ jobs:
           Copy-Item README.md release/ctermd-windows-x86_64/
           Copy-Item LICENSE release/ctermd-windows-x86_64/
 
-      - name: Install NSIS
+      - name: Install NSIS and ImageMagick
         shell: pwsh
         run: |
-          choco install nsis -y
+          choco install nsis imagemagick -y
+
+      - name: Generate app icon
+        shell: pwsh
+        run: |
+          # Get version from Cargo.toml
+          $version = (Select-String -Path Cargo.toml -Pattern '^version = "(.+)"' | Select-Object -First 1).Matches.Groups[1].Value
+          Write-Host "Building icon for version: $version"
+
+          # Read template and substitute version
+          $template = Get-Content -Path packaging/icon_template.svg -Raw
+          $svg = $template -replace '\{\{VERSION\}\}', $version
+          Set-Content -Path release/cterm_icon.svg -Value $svg
+
+          # Convert SVG to ICO using ImageMagick
+          # Create multiple sizes for a proper ICO file
+          $sizes = @(16, 32, 48, 64, 128, 256)
+          $pngFiles = @()
+          foreach ($size in $sizes) {
+            $pngFile = "release/icon_${size}.png"
+            & magick convert -background none -resize "${size}x${size}" release/cterm_icon.svg $pngFile
+            $pngFiles += $pngFile
+          }
+
+          # Combine PNGs into ICO
+          & magick convert $pngFiles release/cterm.ico
+          Write-Host "Generated icon:"
+          Get-Item release/cterm.ico
 
       - name: Create installer
         shell: pwsh
@@ -338,9 +413,10 @@ jobs:
           # Get version from Cargo.toml
           $version = (Select-String -Path Cargo.toml -Pattern '^version = "(.+)"' | Select-Object -First 1).Matches.Groups[1].Value
 
-          # Copy installer script and LICENSE to release directory
+          # Copy installer script, LICENSE, and icon to release directory
           Copy-Item packaging/windows/installer.nsi release/
           Copy-Item LICENSE release/
+          # Icon is already in release/ from the generate step
 
           # Run NSIS
           cd release
@@ -471,6 +547,36 @@ jobs:
           lipo -info universal-binary/cterm
           lipo -info universal-binary/ctermd
 
+      - name: Generate app icon
+        run: |
+          # Install librsvg for SVG to PNG conversion
+          brew install librsvg
+
+          # Get version from Cargo.toml
+          VERSION=$(grep '^version = ' Cargo.toml | head -1 | sed 's/version = "\(.*\)"/\1/')
+          echo "Building icon for version: $VERSION"
+
+          # Generate SVG with version substituted
+          sed "s/{{VERSION}}/$VERSION/g" packaging/icon_template.svg > /tmp/cterm_icon.svg
+
+          # Create iconset directory
+          mkdir -p /tmp/cterm.iconset
+
+          # Generate PNG files at all required sizes
+          for size in 16 32 64 128 256 512; do
+            rsvg-convert -w $size -h $size /tmp/cterm_icon.svg > "/tmp/cterm.iconset/icon_${size}x${size}.png"
+            # Also create @2x versions for Retina displays
+            double=$((size * 2))
+            if [ $double -le 1024 ]; then
+              rsvg-convert -w $double -h $double /tmp/cterm_icon.svg > "/tmp/cterm.iconset/icon_${size}x${size}@2x.png"
+            fi
+          done
+
+          # Create .icns file
+          iconutil -c icns /tmp/cterm.iconset -o packaging/macos/cterm.icns
+          echo "Generated icon:"
+          ls -la packaging/macos/cterm.icns
+
       - name: Create app bundle
         run: |
           APP_DIR="release/cterm.app"
@@ -480,7 +586,7 @@ jobs:
           # Copy binary
           cp universal-binary/cterm "$APP_DIR/Contents/MacOS/"
 
-          # Copy icon
+          # Copy generated icon
           cp packaging/macos/cterm.icns "$APP_DIR/Contents/Resources/"
 
           # Get version from Cargo.toml

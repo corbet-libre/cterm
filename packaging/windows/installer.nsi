@@ -10,6 +10,10 @@ InstallDir "$PROGRAMFILES64\cterm"
 InstallDirRegKey HKLM "Software\cterm" "InstallDir"
 RequestExecutionLevel admin
 
+; Icon settings - use generated icon
+!define MUI_ICON "cterm.ico"
+!define MUI_UNICON "cterm.ico"
+
 ; Interface Settings
 !define MUI_ABORTWARNING
 
@@ -33,21 +37,24 @@ Section "Install"
     ; Copy all files from the build directory
     File /r "cterm-windows-x86_64\*.*"
 
+    ; Copy icon
+    File "cterm.ico"
+
     ; Create uninstaller
     WriteUninstaller "$INSTDIR\uninstall.exe"
 
     ; Create Start Menu shortcuts
     CreateDirectory "$SMPROGRAMS\cterm"
-    CreateShortcut "$SMPROGRAMS\cterm\cterm.lnk" "$INSTDIR\cterm.exe"
+    CreateShortcut "$SMPROGRAMS\cterm\cterm.lnk" "$INSTDIR\cterm.exe" "" "$INSTDIR\cterm.ico"
     CreateShortcut "$SMPROGRAMS\cterm\Uninstall.lnk" "$INSTDIR\uninstall.exe"
 
     ; Create Desktop shortcut
-    CreateShortcut "$DESKTOP\cterm.lnk" "$INSTDIR\cterm.exe"
+    CreateShortcut "$DESKTOP\cterm.lnk" "$INSTDIR\cterm.exe" "" "$INSTDIR\cterm.ico"
 
     ; Write registry keys for uninstaller
     WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\cterm" "DisplayName" "cterm"
     WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\cterm" "UninstallString" "$INSTDIR\uninstall.exe"
-    WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\cterm" "DisplayIcon" "$INSTDIR\cterm.exe"
+    WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\cterm" "DisplayIcon" "$INSTDIR\cterm.ico"
     WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\cterm" "Publisher" "cterm contributors"
     WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\cterm" "DisplayVersion" "${VERSION}"
     WriteRegDWORD HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\cterm" "NoModify" 1
