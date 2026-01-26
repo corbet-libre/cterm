@@ -790,13 +790,8 @@ mod tests {
         // Create initial commit
         create_and_commit_file(&repo, "config.toml", "key = \"value\"", "Initial commit");
 
-        // Push should succeed
-        let result = run_git(&repo, &["push", "-u", "origin", "main"]);
-        // If main doesn't work, try master (git version dependent)
-        if result.is_err() {
-            run_git(&repo, &["branch", "-M", "master"]).unwrap();
-            run_git(&repo, &["push", "-u", "origin", "master"]).unwrap();
-        }
+        // Push using HEAD - works regardless of default branch name
+        run_git(&repo, &["push", "-u", "origin", "HEAD"]).unwrap();
 
         // Verify remote has the commit
         let log = run_git(&bare, &["log", "--oneline"]).unwrap();
@@ -811,10 +806,7 @@ mod tests {
 
         // Create initial commit and push to establish branch
         create_and_commit_file(&repo, "init.txt", "init", "Initial commit");
-        let _ = run_git(&repo, &["push", "-u", "origin", "main"]).or_else(|_| {
-            run_git(&repo, &["branch", "-M", "master"])?;
-            run_git(&repo, &["push", "-u", "origin", "master"])
-        });
+        run_git(&repo, &["push", "-u", "origin", "HEAD"]).unwrap();
 
         // Now test commit_and_push
         fs::write(repo.join("config.toml"), "setting = true").unwrap();
@@ -833,10 +825,7 @@ mod tests {
         // Create first repo, commit, and push
         let repo1 = create_repo_with_remote(&temp, &bare);
         create_and_commit_file(&repo1, "config.toml", "version = 1", "Version 1");
-        let _ = run_git(&repo1, &["push", "-u", "origin", "main"]).or_else(|_| {
-            run_git(&repo1, &["branch", "-M", "master"])?;
-            run_git(&repo1, &["push", "-u", "origin", "master"])
-        });
+        run_git(&repo1, &["push", "-u", "origin", "HEAD"]).unwrap();
 
         // Clone to second repo
         let repo2 = temp.path().join("repo2");
@@ -868,10 +857,7 @@ mod tests {
 
         // Create initial commit and push
         create_and_commit_file(&repo, "config.toml", "data = 1", "Initial");
-        let _ = run_git(&repo, &["push", "-u", "origin", "main"]).or_else(|_| {
-            run_git(&repo, &["branch", "-M", "master"])?;
-            run_git(&repo, &["push", "-u", "origin", "master"])
-        });
+        run_git(&repo, &["push", "-u", "origin", "HEAD"]).unwrap();
 
         // Pull should report up to date
         let result = pull_with_conflict_resolution(&repo).unwrap();
@@ -886,10 +872,7 @@ mod tests {
 
         // Create initial commit and push
         create_and_commit_file(&repo, "config.toml", "v1", "Initial");
-        let _ = run_git(&repo, &["push", "-u", "origin", "main"]).or_else(|_| {
-            run_git(&repo, &["branch", "-M", "master"])?;
-            run_git(&repo, &["push", "-u", "origin", "master"])
-        });
+        run_git(&repo, &["push", "-u", "origin", "HEAD"]).unwrap();
 
         // Make local commit without pushing
         create_and_commit_file(&repo, "config.toml", "v2", "Local change");
@@ -910,10 +893,7 @@ mod tests {
         // Create repo1 and push
         let repo1 = create_repo_with_remote(&temp, &bare);
         create_and_commit_file(&repo1, "config.toml", "v1", "Initial");
-        let _ = run_git(&repo1, &["push", "-u", "origin", "main"]).or_else(|_| {
-            run_git(&repo1, &["branch", "-M", "master"])?;
-            run_git(&repo1, &["push", "-u", "origin", "master"])
-        });
+        run_git(&repo1, &["push", "-u", "origin", "HEAD"]).unwrap();
 
         // Clone to repo2
         let repo2 = temp.path().join("repo2");
@@ -943,10 +923,7 @@ mod tests {
 
         // Create initial commit
         create_and_commit_file(&repo, "config.toml", "v1", "Initial");
-        let _ = run_git(&repo, &["push", "-u", "origin", "main"]).or_else(|_| {
-            run_git(&repo, &["branch", "-M", "master"])?;
-            run_git(&repo, &["push", "-u", "origin", "master"])
-        });
+        run_git(&repo, &["push", "-u", "origin", "HEAD"]).unwrap();
 
         // Make uncommitted changes
         fs::write(repo.join("config.toml"), "v2").unwrap();
@@ -963,10 +940,7 @@ mod tests {
         // Create repo1 and push
         let repo1 = create_repo_with_remote(&temp, &bare);
         create_and_commit_file(&repo1, "config.toml", "original", "Initial");
-        let _ = run_git(&repo1, &["push", "-u", "origin", "main"]).or_else(|_| {
-            run_git(&repo1, &["branch", "-M", "master"])?;
-            run_git(&repo1, &["push", "-u", "origin", "master"])
-        });
+        run_git(&repo1, &["push", "-u", "origin", "HEAD"]).unwrap();
 
         // Clone to repo2
         let repo2 = temp.path().join("repo2");
@@ -1011,10 +985,7 @@ mod tests {
         let repo1 = create_repo_with_remote(&temp, &bare);
         create_and_commit_file(&repo1, "config.toml", "v1", "Initial");
         create_and_commit_file(&repo1, "other.toml", "data", "Add other file");
-        let _ = run_git(&repo1, &["push", "-u", "origin", "main"]).or_else(|_| {
-            run_git(&repo1, &["branch", "-M", "master"])?;
-            run_git(&repo1, &["push", "-u", "origin", "master"])
-        });
+        run_git(&repo1, &["push", "-u", "origin", "HEAD"]).unwrap();
 
         // Clone to repo2
         let repo2 = temp.path().join("repo2");
@@ -1059,10 +1030,7 @@ mod tests {
         // Create repo1 and push initial content
         let repo1 = create_repo_with_remote(&temp, &bare);
         create_and_commit_file(&repo1, "config.toml", "remote content", "Initial");
-        let _ = run_git(&repo1, &["push", "-u", "origin", "main"]).or_else(|_| {
-            run_git(&repo1, &["branch", "-M", "master"])?;
-            run_git(&repo1, &["push", "-u", "origin", "master"])
-        });
+        run_git(&repo1, &["push", "-u", "origin", "HEAD"]).unwrap();
 
         // Create new repo and init with remote
         let repo2 = temp.path().join("repo2");
@@ -1098,10 +1066,7 @@ mod tests {
         run_git(&source, &["add", "themes/custom.toml"]).unwrap();
         run_git(&source, &["commit", "-m", "Add theme"]).unwrap();
 
-        let _ = run_git(&source, &["push", "-u", "origin", "main"]).or_else(|_| {
-            run_git(&source, &["branch", "-M", "master"])?;
-            run_git(&source, &["push", "-u", "origin", "master"])
-        });
+        run_git(&source, &["push", "-u", "origin", "HEAD"]).unwrap();
 
         // Clone to new location
         let clone_path = temp.path().join("cloned");
@@ -1127,10 +1092,7 @@ mod tests {
         // Create repo1 and push
         let repo1 = create_repo_with_remote(&temp, &bare);
         create_and_commit_file(&repo1, "config.toml", "v1", "Version 1");
-        let _ = run_git(&repo1, &["push", "-u", "origin", "main"]).or_else(|_| {
-            run_git(&repo1, &["branch", "-M", "master"])?;
-            run_git(&repo1, &["push", "-u", "origin", "master"])
-        });
+        run_git(&repo1, &["push", "-u", "origin", "HEAD"]).unwrap();
 
         // Clone to repo2
         let repo2 = temp.path().join("repo2");
