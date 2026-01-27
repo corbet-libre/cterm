@@ -398,6 +398,7 @@ impl WindowState {
     /// Render the window
     pub fn render(&mut self) -> windows::core::Result<()> {
         if self.renderer.is_none() {
+            log::debug!("render: no renderer");
             return Ok(());
         }
 
@@ -411,6 +412,8 @@ impl WindowState {
             if let Some(renderer) = self.renderer.as_mut() {
                 renderer.render(term.screen())?;
             }
+        } else {
+            log::debug!("render: no active terminal");
         }
 
         Ok(())
