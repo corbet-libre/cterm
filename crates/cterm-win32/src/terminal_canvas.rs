@@ -312,13 +312,12 @@ impl TerminalRenderer {
         }
 
         let grid = screen.grid();
-        let cursor = screen.cursor();
         log::debug!(
             "render: grid {}x{}, cursor ({}, {})",
             grid.width(),
             grid.height(),
-            cursor.x,
-            cursor.y
+            screen.cursor.col,
+            screen.cursor.row
         );
 
         // Begin drawing
