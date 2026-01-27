@@ -288,11 +288,12 @@ impl TerminalRenderer {
             return Ok(());
         }
 
-        log::trace!(
-            "TerminalRenderer::render - cell dims: {}x{}, font_size: {}",
+        log::debug!(
+            "TerminalRenderer::render - cell dims: {}x{}, font_size: {}, dpi: {}",
             self.cell_dims.width,
             self.cell_dims.height,
-            self.font_size
+            self.font_size,
+            self.dpi.dpi
         );
 
         // Begin drawing
@@ -335,6 +336,28 @@ impl TerminalRenderer {
         let scroll_offset = screen.scroll_offset;
         let rows = grid.height();
         let cols = grid.width();
+
+        // Count non-empty cells for debugging
+        let mut non_empty = 0;
+        for row in 0..rows {
+            for col in 0..cols {
+                if let Some(cell) = grid.get(row, col) {
+                    if cell.c != ' ' && cell.c != '\0' {
+                        non_empty += 1;
+                    }
+                }
+            }
+        }
+        if non_empty > 0 {
+            log::debug!(
+                "draw_grid: {}x{}, {} non-empty cells, first cell pos: ({}, {})",
+                cols,
+                rows,
+                non_empty,
+                0.0 * self.cell_dims.width,
+                0.0 * self.cell_dims.height
+            );
+        }
 
         for row in 0..rows {
             let grid_row = if scroll_offset > 0 {
@@ -539,6 +562,7 @@ impl TerminalRenderer {
     fn draw_cursor(&mut self, screen: &Screen) -> windows::core::Result<()> {
         // Check DECTCEM mode for cursor visibility
         if !screen.modes.show_cursor {
+            log::debug!("Cursor hidden by DECTCEM mode");
             return Ok(());
         }
 
@@ -546,6 +570,13 @@ impl TerminalRenderer {
 
         let x = cursor.col as f32 * self.cell_dims.width;
         let y = cursor.row as f32 * self.cell_dims.height;
+        log::debug!(
+            "Drawing cursor at pixel ({}, {}) - cell ({}, {})",
+            x,
+            y,
+            cursor.col,
+            cursor.row
+        );
 
         let cursor_color = self.theme.cursor.color;
         let brush = self.get_brush(cursor_color)?;
