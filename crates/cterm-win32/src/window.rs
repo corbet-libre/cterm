@@ -8,7 +8,9 @@ use std::thread;
 
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
-use windows::Win32::Graphics::Gdi::{BeginPaint, EndPaint, InvalidateRect, HBRUSH, PAINTSTRUCT};
+use windows::Win32::Graphics::Gdi::{
+    BeginPaint, EndPaint, InvalidateRect, UpdateWindow, HBRUSH, PAINTSTRUCT,
+};
 use windows::Win32::UI::WindowsAndMessaging::GetClientRect;
 use windows::Win32::UI::WindowsAndMessaging::*;
 
@@ -390,6 +392,8 @@ impl WindowState {
         log::debug!("Invalidating window for repaint");
         unsafe {
             let _ = InvalidateRect(Some(self.hwnd), None, false);
+            // Force immediate repaint
+            let _ = UpdateWindow(self.hwnd);
         };
     }
 
