@@ -204,8 +204,24 @@ define_class!(
                 }
             }
 
-            // Convert macOS keycode to terminal Key
+            // Handle Option+Arrow keys specially to match macOS Terminal.app behavior
             let raw_keycode = event.keyCode();
+            if modifiers.contains(cterm_ui::events::Modifiers::ALT) {
+                let seq: Option<&[u8]> = match raw_keycode {
+                    0x7B => Some(b"\x1bb"),  // Option+Left: backward-word (ESC b)
+                    0x7C => Some(b"\x1bf"),  // Option+Right: forward-word (ESC f)
+                    0x7E => Some(b"\x1b[A"), // Option+Up: plain up arrow
+                    0x7D => Some(b"\x1b[B"), // Option+Down: plain down arrow
+                    _ => None,
+                };
+                if let Some(data) = seq {
+                    log::debug!("Option+Arrow -> {:?}", data);
+                    self.write_to_pty(data);
+                    return;
+                }
+            }
+
+            // Convert macOS keycode to terminal Key
             let key = match raw_keycode {
                 // Arrow keys
                 0x7E => Some(Key::Up),
