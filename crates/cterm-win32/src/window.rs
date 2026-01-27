@@ -397,6 +397,7 @@ impl WindowState {
 
     /// Render the window
     pub fn render(&mut self) -> windows::core::Result<()> {
+        log::debug!("render: called, renderer={}", self.renderer.is_some());
         if self.renderer.is_none() {
             log::debug!("render: no renderer");
             return Ok(());
