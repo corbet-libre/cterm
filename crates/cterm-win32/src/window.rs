@@ -391,6 +391,7 @@ impl WindowState {
     /// Render the window
     pub fn render(&mut self) -> windows::core::Result<()> {
         if self.renderer.is_none() {
+            log::warn!("Render called but renderer is None");
             return Ok(());
         }
 
@@ -400,10 +401,20 @@ impl WindowState {
         // Render active terminal
         if let Some(terminal) = terminal {
             let term = terminal.lock().unwrap();
+            let screen = term.screen();
+            log::debug!(
+                "Rendering: grid {}x{}, cursor at ({}, {})",
+                screen.grid().width(),
+                screen.grid().height(),
+                screen.cursor.col,
+                screen.cursor.row
+            );
             // Now get the renderer and render
             if let Some(renderer) = self.renderer.as_mut() {
-                renderer.render(term.screen())?;
+                renderer.render(screen)?;
             }
+        } else {
+            log::warn!("No active terminal to render");
         }
 
         Ok(())
@@ -1184,7 +1195,9 @@ extern "system" fn window_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPA
         WM_PAINT => {
             let mut ps = PAINTSTRUCT::default();
             let _ = unsafe { BeginPaint(hwnd, &mut ps) };
-            state.render().ok();
+            if let Err(e) = state.render() {
+                log::error!("Render failed: {}", e);
+            }
             let _ = unsafe { EndPaint(hwnd, &ps) };
             LRESULT(0)
         }

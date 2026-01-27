@@ -284,8 +284,16 @@ impl TerminalRenderer {
     /// Render the terminal screen
     pub fn render(&mut self, screen: &Screen) -> windows::core::Result<()> {
         if self.render_target.is_none() {
+            log::warn!("render_target is None");
             return Ok(());
         }
+
+        log::trace!(
+            "TerminalRenderer::render - cell dims: {}x{}, font_size: {}",
+            self.cell_dims.width,
+            self.cell_dims.height,
+            self.font_size
+        );
 
         // Begin drawing
         unsafe {
