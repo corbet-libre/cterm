@@ -383,6 +383,7 @@ impl WindowState {
 
     /// Invalidate and request redraw
     pub fn invalidate(&self) {
+        log::debug!("Invalidating window for repaint");
         unsafe {
             let _ = InvalidateRect(Some(self.hwnd), None, false);
         };
