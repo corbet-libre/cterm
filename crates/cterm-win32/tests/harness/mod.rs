@@ -5,6 +5,7 @@
 
 #![cfg(windows)]
 #![allow(dead_code)] // Some utilities are for future tests
+#![allow(unused_imports)] // Platform-specific imports
 
 use std::ffi::OsStr;
 use std::io::{self, Write};
@@ -14,8 +15,8 @@ use std::process::{Child, Command};
 use std::ptr;
 use std::time::{Duration, Instant};
 
-use winapi::shared::minwindef::{BOOL, DWORD, LPARAM, TRUE, UINT, WORD};
-use winapi::shared::windef::{HDC, HGDIOBJ, HWND, RECT};
+use winapi::shared::minwindef::{BOOL, DWORD, LPARAM, TRUE, UINT};
+use winapi::shared::windef::{HGDIOBJ, HWND, RECT};
 use winapi::um::wingdi::{
     BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, DeleteDC, DeleteObject, GetDIBits,
     SelectObject, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS, SRCCOPY,
@@ -428,8 +429,7 @@ fn capture_window_to_png(hwnd: HWND, path: &PathBuf) -> io::Result<()> {
                 io::Error::new(io::ErrorKind::InvalidData, "Failed to create image buffer")
             })?;
 
-        img.save(path)
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+        img.save(path).map_err(io::Error::other)?;
 
         Ok(())
     }
