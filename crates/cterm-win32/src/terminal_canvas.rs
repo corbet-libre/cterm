@@ -307,18 +307,8 @@ impl TerminalRenderer {
     /// Render the terminal screen
     pub fn render(&mut self, screen: &Screen) -> windows::core::Result<()> {
         if self.render_target.is_none() {
-            log::debug!("render: no render_target");
             return Ok(());
         }
-
-        let grid = screen.grid();
-        log::debug!(
-            "render: grid {}x{}, cursor ({}, {})",
-            grid.width(),
-            grid.height(),
-            screen.cursor.col,
-            screen.cursor.row
-        );
 
         // Begin drawing
         unsafe {

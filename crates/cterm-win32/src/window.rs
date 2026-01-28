@@ -21,7 +21,7 @@ use cterm_core::color::Rgb;
 use cterm_core::pty::{PtyConfig, PtySize};
 use cterm_core::screen::{FileTransferOperation, ScreenConfig};
 use cterm_core::term::{Terminal, TerminalEvent};
-use cterm_ui::events::Action;
+use cterm_ui::events::{Action, Modifiers};
 use cterm_ui::theme::Theme;
 
 use crate::clipboard;
@@ -178,25 +178,43 @@ impl WindowState {
     ) -> thread::JoinHandle<()> {
         let hwnd = self.hwnd.0 as usize;
 
+        // Clone the PTY reader handle so we can read without holding the terminal lock.
+        // This is critical: pty.read() is blocking I/O, and holding the mutex during
+        // the read would prevent the UI thread from rendering or handling input.
+        let pty_reader = {
+            let term = terminal.lock().unwrap();
+            term.pty().and_then(|pty| pty.try_clone_reader().ok())
+        };
+
         thread::spawn(move || {
+            let Some(mut reader) = pty_reader else {
+                log::error!("Failed to clone PTY reader for tab {}", tab_id);
+                unsafe {
+                    let _ = PostMessageW(
+                        Some(HWND(hwnd as *mut _)),
+                        WM_APP_PTY_EXIT,
+                        WPARAM(tab_id as usize),
+                        LPARAM(0),
+                    );
+                }
+                return;
+            };
+
             let mut buffer = [0u8; 8192];
 
             loop {
-                // Try to read from PTY
+                // Read from the cloned reader WITHOUT holding the terminal lock.
+                // This allows the UI thread to render and handle input concurrently.
                 let bytes_read = {
-                    let mut term = terminal.lock().unwrap();
-                    if let Some(pty) = term.pty_mut() {
-                        match pty.read(&mut buffer) {
-                            Ok(0) => break, // EOF
-                            Ok(n) => n,
-                            Err(_) => break,
-                        }
-                    } else {
-                        break;
+                    use std::io::Read;
+                    match reader.read(&mut buffer) {
+                        Ok(0) => break, // EOF
+                        Ok(n) => n,
+                        Err(_) => break,
                     }
                 };
 
-                // Process the data
+                // Process the data (briefly lock the terminal)
                 {
                     let mut term = terminal.lock().unwrap();
                     let events = term.process(&buffer[..bytes_read]);
@@ -385,21 +403,17 @@ impl WindowState {
 
     /// Invalidate and request redraw
     pub fn invalidate(&self) {
-        log::debug!("invalidate: calling InvalidateRect and UpdateWindow");
         unsafe {
             let _ = InvalidateRect(Some(self.hwnd), None, false);
             // Force immediate repaint - without UpdateWindow, WM_PAINT may be
             // deferred until the message queue is empty, causing blank terminal
             let _ = UpdateWindow(self.hwnd);
         };
-        log::debug!("invalidate: done");
     }
 
     /// Render the window
     pub fn render(&mut self) -> windows::core::Result<()> {
-        log::debug!("render: called, renderer={}", self.renderer.is_some());
         if self.renderer.is_none() {
-            log::debug!("render: no renderer");
             return Ok(());
         }
 
@@ -414,7 +428,6 @@ impl WindowState {
                 renderer.render(term.screen())?;
             }
         } else {
-            log::debug!("render: no active terminal");
         }
 
         Ok(())
@@ -445,6 +458,23 @@ impl WindowState {
             // Get terminal sequence for special keys
             if let Some(seq) = keycode::vk_to_terminal_seq(vk, modifiers, app_cursor) {
                 term.write(seq.as_bytes()).ok();
+                // Drop the lock before invalidate() — UpdateWindow dispatches WM_PAINT
+                // synchronously, and render() needs to lock the terminal.
+                drop(term);
+                self.invalidate();
+                return true;
+            }
+
+            // Ctrl+letter → send control character (Ctrl+A=0x01 .. Ctrl+Z=0x1a)
+            // We handle this here rather than in WM_CHAR to keep all terminal
+            // input in one place and avoid double-send issues.
+            if modifiers.contains(Modifiers::CTRL)
+                && !modifiers.contains(Modifiers::ALT)
+                && (0x41..=0x5A).contains(&(vk as i32))
+            {
+                let ctrl_char = (vk as u8) - b'A' + 1;
+                term.write(&[ctrl_char]).ok();
+                drop(term);
                 self.invalidate();
                 return true;
             }
@@ -460,8 +490,11 @@ impl WindowState {
             let mut buf = [0u8; 4];
             let s = c.encode_utf8(&mut buf);
             term.write(s.as_bytes()).ok();
-            self.invalidate();
+            // Drop the lock before invalidate() — UpdateWindow dispatches WM_PAINT
+            // synchronously, and render() needs to lock the terminal.
+            drop(term);
         }
+        self.invalidate();
     }
 
     /// Handle an action
@@ -509,8 +542,9 @@ impl WindowState {
                 if let Some(terminal) = self.active_terminal() {
                     let mut term = terminal.lock().unwrap();
                     term.screen_mut().reset();
-                    self.invalidate();
+                    drop(term);
                 }
+                self.invalidate();
             }
             _ => {}
         }
@@ -588,15 +622,17 @@ impl WindowState {
                     if let Some(terminal) = self.active_terminal() {
                         let mut term = terminal.lock().unwrap();
                         term.screen_mut().reset();
-                        self.invalidate();
+                        drop(term);
                     }
+                    self.invalidate();
                 }
                 MenuAction::ClearReset => {
                     if let Some(terminal) = self.active_terminal() {
                         let mut term = terminal.lock().unwrap();
                         term.screen_mut().reset();
-                        self.invalidate();
+                        drop(term);
                     }
+                    self.invalidate();
                 }
                 MenuAction::SendSignalInt => self.send_signal(2), // SIGINT
                 MenuAction::SendSignalKill => self.send_signal(9), // SIGKILL
@@ -715,8 +751,9 @@ impl WindowState {
                         winapi::um::winuser::MB_OK | winapi::um::winuser::MB_ICONINFORMATION,
                     );
                 }
-                self.invalidate();
+                drop(term);
             }
+            self.invalidate();
         }
     }
 
@@ -732,8 +769,9 @@ impl WindowState {
                 // Extend to end - use a large column value for last line
                 screen.extend_selection(total_lines.saturating_sub(1), usize::MAX);
             }
-            self.invalidate();
+            drop(term);
         }
+        self.invalidate();
     }
 
     /// Copy selection as HTML (for now, just copy as plain text with formatting note)
@@ -756,8 +794,9 @@ impl WindowState {
             let mut term = terminal.lock().unwrap();
             // Send Ctrl+C character
             term.write(&[0x03]).ok(); // ETX (Ctrl+C)
-            self.invalidate();
+            drop(term);
         }
+        self.invalidate();
     }
 
     /// Zoom in (increase font size)
@@ -853,14 +892,14 @@ impl WindowState {
             if let Some(terminal) = self.active_terminal() {
                 let mut term = terminal.lock().unwrap();
                 term.write(text.as_bytes()).ok();
-                self.invalidate();
+                drop(term);
             }
+            self.invalidate();
         }
     }
 
     /// Handle PTY data received
     pub fn on_pty_data(&mut self, tab_id: u64) {
-        log::debug!("on_pty_data: tab_id={}", tab_id);
         // Check for file transfers from the terminal
         if let Some(tab) = self.tabs.iter().find(|t| t.id == tab_id) {
             if let Ok(mut terminal) = tab.terminal.lock() {
@@ -1194,7 +1233,6 @@ extern "system" fn window_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPA
 
     match msg {
         WM_PAINT => {
-            log::debug!("WM_PAINT received");
             let mut ps = PAINTSTRUCT::default();
             let _ = unsafe { BeginPaint(hwnd, &mut ps) };
             state.render().ok();
@@ -1241,7 +1279,12 @@ extern "system" fn window_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPA
 
         WM_CHAR => {
             if let Some(c) = char::from_u32(wparam.0 as u32) {
-                if !c.is_control() || c == '\r' || c == '\t' || c == '\x08' {
+                // Only handle printable characters here. Control characters like
+                // Enter (\r), Tab (\t), Backspace (\x08), and Escape (\x1b) are
+                // already handled in WM_KEYDOWN via vk_to_terminal_seq.
+                // TranslateMessage generates WM_CHAR for them too, so we must
+                // skip them here to avoid double input.
+                if !c.is_control() {
                     state.on_char(c);
                 }
             }
