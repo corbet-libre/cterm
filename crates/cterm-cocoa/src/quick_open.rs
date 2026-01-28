@@ -51,7 +51,47 @@ define_class!(
     unsafe impl NSObjectProtocol for QuickOpenOverlay {}
 
     // NSControlTextEditingDelegate is required by NSTextFieldDelegate
-    unsafe impl NSControlTextEditingDelegate for QuickOpenOverlay {}
+    unsafe impl NSControlTextEditingDelegate for QuickOpenOverlay {
+        /// Intercept commands from the text field (Enter, Escape, arrow keys)
+        #[unsafe(method(control:textView:doCommandBySelector:))]
+        fn control_text_view_do_command_by_selector(
+            &self,
+            _control: &objc2_app_kit::NSControl,
+            _text_view: &objc2_app_kit::NSTextView,
+            command_selector: objc2::runtime::Sel,
+        ) -> bool {
+            let sel_name = command_selector.name().to_str().unwrap_or("");
+            log::debug!("doCommandBySelector: {}", sel_name);
+
+            match sel_name {
+                "insertNewline:" => {
+                    self.confirm_selection();
+                    true // We handled it
+                }
+                "cancelOperation:" => {
+                    self.hide();
+                    true
+                }
+                "moveUp:" => {
+                    self.select_previous();
+                    true
+                }
+                "moveDown:" => {
+                    self.select_next();
+                    true
+                }
+                "insertTab:" => {
+                    self.select_next();
+                    true
+                }
+                "insertBacktab:" => {
+                    self.select_previous();
+                    true
+                }
+                _ => false, // Let the text field handle it
+            }
+        }
+    }
 
     // NSTextFieldDelegate for text changes
     unsafe impl NSTextFieldDelegate for QuickOpenOverlay {
