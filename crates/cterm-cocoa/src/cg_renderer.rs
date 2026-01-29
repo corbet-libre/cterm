@@ -192,7 +192,19 @@ impl CGRenderer {
         if screen.modes.show_cursor && screen.scroll_offset == 0 {
             let cursor_x = cursor.col as f64 * self.cell_width;
             let cursor_y = cursor.row as f64 * self.cell_height;
-            self.draw_cursor(cursor_x, cursor_y);
+
+            // Check if cursor is on a wide character
+            let cursor_width = if let Some(cell) = screen.grid().get(cursor.row, cursor.col) {
+                if cell.is_wide() {
+                    self.cell_width * 2.0
+                } else {
+                    self.cell_width
+                }
+            } else {
+                self.cell_width
+            };
+
+            self.draw_cursor(cursor_x, cursor_y, cursor_width);
         }
     }
 
@@ -440,11 +452,11 @@ impl CGRenderer {
         }
     }
 
-    fn draw_cursor(&self, x: f64, y: f64) {
+    fn draw_cursor(&self, x: f64, y: f64, width: f64) {
         let cursor_color = &self.theme.colors.cursor;
         let rect = NSRect::new(
             NSPoint::new(x, y),
-            NSSize::new(self.cell_width, self.cell_height),
+            NSSize::new(width, self.cell_height),
         );
         unsafe {
             let color = Self::ns_color_alpha(cursor_color.r, cursor_color.g, cursor_color.b, 0.7);
