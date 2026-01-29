@@ -929,30 +929,31 @@ impl AppDelegate {
         // Get windows in tab order using macOS native tabbedWindows
         // This preserves the actual visual tab order instead of creation order
         let windows = self.ivars().windows.borrow();
-        let ordered_windows: Vec<Retained<CtermWindow>> = if let Some(first_window) = windows.first() {
-            // Get tabbedWindows from the first window to get correct tab order
-            let tabbed: Option<Retained<objc2_foundation::NSArray<NSWindow>>> =
-                unsafe { msg_send![&**first_window, tabbedWindows] };
+        let ordered_windows: Vec<Retained<CtermWindow>> =
+            if let Some(first_window) = windows.first() {
+                // Get tabbedWindows from the first window to get correct tab order
+                let tabbed: Option<Retained<objc2_foundation::NSArray<NSWindow>>> =
+                    unsafe { msg_send![&**first_window, tabbedWindows] };
 
-            if let Some(tabbed_windows) = tabbed {
-                // Convert NSWindow refs back to CtermWindow refs by matching pointers
-                tabbed_windows
-                    .iter()
-                    .filter_map(|nswin| {
-                        let nswin_ptr = Retained::as_ptr(&nswin);
-                        windows
-                            .iter()
-                            .find(|w| Retained::as_ptr(*w) as *const NSWindow == nswin_ptr)
-                            .cloned()
-                    })
-                    .collect()
+                if let Some(tabbed_windows) = tabbed {
+                    // Convert NSWindow refs back to CtermWindow refs by matching pointers
+                    tabbed_windows
+                        .iter()
+                        .filter_map(|nswin| {
+                            let nswin_ptr = Retained::as_ptr(&nswin);
+                            windows
+                                .iter()
+                                .find(|w| Retained::as_ptr(*w) as *const NSWindow == nswin_ptr)
+                                .cloned()
+                        })
+                        .collect()
+                } else {
+                    // Fallback to our stored order
+                    windows.iter().cloned().collect()
+                }
             } else {
-                // Fallback to our stored order
-                windows.iter().cloned().collect()
-            }
-        } else {
-            Vec::new()
-        };
+                Vec::new()
+            };
         drop(windows);
 
         for window in ordered_windows.iter() {

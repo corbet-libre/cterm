@@ -454,10 +454,7 @@ impl CGRenderer {
 
     fn draw_cursor(&self, x: f64, y: f64, width: f64) {
         let cursor_color = &self.theme.colors.cursor;
-        let rect = NSRect::new(
-            NSPoint::new(x, y),
-            NSSize::new(width, self.cell_height),
-        );
+        let rect = NSRect::new(NSPoint::new(x, y), NSSize::new(width, self.cell_height));
         unsafe {
             let color = Self::ns_color_alpha(cursor_color.r, cursor_color.g, cursor_color.b, 0.7);
             let _: () = msg_send![&*color, setFill];
