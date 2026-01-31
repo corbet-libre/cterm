@@ -195,6 +195,57 @@ define_class!(
                 }
             }
         }
+
+        // Window positioning actions
+        #[unsafe(method(windowFill:))]
+        fn action_window_fill(&self, _sender: Option<&objc2::runtime::AnyObject>) {
+            self.position_fill();
+        }
+
+        #[unsafe(method(windowCenter:))]
+        fn action_window_center(&self, _sender: Option<&objc2::runtime::AnyObject>) {
+            self.position_center();
+        }
+
+        #[unsafe(method(windowLeftHalf:))]
+        fn action_window_left_half(&self, _sender: Option<&objc2::runtime::AnyObject>) {
+            self.position_left_half();
+        }
+
+        #[unsafe(method(windowRightHalf:))]
+        fn action_window_right_half(&self, _sender: Option<&objc2::runtime::AnyObject>) {
+            self.position_right_half();
+        }
+
+        #[unsafe(method(windowTopHalf:))]
+        fn action_window_top_half(&self, _sender: Option<&objc2::runtime::AnyObject>) {
+            self.position_top_half();
+        }
+
+        #[unsafe(method(windowBottomHalf:))]
+        fn action_window_bottom_half(&self, _sender: Option<&objc2::runtime::AnyObject>) {
+            self.position_bottom_half();
+        }
+
+        #[unsafe(method(windowTopLeftQuarter:))]
+        fn action_window_top_left_quarter(&self, _sender: Option<&objc2::runtime::AnyObject>) {
+            self.position_top_left_quarter();
+        }
+
+        #[unsafe(method(windowTopRightQuarter:))]
+        fn action_window_top_right_quarter(&self, _sender: Option<&objc2::runtime::AnyObject>) {
+            self.position_top_right_quarter();
+        }
+
+        #[unsafe(method(windowBottomLeftQuarter:))]
+        fn action_window_bottom_left_quarter(&self, _sender: Option<&objc2::runtime::AnyObject>) {
+            self.position_bottom_left_quarter();
+        }
+
+        #[unsafe(method(windowBottomRightQuarter:))]
+        fn action_window_bottom_right_quarter(&self, _sender: Option<&objc2::runtime::AnyObject>) {
+            self.position_bottom_right_quarter();
+        }
     }
 );
 
@@ -843,5 +894,110 @@ impl CtermWindow {
 
         let response = alert.runModal();
         response == NSAlertFirstButtonReturn
+    }
+
+    // Window positioning methods
+
+    /// Get the visible frame of the screen (excluding menu bar and dock)
+    fn screen_visible_frame(&self) -> NSRect {
+        if let Some(screen) = self.screen() {
+            screen.visibleFrame()
+        } else {
+            NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(800.0, 600.0))
+        }
+    }
+
+    /// Fill the screen (like maximize but respects menu bar and dock)
+    fn position_fill(&self) {
+        let frame = self.screen_visible_frame();
+        self.setFrame_display(frame, true);
+    }
+
+    /// Center the window on screen
+    fn position_center(&self) {
+        self.center();
+    }
+
+    /// Position window to left half of screen
+    fn position_left_half(&self) {
+        let screen = self.screen_visible_frame();
+        let frame = NSRect::new(
+            NSPoint::new(screen.origin.x, screen.origin.y),
+            NSSize::new(screen.size.width / 2.0, screen.size.height),
+        );
+        self.setFrame_display(frame, true);
+    }
+
+    /// Position window to right half of screen
+    fn position_right_half(&self) {
+        let screen = self.screen_visible_frame();
+        let frame = NSRect::new(
+            NSPoint::new(screen.origin.x + screen.size.width / 2.0, screen.origin.y),
+            NSSize::new(screen.size.width / 2.0, screen.size.height),
+        );
+        self.setFrame_display(frame, true);
+    }
+
+    /// Position window to top half of screen
+    fn position_top_half(&self) {
+        let screen = self.screen_visible_frame();
+        let frame = NSRect::new(
+            NSPoint::new(screen.origin.x, screen.origin.y + screen.size.height / 2.0),
+            NSSize::new(screen.size.width, screen.size.height / 2.0),
+        );
+        self.setFrame_display(frame, true);
+    }
+
+    /// Position window to bottom half of screen
+    fn position_bottom_half(&self) {
+        let screen = self.screen_visible_frame();
+        let frame = NSRect::new(
+            NSPoint::new(screen.origin.x, screen.origin.y),
+            NSSize::new(screen.size.width, screen.size.height / 2.0),
+        );
+        self.setFrame_display(frame, true);
+    }
+
+    /// Position window to top-left quarter of screen
+    fn position_top_left_quarter(&self) {
+        let screen = self.screen_visible_frame();
+        let frame = NSRect::new(
+            NSPoint::new(screen.origin.x, screen.origin.y + screen.size.height / 2.0),
+            NSSize::new(screen.size.width / 2.0, screen.size.height / 2.0),
+        );
+        self.setFrame_display(frame, true);
+    }
+
+    /// Position window to top-right quarter of screen
+    fn position_top_right_quarter(&self) {
+        let screen = self.screen_visible_frame();
+        let frame = NSRect::new(
+            NSPoint::new(
+                screen.origin.x + screen.size.width / 2.0,
+                screen.origin.y + screen.size.height / 2.0,
+            ),
+            NSSize::new(screen.size.width / 2.0, screen.size.height / 2.0),
+        );
+        self.setFrame_display(frame, true);
+    }
+
+    /// Position window to bottom-left quarter of screen
+    fn position_bottom_left_quarter(&self) {
+        let screen = self.screen_visible_frame();
+        let frame = NSRect::new(
+            NSPoint::new(screen.origin.x, screen.origin.y),
+            NSSize::new(screen.size.width / 2.0, screen.size.height / 2.0),
+        );
+        self.setFrame_display(frame, true);
+    }
+
+    /// Position window to bottom-right quarter of screen
+    fn position_bottom_right_quarter(&self) {
+        let screen = self.screen_visible_frame();
+        let frame = NSRect::new(
+            NSPoint::new(screen.origin.x + screen.size.width / 2.0, screen.origin.y),
+            NSSize::new(screen.size.width / 2.0, screen.size.height / 2.0),
+        );
+        self.setFrame_display(frame, true);
     }
 }

@@ -502,21 +502,107 @@ fn create_window_menu(mtm: MainThreadMarker) -> Retained<NSMenuItem> {
 
     menu.addItem(&NSMenuItem::separatorItem(mtm));
 
-    // Tab navigation
+    // Window positioning
+    menu.addItem(&create_menu_item_with_key(
+        mtm,
+        "Fill",
+        Some(sel!(windowFill:)),
+        "f",
+        NSEventModifierFlags::Control.union(NSEventModifierFlags::Command),
+    ));
+
+    menu.addItem(&create_menu_item_with_key(
+        mtm,
+        "Center",
+        Some(sel!(windowCenter:)),
+        "c",
+        NSEventModifierFlags::Control.union(NSEventModifierFlags::Command),
+    ));
+
+    // Move & Resize submenu
+    let move_resize_menu = NSMenu::new(mtm);
+    move_resize_menu.setTitle(&NSString::from_str("Move & Resize"));
+
+    // Halves
+    move_resize_menu.addItem(&create_menu_item_with_key(
+        mtm,
+        "Left Half",
+        Some(sel!(windowLeftHalf:)),
+        "\u{f702}", // Left arrow
+        NSEventModifierFlags::Control.union(NSEventModifierFlags::Option),
+    ));
+    move_resize_menu.addItem(&create_menu_item_with_key(
+        mtm,
+        "Right Half",
+        Some(sel!(windowRightHalf:)),
+        "\u{f703}", // Right arrow
+        NSEventModifierFlags::Control.union(NSEventModifierFlags::Option),
+    ));
+    move_resize_menu.addItem(&create_menu_item_with_key(
+        mtm,
+        "Top Half",
+        Some(sel!(windowTopHalf:)),
+        "\u{f700}", // Up arrow
+        NSEventModifierFlags::Control.union(NSEventModifierFlags::Option),
+    ));
+    move_resize_menu.addItem(&create_menu_item_with_key(
+        mtm,
+        "Bottom Half",
+        Some(sel!(windowBottomHalf:)),
+        "\u{f701}", // Down arrow
+        NSEventModifierFlags::Control.union(NSEventModifierFlags::Option),
+    ));
+
+    move_resize_menu.addItem(&NSMenuItem::separatorItem(mtm));
+
+    // Quarters
+    move_resize_menu.addItem(&create_menu_item(
+        mtm,
+        "Top Left Quarter",
+        Some(sel!(windowTopLeftQuarter:)),
+        "",
+    ));
+    move_resize_menu.addItem(&create_menu_item(
+        mtm,
+        "Top Right Quarter",
+        Some(sel!(windowTopRightQuarter:)),
+        "",
+    ));
+    move_resize_menu.addItem(&create_menu_item(
+        mtm,
+        "Bottom Left Quarter",
+        Some(sel!(windowBottomLeftQuarter:)),
+        "",
+    ));
+    move_resize_menu.addItem(&create_menu_item(
+        mtm,
+        "Bottom Right Quarter",
+        Some(sel!(windowBottomRightQuarter:)),
+        "",
+    ));
+
+    let move_resize_item = NSMenuItem::new(mtm);
+    move_resize_item.setTitle(&NSString::from_str("Move & Resize"));
+    move_resize_item.setSubmenu(Some(&move_resize_menu));
+    menu.addItem(&move_resize_item);
+
+    menu.addItem(&NSMenuItem::separatorItem(mtm));
+
+    // Tab navigation (Ctrl+Tab and Ctrl+Shift+Tab)
     menu.addItem(&create_menu_item_with_key(
         mtm,
         "Show Previous Tab",
         Some(sel!(previousTab:)),
-        "[",
-        NSEventModifierFlags::Command.union(NSEventModifierFlags::Shift),
+        "\t", // Tab character
+        NSEventModifierFlags::Control.union(NSEventModifierFlags::Shift),
     ));
 
     menu.addItem(&create_menu_item_with_key(
         mtm,
         "Show Next Tab",
         Some(sel!(nextTab:)),
-        "]",
-        NSEventModifierFlags::Command.union(NSEventModifierFlags::Shift),
+        "\t", // Tab character
+        NSEventModifierFlags::Control,
     ));
 
     menu.addItem(&NSMenuItem::separatorItem(mtm));
