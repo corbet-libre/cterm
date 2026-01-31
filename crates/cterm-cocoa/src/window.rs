@@ -568,7 +568,8 @@ impl CtermWindow {
     pub fn close_current_tab(&self) {
         // With native tabbing, just close the window
         // macOS will handle showing the next tab
-        self.close();
+        // Use performClose to trigger windowShouldClose: delegate method
+        self.performClose(None);
     }
 
     /// Get config reference

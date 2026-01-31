@@ -592,7 +592,7 @@ fn create_window_menu(mtm: MainThreadMarker) -> Retained<NSMenuItem> {
     menu.addItem(&create_menu_item_with_key(
         mtm,
         "Show Previous Tab",
-        Some(sel!(previousTab:)),
+        Some(sel!(selectPreviousTab:)),
         "\t", // Tab character
         NSEventModifierFlags::Control.union(NSEventModifierFlags::Shift),
     ));
@@ -600,7 +600,7 @@ fn create_window_menu(mtm: MainThreadMarker) -> Retained<NSMenuItem> {
     menu.addItem(&create_menu_item_with_key(
         mtm,
         "Show Next Tab",
-        Some(sel!(nextTab:)),
+        Some(sel!(selectNextTab:)),
         "\t", // Tab character
         NSEventModifierFlags::Control,
     ));

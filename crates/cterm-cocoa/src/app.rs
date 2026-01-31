@@ -504,7 +504,8 @@ define_class!(
                         .collect();
 
                     for window in windows_to_close {
-                        window.close();
+                        // Use performClose to trigger windowShouldClose: for process check
+                        window.performClose(None);
                     }
                     log::info!("Closed other tabs");
                 }
