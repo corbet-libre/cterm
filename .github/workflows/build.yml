@@ -109,7 +109,10 @@ jobs:
             libpango1.0-dev \
             libcairo2-dev \
             libglib2.0-dev \
-            protobuf-compiler
+            protobuf-compiler \
+            xvfb \
+            xdotool \
+            imagemagick
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
@@ -125,6 +128,27 @@ jobs:
 
       - name: Run ctermd integration tests
         run: cargo test -p cterm-headless --test grpc_integration -- --test-threads=1
+
+      - name: Build cterm for UI tests
+        run: cargo build -p cterm
+
+      - name: Run UI automation test
+        run: |
+          export DISPLAY=:99
+          Xvfb :99 -screen 0 1280x1024x24 &
+          sleep 2
+          OUTPUT_DIR="${{ runner.temp }}/cterm_ui_test"
+          chmod +x scripts/linux_ui_test.sh
+          ./scripts/linux_ui_test.sh target/debug/cterm "$OUTPUT_DIR" || true
+        timeout-minutes: 5
+
+      - name: Upload UI test artifacts
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: linux-ui-test-results
+          path: ${{ runner.temp }}/cterm_ui_test/
+          if-no-files-found: ignore
 
   test-macos:
     name: Test (macOS)
@@ -150,6 +174,25 @@ jobs:
 
       - name: Run ctermd integration tests
         run: cargo test -p cterm-headless --test grpc_integration -- --test-threads=1
+
+      - name: Build cterm for UI tests
+        run: cargo build -p cterm
+
+      - name: Run UI automation test
+        run: |
+          OUTPUT_DIR="${{ runner.temp }}/cterm_ui_test"
+          chmod +x scripts/macos_ui_test.sh
+          ./scripts/macos_ui_test.sh target/debug/cterm "$OUTPUT_DIR" || true
+        timeout-minutes: 5
+        continue-on-error: true
+
+      - name: Upload UI test artifacts
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: macos-ui-test-results
+          path: ${{ runner.temp }}/cterm_ui_test/
+          if-no-files-found: ignore
 
   build-linux:
     name: Build Linux (Ubuntu 22.04)
