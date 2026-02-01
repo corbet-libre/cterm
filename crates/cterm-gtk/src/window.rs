@@ -28,6 +28,8 @@ struct TabEntry {
     id: u64,
     title: String,
     terminal: TerminalWidget,
+    /// Whether title was explicitly set (locks out OSC updates)
+    title_locked: bool,
 }
 
 /// Main window container
@@ -425,6 +427,7 @@ impl CtermWindow {
                         let mut tabs = tabs_clone.borrow_mut();
                         if let Some(tab) = tabs.get_mut(page_idx as usize) {
                             tab.title = new_title.clone();
+                            tab.title_locked = true; // Lock title so OSC won't override
                             tab_bar_clone.set_title(tab.id, &new_title);
                         }
                     }
@@ -1582,6 +1585,19 @@ fn create_new_tab(
 ) {
     // Create terminal widget with inherited cwd
     let cfg = config.borrow();
+
+    // Get shell basename for initial title
+    let shell = cfg
+        .general
+        .default_shell
+        .clone()
+        .unwrap_or_else(|| std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string()));
+    let initial_title = std::path::Path::new(&shell)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("Terminal")
+        .to_string();
+
     let terminal = match TerminalWidget::new_with_cwd(&cfg, theme, cwd) {
         Ok(t) => t,
         Err(e) => {
@@ -1601,8 +1617,8 @@ fn create_new_tab(
     // Add to notebook
     let page_num = notebook.append_page(terminal.widget(), None::<&gtk4::Widget>);
 
-    // Add to tab bar
-    tab_bar.add_tab(tab_id, "Terminal");
+    // Add to tab bar with shell basename
+    tab_bar.add_tab(tab_id, &initial_title);
 
     // Set up close callback (with confirmation for running processes)
     let notebook_close = notebook.clone();
@@ -1693,6 +1709,16 @@ fn create_new_tab(
     let notebook_title = notebook.clone();
     let has_bell_title = Rc::clone(has_bell);
     terminal.set_on_title_change(move |title| {
+        // Check if title is locked (user-set or template)
+        {
+            let tabs = tabs_title.borrow();
+            if let Some(entry) = tabs.iter().find(|t| t.id == tab_id) {
+                if entry.title_locked {
+                    return; // Don't update locked titles
+                }
+            }
+        }
+
         // Update tab bar
         tab_bar_title.set_title(tab_id, title);
 
@@ -1756,11 +1782,12 @@ fn create_new_tab(
         }
     });
 
-    // Store terminal with its ID
+    // Store terminal with its ID (initial_title from shell basename)
     tabs.borrow_mut().push(TabEntry {
         id: tab_id,
-        title: "Terminal".to_string(),
+        title: initial_title,
         terminal,
+        title_locked: false,
     });
 
     // Update tab bar visibility (show if >1 tabs)
@@ -1907,6 +1934,16 @@ fn create_docker_tab(
     let notebook_title = notebook.clone();
     let has_bell_title = Rc::clone(has_bell);
     terminal.set_on_title_change(move |title| {
+        // Check if title is locked (user-set or template)
+        {
+            let tabs = tabs_title.borrow();
+            if let Some(entry) = tabs.iter().find(|t| t.id == tab_id) {
+                if entry.title_locked {
+                    return; // Don't update locked titles
+                }
+            }
+        }
+
         // Update tab bar
         tab_bar_title.set_title(tab_id, title);
 
@@ -1976,6 +2013,7 @@ fn create_docker_tab(
         id: tab_id,
         title: title_string,
         terminal,
+        title_locked: false,
     });
 
     // Update tab bar visibility
@@ -2125,9 +2163,19 @@ fn create_tab_from_template(
         }
     });
 
-    // Set up title change callback
+    // Set up title change callback (templates have locked titles, so this won't trigger)
     let tab_bar_title = tab_bar.clone();
+    let tabs_title = Rc::clone(tabs);
     terminal.set_on_title_change(move |title| {
+        // Check if title is locked (template tabs are locked)
+        {
+            let tabs = tabs_title.borrow();
+            if let Some(entry) = tabs.iter().find(|t| t.id == tab_id) {
+                if entry.title_locked {
+                    return; // Don't update locked titles
+                }
+            }
+        }
         tab_bar_title.set_title(tab_id, title);
     });
 
@@ -2173,6 +2221,7 @@ fn create_tab_from_template(
         id: tab_id,
         title: template.name.clone(),
         terminal,
+        title_locked: true, // Template name is preferred over OSC updates
     });
 
     // Update tab bar visibility

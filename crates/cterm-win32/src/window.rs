@@ -46,6 +46,8 @@ pub struct TabEntry {
     pub terminal: Arc<Mutex<Terminal>>,
     pub color: Option<String>,
     pub has_bell: bool,
+    /// Whether title was explicitly set (locks out OSC updates)
+    pub title_locked: bool,
     #[allow(dead_code)]
     reader_handle: Option<thread::JoinHandle<()>>,
 }
@@ -148,23 +150,37 @@ impl WindowState {
         let terminal = Terminal::with_shell(cols, rows, screen_config, &pty_config)?;
         let terminal = Arc::new(Mutex::new(terminal));
 
+        // Get shell basename for initial title
+        let shell = self
+            .config
+            .general
+            .default_shell
+            .clone()
+            .unwrap_or_else(|| std::env::var("COMSPEC").unwrap_or_else(|_| "cmd.exe".to_string()));
+        let initial_title = std::path::Path::new(&shell)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("Terminal")
+            .to_string();
+
         // Start PTY reader thread
         let reader_handle = self.start_pty_reader(tab_id, Arc::clone(&terminal));
 
         let entry = TabEntry {
             id: tab_id,
-            title: "Terminal".to_string(),
+            title: initial_title.clone(),
             terminal,
             color: None,
             has_bell: false,
+            title_locked: false,
             reader_handle: Some(reader_handle),
         };
 
         self.tabs.push(entry);
         self.active_tab_index = self.tabs.len() - 1;
 
-        // Update tab bar
-        self.tab_bar.add_tab(tab_id, "Terminal");
+        // Update tab bar with shell basename
+        self.tab_bar.add_tab(tab_id, &initial_title);
         self.tab_bar.set_active(tab_id);
 
         Ok(tab_id)
@@ -706,6 +722,7 @@ impl WindowState {
                 let tab_id = tab.id;
                 if let Some(tab) = self.tabs.iter_mut().find(|t| t.id == tab_id) {
                     tab.title = new_title.clone();
+                    tab.title_locked = true;
                     self.tab_bar.set_title(tab_id, &new_title);
                     self.invalidate();
                 }
@@ -948,6 +965,27 @@ impl WindowState {
         if let Some(tab) = self.tabs.iter_mut().find(|t| t.id == tab_id) {
             tab.has_bell = true;
             self.tab_bar.set_bell(tab_id, true);
+        }
+    }
+
+    /// Handle title change from terminal
+    pub fn on_title_changed(&mut self, tab_id: u64) {
+        if let Some(tab) = self.tabs.iter_mut().find(|t| t.id == tab_id) {
+            // Don't update if title is locked (user-set or template)
+            if tab.title_locked {
+                return;
+            }
+
+            // Get title from terminal's screen
+            let new_title = {
+                let term = tab.terminal.lock().unwrap();
+                term.screen().title.clone()
+            };
+
+            if !new_title.is_empty() {
+                tab.title = new_title.clone();
+                self.tab_bar.set_title(tab_id, &new_title);
+            }
         }
     }
 
@@ -1325,6 +1363,12 @@ extern "system" fn window_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPA
         WM_APP_BELL => {
             let tab_id = wparam.0 as u64;
             state.on_bell(tab_id);
+            LRESULT(0)
+        }
+
+        WM_APP_TITLE_CHANGED => {
+            let tab_id = wparam.0 as u64;
+            state.on_title_changed(tab_id);
             LRESULT(0)
         }
 
