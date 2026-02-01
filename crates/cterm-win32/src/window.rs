@@ -414,13 +414,13 @@ impl WindowState {
     }
 
     /// Check if any tab has a running foreground process
+    ///
+    /// Note: On Windows, process monitoring is not yet implemented,
+    /// so this always returns false.
     pub fn has_running_process(&self) -> bool {
-        self.tabs.iter().any(|tab| {
-            tab.terminal
-                .lock()
-                .map(|t| t.has_foreground_process())
-                .unwrap_or(false)
-        })
+        // Windows doesn't have foreground process detection yet
+        // TODO: Implement Windows process monitoring
+        false
     }
 
     /// Check if we should confirm before closing
