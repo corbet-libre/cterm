@@ -225,6 +225,9 @@ impl Ord for SelectionPoint {
 pub struct Selection {
     /// Starting point of selection (where mouse was pressed)
     pub anchor: SelectionPoint,
+    /// End of original anchor region (for word/line mode, the originally selected word/line end)
+    /// This ensures the original word/line stays selected when extending in either direction
+    pub anchor_end: Option<SelectionPoint>,
     /// Current end point of selection (where mouse is now)
     pub end: SelectionPoint,
     /// Selection type (char, word, line)
@@ -250,7 +253,22 @@ impl Selection {
     pub fn new(point: SelectionPoint, mode: SelectionMode) -> Self {
         Self {
             anchor: point,
+            anchor_end: None,
             end: point,
+            mode,
+        }
+    }
+
+    /// Create a new selection with an anchor range (for word/line modes)
+    pub fn new_with_range(
+        anchor_start: SelectionPoint,
+        anchor_end: SelectionPoint,
+        mode: SelectionMode,
+    ) -> Self {
+        Self {
+            anchor: anchor_start,
+            anchor_end: Some(anchor_end),
+            end: anchor_end,
             mode,
         }
     }
@@ -1605,15 +1623,15 @@ impl Screen {
             }
             SelectionMode::Word => {
                 let (start_col, end_col) = self.find_word_bounds(line, col);
-                let anchor = SelectionPoint::new(line, start_col);
-                let end = SelectionPoint::new(line, end_col);
-                self.selection = Some(Selection { anchor, end, mode });
+                let anchor_start = SelectionPoint::new(line, start_col);
+                let anchor_end = SelectionPoint::new(line, end_col);
+                self.selection = Some(Selection::new_with_range(anchor_start, anchor_end, mode));
             }
             SelectionMode::Line => {
                 // Select entire line (use large end column to select to end of line)
-                let anchor = SelectionPoint::new(line, 0);
-                let end = SelectionPoint::new(line, usize::MAX);
-                self.selection = Some(Selection { anchor, end, mode });
+                let anchor_start = SelectionPoint::new(line, 0);
+                let anchor_end = SelectionPoint::new(line, usize::MAX);
+                self.selection = Some(Selection::new_with_range(anchor_start, anchor_end, mode));
             }
         }
         self.dirty = true;
@@ -1622,10 +1640,13 @@ impl Screen {
     /// Extend the current selection to the given absolute line and column
     pub fn extend_selection(&mut self, line: usize, col: usize) {
         // Extract mode and anchor info before mutating
-        let (mode, anchor_line, anchor_col) = match &self.selection {
-            Some(s) => (s.mode, s.anchor.line, s.anchor.col),
+        let (mode, anchor_start, anchor_end_opt) = match &self.selection {
+            Some(s) => (s.mode, s.anchor, s.anchor_end),
             None => return,
         };
+
+        // Get the effective anchor end (same as anchor start for char/block modes)
+        let anchor_end = anchor_end_opt.unwrap_or(anchor_start);
 
         match mode {
             SelectionMode::Char | SelectionMode::Block => {
@@ -1634,27 +1655,42 @@ impl Screen {
                 }
             }
             SelectionMode::Word => {
-                // Find word bounds before mutating selection
+                // Find word bounds at current position
                 let (word_start, word_end) = self.find_word_bounds(line, col);
+                let current = SelectionPoint::new(line, col);
+
                 if let Some(ref mut selection) = self.selection {
-                    if line < anchor_line || (line == anchor_line && col < anchor_col) {
-                        // Extending backwards - use start of word
-                        selection.extend_to(SelectionPoint::new(line, word_start));
+                    if current.is_before(&anchor_start) {
+                        // Extending before the original word - select from new word start to original word end
+                        selection.anchor = anchor_end;
+                        selection.end = SelectionPoint::new(line, word_start);
+                    } else if anchor_end.is_before(&current)
+                        || (line == anchor_end.line && col > anchor_end.col)
+                    {
+                        // Extending after the original word - select from original word start to new word end
+                        selection.anchor = anchor_start;
+                        selection.end = SelectionPoint::new(line, word_end);
                     } else {
-                        // Extending forwards - use end of word
-                        selection.extend_to(SelectionPoint::new(line, word_end));
+                        // Within the original word - keep original selection
+                        selection.anchor = anchor_start;
+                        selection.end = anchor_end;
                     }
                 }
             }
             SelectionMode::Line => {
                 if let Some(ref mut selection) = self.selection {
-                    // Line mode extends to full lines
-                    if line < anchor_line {
-                        // Extending upward - start of new line to end of anchor line
+                    if line < anchor_start.line {
+                        // Extending upward - from new line start to original line end
+                        selection.anchor = anchor_end;
                         selection.end = SelectionPoint::new(line, 0);
-                    } else {
-                        // Extending downward - end of new line
+                    } else if line > anchor_end.line {
+                        // Extending downward - from original line start to new line end
+                        selection.anchor = anchor_start;
                         selection.end = SelectionPoint::new(line, usize::MAX);
+                    } else {
+                        // Within the original line - keep original selection
+                        selection.anchor = anchor_start;
+                        selection.end = anchor_end;
                     }
                 }
             }
