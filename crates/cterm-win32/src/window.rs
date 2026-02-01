@@ -69,6 +69,8 @@ pub struct WindowState {
     pub mouse_state: MouseState,
     #[allow(dead_code)]
     menu_handle: winapi::shared::windef::HMENU,
+    /// Skip close confirmation (set during relaunch)
+    pub skip_close_confirm: bool,
 }
 
 impl WindowState {
@@ -102,6 +104,7 @@ impl WindowState {
             dpi,
             mouse_state: MouseState::new(),
             menu_handle,
+            skip_close_confirm: false,
         }
     }
 
@@ -408,6 +411,28 @@ impl WindowState {
                 );
             }
         })
+    }
+
+    /// Check if any tab has a running foreground process
+    pub fn has_running_process(&self) -> bool {
+        self.tabs.iter().any(|tab| {
+            tab.terminal
+                .lock()
+                .map(|t| t.has_foreground_process())
+                .unwrap_or(false)
+        })
+    }
+
+    /// Check if we should confirm before closing
+    /// Returns true if confirmation is needed
+    pub fn should_confirm_close(&self) -> bool {
+        if self.skip_close_confirm {
+            return false;
+        }
+        if !self.config.general.confirm_close_with_running {
+            return false;
+        }
+        self.has_running_process()
     }
 
     /// Close a tab
@@ -813,6 +838,8 @@ impl WindowState {
                     if let Ok(exe) = std::env::current_exe() {
                         std::process::Command::new(exe).spawn().ok();
                     }
+                    // Skip close confirmation during relaunch
+                    self.skip_close_confirm = true;
                     unsafe {
                         let _ = PostMessageW(Some(self.hwnd), WM_CLOSE, WPARAM(0), LPARAM(0));
                     };
@@ -1504,6 +1531,26 @@ extern "system" fn window_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPA
         WM_KILLFOCUS => {
             // Send focus out event to terminal if DECSET 1004 is enabled
             state.send_focus_event(false);
+            LRESULT(0)
+        }
+
+        WM_CLOSE => {
+            // Check if we should confirm before closing
+            if state.should_confirm_close() {
+                // Show confirmation dialog
+                let confirmed = crate::dialogs::show_confirm(
+                    hwnd.0 as *mut _,
+                    "Close cterm?",
+                    "A process is still running. Are you sure you want to close?",
+                );
+                if !confirmed {
+                    return LRESULT(0); // User cancelled, don't close
+                }
+            }
+            // Proceed with closing
+            unsafe {
+                let _ = DestroyWindow(hwnd);
+            }
             LRESULT(0)
         }
 

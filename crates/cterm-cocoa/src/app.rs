@@ -140,6 +140,8 @@ pub struct AppDelegateIvars {
     /// Hash of last saved crash state (to avoid redundant writes)
     #[cfg(unix)]
     last_state_hash: std::cell::Cell<u64>,
+    /// Set to true during relaunch to skip close confirmation
+    is_relaunching: std::cell::Cell<bool>,
 }
 
 define_class!(
@@ -348,6 +350,11 @@ define_class!(
             _sender: &NSApplication,
         ) -> objc2_app_kit::NSApplicationTerminateReply {
             use objc2_app_kit::{NSAlert, NSAlertFirstButtonReturn, NSAlertStyle, NSApplicationTerminateReply};
+
+            // Skip confirmation during relaunch
+            if self.ivars().is_relaunching.get() {
+                return NSApplicationTerminateReply::TerminateNow;
+            }
 
             // Check if config says to confirm close with running processes
             if !self.ivars().config.general.confirm_close_with_running {
@@ -675,6 +682,7 @@ impl AppDelegate {
             windows: std::cell::RefCell::new(Vec::new()),
             #[cfg(unix)]
             last_state_hash: std::cell::Cell::new(0),
+            is_relaunching: std::cell::Cell::new(false),
         });
         unsafe { msg_send![super(this), init] }
     }
@@ -1083,6 +1091,8 @@ impl AppDelegate {
         match execute_upgrade(&binary, &upgrade_state, &fds) {
             Ok(()) => {
                 log::info!("Relaunch successful, terminating old process");
+                // Mark as relaunching to skip close confirmation
+                self.ivars().is_relaunching.set(true);
                 // Terminate this process - the new one has taken over
                 let mtm = MainThreadMarker::from(self);
                 let app = NSApplication::sharedApplication(mtm);
