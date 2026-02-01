@@ -21,6 +21,7 @@ use cterm_app::upgrade::{
     execute_upgrade, TabUpgradeState, TerminalUpgradeState, UpgradeState, WindowUpgradeState,
 };
 use cterm_core::screen::{ScreenConfig, SelectionMode};
+use cterm_core::term::TerminalEvent;
 use cterm_core::{Pty, PtyConfig, PtySize, Terminal};
 use cterm_ui::theme::Theme;
 
@@ -36,6 +37,10 @@ struct ViewState {
     pty_closed: AtomicBool,
     /// Set when the view is being deallocated - threads should stop
     view_invalid: AtomicBool,
+    /// Current terminal title (updated from PTY thread)
+    title: std::sync::RwLock<String>,
+    /// Flag indicating title has changed and needs UI update
+    title_changed: AtomicBool,
 }
 
 /// Terminal view state
@@ -1202,6 +1207,8 @@ impl TerminalView {
             needs_redraw: AtomicBool::new(false),
             pty_closed: AtomicBool::new(false),
             view_invalid: AtomicBool::new(false),
+            title: std::sync::RwLock::new(String::new()),
+            title_changed: AtomicBool::new(false),
         });
 
         // Initial frame
@@ -1277,6 +1284,8 @@ impl TerminalView {
             needs_redraw: AtomicBool::new(false),
             pty_closed: AtomicBool::new(false),
             view_invalid: AtomicBool::new(false),
+            title: std::sync::RwLock::new(String::new()),
+            title_changed: AtomicBool::new(false),
         });
 
         // Initial frame
@@ -1350,6 +1359,8 @@ impl TerminalView {
             needs_redraw: AtomicBool::new(false),
             pty_closed: AtomicBool::new(false),
             view_invalid: AtomicBool::new(false),
+            title: std::sync::RwLock::new(String::new()),
+            title_changed: AtomicBool::new(false),
         });
 
         // Initial frame
@@ -1432,6 +1443,8 @@ impl TerminalView {
             needs_redraw: AtomicBool::new(false),
             pty_closed: AtomicBool::new(false),
             view_invalid: AtomicBool::new(false),
+            title: std::sync::RwLock::new(String::new()),
+            title_changed: AtomicBool::new(false),
         });
 
         // Initial frame
@@ -1540,6 +1553,8 @@ impl TerminalView {
             needs_redraw: AtomicBool::new(false),
             pty_closed: AtomicBool::new(false),
             view_invalid: AtomicBool::new(false),
+            title: std::sync::RwLock::new(String::new()),
+            title_changed: AtomicBool::new(false),
         });
 
         // Initial frame
@@ -1645,6 +1660,26 @@ impl TerminalView {
                     break;
                 }
 
+                // Check for title change
+                if state.title_changed.swap(false, Ordering::Relaxed) {
+                    // Only dispatch if view is still valid
+                    if !state.view_invalid.load(Ordering::SeqCst) {
+                        // Get the new title
+                        let new_title = state.title.read().map(|t| t.clone()).unwrap_or_default();
+                        #[allow(deprecated)]
+                        dispatch2::Queue::main().exec_async(move || {
+                            if view_ptr != 0 {
+                                unsafe {
+                                    let view = &*(view_ptr as *const TerminalView);
+                                    if let Some(window) = view.window() {
+                                        window.setTitle(&NSString::from_str(&new_title));
+                                    }
+                                }
+                            }
+                        });
+                    }
+                }
+
                 // Check for redraw
                 if state.needs_redraw.swap(false, Ordering::Relaxed) {
                     // Only dispatch if view is still valid
@@ -1694,6 +1729,24 @@ impl TerminalView {
         match Pty::new(&pty_config) {
             Ok(pty) => {
                 log::info!("Spawned shell: {}", shell);
+
+                // Get shell basename for initial title
+                let shell_name = std::path::Path::new(&shell)
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("Terminal")
+                    .to_string();
+
+                // Set initial title to shell name
+                {
+                    let mut term = terminal.lock();
+                    term.screen_mut().title = shell_name.clone();
+                }
+
+                // Update window title to shell name
+                if let Some(window) = self.window() {
+                    window.setTitle(&NSString::from_str(&shell_name));
+                }
 
                 // Start reading from PTY in background
                 let pty_fd = pty.raw_fd();
@@ -1760,6 +1813,20 @@ impl TerminalView {
                     template.name
                 );
 
+                // Use template name as initial title
+                let initial_title = template.name.clone();
+
+                // Set initial title
+                {
+                    let mut term = terminal.lock();
+                    term.screen_mut().title = initial_title.clone();
+                }
+
+                // Update window title
+                if let Some(window) = self.window() {
+                    window.setTitle(&NSString::from_str(&initial_title));
+                }
+
                 // Start reading from PTY in background
                 let pty_fd = pty.raw_fd();
 
@@ -1802,7 +1869,19 @@ impl TerminalView {
                 }
                 Ok(n) => {
                     let mut term = terminal.lock();
-                    term.process(&buf[..n]);
+                    let events = term.process(&buf[..n]);
+
+                    // Check for title change event
+                    for event in events {
+                        if let TerminalEvent::TitleChanged(ref title) = event {
+                            // Update stored title
+                            if let Ok(mut current_title) = state.title.write() {
+                                *current_title = title.clone();
+                            }
+                            state.title_changed.store(true, Ordering::Relaxed);
+                        }
+                    }
+
                     drop(term);
 
                     // Signal that we need a redraw

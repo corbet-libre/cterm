@@ -285,8 +285,8 @@ impl CtermWindow {
             ]
         };
 
-        // Set window title
-        this.setTitle(&NSString::from_str("cterm"));
+        // Set initial window title (will be updated when shell spawns)
+        this.setTitle(&NSString::from_str("Terminal"));
 
         // Set minimum size
         this.setMinSize(NSSize::new(400.0, 200.0));
@@ -354,8 +354,8 @@ impl CtermWindow {
             ]
         };
 
-        // Set window title
-        this.setTitle(&NSString::from_str("cterm"));
+        // Set initial window title (will be updated when shell spawns)
+        this.setTitle(&NSString::from_str("Terminal"));
 
         // Set minimum size
         this.setMinSize(NSSize::new(400.0, 200.0));
@@ -502,8 +502,8 @@ impl CtermWindow {
             ]
         };
 
-        // Set window title for recovered terminal
-        this.setTitle(&NSString::from_str("cterm"));
+        // Set window title for recovered terminal (will be updated from saved state)
+        this.setTitle(&NSString::from_str("Terminal"));
 
         // Set minimum size
         this.setMinSize(NSSize::new(400.0, 200.0));
