@@ -989,7 +989,7 @@ impl CtermWindow {
                             return glib::Propagation::Stop;
                         }
                         Action::CloseTab => {
-                            close_current_tab(&notebook, &tabs, &tab_bar, &window);
+                            close_current_tab(&notebook, &tabs, &tab_bar, &window, &config);
                             return glib::Propagation::Stop;
                         }
                         Action::NextTab => {
@@ -2289,13 +2289,14 @@ fn request_close_tab_by_id(
         let tabs = Rc::clone(tabs);
         let tab_bar = tab_bar.clone();
         let window = window.clone();
+        let window_for_closure = window.clone();
 
         dialogs::show_close_confirmation_dialog(
             &window,
             vec![(tab_title, process_name)],
             move |confirmed| {
                 if confirmed {
-                    close_tab_by_id(&notebook, &tabs, &tab_bar, &window, id);
+                    close_tab_by_id(&notebook, &tabs, &tab_bar, &window_for_closure, id);
                 }
             },
         );
