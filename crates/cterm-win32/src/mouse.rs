@@ -95,6 +95,7 @@ impl MouseState {
         // Return initial selection
         Some(Selection {
             anchor: point,
+            anchor_end: None,
             end: point,
             mode: self.mode,
         })
@@ -118,6 +119,7 @@ impl MouseState {
 
         self.start.map(|anchor| Selection {
             anchor,
+            anchor_end: None,
             end: point,
             mode: self.mode,
         })
@@ -143,6 +145,7 @@ impl MouseState {
 
         self.start.map(|anchor| Selection {
             anchor,
+            anchor_end: None,
             end: point,
             mode: self.mode,
         })
@@ -166,6 +169,7 @@ impl MouseState {
         match (self.start, self.current) {
             (Some(anchor), Some(end)) => Some(Selection {
                 anchor,
+                anchor_end: None,
                 end,
                 mode: self.mode,
             }),
