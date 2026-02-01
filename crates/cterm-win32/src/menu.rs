@@ -16,6 +16,7 @@ pub enum MenuAction {
     // File menu
     NewTab = 1001,
     NewWindow = 1002,
+    QuickOpen = 1007,
     CloseTab = 1003,
     CloseOtherTabs = 1004,
     DockerPicker = 1005,
@@ -75,6 +76,7 @@ impl MenuAction {
         match id {
             1001 => Some(Self::NewTab),
             1002 => Some(Self::NewWindow),
+            1007 => Some(Self::QuickOpen),
             1003 => Some(Self::CloseTab),
             1004 => Some(Self::CloseOtherTabs),
             1005 => Some(Self::DockerPicker),
@@ -138,6 +140,7 @@ pub fn create_menu_bar(show_debug: bool) -> HMENU {
         let file_menu = CreatePopupMenu();
         append_menu_item(file_menu, MenuAction::NewTab, "&New Tab\tCtrl+T");
         append_menu_item(file_menu, MenuAction::NewWindow, "New &Window\tCtrl+N");
+        append_menu_item(file_menu, MenuAction::QuickOpen, "&Quick Open\tCtrl+G");
         append_separator(file_menu);
         append_menu_item(file_menu, MenuAction::CloseTab, "&Close Tab\tCtrl+W");
         append_menu_item(file_menu, MenuAction::CloseOtherTabs, "Close &Other Tabs");
@@ -308,6 +311,11 @@ pub fn get_accelerators() -> Vec<Accelerator> {
         Accelerator {
             action: MenuAction::NewWindow,
             key: 'N' as u16,
+            modifiers: AcceleratorModifiers::CTRL,
+        },
+        Accelerator {
+            action: MenuAction::QuickOpen,
+            key: 'G' as u16,
             modifiers: AcceleratorModifiers::CTRL,
         },
         Accelerator {

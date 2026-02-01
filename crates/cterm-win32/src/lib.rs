@@ -17,10 +17,12 @@ pub mod menu;
 pub mod mouse;
 pub mod notification_bar;
 pub mod preferences_dialog;
+pub mod quick_open;
 pub mod tab_bar;
 pub mod templates_dialog;
 pub mod terminal_canvas;
 pub mod update_dialog;
+pub mod upgrade_receiver;
 pub mod window;
 
 use clap::Parser;
@@ -58,6 +60,10 @@ pub struct Args {
     #[arg(short = 't', long = "title")]
     pub title: Option<String>,
 
+    /// Receive upgrade state from parent process via inherited handle (internal use)
+    #[arg(long, hide = true)]
+    pub upgrade_receiver: Option<usize>,
+
     /// Disable watchdog supervision (run directly without crash recovery)
     #[arg(long)]
     pub no_watchdog: bool,
@@ -80,6 +86,13 @@ pub fn run() {
     cterm_app::log_capture::init();
 
     log::info!("Starting cterm (Windows native UI)");
+
+    // Check if we're in upgrade receiver mode
+    if let Some(handle) = args.upgrade_receiver {
+        log::info!("Running in upgrade receiver mode with handle {}", handle);
+        let exit_code = upgrade_receiver::run_receiver(handle);
+        std::process::exit(exit_code);
+    }
 
     // Store args for later access
     let _ = APP_ARGS.set(args);
@@ -184,9 +197,11 @@ mod tests {
             fullscreen: false,
             maximized: false,
             title: None,
+            upgrade_receiver: None,
             no_watchdog: false,
         };
         assert!(!args.fullscreen);
         assert!(!args.no_watchdog);
+        assert!(args.upgrade_receiver.is_none());
     }
 }

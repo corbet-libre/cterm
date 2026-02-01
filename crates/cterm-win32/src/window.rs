@@ -186,6 +186,117 @@ impl WindowState {
         Ok(tab_id)
     }
 
+    /// Create a new tab from a template
+    pub fn new_tab_from_template(
+        &mut self,
+        template: &cterm_app::config::StickyTabConfig,
+    ) -> Result<u64, Box<dyn std::error::Error>> {
+        let tab_id = self.next_tab_id.fetch_add(1, Ordering::SeqCst);
+
+        // Get terminal size
+        let (cols, rows) = self.terminal_size();
+
+        // Create terminal
+        let screen_config = ScreenConfig {
+            scrollback_lines: self.config.general.scrollback_lines,
+        };
+
+        // Build the shell command and args from the template
+        let (shell, args) = if let Some(ref cmd) = template.command {
+            // Use template command
+            (Some(cmd.clone()), template.args.clone())
+        } else if let Some(ref container) = template.docker_container {
+            // Docker exec into container
+            (
+                Some("docker".to_string()),
+                vec![
+                    "exec".to_string(),
+                    "-it".to_string(),
+                    container.clone(),
+                    template
+                        .docker_shell
+                        .clone()
+                        .unwrap_or_else(|| "/bin/sh".to_string()),
+                ],
+            )
+        } else if let Some(ref image) = template.docker_image {
+            // Docker run image
+            (
+                Some("docker".to_string()),
+                vec![
+                    "run".to_string(),
+                    "-it".to_string(),
+                    "--rm".to_string(),
+                    image.clone(),
+                ],
+            )
+        } else {
+            // Use default shell
+            (self.config.general.default_shell.clone(), Vec::new())
+        };
+
+        let pty_config = PtyConfig {
+            size: PtySize {
+                cols: cols as u16,
+                rows: rows as u16,
+                pixel_width: 0,
+                pixel_height: 0,
+            },
+            shell,
+            args,
+            cwd: template
+                .cwd
+                .clone()
+                .or_else(|| self.config.general.working_directory.clone()),
+            env: template
+                .env
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .chain(
+                    self.config
+                        .general
+                        .env
+                        .iter()
+                        .map(|(k, v)| (k.clone(), v.clone())),
+                )
+                .collect(),
+            term: self.config.general.term.clone(),
+        };
+
+        let terminal = Terminal::with_shell(cols, rows, screen_config, &pty_config)?;
+        let terminal = Arc::new(Mutex::new(terminal));
+
+        // Start PTY reader thread
+        let reader_handle = self.start_pty_reader(tab_id, Arc::clone(&terminal));
+
+        let entry = TabEntry {
+            id: tab_id,
+            title: template.name.clone(),
+            terminal,
+            color: template.color.clone(),
+            has_bell: false,
+            title_locked: true, // Lock title for template tabs
+            reader_handle: Some(reader_handle),
+        };
+
+        self.tabs.push(entry);
+        self.active_tab_index = self.tabs.len() - 1;
+
+        // Update tab bar
+        self.tab_bar.add_tab(tab_id, &template.name);
+        self.tab_bar.set_active(tab_id);
+
+        // Set tab color if specified
+        if let Some(ref color_hex) = template.color {
+            let rgb = parse_hex_color(color_hex);
+            self.tab_bar.set_color(tab_id, rgb);
+        }
+
+        self.invalidate();
+
+        Ok(tab_id)
+    }
+
     /// Start the PTY reader thread
     fn start_pty_reader(
         &self,
@@ -597,6 +708,16 @@ impl WindowState {
                         for id in ids {
                             self.close_tab(id);
                         }
+                    }
+                }
+                MenuAction::QuickOpen => {
+                    // Show Quick Open dialog
+                    let templates = cterm_app::get_templates();
+                    if let Some(template) = crate::quick_open::show_quick_open(self.hwnd, templates)
+                    {
+                        // Create a new tab with the selected template
+                        log::info!("Quick open selected: {}", template.name);
+                        self.new_tab_from_template(&template).ok();
                     }
                 }
                 MenuAction::DockerPicker => {
