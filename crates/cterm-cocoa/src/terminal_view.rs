@@ -1179,15 +1179,23 @@ impl TerminalView {
         // Create CoreGraphics renderer first to get cell dimensions
         let font_name = &config.appearance.font.family;
         let font_size = config.appearance.font.size;
+        log::info!("TerminalView::new: creating renderer");
         let renderer = CGRenderer::new(mtm, font_name, font_size, theme);
         let (cell_width, cell_height) = renderer.cell_size();
+        log::info!(
+            "TerminalView::new: got cell size {}x{}",
+            cell_width,
+            cell_height
+        );
 
         // Create terminal with default size (will resize later)
+        log::info!("TerminalView::new: creating Terminal");
         let mut terminal = Terminal::new(80, 24, ScreenConfig::default());
         // Set cell height hint for sixel image positioning
         terminal.screen_mut().set_cell_height_hint(cell_height);
         terminal.screen_mut().set_cell_width_hint(cell_width);
         let terminal = Arc::new(Mutex::new(terminal));
+        log::info!("TerminalView::new: Terminal created");
 
         // Create shared state for PTY thread communication
         let state = Arc::new(ViewState {
@@ -1200,6 +1208,7 @@ impl TerminalView {
         let frame = NSRect::new(NSPoint::ZERO, NSSize::new(800.0, 600.0));
 
         // Allocate and initialize
+        log::info!("TerminalView::new: setting up ivars");
         let this = mtm.alloc::<Self>();
         let this = this.set_ivars(TerminalViewIvars {
             terminal: terminal.clone(),
@@ -1216,9 +1225,10 @@ impl TerminalView {
             file_manager: RefCell::new(PendingFileManager::new()),
             color_palette: theme.colors.clone(),
         });
+        log::info!("TerminalView::new: ivars set, calling initWithFrame");
 
         let this: Retained<Self> = unsafe { msg_send![super(this), initWithFrame: frame] };
-        log::debug!("TerminalView: NSView initialized");
+        log::info!("TerminalView::new: NSView initialized");
 
         // Create notification bar
         this.setup_notification_bar(mtm);
