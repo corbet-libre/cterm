@@ -2175,4 +2175,94 @@ mod tests {
 
         assert_eq!(screen.get_cell(0, 0).unwrap().c, ' ');
     }
+
+    /// Helper: create a screen with text on the first line
+    fn screen_with_text(text: &str) -> Screen {
+        let mut screen = Screen::new(80, 24, ScreenConfig::default());
+        for c in text.chars() {
+            screen.put_char(c);
+        }
+        screen
+    }
+
+    #[test]
+    fn test_word_selection_stays_within_word() {
+        // "hello world" - double-click on "hello" (col 2), then extend within "hello"
+        let mut screen = screen_with_text("hello world");
+        screen.start_selection(0, 2, SelectionMode::Word);
+
+        let sel = screen.selection.as_ref().unwrap();
+        assert_eq!(sel.anchor, SelectionPoint::new(0, 0));
+        assert_eq!(sel.end, SelectionPoint::new(0, 4));
+
+        // Extend to another position within the same word
+        screen.extend_selection(0, 4);
+        let sel = screen.selection.as_ref().unwrap();
+        assert_eq!(sel.anchor, SelectionPoint::new(0, 0));
+        assert_eq!(sel.end, SelectionPoint::new(0, 4));
+    }
+
+    #[test]
+    fn test_word_selection_extend_forward() {
+        // "hello world" - double-click on "hello", drag to "world"
+        let mut screen = screen_with_text("hello world");
+        screen.start_selection(0, 2, SelectionMode::Word);
+
+        // Extend to "world" (col 8)
+        screen.extend_selection(0, 8);
+        let sel = screen.selection.as_ref().unwrap();
+        // anchor should be start of original word, end should be end of "world"
+        assert_eq!(sel.anchor, SelectionPoint::new(0, 0));
+        assert_eq!(sel.end, SelectionPoint::new(0, 10));
+    }
+
+    #[test]
+    fn test_word_selection_extend_backward() {
+        // "foo bar baz" - double-click on "bar" (col 5), drag backward to "foo"
+        let mut screen = screen_with_text("foo bar baz");
+        screen.start_selection(0, 5, SelectionMode::Word);
+
+        let sel = screen.selection.as_ref().unwrap();
+        assert_eq!(sel.anchor, SelectionPoint::new(0, 4));
+        assert_eq!(sel.end, SelectionPoint::new(0, 6));
+
+        // Extend backward to "foo" (col 1)
+        screen.extend_selection(0, 1);
+        let sel = screen.selection.as_ref().unwrap();
+        // anchor should flip to end of original word, end should be start of "foo"
+        assert_eq!(sel.anchor, SelectionPoint::new(0, 6));
+        assert_eq!(sel.end, SelectionPoint::new(0, 0));
+    }
+
+    #[test]
+    fn test_word_selection_extend_and_return() {
+        // "hello world" - double-click on "hello", drag to "world", then back to "hello"
+        let mut screen = screen_with_text("hello world");
+        screen.start_selection(0, 2, SelectionMode::Word);
+
+        // Extend to "world"
+        screen.extend_selection(0, 8);
+        let sel = screen.selection.as_ref().unwrap();
+        assert_eq!(sel.anchor, SelectionPoint::new(0, 0));
+        assert_eq!(sel.end, SelectionPoint::new(0, 10));
+
+        // Return back to within original word
+        screen.extend_selection(0, 3);
+        let sel = screen.selection.as_ref().unwrap();
+        // Should restore original word selection
+        assert_eq!(sel.anchor, SelectionPoint::new(0, 0));
+        assert_eq!(sel.end, SelectionPoint::new(0, 4));
+    }
+
+    #[test]
+    fn test_word_selection_on_non_word_char() {
+        // "hello world" - double-click on space (col 5)
+        let mut screen = screen_with_text("hello world");
+        screen.start_selection(0, 5, SelectionMode::Word);
+
+        let sel = screen.selection.as_ref().unwrap();
+        // Space is a non-word char, so anchor == end (single char range)
+        assert_eq!(sel.anchor, SelectionPoint::new(0, 5));
+        assert_eq!(sel.end, SelectionPoint::new(0, 5));
+    }
 }

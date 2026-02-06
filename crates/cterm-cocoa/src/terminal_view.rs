@@ -451,8 +451,14 @@ define_class!(
             // Normal selection mode - check if selection is empty and clear it, or copy to clipboard
             let terminal = self.ivars().terminal.lock();
             if let Some(selection) = &terminal.screen().selection {
-                if selection.anchor == selection.end {
-                    // Empty selection - clear it
+                if selection.anchor == selection.end
+                    && matches!(
+                        selection.mode,
+                        SelectionMode::Char | SelectionMode::Block
+                    )
+                {
+                    // Empty char/block selection - clear it
+                    // Word/line selections are never "empty" since they select at minimum the clicked word/line
                     drop(terminal);
                     let mut terminal = self.ivars().terminal.lock();
                     terminal.screen_mut().clear_selection();

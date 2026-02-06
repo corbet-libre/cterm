@@ -923,9 +923,16 @@ impl TerminalWidget {
             *selecting_released.borrow_mut() = false;
 
             // Check if selection is empty (same start and end) and clear it
+            // Only clear char/block selections - word/line selections are never "empty"
+            // since they select at minimum the clicked word/line
             let term = terminal_released.lock();
             if let Some(selection) = &term.screen().selection {
-                if selection.anchor == selection.end {
+                if selection.anchor == selection.end
+                    && matches!(
+                        selection.mode,
+                        cterm_core::SelectionMode::Char | cterm_core::SelectionMode::Block
+                    )
+                {
                     drop(term);
                     let mut term = terminal_released.lock();
                     term.screen_mut().clear_selection();
