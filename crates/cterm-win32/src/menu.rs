@@ -48,6 +48,7 @@ pub enum MenuAction {
     // Tabs menu
     PrevTab = 4001,
     NextTab = 4002,
+    NextAlertedTab = 4003,
     Tab1 = 4011,
     Tab2 = 4012,
     Tab3 = 4013,
@@ -100,6 +101,7 @@ impl MenuAction {
             3009 => Some(Self::SendSignalTerm),
             4001 => Some(Self::PrevTab),
             4002 => Some(Self::NextTab),
+            4003 => Some(Self::NextAlertedTab),
             4011 => Some(Self::Tab1),
             4012 => Some(Self::Tab2),
             4013 => Some(Self::Tab3),
@@ -209,6 +211,12 @@ pub fn create_menu_bar(show_debug: bool) -> HMENU {
             "&Previous Tab\tCtrl+Shift+Tab",
         );
         append_menu_item(tabs_menu, MenuAction::NextTab, "&Next Tab\tCtrl+Tab");
+        append_separator(tabs_menu);
+        append_menu_item(
+            tabs_menu,
+            MenuAction::NextAlertedTab,
+            "Next &Alerted Tab\tCtrl+Shift+B",
+        );
         append_separator(tabs_menu);
         append_menu_item(tabs_menu, MenuAction::Tab1, "Tab &1\tAlt+1");
         append_menu_item(tabs_menu, MenuAction::Tab2, "Tab &2\tAlt+2");

@@ -578,6 +578,22 @@ impl WindowState {
         }
     }
 
+    /// Switch to the next tab that has an active bell indicator
+    pub fn next_alerted_tab(&mut self) {
+        let count = self.tabs.len();
+        if count == 0 {
+            return;
+        }
+        for offset in 1..count {
+            let idx = (self.active_tab_index + offset) % count;
+            if self.tabs[idx].has_bell {
+                self.switch_to_tab(idx);
+                return;
+            }
+        }
+        log::debug!("No alerted tabs found");
+    }
+
     /// Get the active terminal
     pub fn active_terminal(&self) -> Option<Arc<Mutex<Terminal>>> {
         self.tabs
@@ -754,6 +770,7 @@ impl WindowState {
             }
             Action::NextTab => self.next_tab(),
             Action::PrevTab => self.prev_tab(),
+            Action::NextAlertedTab => self.next_alerted_tab(),
             Action::Tab(n) => {
                 let idx = (n as usize).saturating_sub(1);
                 self.switch_to_tab(idx);
@@ -883,6 +900,7 @@ impl WindowState {
                 MenuAction::SendSignalTerm => self.send_signal(15), // SIGTERM
                 MenuAction::PrevTab => self.prev_tab(),
                 MenuAction::NextTab => self.next_tab(),
+                MenuAction::NextAlertedTab => self.next_alerted_tab(),
                 MenuAction::Tab1 => self.switch_to_tab(0),
                 MenuAction::Tab2 => self.switch_to_tab(1),
                 MenuAction::Tab3 => self.switch_to_tab(2),
