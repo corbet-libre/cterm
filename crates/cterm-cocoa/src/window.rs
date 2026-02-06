@@ -54,6 +54,13 @@ define_class!(
                 terminal.send_focus_event(true);
             }
 
+            // Clear bell indicator from window title if present
+            let current_title: Retained<NSString> = unsafe { msg_send![self, title] };
+            let title_str = current_title.to_string();
+            if let Some(stripped) = title_str.strip_prefix("🔔 ") {
+                self.setTitle(&NSString::from_str(stripped));
+            }
+
             // Apply pending tab color if any (tab property becomes available after joining tab group)
             // Try immediately, and schedule a retry in case the tab isn't ready yet
             if !self.apply_pending_tab_color() {

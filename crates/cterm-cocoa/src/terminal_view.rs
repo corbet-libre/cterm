@@ -9,7 +9,10 @@ use std::sync::Arc;
 use objc2::rc::Retained;
 use objc2::runtime::AnyObject;
 use objc2::{class, define_class, msg_send, sel, DefinedClass, MainThreadOnly};
-use objc2_app_kit::{NSEvent, NSMenu, NSMenuItem, NSTextInputClient, NSView};
+use objc2_app_kit::{
+    NSApplication, NSEvent, NSMenu, NSMenuItem, NSRequestUserAttentionType, NSTextInputClient,
+    NSView,
+};
 use objc2_foundation::{
     MainThreadMarker, NSArray, NSAttributedString, NSNumber, NSObjectProtocol, NSPoint, NSRange,
     NSRect, NSSize, NSString,
@@ -43,6 +46,8 @@ struct ViewState {
     title_changed: AtomicBool,
     /// Whether title was explicitly set by user or template (locks out OSC updates)
     title_locked: AtomicBool,
+    /// Flag indicating bell was triggered and needs UI update
+    bell_changed: AtomicBool,
 }
 
 /// Terminal view state
@@ -1215,6 +1220,7 @@ impl TerminalView {
             title: std::sync::RwLock::new(String::new()),
             title_changed: AtomicBool::new(false),
             title_locked: AtomicBool::new(false),
+            bell_changed: AtomicBool::new(false),
         });
 
         // Initial frame
@@ -1293,6 +1299,7 @@ impl TerminalView {
             title: std::sync::RwLock::new(String::new()),
             title_changed: AtomicBool::new(false),
             title_locked: AtomicBool::new(false),
+            bell_changed: AtomicBool::new(false),
         });
 
         // Initial frame
@@ -1369,6 +1376,7 @@ impl TerminalView {
             title: std::sync::RwLock::new(String::new()),
             title_changed: AtomicBool::new(false),
             title_locked: AtomicBool::new(false),
+            bell_changed: AtomicBool::new(false),
         });
 
         // Initial frame
@@ -1454,6 +1462,7 @@ impl TerminalView {
             title: std::sync::RwLock::new(String::new()),
             title_changed: AtomicBool::new(false),
             title_locked: AtomicBool::new(false),
+            bell_changed: AtomicBool::new(false),
         });
 
         // Initial frame
@@ -1565,6 +1574,7 @@ impl TerminalView {
             title: std::sync::RwLock::new(String::new()),
             title_changed: AtomicBool::new(false),
             title_locked: AtomicBool::new(false),
+            bell_changed: AtomicBool::new(false),
         });
 
         // Initial frame
@@ -1685,6 +1695,35 @@ impl TerminalView {
                                     let view = &*(view_ptr as *const TerminalView);
                                     if let Some(window) = view.window() {
                                         window.setTitle(&NSString::from_str(&new_title));
+                                    }
+                                }
+                            }
+                        });
+                    }
+                }
+
+                // Check for bell
+                if state.bell_changed.swap(false, Ordering::Relaxed) {
+                    if !state.view_invalid.load(Ordering::SeqCst) {
+                        #[allow(deprecated)]
+                        dispatch2::Queue::main().exec_async(move || {
+                            if view_ptr != 0 {
+                                unsafe {
+                                    let view = &*(view_ptr as *const TerminalView);
+                                    if let Some(window) = view.window() {
+                                        // Only show bell indicator if window is not key (not focused)
+                                        if !window.isKeyWindow() {
+                                            // Get current title and prepend bell emoji if not already present
+                                            let current_title: Retained<NSString> = msg_send![&window, title];
+                                            let title_str = current_title.to_string();
+                                            if !title_str.starts_with("🔔 ") {
+                                                let new_title = format!("🔔 {}", title_str);
+                                                window.setTitle(&NSString::from_str(&new_title));
+                                            }
+                                        }
+                                        // Request attention in the dock
+                                        let app = NSApplication::sharedApplication(MainThreadMarker::new().unwrap());
+                                        app.requestUserAttention(objc2_app_kit::NSRequestUserAttentionType::InformationalRequest);
                                     }
                                 }
                             }
@@ -1884,14 +1923,20 @@ impl TerminalView {
                     let mut term = terminal.lock();
                     let events = term.process(&buf[..n]);
 
-                    // Check for title change event
+                    // Check for terminal events
                     for event in events {
-                        if let TerminalEvent::TitleChanged(ref title) = event {
-                            // Update stored title
-                            if let Ok(mut current_title) = state.title.write() {
-                                *current_title = title.clone();
+                        match event {
+                            TerminalEvent::TitleChanged(ref title) => {
+                                // Update stored title
+                                if let Ok(mut current_title) = state.title.write() {
+                                    *current_title = title.clone();
+                                }
+                                state.title_changed.store(true, Ordering::Relaxed);
                             }
-                            state.title_changed.store(true, Ordering::Relaxed);
+                            TerminalEvent::Bell => {
+                                state.bell_changed.store(true, Ordering::Relaxed);
+                            }
+                            _ => {}
                         }
                     }
 

@@ -1112,9 +1112,16 @@ impl WindowState {
 
     /// Handle bell
     pub fn on_bell(&mut self, tab_id: u64) {
+        // Only show bell indicator if this tab is not the current tab
+        let is_current_tab = self.current_tab == Some(tab_id);
+
         if let Some(tab) = self.tabs.iter_mut().find(|t| t.id == tab_id) {
-            tab.has_bell = true;
-            self.tab_bar.set_bell(tab_id, true);
+            if !is_current_tab {
+                tab.has_bell = true;
+                self.tab_bar.set_bell(tab_id, true);
+                // Invalidate to redraw the tab bar with the bell indicator
+                self.invalidate();
+            }
         }
     }
 
