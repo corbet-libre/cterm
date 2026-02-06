@@ -302,6 +302,94 @@ impl WindowState {
         Ok(tab_id)
     }
 
+    /// Create a new tab for Docker (exec into container or run image)
+    pub fn new_docker_tab(
+        &mut self,
+        selection: crate::docker_dialog::DockerSelection,
+    ) -> Result<u64, Box<dyn std::error::Error>> {
+        let tab_id = self.next_tab_id.fetch_add(1, Ordering::SeqCst);
+        let (cols, rows) = self.terminal_size();
+
+        let screen_config = ScreenConfig {
+            scrollback_lines: self.config.general.scrollback_lines,
+        };
+
+        // Build the docker command based on selection
+        let (shell, args, title) = match &selection {
+            crate::docker_dialog::DockerSelection::ExecContainer(container) => (
+                Some("docker".to_string()),
+                vec![
+                    "exec".to_string(),
+                    "-it".to_string(),
+                    container.name.clone(),
+                    "/bin/sh".to_string(),
+                ],
+                format!("docker: {}", container.name),
+            ),
+            crate::docker_dialog::DockerSelection::RunImage(image) => {
+                let image_name = if image.tag == "<none>" {
+                    image.repository.clone()
+                } else {
+                    format!("{}:{}", image.repository, image.tag)
+                };
+                (
+                    Some("docker".to_string()),
+                    vec![
+                        "run".to_string(),
+                        "-it".to_string(),
+                        "--rm".to_string(),
+                        image_name.clone(),
+                    ],
+                    format!("docker: {}", image_name),
+                )
+            }
+        };
+
+        let pty_config = PtyConfig {
+            size: PtySize {
+                cols: cols as u16,
+                rows: rows as u16,
+                pixel_width: 0,
+                pixel_height: 0,
+            },
+            shell,
+            args,
+            cwd: self.config.general.working_directory.clone(),
+            env: self
+                .config
+                .general
+                .env
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect(),
+        };
+
+        let terminal = Terminal::new(screen_config, Some(pty_config))?;
+        let terminal = Arc::new(Mutex::new(terminal));
+
+        let reader_handle = self.start_pty_reader(tab_id, Arc::clone(&terminal));
+
+        let entry = TabEntry {
+            id: tab_id,
+            title: title.clone(),
+            terminal,
+            color: None,
+            has_bell: false,
+            title_locked: true, // Lock title for docker tabs
+            reader_handle: Some(reader_handle),
+        };
+
+        self.tabs.push(entry);
+        self.active_tab_index = self.tabs.len() - 1;
+
+        self.tab_bar.add_tab(tab_id, &title);
+        self.tab_bar.set_active(tab_id);
+
+        self.invalidate();
+
+        Ok(tab_id)
+    }
+
     /// Start the PTY reader thread
     fn start_pty_reader(
         &self,
@@ -746,15 +834,13 @@ impl WindowState {
                         crate::docker_dialog::show_docker_picker(self.hwnd.0 as *mut _)
                     {
                         // Create a new tab with the selected Docker configuration
-                        match selection {
-                            crate::docker_dialog::DockerSelection::ExecContainer(container) => {
-                                log::info!("Docker exec into container: {}", container.name);
-                                // TODO: Create new tab with docker exec command
-                            }
-                            crate::docker_dialog::DockerSelection::RunImage(image) => {
-                                log::info!("Docker run image: {}:{}", image.repository, image.tag);
-                                // TODO: Create new tab with docker run command
-                            }
+                        if let Err(e) = self.new_docker_tab(selection) {
+                            log::error!("Failed to create Docker tab: {}", e);
+                            crate::dialogs::show_error(
+                                self.hwnd.0 as *mut _,
+                                "Docker Error",
+                                &format!("Failed to create Docker tab: {}", e),
+                            );
                         }
                     }
                 }
