@@ -142,6 +142,8 @@ pub struct AppDelegateIvars {
     last_state_hash: std::cell::Cell<u64>,
     /// Set to true during relaunch to skip close confirmation
     is_relaunching: std::cell::Cell<bool>,
+    /// Count of windows with active bell notifications
+    bell_count: std::cell::Cell<u32>,
 }
 
 define_class!(
@@ -683,8 +685,39 @@ impl AppDelegate {
             #[cfg(unix)]
             last_state_hash: std::cell::Cell::new(0),
             is_relaunching: std::cell::Cell::new(false),
+            bell_count: std::cell::Cell::new(0),
         });
         unsafe { msg_send![super(this), init] }
+    }
+
+    /// Increment the bell count and update dock badge
+    pub fn increment_bell_count(&self) {
+        let count = self.ivars().bell_count.get() + 1;
+        self.ivars().bell_count.set(count);
+        self.update_dock_badge(count);
+    }
+
+    /// Decrement the bell count and update dock badge
+    pub fn decrement_bell_count(&self) {
+        let count = self.ivars().bell_count.get().saturating_sub(1);
+        self.ivars().bell_count.set(count);
+        self.update_dock_badge(count);
+    }
+
+    /// Update the dock badge with the current bell count
+    fn update_dock_badge(&self, count: u32) {
+        let mtm = MainThreadMarker::from(self);
+        let app = NSApplication::sharedApplication(mtm);
+        unsafe {
+            let dock_tile: Retained<objc2::runtime::AnyObject> = msg_send![&app, dockTile];
+            if count > 0 {
+                let badge = NSString::from_str(&count.to_string());
+                let _: () = msg_send![&dock_tile, setBadgeLabel: &*badge];
+            } else {
+                let null: *const NSString = std::ptr::null();
+                let _: () = msg_send![&dock_tile, setBadgeLabel: null];
+            }
+        }
     }
 
     /// Open a tab from a template

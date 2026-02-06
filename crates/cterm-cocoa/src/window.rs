@@ -32,6 +32,8 @@ pub struct CtermWindowIvars {
     active_terminal: RefCell<Option<Retained<TerminalView>>>,
     pending_tab_color: RefCell<Option<String>>,
     quick_open: RefCell<Option<Retained<QuickOpenOverlay>>>,
+    /// Whether this window has an active bell notification
+    has_active_bell: std::cell::Cell<bool>,
 }
 
 define_class!(
@@ -60,6 +62,9 @@ define_class!(
             if let Some(stripped) = title_str.strip_prefix("🔔 ") {
                 self.setTitle(&NSString::from_str(stripped));
             }
+
+            // Clear bell state and update dock badge
+            self.set_bell(false);
 
             // Apply pending tab color if any (tab property becomes available after joining tab group)
             // Try immediately, and schedule a retry in case the tab isn't ready yet
@@ -280,6 +285,7 @@ impl CtermWindow {
             active_terminal: RefCell::new(None),
             pending_tab_color: RefCell::new(None),
             quick_open: RefCell::new(None),
+            has_active_bell: std::cell::Cell::new(false),
         });
 
         let this: Retained<Self> = unsafe {
@@ -349,6 +355,7 @@ impl CtermWindow {
             active_terminal: RefCell::new(None),
             pending_tab_color: RefCell::new(None),
             quick_open: RefCell::new(None),
+            has_active_bell: std::cell::Cell::new(false),
         });
 
         let this: Retained<Self> = unsafe {
@@ -419,6 +426,7 @@ impl CtermWindow {
             active_terminal: RefCell::new(None),
             pending_tab_color: RefCell::new(None),
             quick_open: RefCell::new(None),
+            has_active_bell: std::cell::Cell::new(false),
         });
 
         let this: Retained<Self> = unsafe {
@@ -497,6 +505,7 @@ impl CtermWindow {
             active_terminal: RefCell::new(None),
             pending_tab_color: RefCell::new(None),
             quick_open: RefCell::new(None),
+            has_active_bell: std::cell::Cell::new(false),
         });
 
         let this: Retained<Self> = unsafe {
@@ -592,6 +601,28 @@ impl CtermWindow {
     /// Get a reference to the active terminal view
     pub fn active_terminal(&self) -> Option<Retained<TerminalView>> {
         self.ivars().active_terminal.borrow().clone()
+    }
+
+    /// Set the bell state for this window and update dock badge
+    pub fn set_bell(&self, active: bool) {
+        let was_active = self.ivars().has_active_bell.get();
+        if active == was_active {
+            return; // No change
+        }
+        self.ivars().has_active_bell.set(active);
+
+        let mtm = MainThreadMarker::from(self);
+        let app = NSApplication::sharedApplication(mtm);
+        if let Some(delegate) = app.delegate() {
+            // Cast to our AppDelegate type via raw pointer
+            let delegate_ptr = Retained::as_ptr(&delegate) as *const crate::app::AppDelegate;
+            let app_delegate: &crate::app::AppDelegate = unsafe { &*delegate_ptr };
+            if active {
+                app_delegate.increment_bell_count();
+            } else {
+                app_delegate.decrement_bell_count();
+            }
+        }
     }
 
     /// Show the Quick Open overlay for template selection
@@ -701,6 +732,7 @@ impl CtermWindow {
             active_terminal: RefCell::new(None),
             pending_tab_color: RefCell::new(template.color.clone()),
             quick_open: RefCell::new(None),
+            has_active_bell: std::cell::Cell::new(false),
         });
 
         let this: Retained<Self> = unsafe {
