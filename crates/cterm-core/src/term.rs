@@ -163,6 +163,12 @@ impl Terminal {
             }
         }
 
+        // Check for bell
+        if self.screen.bell {
+            self.screen.bell = false;
+            events.push(TerminalEvent::Bell);
+        }
+
         // Check for title change
         if self.screen.title != self.last_title {
             self.last_title = self.screen.title.clone();
