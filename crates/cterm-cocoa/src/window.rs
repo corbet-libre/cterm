@@ -261,29 +261,39 @@ define_class!(
     }
 );
 
+/// Approximate ratio of cell width to font size
+const CELL_WIDTH_RATIO: f64 = 0.6;
+/// Approximate ratio of cell height to font size
+const CELL_HEIGHT_RATIO: f64 = 1.2;
+
 impl CtermWindow {
-    pub fn new(mtm: MainThreadMarker, config: &Config, theme: &Theme) -> Retained<Self> {
-        // Calculate initial window size for 80x24 terminal
-        let cell_width = config.appearance.font.size * 0.6; // Approximate
-        let cell_height = config.appearance.font.size * 1.2;
+    /// Common window initialization: calculate size, allocate, init NSWindow,
+    /// set min size, tabbing mode, and delegate.
+    fn init_window(
+        mtm: MainThreadMarker,
+        config: &Config,
+        theme: &Theme,
+        title: &str,
+        pending_tab_color: Option<String>,
+    ) -> Retained<Self> {
+        let cell_width = config.appearance.font.size * CELL_WIDTH_RATIO;
+        let cell_height = config.appearance.font.size * CELL_HEIGHT_RATIO;
         let width = cell_width * 80.0;
         let height = cell_height * 24.0;
 
         let content_rect = NSRect::new(NSPoint::new(200.0, 200.0), NSSize::new(width, height));
-
         let style_mask = NSWindowStyleMask::Titled
             | NSWindowStyleMask::Closable
             | NSWindowStyleMask::Miniaturizable
             | NSWindowStyleMask::Resizable;
 
-        // Allocate and initialize
         let this = mtm.alloc::<Self>();
         let this = this.set_ivars(CtermWindowIvars {
             config: config.clone(),
             theme: theme.clone(),
             shortcuts: ShortcutManager::from_config(&config.shortcuts),
             active_terminal: RefCell::new(None),
-            pending_tab_color: RefCell::new(None),
+            pending_tab_color: RefCell::new(pending_tab_color),
             quick_open: RefCell::new(None),
             has_active_bell: std::cell::Cell::new(false),
         });
@@ -298,101 +308,36 @@ impl CtermWindow {
             ]
         };
 
-        // Set initial window title (will be updated when shell spawns)
-        this.setTitle(&NSString::from_str("Terminal"));
-
-        // Set minimum size
+        this.setTitle(&NSString::from_str(title));
         this.setMinSize(NSSize::new(400.0, 200.0));
-
-        // Prevent macOS from releasing window on close (we manage lifetime)
         unsafe { this.setReleasedWhenClosed(false) };
-
-        // Enable native macOS window tabbing
         this.setTabbingMode(NSWindowTabbingMode::Preferred);
-
-        // Set self as delegate
         this.setDelegate(Some(ProtocolObject::from_ref(&*this)));
-
-        // Create the terminal view
-        let terminal = TerminalView::new(mtm, config, theme);
-        this.setContentView(Some(&terminal));
-
-        // Set content resize increments to snap to character grid
-        let (cell_width, cell_height) = terminal.cell_size();
-        this.setContentResizeIncrements(NSSize::new(cell_width, cell_height));
-
-        *this.ivars().active_terminal.borrow_mut() = Some(terminal);
 
         this
     }
 
-    /// Create a window with a specified working directory
+    /// Attach a terminal view to this window as content and store it
+    fn attach_terminal_view(&self, terminal: Retained<TerminalView>) {
+        self.setContentView(Some(&terminal));
+        let (cell_width, cell_height) = terminal.cell_size();
+        self.setContentResizeIncrements(NSSize::new(cell_width, cell_height));
+        *self.ivars().active_terminal.borrow_mut() = Some(terminal);
+    }
+
+    pub fn new(mtm: MainThreadMarker, config: &Config, theme: &Theme) -> Retained<Self> {
+        Self::new_with_cwd(mtm, config, theme, None)
+    }
+
     pub fn new_with_cwd(
         mtm: MainThreadMarker,
         config: &Config,
         theme: &Theme,
         cwd: Option<String>,
     ) -> Retained<Self> {
-        // Calculate initial window size for 80x24 terminal
-        let cell_width = config.appearance.font.size * 0.6; // Approximate
-        let cell_height = config.appearance.font.size * 1.2;
-        let width = cell_width * 80.0;
-        let height = cell_height * 24.0;
-
-        let content_rect = NSRect::new(NSPoint::new(200.0, 200.0), NSSize::new(width, height));
-
-        let style_mask = NSWindowStyleMask::Titled
-            | NSWindowStyleMask::Closable
-            | NSWindowStyleMask::Miniaturizable
-            | NSWindowStyleMask::Resizable;
-
-        // Allocate and initialize
-        let this = mtm.alloc::<Self>();
-        let this = this.set_ivars(CtermWindowIvars {
-            config: config.clone(),
-            theme: theme.clone(),
-            shortcuts: ShortcutManager::from_config(&config.shortcuts),
-            active_terminal: RefCell::new(None),
-            pending_tab_color: RefCell::new(None),
-            quick_open: RefCell::new(None),
-            has_active_bell: std::cell::Cell::new(false),
-        });
-
-        let this: Retained<Self> = unsafe {
-            msg_send![
-                super(this),
-                initWithContentRect: content_rect,
-                styleMask: style_mask,
-                backing: 2u64, // NSBackingStoreBuffered
-                defer: false
-            ]
-        };
-
-        // Set initial window title (will be updated when shell spawns)
-        this.setTitle(&NSString::from_str("Terminal"));
-
-        // Set minimum size
-        this.setMinSize(NSSize::new(400.0, 200.0));
-
-        // Prevent macOS from releasing window on close (we manage lifetime)
-        unsafe { this.setReleasedWhenClosed(false) };
-
-        // Enable native macOS window tabbing
-        this.setTabbingMode(NSWindowTabbingMode::Preferred);
-
-        // Set self as delegate
-        this.setDelegate(Some(ProtocolObject::from_ref(&*this)));
-
-        // Create the terminal view with cwd
+        let this = Self::init_window(mtm, config, theme, "Terminal", None);
         let terminal = TerminalView::new_with_cwd(mtm, config, theme, cwd);
-        this.setContentView(Some(&terminal));
-
-        // Set content resize increments to snap to character grid
-        let (cell_width, cell_height) = terminal.cell_size();
-        this.setContentResizeIncrements(NSSize::new(cell_width, cell_height));
-
-        *this.ivars().active_terminal.borrow_mut() = Some(terminal);
-
+        this.attach_terminal_view(terminal);
         this
     }
 
@@ -404,42 +349,6 @@ impl CtermWindow {
         theme: &Theme,
         terminal: Terminal,
     ) -> Retained<Self> {
-        // Calculate initial window size for 80x24 terminal
-        let cell_width = config.appearance.font.size * 0.6;
-        let cell_height = config.appearance.font.size * 1.2;
-        let width = cell_width * 80.0;
-        let height = cell_height * 24.0;
-
-        let content_rect = NSRect::new(NSPoint::new(200.0, 200.0), NSSize::new(width, height));
-
-        let style_mask = NSWindowStyleMask::Titled
-            | NSWindowStyleMask::Closable
-            | NSWindowStyleMask::Miniaturizable
-            | NSWindowStyleMask::Resizable;
-
-        // Allocate and initialize
-        let this = mtm.alloc::<Self>();
-        let this = this.set_ivars(CtermWindowIvars {
-            config: config.clone(),
-            theme: theme.clone(),
-            shortcuts: ShortcutManager::from_config(&config.shortcuts),
-            active_terminal: RefCell::new(None),
-            pending_tab_color: RefCell::new(None),
-            quick_open: RefCell::new(None),
-            has_active_bell: std::cell::Cell::new(false),
-        });
-
-        let this: Retained<Self> = unsafe {
-            msg_send![
-                super(this),
-                initWithContentRect: content_rect,
-                styleMask: style_mask,
-                backing: 2u64,
-                defer: false
-            ]
-        };
-
-        // Set window title from restored terminal
         let title = {
             let term = terminal.screen();
             if term.title.is_empty() {
@@ -448,30 +357,9 @@ impl CtermWindow {
                 term.title.clone()
             }
         };
-        this.setTitle(&NSString::from_str(&title));
-
-        // Set minimum size
-        this.setMinSize(NSSize::new(400.0, 200.0));
-
-        // Prevent macOS from releasing window on close (we manage lifetime)
-        unsafe { this.setReleasedWhenClosed(false) };
-
-        // Enable native macOS window tabbing
-        this.setTabbingMode(NSWindowTabbingMode::Preferred);
-
-        // Set self as delegate
-        this.setDelegate(Some(ProtocolObject::from_ref(&*this)));
-
-        // Create the terminal view from the restored terminal
+        let this = Self::init_window(mtm, config, theme, &title, None);
         let terminal_view = TerminalView::from_restored(mtm, config, theme, terminal);
-        this.setContentView(Some(&terminal_view));
-
-        // Set content resize increments to snap to character grid
-        let (cell_width, cell_height) = terminal_view.cell_size();
-        this.setContentResizeIncrements(NSSize::new(cell_width, cell_height));
-
-        *this.ivars().active_terminal.borrow_mut() = Some(terminal_view);
-
+        this.attach_terminal_view(terminal_view);
         this
     }
 
@@ -483,66 +371,9 @@ impl CtermWindow {
         theme: &Theme,
         recovered: &cterm_app::RecoveredFd,
     ) -> Retained<Self> {
-        // Calculate initial window size for 80x24 terminal
-        let cell_width = config.appearance.font.size * 0.6;
-        let cell_height = config.appearance.font.size * 1.2;
-        let width = cell_width * 80.0;
-        let height = cell_height * 24.0;
-
-        let content_rect = NSRect::new(NSPoint::new(200.0, 200.0), NSSize::new(width, height));
-
-        let style_mask = NSWindowStyleMask::Titled
-            | NSWindowStyleMask::Closable
-            | NSWindowStyleMask::Miniaturizable
-            | NSWindowStyleMask::Resizable;
-
-        // Allocate and initialize
-        let this = mtm.alloc::<Self>();
-        let this = this.set_ivars(CtermWindowIvars {
-            config: config.clone(),
-            theme: theme.clone(),
-            shortcuts: ShortcutManager::from_config(&config.shortcuts),
-            active_terminal: RefCell::new(None),
-            pending_tab_color: RefCell::new(None),
-            quick_open: RefCell::new(None),
-            has_active_bell: std::cell::Cell::new(false),
-        });
-
-        let this: Retained<Self> = unsafe {
-            msg_send![
-                super(this),
-                initWithContentRect: content_rect,
-                styleMask: style_mask,
-                backing: 2u64,
-                defer: false
-            ]
-        };
-
-        // Set window title for recovered terminal (will be updated from saved state)
-        this.setTitle(&NSString::from_str("Terminal"));
-
-        // Set minimum size
-        this.setMinSize(NSSize::new(400.0, 200.0));
-
-        // Prevent macOS from releasing window on close (we manage lifetime)
-        unsafe { this.setReleasedWhenClosed(false) };
-
-        // Enable native macOS window tabbing
-        this.setTabbingMode(NSWindowTabbingMode::Preferred);
-
-        // Set self as delegate
-        this.setDelegate(Some(ProtocolObject::from_ref(&*this)));
-
-        // Create the terminal view from the recovered FD
+        let this = Self::init_window(mtm, config, theme, "Terminal", None);
         let terminal_view = TerminalView::from_recovered_fd(mtm, config, theme, recovered);
-        this.setContentView(Some(&terminal_view));
-
-        // Set content resize increments to snap to character grid
-        let (cell_width, cell_height) = terminal_view.cell_size();
-        this.setContentResizeIncrements(NSSize::new(cell_width, cell_height));
-
-        *this.ivars().active_terminal.borrow_mut() = Some(terminal_view);
-
+        this.attach_terminal_view(terminal_view);
         this
     }
 
@@ -710,55 +541,7 @@ impl CtermWindow {
         theme: &Theme,
         template: &cterm_app::config::StickyTabConfig,
     ) -> Retained<Self> {
-        // Calculate initial window size for 80x24 terminal
-        let cell_width = config.appearance.font.size * 0.6;
-        let cell_height = config.appearance.font.size * 1.2;
-        let width = cell_width * 80.0;
-        let height = cell_height * 24.0;
-
-        let content_rect = NSRect::new(NSPoint::new(200.0, 200.0), NSSize::new(width, height));
-
-        let style_mask = NSWindowStyleMask::Titled
-            | NSWindowStyleMask::Closable
-            | NSWindowStyleMask::Miniaturizable
-            | NSWindowStyleMask::Resizable;
-
-        // Allocate and initialize
-        let this = mtm.alloc::<Self>();
-        let this = this.set_ivars(CtermWindowIvars {
-            config: config.clone(),
-            theme: theme.clone(),
-            shortcuts: ShortcutManager::from_config(&config.shortcuts),
-            active_terminal: RefCell::new(None),
-            pending_tab_color: RefCell::new(template.color.clone()),
-            quick_open: RefCell::new(None),
-            has_active_bell: std::cell::Cell::new(false),
-        });
-
-        let this: Retained<Self> = unsafe {
-            msg_send![
-                super(this),
-                initWithContentRect: content_rect,
-                styleMask: style_mask,
-                backing: 2u64,
-                defer: false
-            ]
-        };
-
-        // Set window title from template
-        this.setTitle(&NSString::from_str(&template.name));
-
-        // Set minimum size
-        this.setMinSize(NSSize::new(400.0, 200.0));
-
-        // Prevent macOS from releasing window on close (we manage lifetime)
-        unsafe { this.setReleasedWhenClosed(false) };
-
-        // Enable native macOS window tabbing
-        this.setTabbingMode(NSWindowTabbingMode::Preferred);
-
-        // Set self as delegate
-        this.setDelegate(Some(ProtocolObject::from_ref(&*this)));
+        let this = Self::init_window(mtm, config, theme, &template.name, template.color.clone());
 
         // Prepare working directory (clone from git if needed)
         if let Some(ref working_dir) = template.working_directory {
@@ -769,16 +552,8 @@ impl CtermWindow {
             }
         }
 
-        // Create the terminal view from template
         let terminal_view = TerminalView::from_template(mtm, config, theme, template);
-        this.setContentView(Some(&terminal_view));
-
-        // Set content resize increments to snap to character grid
-        let (cell_width, cell_height) = terminal_view.cell_size();
-        this.setContentResizeIncrements(NSSize::new(cell_width, cell_height));
-
-        *this.ivars().active_terminal.borrow_mut() = Some(terminal_view);
-
+        this.attach_terminal_view(terminal_view);
         this
     }
 

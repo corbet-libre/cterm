@@ -50,6 +50,20 @@ struct ViewState {
     bell_changed: AtomicBool,
 }
 
+impl Default for ViewState {
+    fn default() -> Self {
+        Self {
+            needs_redraw: AtomicBool::new(false),
+            pty_closed: AtomicBool::new(false),
+            view_invalid: AtomicBool::new(false),
+            title: std::sync::RwLock::new(String::new()),
+            title_changed: AtomicBool::new(false),
+            title_locked: AtomicBool::new(false),
+            bell_changed: AtomicBool::new(false),
+        }
+    }
+}
+
 /// Terminal view state
 pub struct TerminalViewIvars {
     terminal: Arc<Mutex<Terminal>>,
@@ -1188,46 +1202,27 @@ define_class!(
     }
 );
 
+/// Options for varying parameters when initializing a TerminalView
+#[derive(Default)]
+struct ViewInitOptions {
+    template_name: Option<String>,
+    #[cfg(unix)]
+    watchdog_fd_id: u64,
+}
+
 impl TerminalView {
-    /// Create a new terminal view with a fresh shell
-    pub fn new(mtm: MainThreadMarker, config: &Config, theme: &Theme) -> Retained<Self> {
-        // Create CoreGraphics renderer first to get cell dimensions
-        let font_name = &config.appearance.font.family;
-        let font_size = config.appearance.font.size;
-        log::info!("TerminalView::new: creating renderer");
-        let renderer = CGRenderer::new(mtm, font_name, font_size, theme);
+    /// Common initialization: allocate NSView, set ivars, init frame, setup notification bar
+    fn init_view(
+        mtm: MainThreadMarker,
+        renderer: CGRenderer,
+        terminal: Arc<Mutex<Terminal>>,
+        theme: &Theme,
+        options: ViewInitOptions,
+    ) -> (Retained<Self>, Arc<ViewState>) {
         let (cell_width, cell_height) = renderer.cell_size();
-        log::info!(
-            "TerminalView::new: got cell size {}x{}",
-            cell_width,
-            cell_height
-        );
-
-        // Create terminal with default size (will resize later)
-        log::info!("TerminalView::new: creating Terminal");
-        let mut terminal = Terminal::new(80, 24, ScreenConfig::default());
-        // Set cell height hint for sixel image positioning
-        terminal.screen_mut().set_cell_height_hint(cell_height);
-        terminal.screen_mut().set_cell_width_hint(cell_width);
-        let terminal = Arc::new(Mutex::new(terminal));
-        log::info!("TerminalView::new: Terminal created");
-
-        // Create shared state for PTY thread communication
-        let state = Arc::new(ViewState {
-            needs_redraw: AtomicBool::new(false),
-            pty_closed: AtomicBool::new(false),
-            view_invalid: AtomicBool::new(false),
-            title: std::sync::RwLock::new(String::new()),
-            title_changed: AtomicBool::new(false),
-            title_locked: AtomicBool::new(false),
-            bell_changed: AtomicBool::new(false),
-        });
-
-        // Initial frame
+        let state = Arc::new(ViewState::default());
         let frame = NSRect::new(NSPoint::ZERO, NSSize::new(800.0, 600.0));
 
-        // Allocate and initialize
-        log::info!("TerminalView::new: setting up ivars");
         let this = mtm.alloc::<Self>();
         let this = this.set_ivars(TerminalViewIvars {
             terminal: terminal.clone(),
@@ -1236,39 +1231,24 @@ impl TerminalView {
             cell_height,
             state: state.clone(),
             is_selecting: Cell::new(false),
-            template_name: RefCell::new(None),
+            template_name: RefCell::new(options.template_name),
             #[cfg(unix)]
-            watchdog_fd_id: Cell::new(0),
+            watchdog_fd_id: Cell::new(options.watchdog_fd_id),
             marked_text: RefCell::new(String::new()),
             notification_bar: RefCell::new(None),
             file_manager: RefCell::new(PendingFileManager::new()),
             color_palette: theme.colors.clone(),
         });
-        log::info!("TerminalView::new: ivars set, calling initWithFrame");
 
         let this: Retained<Self> = unsafe { msg_send![super(this), initWithFrame: frame] };
-        log::info!("TerminalView::new: NSView initialized");
-
-        // Create notification bar
         this.setup_notification_bar(mtm);
-        log::debug!("TerminalView: notification bar set up");
 
-        // Store view pointer as usize for thread-safe passing
-        // Safety: We only use this pointer on the main thread via dispatch
-        let view_ptr = &*this as *const _ as usize;
+        (this, state)
+    }
 
-        // Spawn shell and register with watchdog
-        log::debug!("TerminalView: spawning shell...");
-        this.spawn_shell(config, state.clone(), None);
-        log::debug!("TerminalView: shell spawned");
-        this.register_pty_with_watchdog();
-        log::debug!("TerminalView: registered with watchdog");
-
-        // Start the redraw check loop
-        this.schedule_redraw_check(view_ptr, state);
-        log::debug!("TerminalView: redraw check scheduled");
-
-        this
+    /// Create a new terminal view with a fresh shell
+    pub fn new(mtm: MainThreadMarker, config: &Config, theme: &Theme) -> Retained<Self> {
+        Self::new_with_cwd(mtm, config, theme, None)
     }
 
     /// Create a terminal view with a specified working directory
@@ -1278,65 +1258,25 @@ impl TerminalView {
         theme: &Theme,
         cwd: Option<String>,
     ) -> Retained<Self> {
-        // Create CoreGraphics renderer first to get cell dimensions
-        let font_name = &config.appearance.font.family;
-        let font_size = config.appearance.font.size;
-        let renderer = CGRenderer::new(mtm, font_name, font_size, theme);
+        let renderer = CGRenderer::new(
+            mtm,
+            &config.appearance.font.family,
+            config.appearance.font.size,
+            theme,
+        );
         let (cell_width, cell_height) = renderer.cell_size();
 
-        // Create terminal with default size (will resize later)
         let mut terminal = Terminal::new(80, 24, ScreenConfig::default());
-        // Set cell height hint for sixel image positioning
         terminal.screen_mut().set_cell_height_hint(cell_height);
         terminal.screen_mut().set_cell_width_hint(cell_width);
         let terminal = Arc::new(Mutex::new(terminal));
 
-        // Create shared state for PTY thread communication
-        let state = Arc::new(ViewState {
-            needs_redraw: AtomicBool::new(false),
-            pty_closed: AtomicBool::new(false),
-            view_invalid: AtomicBool::new(false),
-            title: std::sync::RwLock::new(String::new()),
-            title_changed: AtomicBool::new(false),
-            title_locked: AtomicBool::new(false),
-            bell_changed: AtomicBool::new(false),
-        });
+        let (this, state) =
+            Self::init_view(mtm, renderer, terminal, theme, ViewInitOptions::default());
 
-        // Initial frame
-        let frame = NSRect::new(NSPoint::ZERO, NSSize::new(800.0, 600.0));
-
-        // Allocate and initialize
-        let this = mtm.alloc::<Self>();
-        let this = this.set_ivars(TerminalViewIvars {
-            terminal: terminal.clone(),
-            renderer: RefCell::new(Some(renderer)),
-            cell_width,
-            cell_height,
-            state: state.clone(),
-            is_selecting: Cell::new(false),
-            template_name: RefCell::new(None),
-            #[cfg(unix)]
-            watchdog_fd_id: Cell::new(0),
-            marked_text: RefCell::new(String::new()),
-            notification_bar: RefCell::new(None),
-            file_manager: RefCell::new(PendingFileManager::new()),
-            color_palette: theme.colors.clone(),
-        });
-
-        let this: Retained<Self> = unsafe { msg_send![super(this), initWithFrame: frame] };
-
-        // Create notification bar
-        this.setup_notification_bar(mtm);
-
-        // Store view pointer as usize for thread-safe passing
-        // Safety: We only use this pointer on the main thread via dispatch
         let view_ptr = &*this as *const _ as usize;
-
-        // Spawn shell and register with watchdog
         this.spawn_shell(config, state.clone(), cwd);
         this.register_pty_with_watchdog();
-
-        // Start the redraw check loop
         this.schedule_redraw_check(view_ptr, state);
 
         this
@@ -1349,70 +1289,31 @@ impl TerminalView {
         theme: &Theme,
         template: &cterm_app::config::StickyTabConfig,
     ) -> Retained<Self> {
-        // Create CoreGraphics renderer first to get cell dimensions
-        let font_name = &config.appearance.font.family;
-        let font_size = config.appearance.font.size;
-        let mut renderer = CGRenderer::new(mtm, font_name, font_size, theme);
-
-        // Apply background color override from template if set
+        let mut renderer = CGRenderer::new(
+            mtm,
+            &config.appearance.font.family,
+            config.appearance.font.size,
+            theme,
+        );
         if let Some(ref bg_color) = template.background_color {
             renderer.set_background_override(Some(bg_color));
         }
-
         let (cell_width, cell_height) = renderer.cell_size();
 
-        // Create terminal with default size (will resize later)
         let mut terminal = Terminal::new(80, 24, ScreenConfig::default());
-        // Set cell height hint for sixel image positioning
         terminal.screen_mut().set_cell_height_hint(cell_height);
         terminal.screen_mut().set_cell_width_hint(cell_width);
         let terminal = Arc::new(Mutex::new(terminal));
 
-        // Create shared state for PTY thread communication
-        let state = Arc::new(ViewState {
-            needs_redraw: AtomicBool::new(false),
-            pty_closed: AtomicBool::new(false),
-            view_invalid: AtomicBool::new(false),
-            title: std::sync::RwLock::new(String::new()),
-            title_changed: AtomicBool::new(false),
-            title_locked: AtomicBool::new(false),
-            bell_changed: AtomicBool::new(false),
-        });
+        let options = ViewInitOptions {
+            template_name: Some(template.name.clone()),
+            ..Default::default()
+        };
+        let (this, state) = Self::init_view(mtm, renderer, terminal, theme, options);
 
-        // Initial frame
-        let frame = NSRect::new(NSPoint::ZERO, NSSize::new(800.0, 600.0));
-
-        // Allocate and initialize
-        let this = mtm.alloc::<Self>();
-        let this = this.set_ivars(TerminalViewIvars {
-            terminal: terminal.clone(),
-            renderer: RefCell::new(Some(renderer)),
-            cell_width,
-            cell_height,
-            state: state.clone(),
-            is_selecting: Cell::new(false),
-            template_name: RefCell::new(Some(template.name.clone())),
-            #[cfg(unix)]
-            watchdog_fd_id: Cell::new(0),
-            marked_text: RefCell::new(String::new()),
-            notification_bar: RefCell::new(None),
-            file_manager: RefCell::new(PendingFileManager::new()),
-            color_palette: theme.colors.clone(),
-        });
-
-        let this: Retained<Self> = unsafe { msg_send![super(this), initWithFrame: frame] };
-
-        // Create notification bar
-        this.setup_notification_bar(mtm);
-
-        // Store view pointer as usize for thread-safe passing
         let view_ptr = &*this as *const _ as usize;
-
-        // Spawn shell from template and register with watchdog
         this.spawn_template_shell(config, template, state.clone());
         this.register_pty_with_watchdog();
-
-        // Start the redraw check loop
         this.schedule_redraw_check(view_ptr, state);
 
         this
@@ -1429,103 +1330,39 @@ impl TerminalView {
         recovered: &cterm_app::RecoveredFd,
     ) -> Retained<Self> {
         use cterm_core::screen::{Screen, ScreenConfig};
-        use std::io::Read;
-        use std::os::unix::io::RawFd;
 
-        // Create CoreGraphics renderer first to get cell dimensions
-        let font_name = &config.appearance.font.family;
-        let font_size = config.appearance.font.size;
-        let renderer = CGRenderer::new(mtm, font_name, font_size, theme);
+        let renderer = CGRenderer::new(
+            mtm,
+            &config.appearance.font.family,
+            config.appearance.font.size,
+            theme,
+        );
         let (cell_width, cell_height) = renderer.cell_size();
 
-        // Create a fresh screen (we don't preserve screen state in crash recovery)
         let mut screen = Screen::new(80, 24, ScreenConfig::default());
-        // Set cell height hint for sixel image positioning
         screen.set_cell_height_hint(cell_height);
         screen.set_cell_width_hint(cell_width);
 
-        // Create Terminal from the recovered FD
         let terminal =
             unsafe { Terminal::from_restored_fd(screen, recovered.fd, recovered.child_pid) };
-
-        // Get a reader for the PTY before wrapping terminal in Arc<Mutex>
         let pty_reader = terminal.pty_reader();
-
-        // Wrap terminal in Arc<Mutex> for sharing
         let terminal = Arc::new(Mutex::new(terminal));
 
-        // Create shared state for PTY thread communication
-        let state = Arc::new(ViewState {
-            needs_redraw: AtomicBool::new(false),
-            pty_closed: AtomicBool::new(false),
-            view_invalid: AtomicBool::new(false),
-            title: std::sync::RwLock::new(String::new()),
-            title_changed: AtomicBool::new(false),
-            title_locked: AtomicBool::new(false),
-            bell_changed: AtomicBool::new(false),
-        });
+        let options = ViewInitOptions {
+            watchdog_fd_id: recovered.id,
+            ..Default::default()
+        };
+        let (this, state) = Self::init_view(mtm, renderer, terminal.clone(), theme, options);
 
-        // Initial frame
-        let frame = NSRect::new(NSPoint::ZERO, NSSize::new(800.0, 600.0));
-
-        // Allocate and initialize
-        let this = mtm.alloc::<Self>();
-        let this = this.set_ivars(TerminalViewIvars {
-            terminal: terminal.clone(),
-            renderer: RefCell::new(Some(renderer)),
-            cell_width,
-            cell_height,
-            state: state.clone(),
-            is_selecting: Cell::new(false),
-            template_name: RefCell::new(None),
-            watchdog_fd_id: Cell::new(recovered.id), // Already registered with watchdog
-            marked_text: RefCell::new(String::new()),
-            notification_bar: RefCell::new(None),
-            file_manager: RefCell::new(PendingFileManager::new()),
-            color_palette: theme.colors.clone(),
-        });
-
-        let this: Retained<Self> = unsafe { msg_send![super(this), initWithFrame: frame] };
-
-        // Create notification bar
-        this.setup_notification_bar(mtm);
-
-        // Store view pointer for thread-safe passing
         let view_ptr = &*this as *const _ as usize;
-
-        // Start the PTY read loop if we have a reader
-        if let Some(mut reader) = pty_reader {
-            let terminal_clone = terminal.clone();
+        if let Some(reader) = pty_reader {
             let state_clone = state.clone();
             std::thread::spawn(move || {
-                let mut buf = [0u8; 4096];
-                loop {
-                    match reader.read(&mut buf) {
-                        Ok(0) => {
-                            log::info!("PTY closed (EOF) - recovered terminal");
-                            break;
-                        }
-                        Ok(n) => {
-                            let mut term = terminal_clone.lock();
-                            term.process(&buf[..n]);
-                            drop(term);
-                            state_clone.needs_redraw.store(true, Ordering::Relaxed);
-                        }
-                        Err(e) => {
-                            if e.kind() != std::io::ErrorKind::Interrupted {
-                                log::error!("PTY read error (recovered): {}", e);
-                                break;
-                            }
-                        }
-                    }
-                }
-                state_clone.pty_closed.store(true, Ordering::Relaxed);
+                Self::read_pty_loop_reader(reader, terminal, state_clone);
             });
         } else {
             log::warn!("Recovered terminal has no PTY reader");
         }
-
-        // Start the redraw check loop
         this.schedule_redraw_check(view_ptr, state);
 
         log::info!(
@@ -1548,97 +1385,36 @@ impl TerminalView {
         theme: &Theme,
         mut terminal: Terminal,
     ) -> Retained<Self> {
-        use std::io::Read;
-
-        // Create CoreGraphics renderer first to get cell dimensions
-        let font_name = &config.appearance.font.family;
-        let font_size = config.appearance.font.size;
-        let renderer = CGRenderer::new(mtm, font_name, font_size, theme);
+        let renderer = CGRenderer::new(
+            mtm,
+            &config.appearance.font.family,
+            config.appearance.font.size,
+            theme,
+        );
         let (cell_width, cell_height) = renderer.cell_size();
 
-        // Set cell height hint for sixel image positioning
         terminal.screen_mut().set_cell_height_hint(cell_height);
         terminal.screen_mut().set_cell_width_hint(cell_width);
-
-        // Get a reader for the PTY before wrapping terminal in Arc<Mutex>
         let pty_reader = terminal.pty_reader();
-
-        // Wrap terminal in Arc<Mutex> for sharing
         let terminal = Arc::new(Mutex::new(terminal));
 
-        // Create shared state for PTY thread communication
-        let state = Arc::new(ViewState {
-            needs_redraw: AtomicBool::new(false),
-            pty_closed: AtomicBool::new(false),
-            view_invalid: AtomicBool::new(false),
-            title: std::sync::RwLock::new(String::new()),
-            title_changed: AtomicBool::new(false),
-            title_locked: AtomicBool::new(false),
-            bell_changed: AtomicBool::new(false),
-        });
+        let (this, state) = Self::init_view(
+            mtm,
+            renderer,
+            terminal.clone(),
+            theme,
+            ViewInitOptions::default(),
+        );
 
-        // Initial frame
-        let frame = NSRect::new(NSPoint::ZERO, NSSize::new(800.0, 600.0));
-
-        // Allocate and initialize
-        let this = mtm.alloc::<Self>();
-        let this = this.set_ivars(TerminalViewIvars {
-            terminal: terminal.clone(),
-            renderer: RefCell::new(Some(renderer)),
-            cell_width,
-            cell_height,
-            state: state.clone(),
-            is_selecting: Cell::new(false),
-            template_name: RefCell::new(None), // Caller should use set_template_name() if needed
-            #[cfg(unix)]
-            watchdog_fd_id: Cell::new(0),
-            marked_text: RefCell::new(String::new()),
-            notification_bar: RefCell::new(None),
-            file_manager: RefCell::new(PendingFileManager::new()),
-            color_palette: theme.colors.clone(),
-        });
-
-        let this: Retained<Self> = unsafe { msg_send![super(this), initWithFrame: frame] };
-
-        // Create notification bar
-        this.setup_notification_bar(mtm);
-
-        // Store view pointer as usize for thread-safe passing
         let view_ptr = &*this as *const _ as usize;
-
-        // Start the PTY read loop if we have a reader
-        if let Some(mut reader) = pty_reader {
-            let terminal_clone = terminal.clone();
+        if let Some(reader) = pty_reader {
             let state_clone = state.clone();
             std::thread::spawn(move || {
-                let mut buf = [0u8; 4096];
-                loop {
-                    match reader.read(&mut buf) {
-                        Ok(0) => {
-                            log::info!("PTY closed (EOF) - restored terminal");
-                            break;
-                        }
-                        Ok(n) => {
-                            let mut term = terminal_clone.lock();
-                            term.process(&buf[..n]);
-                            drop(term);
-                            state_clone.needs_redraw.store(true, Ordering::Relaxed);
-                        }
-                        Err(e) => {
-                            if e.kind() != std::io::ErrorKind::Interrupted {
-                                log::error!("PTY read error (restored): {}", e);
-                                break;
-                            }
-                        }
-                    }
-                }
-                state_clone.pty_closed.store(true, Ordering::Relaxed);
+                Self::read_pty_loop_reader(reader, terminal, state_clone);
             });
         } else {
             log::warn!("Restored terminal has no PTY reader");
         }
-
-        // Start the redraw check loop
         this.schedule_redraw_check(view_ptr, state);
 
         this
@@ -1972,6 +1748,58 @@ impl TerminalView {
         // Use into_raw_fd() to consume the File without closing the fd
         use std::os::unix::io::IntoRawFd;
         let _ = file.into_raw_fd();
+    }
+
+    /// Background thread to read from a PTY reader (for recovered/restored terminals)
+    ///
+    /// Unlike `read_pty_loop` which reads from a raw FD, this takes an owned File reader
+    /// and properly handles title change and bell events.
+    #[cfg(unix)]
+    fn read_pty_loop_reader(
+        mut reader: std::fs::File,
+        terminal: Arc<Mutex<Terminal>>,
+        state: Arc<ViewState>,
+    ) {
+        use std::io::Read;
+
+        let mut buf = [0u8; 4096];
+        loop {
+            match reader.read(&mut buf) {
+                Ok(0) => {
+                    log::info!("PTY closed (EOF) - reader loop");
+                    break;
+                }
+                Ok(n) => {
+                    let mut term = terminal.lock();
+                    let events = term.process(&buf[..n]);
+
+                    for event in events {
+                        match event {
+                            TerminalEvent::TitleChanged(ref title) => {
+                                if let Ok(mut current_title) = state.title.write() {
+                                    *current_title = title.clone();
+                                }
+                                state.title_changed.store(true, Ordering::Relaxed);
+                            }
+                            TerminalEvent::Bell => {
+                                state.bell_changed.store(true, Ordering::Relaxed);
+                            }
+                            _ => {}
+                        }
+                    }
+
+                    drop(term);
+                    state.needs_redraw.store(true, Ordering::Relaxed);
+                }
+                Err(e) => {
+                    if e.kind() != std::io::ErrorKind::Interrupted {
+                        log::error!("PTY read error (reader loop): {}", e);
+                        break;
+                    }
+                }
+            }
+        }
+        state.pty_closed.store(true, Ordering::Relaxed);
     }
 
     /// Handle window resize

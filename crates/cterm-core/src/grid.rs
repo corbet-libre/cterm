@@ -68,11 +68,22 @@ impl Row {
 
     /// Get the text content of this row (trimmed)
     pub fn text(&self) -> String {
-        let mut s: String = self.cells.iter().map(|c| c.c).collect();
-        // Trim trailing spaces
-        let trimmed_len = s.trim_end().len();
-        s.truncate(trimmed_len);
+        let mut s = String::new();
+        self.write_text_to(&mut s);
         s
+    }
+
+    /// Write the text content of this row (trimmed) into an existing buffer.
+    ///
+    /// The buffer is cleared first, then the row's text is appended.
+    /// This allows reusing a single String allocation across many rows.
+    pub fn write_text_to(&self, buf: &mut String) {
+        buf.clear();
+        for cell in &self.cells {
+            buf.push(cell.c);
+        }
+        let trimmed_len = buf.trim_end().len();
+        buf.truncate(trimmed_len);
     }
 
     /// Check if this row contains only empty cells

@@ -587,34 +587,14 @@ where
 
 /// Create a restored terminal tab (Unix)
 #[cfg(unix)]
-fn create_restored_tab_unix(
-    config: &Config,
-    theme: &Theme,
-    tab_state: TabUpgradeState,
-    fds: &[RawFd],
-) -> Result<(u64, String, TerminalWidget), Box<dyn std::error::Error>> {
-    // Get the PTY FD for this tab
-    if tab_state.pty_fd_index >= fds.len() {
-        return Err(format!(
-            "PTY FD index {} out of range (max {})",
-            tab_state.pty_fd_index,
-            fds.len()
-        )
-        .into());
-    }
-
-    let pty_fd = fds[tab_state.pty_fd_index];
-
-    // Reconstruct Pty from the FD and child PID
-    let pty = unsafe { Pty::from_raw_fd(pty_fd, tab_state.child_pid) };
-
-    // Reconstruct Screen from the terminal state
+/// Reconstruct a Screen from saved terminal state
+fn reconstruct_screen(config: &Config, tab_state: &TabUpgradeState) -> Screen {
     let term_state = &tab_state.terminal;
     let screen_config = ScreenConfig {
         scrollback_lines: config.general.scrollback_lines,
     };
 
-    let screen = Screen::from_upgrade_state(
+    Screen::from_upgrade_state(
         term_state.grid.clone(),
         term_state.scrollback.clone(),
         term_state.alternate_grid.clone(),
@@ -628,12 +608,28 @@ fn create_restored_tab_unix(
         term_state.scroll_offset,
         term_state.tab_stops.clone(),
         screen_config,
-    );
+    )
+}
 
-    // Create Terminal with the restored screen and PTY
+fn create_restored_tab_unix(
+    config: &Config,
+    theme: &Theme,
+    tab_state: TabUpgradeState,
+    fds: &[RawFd],
+) -> Result<(u64, String, TerminalWidget), Box<dyn std::error::Error>> {
+    if tab_state.pty_fd_index >= fds.len() {
+        return Err(format!(
+            "PTY FD index {} out of range (max {})",
+            tab_state.pty_fd_index,
+            fds.len()
+        )
+        .into());
+    }
+
+    let pty_fd = fds[tab_state.pty_fd_index];
+    let pty = unsafe { Pty::from_raw_fd(pty_fd, tab_state.child_pid) };
+    let screen = reconstruct_screen(config, &tab_state);
     let terminal = Terminal::from_restored(screen, pty);
-
-    // Create TerminalWidget with the restored terminal
     let terminal_widget = TerminalWidget::from_restored(terminal, config, theme);
 
     Ok((tab_state.id, tab_state.title, terminal_widget))
@@ -647,7 +643,6 @@ fn create_restored_tab_windows(
     tab_state: TabUpgradeState,
     handles: &[(RawHandle, RawHandle, RawHandle, RawHandle, u32)],
 ) -> Result<(u64, String, TerminalWidget), Box<dyn std::error::Error>> {
-    // Get the PTY handles for this tab
     if tab_state.pty_fd_index >= handles.len() {
         return Err(format!(
             "PTY handle index {} out of range (max {})",
@@ -658,37 +653,10 @@ fn create_restored_tab_windows(
     }
 
     let (hpc, read_pipe, write_pipe, process_handle, process_id) = handles[tab_state.pty_fd_index];
-
-    // Reconstruct Pty from the handles
     let pty =
         unsafe { Pty::from_raw_handles(hpc, read_pipe, write_pipe, process_handle, process_id) };
-
-    // Reconstruct Screen from the terminal state
-    let term_state = &tab_state.terminal;
-    let screen_config = ScreenConfig {
-        scrollback_lines: config.general.scrollback_lines,
-    };
-
-    let screen = Screen::from_upgrade_state(
-        term_state.grid.clone(),
-        term_state.scrollback.clone(),
-        term_state.alternate_grid.clone(),
-        term_state.cursor.clone(),
-        term_state.saved_cursor.clone(),
-        term_state.alt_saved_cursor.clone(),
-        term_state.scroll_region,
-        term_state.style.clone(),
-        term_state.modes.clone(),
-        term_state.title.clone(),
-        term_state.scroll_offset,
-        term_state.tab_stops.clone(),
-        screen_config,
-    );
-
-    // Create Terminal with the restored screen and PTY
+    let screen = reconstruct_screen(config, &tab_state);
     let terminal = Terminal::from_restored(screen, pty);
-
-    // Create TerminalWidget with the restored terminal
     let terminal_widget = TerminalWidget::from_restored(terminal, config, theme);
 
     Ok((tab_state.id, tab_state.title, terminal_widget))

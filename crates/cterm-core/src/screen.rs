@@ -343,6 +343,10 @@ pub struct TerminalImage {
     pub pixel_height: usize,
 }
 
+/// Sentinel column value meaning "end of row" for line selection mode.
+/// Used in `SelectionPoint::col` to indicate the selection extends to the end of the line.
+const COL_END_OF_ROW: usize = usize::MAX;
+
 /// Terminal screen state
 #[derive(Debug)]
 pub struct Screen {
@@ -400,6 +404,9 @@ pub struct Screen {
     cell_width_hint: f64,
     /// DRCS fonts (soft fonts) keyed by designator
     drcs_fonts: HashMap<String, DrcsFont>,
+    /// Total number of lines ever pushed to scrollback (monotonically increasing).
+    /// Used to compute correct absolute line numbers for image pruning.
+    scrollback_total_pushed: usize,
 }
 
 impl Screen {
@@ -423,6 +430,7 @@ impl Screen {
         tab_stops: Vec<bool>,
         config: ScreenConfig,
     ) -> Self {
+        let scrollback_len = scrollback.len();
         Self {
             grid,
             scrollback: scrollback.into(),
@@ -451,6 +459,7 @@ impl Screen {
             cell_height_hint: 16.0, // Default assumption
             cell_width_hint: 8.0,   // Default assumption
             drcs_fonts: HashMap::new(),
+            scrollback_total_pushed: scrollback_len,
         }
     }
 
@@ -497,6 +506,7 @@ impl Screen {
             cell_height_hint: 16.0, // Default assumption
             cell_width_hint: 8.0,   // Default assumption
             drcs_fonts: HashMap::new(),
+            scrollback_total_pushed: 0,
         }
     }
 
@@ -867,6 +877,7 @@ impl Screen {
                     lines_removed += 1;
                 }
                 self.scrollback.push_back(row);
+                self.scrollback_total_pushed += 1;
             }
 
             // If user is viewing scrollback (not at bottom), adjust scroll_offset
@@ -894,6 +905,9 @@ impl Screen {
                     }
                 }
             }
+
+            // Prune images that have scrolled off the top of the scrollback buffer
+            self.prune_old_images();
         }
 
         self.dirty = true;
@@ -1176,15 +1190,22 @@ impl Screen {
         };
 
         let search_pattern = if !case_sensitive && !regex {
-            pattern.to_lowercase()
+            std::borrow::Cow::Owned(pattern.to_lowercase())
         } else {
-            pattern.to_string()
+            std::borrow::Cow::Borrowed(pattern)
         };
+
+        // Reuse a single text buffer across all rows to avoid per-row allocation
+        let mut text_buf = String::new();
+        // Reuse a lowercase buffer for case-insensitive search
+        let mut lower_buf = String::new();
 
         // Search scrollback
         for (line_idx, row) in self.scrollback.iter().enumerate() {
-            self.search_row(
-                row,
+            row.write_text_to(&mut text_buf);
+            Self::search_in_text(
+                &text_buf,
+                &mut lower_buf,
                 line_idx,
                 &search_pattern,
                 case_sensitive,
@@ -1197,8 +1218,10 @@ impl Screen {
         let scrollback_len = self.scrollback.len();
         for row_idx in 0..self.grid.height() {
             if let Some(row) = self.grid.row(row_idx) {
-                self.search_row(
-                    row,
+                row.write_text_to(&mut text_buf);
+                Self::search_in_text(
+                    &text_buf,
+                    &mut lower_buf,
                     scrollback_len + row_idx,
                     &search_pattern,
                     case_sensitive,
@@ -1211,20 +1234,18 @@ impl Screen {
         results
     }
 
-    /// Search a single row for matches
-    fn search_row(
-        &self,
-        row: &crate::grid::Row,
+    /// Search for pattern matches within a single row's text
+    fn search_in_text(
+        line_text: &str,
+        lower_buf: &mut String,
         line_idx: usize,
         pattern: &str,
         case_sensitive: bool,
         regex_pattern: &Option<regex::Regex>,
         results: &mut Vec<SearchResult>,
     ) {
-        let line_text = row.text();
-
         if let Some(re) = regex_pattern {
-            for m in re.find_iter(&line_text) {
+            for m in re.find_iter(line_text) {
                 results.push(SearchResult {
                     line: line_idx,
                     col: m.start(),
@@ -1232,11 +1253,13 @@ impl Screen {
                 });
             }
         } else {
-            // Simple string search
+            // Simple string search - reuse lower_buf for case-insensitive
             let search_text = if case_sensitive {
-                line_text.clone()
+                line_text
             } else {
-                line_text.to_lowercase()
+                lower_buf.clear();
+                lower_buf.push_str(&line_text.to_lowercase());
+                lower_buf.as_str()
             };
 
             let mut start = 0;
@@ -1402,19 +1425,19 @@ impl Screen {
 
     /// Prune images that have scrolled off the top of the scrollback buffer
     fn prune_old_images(&mut self) {
-        // Remove images whose line is before the start of our scrollback
-        // When scrollback is at max capacity and lines are removed,
-        // images at the oldest lines should also be removed
-        let max_scrollback = self.config.scrollback_lines;
-        let scrollback_len = self.scrollback.len();
-
-        // If we're at max scrollback, images at line 0 are about to scroll off
-        if scrollback_len >= max_scrollback {
-            // Calculate the minimum valid line
-            let min_valid_line = scrollback_len.saturating_sub(max_scrollback);
-
-            self.images.retain(|_, img| img.line >= min_valid_line);
+        if self.images.is_empty() {
+            return;
         }
+
+        // Image line numbers are absolute (scrollback.len() + row at creation time),
+        // so they grow monotonically. When scrollback is at capacity, old lines are
+        // discarded from the front. The minimum valid line is the total lines ever
+        // pushed minus the max scrollback capacity.
+        let min_valid_line = self
+            .scrollback_total_pushed
+            .saturating_sub(self.config.scrollback_lines);
+
+        self.images.retain(|_, img| img.line >= min_valid_line);
     }
 
     /// Clear all images (called on screen clear)
@@ -1630,7 +1653,7 @@ impl Screen {
             SelectionMode::Line => {
                 // Select entire line (use large end column to select to end of line)
                 let anchor_start = SelectionPoint::new(line, 0);
-                let anchor_end = SelectionPoint::new(line, usize::MAX);
+                let anchor_end = SelectionPoint::new(line, COL_END_OF_ROW);
                 self.selection = Some(Selection::new_with_range(anchor_start, anchor_end, mode));
             }
         }
@@ -1686,7 +1709,7 @@ impl Screen {
                     } else if line > anchor_end.line {
                         // Extending downward - from original line start to new line end
                         selection.anchor = anchor_start;
-                        selection.end = SelectionPoint::new(line, usize::MAX);
+                        selection.end = SelectionPoint::new(line, COL_END_OF_ROW);
                     } else {
                         // Within the original line - keep original selection
                         selection.anchor = anchor_start;

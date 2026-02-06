@@ -59,6 +59,8 @@ pub struct Parser {
     dcs_state: DcsState,
     /// State for intercepting OSC 1337 File sequences
     osc_1337_state: Osc1337State,
+    /// Whether an OSC 1337 string terminator (BEL or ESC \) was seen
+    osc_1337_terminated: bool,
 }
 
 impl Default for Parser {
@@ -73,6 +75,7 @@ impl Parser {
             state_machine: vte::Parser::new(),
             dcs_state: DcsState::None,
             osc_1337_state: Osc1337State::None,
+            osc_1337_terminated: false,
         }
     }
 
@@ -155,6 +158,7 @@ impl Parser {
                         // Remove the ESC we added
                         content.pop();
                     }
+                    self.osc_1337_terminated = true;
                     return true;
                 }
 
@@ -180,6 +184,7 @@ impl Parser {
                 // Check for string terminator
                 if byte == 0x07 || (params.ends_with('\x1b') && byte == b'\\') {
                     // Terminator without data - will be handled by check_osc_1337_finish
+                    self.osc_1337_terminated = true;
                     return true;
                 }
 
@@ -207,7 +212,8 @@ impl Parser {
             Osc1337State::Osc1337Data(receiver) => {
                 // Check for string terminator (BEL or ESC \)
                 if byte == 0x07 || byte == b'\\' {
-                    // Terminator - will be handled by check_osc_1337_finish
+                    // Terminator - mark as terminated for check_osc_1337_finish
+                    self.osc_1337_terminated = true;
                     return true;
                 }
 
@@ -229,23 +235,21 @@ impl Parser {
 
     /// Check if OSC 1337 streaming needs to be finished
     fn check_osc_1337_finish(&mut self, screen: &mut Screen) {
-        // Check if we're at a termination state
-        let should_finish = matches!(
-            &self.osc_1337_state,
-            Osc1337State::Osc1337Content(_) | Osc1337State::Osc1337Params(_)
-        );
+        if !self.osc_1337_terminated {
+            return;
+        }
+        self.osc_1337_terminated = false;
 
-        // For Osc1337Data, check if we just processed a terminator
-        let finish_data = matches!(&self.osc_1337_state, Osc1337State::Osc1337Data(_));
-
-        if should_finish {
-            // Non-File content or terminated params - just reset
-            self.osc_1337_state = Osc1337State::None;
-        } else if finish_data {
-            // Check the last byte was a terminator (this is called after put returns true for terminator)
-            // Actually we need a different approach - track if we saw terminator
-            // For now, this will be called when we see BEL or ESC \
-            self.finish_streaming_file_direct(screen);
+        match &self.osc_1337_state {
+            Osc1337State::Osc1337Content(_) | Osc1337State::Osc1337Params(_) => {
+                // Non-File content or terminated params without data - just reset
+                self.osc_1337_state = Osc1337State::None;
+            }
+            Osc1337State::Osc1337Data(_) => {
+                // Streaming data terminated - finish the transfer
+                self.finish_streaming_file_direct(screen);
+            }
+            _ => {}
         }
     }
 
@@ -1573,6 +1577,55 @@ mod tests {
         for col in 0..5 {
             assert_eq!(screen.get_cell(0, col).unwrap().c, ' ');
         }
+    }
+
+    #[test]
+    fn test_osc_1337_streaming_multi_byte() {
+        let mut screen = make_screen();
+        let mut parser = Parser::new();
+
+        // Feed a complete OSC 1337 File= sequence with multi-byte base64 data
+        // This is: ESC ] 1337 ; File=inline=1;size=4: AQAAAA== BEL
+        // "AQAAAA==" is base64 for 4 bytes (0x01, 0x00, 0x00, 0x00)
+        // We use a tiny 1x1 image won't decode, but we can verify the streaming
+        // doesn't terminate prematurely by checking the state machine handles
+        // multi-byte data correctly.
+
+        // Build the sequence byte by byte to test streaming
+        let prefix = b"\x1b]1337;File=inline=0;size=4:";
+        let data = b"AQAAAA==";
+        let terminator = b"\x07";
+
+        // Feed prefix - should be consumed by the state machine
+        parser.parse(&mut screen, prefix);
+        // At this point we should be in Osc1337Data state
+        assert!(
+            matches!(parser.osc_1337_state, Osc1337State::Osc1337Data(_)),
+            "Should be in Osc1337Data state after prefix, got {:?}",
+            std::mem::discriminant(&parser.osc_1337_state)
+        );
+
+        // Feed data bytes one at a time - should NOT terminate early
+        for &byte in data.iter() {
+            parser.parse(&mut screen, &[byte]);
+            assert!(
+                matches!(parser.osc_1337_state, Osc1337State::Osc1337Data(_)),
+                "Should still be in Osc1337Data state during data"
+            );
+        }
+
+        // Feed terminator - should finish
+        parser.parse(&mut screen, terminator);
+        assert!(
+            matches!(parser.osc_1337_state, Osc1337State::None),
+            "Should be in None state after terminator"
+        );
+
+        // Verify a file transfer was queued (inline=0 means file transfer, not inline image)
+        assert!(
+            screen.has_file_transfers(),
+            "Should have a pending file transfer"
+        );
     }
 
     #[test]
