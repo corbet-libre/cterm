@@ -183,6 +183,103 @@ pub fn show_save_panel(
     }
 }
 
+/// Result of the file drop dialog
+pub enum FileDropChoice {
+    PastePath,
+    PasteContents,
+    CreateViaBase64(String),
+    CreateViaPrintf(String),
+    Cancel,
+}
+
+/// Show a file drop options dialog
+///
+/// Returns the user's chosen action for handling the dropped file.
+pub fn show_file_drop_dialog(
+    mtm: MainThreadMarker,
+    info: &cterm_app::file_drop::FileDropInfo,
+) -> FileDropChoice {
+    use cterm_app::file_drop::{format_size, SIZE_WARNING_THRESHOLD};
+
+    let alert = NSAlert::new(mtm);
+    alert.setAlertStyle(NSAlertStyle::Informational);
+    alert.setMessageText(&NSString::from_str(&format!(
+        "File dropped: {}",
+        info.filename
+    )));
+
+    let mut informative = format_size(info.size);
+    if info.size > SIZE_WARNING_THRESHOLD {
+        informative.push_str(&format!(
+            "\n\nWarning: This file is large ({}). Sending its contents may take a while.",
+            format_size(info.size)
+        ));
+    }
+    alert.setInformativeText(&NSString::from_str(&informative));
+
+    // Button order: first added = NSAlertFirstButtonReturn (1000)
+    // The order determines the return value offset.
+    alert.addButtonWithTitle(&NSString::from_str("Paste Path"));
+    // Track button indices: 0 = Paste Path
+    let mut paste_contents_idx: Option<usize> = None;
+    let mut next_idx: usize = 1;
+
+    if info.is_text {
+        alert.addButtonWithTitle(&NSString::from_str("Paste Contents"));
+        paste_contents_idx = Some(next_idx);
+        next_idx += 1;
+    }
+
+    alert.addButtonWithTitle(&NSString::from_str("Create via base64"));
+    let base64_idx = next_idx;
+    next_idx += 1;
+
+    alert.addButtonWithTitle(&NSString::from_str("Create via printf"));
+    let printf_idx = next_idx;
+    next_idx += 1;
+
+    alert.addButtonWithTitle(&NSString::from_str("Cancel"));
+    let _cancel_idx = next_idx;
+
+    let response = alert.runModal();
+    let chosen = (response - NSAlertFirstButtonReturn) as usize;
+
+    if chosen == 0 {
+        return FileDropChoice::PastePath;
+    }
+    if paste_contents_idx == Some(chosen) {
+        return FileDropChoice::PasteContents;
+    }
+    if chosen == base64_idx {
+        // Ask for filename
+        if let Some(filename) = show_input(
+            mtm,
+            None,
+            "Filename",
+            "Enter the target filename:",
+            &info.filename,
+        ) {
+            return FileDropChoice::CreateViaBase64(filename);
+        }
+        return FileDropChoice::Cancel;
+    }
+    if chosen == printf_idx {
+        // Ask for filename
+        if let Some(filename) = show_input(
+            mtm,
+            None,
+            "Filename",
+            "Enter the target filename:",
+            &info.filename,
+        ) {
+            return FileDropChoice::CreateViaPrintf(filename);
+        }
+        return FileDropChoice::Cancel;
+    }
+
+    FileDropChoice::Cancel
+}
+
 /// Dialogs wrapper implementing cterm-ui traits
 pub struct Dialogs {
     mtm: MainThreadMarker,

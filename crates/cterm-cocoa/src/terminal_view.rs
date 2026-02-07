@@ -1056,6 +1056,17 @@ define_class!(
                 self.write_to_pty(text.as_bytes());
             }
         }
+
+        // Drag-and-drop support
+        #[unsafe(method(draggingEntered:))]
+        fn dragging_entered(&self, _sender: &AnyObject) -> usize {
+            1 // NSDragOperationCopy
+        }
+
+        #[unsafe(method(performDragOperation:))]
+        fn perform_drag_operation(&self, sender: &AnyObject) -> bool {
+            self.handle_drop(sender)
+        }
     }
 
     // NSTextInputClient protocol for IME support (Japanese, Chinese, Korean, etc.)
@@ -1248,6 +1259,13 @@ impl TerminalView {
 
         let this: Retained<Self> = unsafe { msg_send![super(this), initWithFrame: frame] };
         this.setup_notification_bar(mtm);
+
+        // Register for file drag-and-drop
+        unsafe {
+            let file_url_type = objc2_app_kit::NSPasteboardTypeFileURL;
+            let types = NSArray::from_slice(&[file_url_type]);
+            let _: () = msg_send![&*this, registerForDraggedTypes: &*types];
+        }
 
         (this, state)
     }
@@ -1848,6 +1866,88 @@ impl TerminalView {
         if let Err(e) = terminal.write(data) {
             log::error!("Failed to write to PTY: {}", e);
         }
+    }
+
+    /// Handle a drop operation — extract file URL, show dialog, write to PTY
+    fn handle_drop(&self, sender: &AnyObject) -> bool {
+        use cterm_app::file_drop::{build_pty_input, FileDropAction, FileDropInfo};
+        use objc2_app_kit::NSPasteboard;
+
+        let mtm = MainThreadMarker::from(self);
+
+        // Get the dragging pasteboard
+        let pasteboard: Retained<NSPasteboard> = unsafe { msg_send![sender, draggingPasteboard] };
+
+        // Read file URLs from pasteboard
+        let nsurl_class = class!(NSURL);
+        let classes = NSArray::from_slice(&[nsurl_class]);
+        let urls: Option<Retained<NSArray<AnyObject>>> = unsafe {
+            let options =
+                objc2_foundation::NSDictionary::<objc2_foundation::NSString, AnyObject>::new();
+            pasteboard.readObjectsForClasses_options(&classes, Some(&options))
+        };
+
+        let Some(urls) = urls else {
+            return false;
+        };
+        if urls.count() == 0 {
+            return false;
+        }
+
+        // Get the first URL
+        let url: Retained<AnyObject> = unsafe { msg_send![&*urls, objectAtIndex: 0usize] };
+        let path_str: Option<Retained<NSString>> = unsafe { msg_send![&*url, path] };
+        let Some(path_str) = path_str else {
+            return false;
+        };
+        let path = std::path::PathBuf::from(path_str.to_string());
+
+        let info = match FileDropInfo::from_path(&path) {
+            Ok(info) => info,
+            Err(e) => {
+                log::error!("Failed to read dropped file info: {}", e);
+                return false;
+            }
+        };
+
+        let choice = crate::dialogs::show_file_drop_dialog(mtm, &info);
+
+        let action = match choice {
+            crate::dialogs::FileDropChoice::PastePath => FileDropAction::PastePath,
+            crate::dialogs::FileDropChoice::PasteContents => FileDropAction::PasteContents,
+            crate::dialogs::FileDropChoice::CreateViaBase64(filename) => {
+                FileDropAction::CreateViaBase64 { filename }
+            }
+            crate::dialogs::FileDropChoice::CreateViaPrintf(filename) => {
+                FileDropAction::CreateViaPrintf { filename }
+            }
+            crate::dialogs::FileDropChoice::Cancel => return true,
+        };
+
+        let use_bracketed = matches!(action, FileDropAction::PasteContents);
+
+        match build_pty_input(&info, action) {
+            Ok(text) => {
+                if use_bracketed {
+                    let terminal = self.ivars().terminal.lock();
+                    let bracketed = terminal.screen().modes.bracketed_paste;
+                    drop(terminal);
+                    let paste = if bracketed {
+                        format!("\x1b[200~{}\x1b[201~", text)
+                    } else {
+                        text
+                    };
+                    self.write_to_pty(paste.as_bytes());
+                } else {
+                    self.write_to_pty(text.as_bytes());
+                }
+            }
+            Err(e) => {
+                log::error!("Failed to build PTY input for dropped file: {}", e);
+            }
+        }
+
+        true
     }
 
     /// Get the terminal

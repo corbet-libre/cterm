@@ -8,6 +8,7 @@ pub mod config;
 #[cfg(unix)]
 pub mod crash_recovery;
 pub mod docker;
+pub mod file_drop;
 pub mod file_transfer;
 pub mod git_sync;
 pub mod log_capture;
@@ -17,8 +18,8 @@ pub mod shortcuts;
 pub mod upgrade;
 
 pub use config::{
-    background_sync, load_config, load_sticky_tabs, save_config, save_config_with_sync,
-    save_sticky_tabs, Config,
+    background_sync, load_config, load_sticky_tabs, load_tool_shortcuts, save_config,
+    save_config_with_sync, save_sticky_tabs, save_tool_shortcuts, Config, ToolShortcutEntry,
 };
 #[cfg(unix)]
 pub use crash_recovery::{

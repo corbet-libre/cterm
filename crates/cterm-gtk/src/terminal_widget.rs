@@ -124,6 +124,9 @@ impl TerminalWidget {
         // Set up input handling
         widget.setup_input();
 
+        // Set up file drag-and-drop
+        widget.setup_drop();
+
         // Set up PTY reading
         widget.setup_pty_reader();
 
@@ -213,6 +216,9 @@ impl TerminalWidget {
         // Set up input handling
         widget.setup_input();
 
+        // Set up file drag-and-drop
+        widget.setup_drop();
+
         // Set up PTY reading
         widget.setup_pty_reader();
 
@@ -299,6 +305,9 @@ impl TerminalWidget {
         // Set up input handling
         widget.setup_input();
 
+        // Set up file drag-and-drop
+        widget.setup_drop();
+
         // Set up PTY reading
         widget.setup_pty_reader();
 
@@ -362,6 +371,9 @@ impl TerminalWidget {
 
         // Set up input handling
         widget.setup_input();
+
+        // Set up file drag-and-drop
+        widget.setup_drop();
 
         // Set up PTY reading (the restored PTY should already be running)
         widget.setup_pty_reader();
@@ -1033,6 +1045,79 @@ impl TerminalWidget {
         });
 
         self.drawing_area.add_controller(scroll_controller);
+    }
+
+    /// Set up file drag-and-drop
+    fn setup_drop(&self) {
+        let drop_target = gtk4::DropTarget::new(gio::File::static_type(), gdk::DragAction::COPY);
+        let terminal = Arc::clone(&self.terminal);
+        let drawing_area = self.drawing_area.clone();
+
+        drop_target.connect_drop(move |_, value, _, _| {
+            let file = match value.get::<gio::File>() {
+                Ok(f) => f,
+                Err(_) => return false,
+            };
+            let Some(path) = file.path() else {
+                return false;
+            };
+            let info = match cterm_app::file_drop::FileDropInfo::from_path(&path) {
+                Ok(info) => info,
+                Err(e) => {
+                    log::error!("Failed to read dropped file info: {}", e);
+                    return false;
+                }
+            };
+
+            // Get the parent window
+            let Some(root) = drawing_area.root() else {
+                return false;
+            };
+            let Some(window) = root.downcast_ref::<gtk4::Window>() else {
+                return false;
+            };
+
+            let terminal = Arc::clone(&terminal);
+            let info = std::rc::Rc::new(info);
+            let info_for_cb = std::rc::Rc::clone(&info);
+
+            crate::dialogs::show_file_drop_dialog(window, &info, move |choice| {
+                use cterm_app::file_drop::{build_pty_input, FileDropAction};
+
+                let action = match choice {
+                    crate::dialogs::FileDropChoice::PastePath => FileDropAction::PastePath,
+                    crate::dialogs::FileDropChoice::PasteContents => FileDropAction::PasteContents,
+                    crate::dialogs::FileDropChoice::CreateViaBase64(name) => {
+                        FileDropAction::CreateViaBase64 { filename: name }
+                    }
+                    crate::dialogs::FileDropChoice::CreateViaPrintf(name) => {
+                        FileDropAction::CreateViaPrintf { filename: name }
+                    }
+                    crate::dialogs::FileDropChoice::Cancel => return,
+                };
+
+                let use_bracketed = matches!(action, FileDropAction::PasteContents);
+
+                match build_pty_input(&info_for_cb, action) {
+                    Ok(text) => {
+                        let mut term = terminal.lock();
+                        if use_bracketed && term.screen().modes.bracketed_paste {
+                            let paste = format!("\x1b[200~{}\x1b[201~", text);
+                            let _ = term.write_str(&paste);
+                        } else {
+                            let _ = term.write_str(&text);
+                        }
+                    }
+                    Err(e) => {
+                        log::error!("Failed to build PTY input for dropped file: {}", e);
+                    }
+                }
+            });
+
+            true
+        });
+
+        self.drawing_area.add_controller(drop_target);
     }
 
     /// Set up PTY reader

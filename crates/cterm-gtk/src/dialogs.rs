@@ -583,6 +583,10 @@ pub fn show_preferences_dialog(
     let (shortcuts_page, shortcut_entries) = create_shortcuts_preferences(config);
     notebook.append_page(&shortcuts_page, Some(&Label::new(Some("Shortcuts"))));
 
+    // Tools tab
+    let (tools_page, tool_entries) = create_tools_preferences();
+    notebook.append_page(&tools_page, Some(&Label::new(Some("Tools"))));
+
     // Git Sync tab
     let (
         git_sync_page,
@@ -630,6 +634,7 @@ pub fn show_preferences_dialog(
     });
 
     let widgets_for_response = Rc::clone(&widgets);
+    let tool_entries_for_response = Rc::clone(&tool_entries);
     dialog.connect_response(move |dialog, response| match response {
         ResponseType::Ok | ResponseType::Apply => {
             let final_config =
@@ -638,6 +643,35 @@ pub fn show_preferences_dialog(
             // Save config and sync if git is configured
             if let Err(e) = cterm_app::config::save_config(&final_config) {
                 log::error!("Failed to save config: {}", e);
+            }
+
+            // Save tool shortcuts
+            {
+                let entries = tool_entries_for_response.borrow();
+                let tools: Vec<cterm_app::config::ToolShortcutEntry> = entries
+                    .iter()
+                    .filter_map(|(name_e, cmd_e, args_e)| {
+                        let name = name_e.text().to_string();
+                        let command = cmd_e.text().to_string();
+                        if name.is_empty() || command.is_empty() {
+                            return None;
+                        }
+                        let args_str = args_e.text().to_string();
+                        let args: Vec<String> = if args_str.is_empty() {
+                            Vec::new()
+                        } else {
+                            args_str.split_whitespace().map(|s| s.to_string()).collect()
+                        };
+                        Some(cterm_app::config::ToolShortcutEntry {
+                            name,
+                            command,
+                            args,
+                        })
+                    })
+                    .collect();
+                if let Err(e) = cterm_app::config::save_tool_shortcuts(&tools) {
+                    log::error!("Failed to save tool shortcuts: {}", e);
+                }
             }
 
             // If git sync is configured, commit and push
@@ -957,6 +991,174 @@ fn create_shortcuts_preferences(config: &Config) -> (GtkBox, Vec<(String, Entry)
     (page, entries)
 }
 
+/// Tool entry row: (name_entry, command_entry, args_entry)
+type ToolEntryRow = (Entry, Entry, Entry);
+
+fn create_tools_preferences() -> (GtkBox, Rc<RefCell<Vec<ToolEntryRow>>>) {
+    let page = GtkBox::new(Orientation::Vertical, 12);
+    page.set_margin_top(12);
+    page.set_margin_bottom(12);
+    page.set_margin_start(12);
+    page.set_margin_end(12);
+
+    let header = Label::new(Some("External Tool Shortcuts"));
+    header.set_halign(Align::Start);
+    header.add_css_class("heading");
+    page.append(&header);
+
+    let scroll = ScrolledWindow::new();
+    scroll.set_vexpand(true);
+
+    let entries_box = GtkBox::new(Orientation::Vertical, 4);
+    let entries: Rc<RefCell<Vec<ToolEntryRow>>> = Rc::new(RefCell::new(Vec::new()));
+
+    // Column header row
+    let header_row = GtkBox::new(Orientation::Horizontal, 8);
+    let name_h = Label::new(Some("Name"));
+    name_h.set_width_chars(15);
+    name_h.set_halign(Align::Start);
+    let cmd_h = Label::new(Some("Command"));
+    cmd_h.set_width_chars(15);
+    cmd_h.set_halign(Align::Start);
+    let args_h = Label::new(Some("Args"));
+    args_h.set_hexpand(true);
+    args_h.set_halign(Align::Start);
+    header_row.append(&name_h);
+    header_row.append(&cmd_h);
+    header_row.append(&args_h);
+    entries_box.append(&header_row);
+
+    // Helper to add a row
+    let add_tool_row = |entries_box: &GtkBox,
+                        entries: &Rc<RefCell<Vec<ToolEntryRow>>>,
+                        name: &str,
+                        command: &str,
+                        args: &str| {
+        let row = GtkBox::new(Orientation::Horizontal, 8);
+        let name_entry = Entry::new();
+        name_entry.set_text(name);
+        name_entry.set_width_chars(15);
+        name_entry.set_placeholder_text(Some("Name"));
+        let cmd_entry = Entry::new();
+        cmd_entry.set_text(command);
+        cmd_entry.set_width_chars(15);
+        cmd_entry.set_placeholder_text(Some("Command"));
+        let args_entry = Entry::new();
+        args_entry.set_text(args);
+        args_entry.set_hexpand(true);
+        args_entry.set_placeholder_text(Some("Arguments"));
+        row.append(&name_entry);
+        row.append(&cmd_entry);
+        row.append(&args_entry);
+
+        // Remove button
+        let remove_btn = Button::with_label("Remove");
+        let entries_clone = Rc::clone(entries);
+        let row_clone = row.clone();
+        let name_entry_clone = name_entry.clone();
+        let entries_box_clone = entries_box.clone();
+        remove_btn.connect_clicked(move |_| {
+            // Remove from UI
+            entries_box_clone.remove(&row_clone);
+            // Remove from entries list by matching the name entry pointer
+            let mut entries = entries_clone.borrow_mut();
+            entries.retain(|(n, _, _)| n != &name_entry_clone);
+        });
+        row.append(&remove_btn);
+
+        entries_box.append(&row);
+        entries
+            .borrow_mut()
+            .push((name_entry, cmd_entry, args_entry));
+    };
+
+    // Load existing entries
+    let shortcuts = cterm_app::config::load_tool_shortcuts().unwrap_or_default();
+    for shortcut in &shortcuts {
+        add_tool_row(
+            &entries_box,
+            &entries,
+            &shortcut.name,
+            &shortcut.command,
+            &shortcut.args.join(" "),
+        );
+    }
+
+    scroll.set_child(Some(&entries_box));
+    page.append(&scroll);
+
+    // Button row
+    let button_row = GtkBox::new(Orientation::Horizontal, 8);
+    let add_btn = Button::with_label("Add");
+    let entries_for_add = Rc::clone(&entries);
+    let entries_box_for_add = entries_box.clone();
+    add_btn.connect_clicked(move |_| {
+        add_tool_row(&entries_box_for_add, &entries_for_add, "", "", "");
+    });
+
+    let reset_btn = Button::with_label("Reset to Defaults");
+    let entries_for_reset = Rc::clone(&entries);
+    let entries_box_for_reset = entries_box.clone();
+    reset_btn.connect_clicked(move |_| {
+        // Remove all entry rows (keep the header row)
+        {
+            let mut entries = entries_for_reset.borrow_mut();
+            entries.clear();
+        }
+        // Remove all children except the header row
+        while let Some(child) = entries_box_for_reset.last_child() {
+            if let Some(first) = entries_box_for_reset.first_child() {
+                if child == first {
+                    break; // Keep the header row
+                }
+            }
+            entries_box_for_reset.remove(&child);
+        }
+        // Add defaults
+        for shortcut in cterm_app::config::default_tool_shortcuts() {
+            let row = GtkBox::new(Orientation::Horizontal, 8);
+            let name_entry = Entry::new();
+            name_entry.set_text(&shortcut.name);
+            name_entry.set_width_chars(15);
+            name_entry.set_placeholder_text(Some("Name"));
+            let cmd_entry = Entry::new();
+            cmd_entry.set_text(&shortcut.command);
+            cmd_entry.set_width_chars(15);
+            cmd_entry.set_placeholder_text(Some("Command"));
+            let args_entry = Entry::new();
+            args_entry.set_text(&shortcut.args.join(" "));
+            args_entry.set_hexpand(true);
+            args_entry.set_placeholder_text(Some("Arguments"));
+            row.append(&name_entry);
+            row.append(&cmd_entry);
+            row.append(&args_entry);
+
+            let remove_btn = Button::with_label("Remove");
+            let entries_clone = Rc::clone(&entries_for_reset);
+            let row_clone = row.clone();
+            let name_entry_clone = name_entry.clone();
+            let entries_box_clone = entries_box_for_reset.clone();
+            remove_btn.connect_clicked(move |_| {
+                entries_box_clone.remove(&row_clone);
+                let mut entries = entries_clone.borrow_mut();
+                entries.retain(|(n, _, _)| n != &name_entry_clone);
+            });
+            row.append(&remove_btn);
+
+            entries_box_for_reset.append(&row);
+            entries_for_reset
+                .borrow_mut()
+                .push((name_entry, cmd_entry, args_entry));
+        }
+    });
+
+    button_row.append(&add_btn);
+    button_row.append(&reset_btn);
+    page.append(&button_row);
+
+    (page, entries)
+}
+
 fn create_git_sync_preferences() -> (GtkBox, Entry, Label, Label, Label, Label, Button) {
     let page = GtkBox::new(Orientation::Vertical, 12);
     page.set_margin_top(12);
@@ -1149,6 +1351,138 @@ pub fn show_close_confirmation_dialog<F>(
 
     dialog.connect_response(move |dialog, response| {
         callback(response == ResponseType::Ok);
+        dialog.close();
+    });
+
+    dialog.present();
+}
+
+/// Result of a file drop dialog
+pub enum FileDropChoice {
+    PastePath,
+    PasteContents,
+    CreateViaBase64(String),
+    CreateViaPrintf(String),
+    Cancel,
+}
+
+/// Show a file drop options dialog
+///
+/// The `callback` is called with the user's chosen action.
+pub fn show_file_drop_dialog<F>(
+    parent: &impl IsA<Window>,
+    info: &cterm_app::file_drop::FileDropInfo,
+    callback: F,
+) where
+    F: Fn(FileDropChoice) + 'static,
+{
+    use cterm_app::file_drop::{format_size, SIZE_WARNING_THRESHOLD};
+
+    let dialog = Dialog::builder()
+        .title("File Dropped")
+        .transient_for(parent)
+        .modal(true)
+        .build();
+
+    // Add buttons — the response IDs must be distinct.
+    dialog.add_button("Cancel", ResponseType::Cancel);
+    dialog.add_button("Paste Path", ResponseType::Other(1));
+    if info.is_text {
+        dialog.add_button("Paste Contents", ResponseType::Other(2));
+    }
+    dialog.add_button("Create via base64", ResponseType::Other(3));
+    dialog.add_button("Create via printf", ResponseType::Other(4));
+
+    let content = dialog.content_area();
+    content.set_spacing(12);
+    content.set_margin_top(12);
+    content.set_margin_bottom(12);
+    content.set_margin_start(12);
+    content.set_margin_end(12);
+
+    let mut message = format!("File: {}\nSize: {}", info.filename, format_size(info.size));
+    if info.size > SIZE_WARNING_THRESHOLD {
+        message.push_str(&format!(
+            "\n\nWarning: This file is large ({}). Sending its contents may take a while.",
+            format_size(info.size)
+        ));
+    }
+
+    let label = Label::new(Some(&message));
+    label.set_halign(Align::Start);
+    label.set_wrap(true);
+    content.append(&label);
+
+    let filename = info.filename.clone();
+    let parent_window = parent.clone().upcast::<Window>();
+    let callback = Rc::new(callback);
+
+    dialog.connect_response(move |dialog, response| {
+        dialog.close();
+
+        match response {
+            ResponseType::Other(1) => {
+                (callback)(FileDropChoice::PastePath);
+            }
+            ResponseType::Other(2) => {
+                (callback)(FileDropChoice::PasteContents);
+            }
+            ResponseType::Other(3) => {
+                let cb = Rc::clone(&callback);
+                show_filename_input(&parent_window, &filename, move |name| {
+                    (cb)(FileDropChoice::CreateViaBase64(name));
+                });
+            }
+            ResponseType::Other(4) => {
+                let cb = Rc::clone(&callback);
+                show_filename_input(&parent_window, &filename, move |name| {
+                    (cb)(FileDropChoice::CreateViaPrintf(name));
+                });
+            }
+            _ => {
+                (callback)(FileDropChoice::Cancel);
+            }
+        }
+    });
+
+    dialog.present();
+}
+
+/// Show a filename input dialog. Calls `callback` with the entered name,
+/// or does nothing if cancelled.
+fn show_filename_input<F>(parent: &Window, default: &str, callback: F)
+where
+    F: Fn(String) + 'static,
+{
+    let dialog = Dialog::builder()
+        .title("Filename")
+        .transient_for(parent)
+        .modal(true)
+        .build();
+    dialog.add_button("Cancel", ResponseType::Cancel);
+    dialog.add_button("OK", ResponseType::Ok);
+
+    let content = dialog.content_area();
+    content.set_spacing(12);
+    content.set_margin_top(12);
+    content.set_margin_bottom(12);
+    content.set_margin_start(12);
+    content.set_margin_end(12);
+
+    let label = Label::new(Some("Enter the target filename:"));
+    label.set_halign(Align::Start);
+    content.append(&label);
+
+    let entry = Entry::new();
+    entry.set_text(default);
+    entry.set_hexpand(true);
+    content.append(&entry);
+
+    dialog.connect_response(move |dialog, response| {
+        if response == ResponseType::Ok {
+            let name = entry.text().to_string();
+            callback(name);
+        }
         dialog.close();
     });
 

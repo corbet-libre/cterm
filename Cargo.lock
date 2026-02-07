@@ -391,6 +391,7 @@ dependencies = [
 name = "cterm-app"
 version = "0.0.9"
 dependencies = [
+ "base64",
  "bincode",
  "cterm-core",
  "cterm-ui",
