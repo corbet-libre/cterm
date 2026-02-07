@@ -3,6 +3,8 @@
 //! These types capture all the state needed to reconstruct terminal windows
 //! after a seamless upgrade. They are serialized and passed to the new process.
 
+use std::io;
+
 use serde::{Deserialize, Serialize};
 
 use cterm_core::cell::CellStyle;
@@ -23,7 +25,7 @@ pub struct UpgradeState {
 impl UpgradeState {
     /// Current format version
     /// Increment this when making incompatible changes to serialized types
-    pub const FORMAT_VERSION: u32 = 2;
+    pub const FORMAT_VERSION: u32 = 3;
 
     /// Create a new upgrade state
     pub fn new(cterm_version: &str) -> Self {
@@ -170,8 +172,11 @@ pub struct TerminalUpgradeState {
     pub rows: usize,
     /// Main screen grid
     pub grid: Grid,
-    /// Scrollback buffer
+    /// Scrollback buffer (may be empty if spilled to file)
     pub scrollback: Vec<Row>,
+    /// Path to temp file containing bincode-serialized scrollback (when spilled to disk)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scrollback_file: Option<String>,
     /// Alternate screen grid (for vim, less, etc.)
     pub alternate_grid: Option<Grid>,
     /// Current cursor position and style
@@ -207,6 +212,7 @@ impl Default for TerminalUpgradeState {
             rows: 24,
             grid: Grid::new(80, 24),
             scrollback: Vec::new(),
+            scrollback_file: None,
             alternate_grid: None,
             cursor: Cursor::default(),
             saved_cursor: None,
@@ -221,6 +227,39 @@ impl Default for TerminalUpgradeState {
             cursor_style: CursorStyle::default(),
             mouse_mode: MouseMode::default(),
         }
+    }
+}
+
+impl TerminalUpgradeState {
+    /// Spill scrollback to a temp file using bincode serialization.
+    /// Called before serialization to keep the state compact for socket transfer.
+    pub fn save_scrollback_to_file(&mut self, index: usize) -> io::Result<()> {
+        if self.scrollback.is_empty() {
+            return Ok(());
+        }
+        let path = std::env::temp_dir().join(format!(
+            "cterm_scrollback_{}_{}.bin",
+            std::process::id(),
+            index
+        ));
+        let file = std::fs::File::create(&path)?;
+        bincode::serialize_into(std::io::BufWriter::new(file), &self.scrollback)
+            .map_err(io::Error::other)?;
+        self.scrollback_file = Some(path.to_string_lossy().into_owned());
+        self.scrollback = Vec::new();
+        Ok(())
+    }
+
+    /// Load scrollback from a temp file if one was used.
+    /// Called after deserialization to restore spilled scrollback data.
+    pub fn load_scrollback_from_file(&mut self) -> io::Result<()> {
+        if let Some(path) = self.scrollback_file.take() {
+            let file = std::fs::File::open(&path)?;
+            self.scrollback = bincode::deserialize_from(std::io::BufReader::new(file))
+                .map_err(io::Error::other)?;
+            let _ = std::fs::remove_file(&path);
+        }
+        Ok(())
     }
 }
 

@@ -395,6 +395,7 @@ impl TerminalWidget {
             rows: screen.grid().height(),
             grid: screen.grid().clone(),
             scrollback: screen.scrollback().iter().cloned().collect(),
+            scrollback_file: None,
             alternate_grid: screen.alternate_grid().cloned(),
             cursor: screen.cursor.clone(),
             saved_cursor: screen.saved_cursor().cloned(),

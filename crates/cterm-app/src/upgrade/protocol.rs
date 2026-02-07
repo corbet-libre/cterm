@@ -27,8 +27,8 @@ use std::os::windows::io::RawHandle;
 
 use super::state::UpgradeState;
 
-/// Maximum size of the state buffer (64MB)
-pub const MAX_STATE_SIZE: usize = 64 * 1024 * 1024;
+/// Maximum size of the state buffer (128MB)
+pub const MAX_STATE_SIZE: usize = 128 * 1024 * 1024;
 
 /// Maximum number of file descriptors to transfer
 pub const MAX_FDS: usize = 256;
@@ -89,9 +89,20 @@ pub fn execute_upgrade(
 
     log::info!("Created socketpair, child FD: {}", child_fd);
 
+    // Spill scrollback to temp files to keep state within socket buffer limits
+    let mut state = state.clone();
+    for (w_idx, window) in state.windows.iter_mut().enumerate() {
+        for (t_idx, tab) in window.tabs.iter_mut().enumerate() {
+            let index = w_idx * 1000 + t_idx;
+            if let Err(e) = tab.terminal.save_scrollback_to_file(index) {
+                log::warn!("Failed to save scrollback to file for tab {}: {}", index, e);
+            }
+        }
+    }
+
     // Serialize the state as JSON for forward/backward compatibility
     let state_bytes =
-        serde_json::to_vec(state).map_err(|e| UpgradeError::Serialization(e.to_string()))?;
+        serde_json::to_vec(&state).map_err(|e| UpgradeError::Serialization(e.to_string()))?;
 
     log::info!(
         "State serialized: {} bytes, {} FDs",
@@ -217,9 +228,20 @@ pub fn execute_upgrade(
         return Err(UpgradeError::TooManyFds(handles.len(), MAX_FDS));
     }
 
+    // Spill scrollback to temp files to keep state within socket buffer limits
+    let mut state = state.clone();
+    for (w_idx, window) in state.windows.iter_mut().enumerate() {
+        for (t_idx, tab) in window.tabs.iter_mut().enumerate() {
+            let index = w_idx * 1000 + t_idx;
+            if let Err(e) = tab.terminal.save_scrollback_to_file(index) {
+                log::warn!("Failed to save scrollback to file for tab {}: {}", index, e);
+            }
+        }
+    }
+
     // Serialize the state as JSON for forward/backward compatibility
     let state_bytes =
-        serde_json::to_vec(state).map_err(|e| UpgradeError::Serialization(e.to_string()))?;
+        serde_json::to_vec(&state).map_err(|e| UpgradeError::Serialization(e.to_string()))?;
 
     log::info!(
         "State serialized: {} bytes, {} handle sets",
@@ -473,7 +495,7 @@ pub fn receive_upgrade(fd: RawFd) -> Result<(UpgradeState, Vec<RawFd>), UpgradeE
     let state_data = &buf[..data_len];
 
     // Try JSON first (new format), fall back to bincode (legacy)
-    let state: UpgradeState = if state_data.first() == Some(&b'{') {
+    let mut state: UpgradeState = if state_data.first() == Some(&b'{') {
         log::info!("Detected JSON upgrade format");
         serde_json::from_slice(state_data)
             .map_err(|e| UpgradeError::Deserialization(e.to_string()))?
@@ -482,6 +504,15 @@ pub fn receive_upgrade(fd: RawFd) -> Result<(UpgradeState, Vec<RawFd>), UpgradeE
         bincode::deserialize(state_data)
             .map_err(|e| UpgradeError::Deserialization(e.to_string()))?
     };
+
+    // Load scrollback from temp files if spilled by the sender
+    for window in &mut state.windows {
+        for tab in &mut window.tabs {
+            if let Err(e) = tab.terminal.load_scrollback_from_file() {
+                log::warn!("Failed to load scrollback from file: {}", e);
+            }
+        }
+    }
 
     log::info!(
         "State deserialized: format_version={}, cterm_version={}, windows={}",
@@ -568,7 +599,7 @@ pub fn receive_upgrade(
     let state_bytes = &upgrade_data.state_bytes;
 
     // Try JSON first (new format), fall back to bincode (legacy)
-    let state: UpgradeState = if state_bytes.first() == Some(&b'{') {
+    let mut state: UpgradeState = if state_bytes.first() == Some(&b'{') {
         log::info!("Detected JSON upgrade format");
         serde_json::from_slice(state_bytes)
             .map_err(|e| UpgradeError::Deserialization(e.to_string()))?
@@ -577,6 +608,15 @@ pub fn receive_upgrade(
         bincode::deserialize(state_bytes)
             .map_err(|e| UpgradeError::Deserialization(e.to_string()))?
     };
+
+    // Load scrollback from temp files if spilled by the sender
+    for window in &mut state.windows {
+        for tab in &mut window.tabs {
+            if let Err(e) = tab.terminal.load_scrollback_from_file() {
+                log::warn!("Failed to load scrollback from file: {}", e);
+            }
+        }
+    }
 
     log::info!(
         "State deserialized: format_version={}, cterm_version={}, windows={}",
