@@ -660,6 +660,83 @@ jobs:
           # Create PkgInfo
           echo -n "APPL????" > "$APP_DIR/Contents/PkgInfo"
 
+      - name: Import signing certificate
+        if: env.APPLE_CERTIFICATE_BASE64 != ''
+        env:
+          APPLE_CERTIFICATE_BASE64: ${{ secrets.APPLE_CERTIFICATE_BASE64 }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+        run: |
+          # Decode certificate
+          echo "$APPLE_CERTIFICATE_BASE64" | base64 --decode > /tmp/certificate.p12
+
+          # Create a temporary keychain
+          KEYCHAIN_PATH="/tmp/signing.keychain-db"
+          KEYCHAIN_PASSWORD="$(openssl rand -hex 16)"
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+
+          # Import certificate
+          security import /tmp/certificate.p12 -P "$APPLE_CERTIFICATE_PASSWORD" \
+            -A -t cert -f pkcs12 -k "$KEYCHAIN_PATH"
+
+          # Allow codesign to access the keychain
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+
+          # Add temporary keychain to search list
+          security list-keychains -d user -s "$KEYCHAIN_PATH" $(security list-keychains -d user | tr -d '"')
+
+          # Clean up certificate file
+          rm /tmp/certificate.p12
+
+      - name: Sign app bundle
+        if: env.APPLE_CERTIFICATE_BASE64 != ''
+        env:
+          APPLE_CERTIFICATE_BASE64: ${{ secrets.APPLE_CERTIFICATE_BASE64 }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          IDENTITY="Developer ID Application: ($APPLE_TEAM_ID)"
+
+          # Sign the binary inside the bundle with hardened runtime
+          codesign --force --options runtime \
+            --entitlements packaging/macos/cterm.entitlements \
+            --sign "$IDENTITY" \
+            --timestamp \
+            "release/cterm.app/Contents/MacOS/cterm"
+
+          # Sign the app bundle itself
+          codesign --force --options runtime \
+            --entitlements packaging/macos/cterm.entitlements \
+            --sign "$IDENTITY" \
+            --timestamp \
+            "release/cterm.app"
+
+          # Verify
+          codesign --verify --deep --strict --verbose=2 "release/cterm.app"
+
+      - name: Notarize app bundle
+        if: env.APPLE_CERTIFICATE_BASE64 != ''
+        env:
+          APPLE_CERTIFICATE_BASE64: ${{ secrets.APPLE_CERTIFICATE_BASE64 }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_ID_PASSWORD: ${{ secrets.APPLE_ID_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          # Create a zip for notarization submission
+          ditto -c -k --keepParent "release/cterm.app" /tmp/cterm-notarize.zip
+
+          # Submit for notarization
+          xcrun notarytool submit /tmp/cterm-notarize.zip \
+            --apple-id "$APPLE_ID" \
+            --password "$APPLE_ID_PASSWORD" \
+            --team-id "$APPLE_TEAM_ID" \
+            --wait --timeout 30m
+
+          # Staple the notarization ticket to the app
+          xcrun stapler staple "release/cterm.app"
+
+          rm /tmp/cterm-notarize.zip
+
       - name: Install create-dmg
         run: brew install create-dmg
 
@@ -691,6 +768,50 @@ jobs:
 
           # Rename to standard name for artifact
           mv "release/cterm-macos-$VERSION.dmg" "release/cterm-macos-universal.dmg"
+
+      - name: Sign and notarize DMG
+        if: env.APPLE_CERTIFICATE_BASE64 != ''
+        env:
+          APPLE_CERTIFICATE_BASE64: ${{ secrets.APPLE_CERTIFICATE_BASE64 }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_ID_PASSWORD: ${{ secrets.APPLE_ID_PASSWORD }}
+        run: |
+          IDENTITY="Developer ID Application: ($APPLE_TEAM_ID)"
+
+          # Sign the DMG
+          codesign --force --sign "$IDENTITY" --timestamp "release/cterm-macos-universal.dmg"
+
+          # Notarize the DMG
+          xcrun notarytool submit "release/cterm-macos-universal.dmg" \
+            --apple-id "$APPLE_ID" \
+            --password "$APPLE_ID_PASSWORD" \
+            --team-id "$APPLE_TEAM_ID" \
+            --wait --timeout 30m
+
+          # Staple the notarization ticket to the DMG
+          xcrun stapler staple "release/cterm-macos-universal.dmg"
+
+      - name: Sign ctermd binary
+        if: env.APPLE_CERTIFICATE_BASE64 != ''
+        env:
+          APPLE_CERTIFICATE_BASE64: ${{ secrets.APPLE_CERTIFICATE_BASE64 }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          IDENTITY="Developer ID Application: ($APPLE_TEAM_ID)"
+          codesign --force --options runtime \
+            --sign "$IDENTITY" \
+            --timestamp \
+            "universal-binary/ctermd"
+          codesign --verify --strict --verbose=2 "universal-binary/ctermd"
+
+      - name: Clean up keychain
+        if: always()
+        run: |
+          KEYCHAIN_PATH="/tmp/signing.keychain-db"
+          if [ -f "$KEYCHAIN_PATH" ]; then
+            security delete-keychain "$KEYCHAIN_PATH" || true
+          fi
 
       - name: Create tar.gz for auto-update (app bundle)
         run: |
