@@ -694,9 +694,14 @@ jobs:
         if: env.APPLE_CERTIFICATE_BASE64 != ''
         env:
           APPLE_CERTIFICATE_BASE64: ${{ secrets.APPLE_CERTIFICATE_BASE64 }}
-          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         run: |
-          IDENTITY="Developer ID Application: ($APPLE_TEAM_ID)"
+          IDENTITY=$(security find-identity -v -p codesigning | grep "Developer ID Application" | head -1 | sed 's/.*"\(.*\)".*/\1/')
+          if [ -z "$IDENTITY" ]; then
+            echo "::error::No Developer ID Application identity found in keychain"
+            security find-identity -v -p codesigning
+            exit 1
+          fi
+          echo "Signing with: $IDENTITY"
 
           # Sign the binary inside the bundle with hardened runtime
           codesign --force --options runtime \
@@ -778,7 +783,7 @@ jobs:
           APPLE_ID: ${{ secrets.APPLE_ID }}
           APPLE_ID_PASSWORD: ${{ secrets.APPLE_ID_PASSWORD }}
         run: |
-          IDENTITY="Developer ID Application: ($APPLE_TEAM_ID)"
+          IDENTITY=$(security find-identity -v -p codesigning | grep "Developer ID Application" | head -1 | sed 's/.*"\(.*\)".*/\1/')
 
           # Sign the DMG
           codesign --force --sign "$IDENTITY" --timestamp "release/cterm-macos-universal.dmg"
@@ -799,7 +804,7 @@ jobs:
           APPLE_CERTIFICATE_BASE64: ${{ secrets.APPLE_CERTIFICATE_BASE64 }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         run: |
-          IDENTITY="Developer ID Application: ($APPLE_TEAM_ID)"
+          IDENTITY=$(security find-identity -v -p codesigning | grep "Developer ID Application" | head -1 | sed 's/.*"\(.*\)".*/\1/')
           codesign --force --options runtime \
             --sign "$IDENTITY" \
             --timestamp \
