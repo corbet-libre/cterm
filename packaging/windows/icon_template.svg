@@ -1,0 +1,60 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024">
+  <defs>
+    <linearGradient id="bgGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" style="stop-color:#2D3748"/>
+      <stop offset="100%" style="stop-color:#1A202C"/>
+    </linearGradient>
+    <linearGradient id="screenGrad" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" style="stop-color:#1E1E2E"/>
+      <stop offset="100%" style="stop-color:#11111B"/>
+    </linearGradient>
+    <filter id="shadow" x="-20%" y="-20%" width="140%" height="140%">
+      <feDropShadow dx="0" dy="4" stdDeviation="12" flood-opacity="0.3"/>
+    </filter>
+  </defs>
+
+  <!-- Background rectangle (window, sharper corners like Windows) -->
+  <rect x="64" y="64" width="896" height="896" rx="16" ry="16" fill="url(#bgGrad)" filter="url(#shadow)"/>
+
+  <!-- Title bar -->
+  <rect x="64" y="64" width="896" height="80" rx="16" ry="16" fill="#374151"/>
+  <rect x="64" y="110" width="896" height="34" fill="#374151"/>
+
+  <!-- Windows-style buttons (right side) -->
+  <!-- Minimize (horizontal line) -->
+  <rect x="784" y="98" width="24" height="3" fill="#A6ADC8" opacity="0.8"/>
+  <!-- Maximize (square outline) -->
+  <rect x="834" y="84" width="22" height="22" rx="2" fill="none" stroke="#A6ADC8" stroke-width="2.5" opacity="0.8"/>
+  <!-- Close (X on red background) -->
+  <rect x="880" y="72" width="52" height="48" rx="4" fill="#C42B1C"/>
+  <line x1="896" y1="86" x2="916" y2="106" stroke="#fff" stroke-width="2.5" stroke-linecap="round"/>
+  <line x1="916" y1="86" x2="896" y2="106" stroke="#fff" stroke-width="2.5" stroke-linecap="round"/>
+
+  <!-- Terminal screen area -->
+  <rect x="96" y="160" width="832" height="768" rx="8" ry="8" fill="url(#screenGrad)"/>
+
+  <!-- Prompt line 1 -->
+  <text x="140" y="260" font-family="Consolas, Monaco, monospace" font-size="56" font-weight="bold" fill="#10B981">&gt;</text>
+  <text x="200" y="260" font-family="Consolas, Monaco, monospace" font-size="56" fill="#CDD6F4">echo "Hello, World!"</text>
+
+  <!-- Output line -->
+  <text x="140" y="340" font-family="Consolas, Monaco, monospace" font-size="56" fill="#A6ADC8">Hello, World!</text>
+
+  <!-- Prompt line 2 -->
+  <text x="140" y="440" font-family="Consolas, Monaco, monospace" font-size="56" font-weight="bold" fill="#10B981">&gt;</text>
+  <text x="200" y="440" font-family="Consolas, Monaco, monospace" font-size="56" fill="#CDD6F4">cterm &#x2d;&#x2d;version</text>
+
+  <!-- Output line 2 -->
+  <text x="140" y="520" font-family="Consolas, Monaco, monospace" font-size="56" fill="#F59E0B">cterm {{VERSION}}</text>
+
+  <!-- Current prompt with cursor -->
+  <text x="140" y="620" font-family="Consolas, Monaco, monospace" font-size="56" font-weight="bold" fill="#10B981">&gt;</text>
+
+  <!-- Block cursor -->
+  <rect x="200" y="575" width="32" height="56" fill="#CDD6F4"/>
+
+  <!-- Decorative accent line at bottom -->
+  <rect x="140" y="820" width="200" height="6" rx="3" fill="#10B981" opacity="0.6"/>
+  <rect x="360" y="820" width="120" height="6" rx="3" fill="#CDD6F4" opacity="0.3"/>
+  <rect x="500" y="820" width="80" height="6" rx="3" fill="#CDD6F4" opacity="0.2"/>
+</svg>

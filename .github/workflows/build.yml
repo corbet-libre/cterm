@@ -235,7 +235,7 @@ jobs:
           echo "Building icon for version: $VERSION"
 
           # Generate SVG with version substituted
-          sed "s/{{VERSION}}/$VERSION/g" packaging/icon_template.svg > /tmp/cterm_icon.svg
+          sed "s/{{VERSION}}/$VERSION/g" packaging/linux/icon_template.svg > /tmp/cterm_icon.svg
 
           # Generate PNG icons at standard sizes
           mkdir -p /tmp/icons
@@ -315,7 +315,7 @@ jobs:
           echo "Building icon for version: $VERSION"
 
           # Generate SVG with version substituted
-          sed "s/{{VERSION}}/$VERSION/g" packaging/icon_template.svg > /tmp/cterm_icon.svg
+          sed "s/{{VERSION}}/$VERSION/g" packaging/linux/icon_template.svg > /tmp/cterm_icon.svg
 
           # Generate PNG icons at standard sizes
           mkdir -p /tmp/icons
@@ -451,7 +451,7 @@ jobs:
           Write-Host "Building icon for version: $version"
 
           # Read template and substitute version
-          $template = Get-Content -Path packaging/icon_template.svg -Raw
+          $template = Get-Content -Path packaging/windows/icon_template.svg -Raw
           $svg = $template -replace '\{\{VERSION\}\}', $version
           Set-Content -Path release/cterm_icon.svg -Value $svg
 
