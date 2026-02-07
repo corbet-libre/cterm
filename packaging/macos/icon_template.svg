@@ -1,0 +1,20 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024">
+  <defs>
+    <linearGradient id="bgGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" style="stop-color:#1E1E2E"/>
+      <stop offset="100%" style="stop-color:#11111B"/>
+    </linearGradient>
+  </defs>
+
+  <!-- Background fills entire canvas - macOS applies rounded rect mask -->
+  <rect width="1024" height="1024" fill="url(#bgGrad)"/>
+
+  <!-- "cterm" in orange -->
+  <text x="80" y="580" font-family="Monaco, Menlo, monospace" font-size="172" font-weight="bold" fill="#F59E0B">cterm</text>
+
+  <!-- "$" in green -->
+  <text x="700" y="580" font-family="Monaco, Menlo, monospace" font-size="172" font-weight="bold" fill="#10B981">$</text>
+
+  <!-- Cursor block -->
+  <rect x="820" y="460" width="22" height="130" rx="4" fill="#CDD6F4" opacity="0.9"/>
+</svg>

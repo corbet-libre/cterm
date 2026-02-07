@@ -619,8 +619,8 @@ jobs:
           VERSION=$(grep '^version = ' Cargo.toml | head -1 | sed 's/version = "\(.*\)"/\1/')
           echo "Building icon for version: $VERSION"
 
-          # Generate SVG with version substituted
-          sed "s/{{VERSION}}/$VERSION/g" packaging/icon_template.svg > /tmp/cterm_icon.svg
+          # Use macOS-specific icon template (no window chrome, fills full canvas)
+          sed "s/{{VERSION}}/$VERSION/g" packaging/macos/icon_template.svg > /tmp/cterm_icon.svg
 
           # Create iconset directory
           mkdir -p /tmp/cterm.iconset
