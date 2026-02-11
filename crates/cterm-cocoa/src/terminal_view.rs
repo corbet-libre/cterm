@@ -1488,9 +1488,10 @@ impl TerminalView {
                     {
                         // Get the new title
                         let new_title = state.title.read().map(|t| t.clone()).unwrap_or_default();
+                        let state_clone = state.clone();
                         #[allow(deprecated)]
                         dispatch2::Queue::main().exec_async(move || {
-                            if view_ptr != 0 {
+                            if !state_clone.view_invalid.load(Ordering::SeqCst) && view_ptr != 0 {
                                 unsafe {
                                     let view = &*(view_ptr as *const TerminalView);
                                     if let Some(window) = view.window() {
@@ -1506,9 +1507,10 @@ impl TerminalView {
                 if state.bell_changed.swap(false, Ordering::Relaxed)
                     && !state.view_invalid.load(Ordering::SeqCst)
                 {
+                    let state_clone = state.clone();
                     #[allow(deprecated)]
                     dispatch2::Queue::main().exec_async(move || {
-                        if view_ptr != 0 {
+                        if !state_clone.view_invalid.load(Ordering::SeqCst) && view_ptr != 0 {
                             unsafe {
                                 let view = &*(view_ptr as *const TerminalView);
                                 if let Some(window) = view.window() {
