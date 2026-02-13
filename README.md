@@ -14,7 +14,8 @@ A high-performance, customizable terminal emulator built in pure Rust. Features 
 ### User Interface
 - **Tabs**: Multiple terminal tabs with keyboard shortcuts
 - **Tab Customization**: Custom colors and names for tabs
-- **Sticky Tabs**: Persistent tab configurations for frequently-used commands (great for Claude sessions)
+- **Tab Templates**: Persistent tab configurations for frequently-used commands (great for Claude sessions)
+- **Quick Launch**: VS Code-style fuzzy search overlay to instantly open or switch to tabs (Cmd+G / Ctrl+Shift+G)
 - **Themes**: Built-in themes (Tokyo Night, Dracula, Nord, and more) plus custom TOML themes
 - **Keyboard Shortcuts**: Fully configurable shortcuts for all actions
 - **Zoom**: Adjustable font size with Ctrl+/Ctrl-
@@ -110,10 +111,10 @@ See [docs/configuration.md](docs/configuration.md) for detailed configuration op
 |--------|-------|---------------|
 | New Tab | Cmd+T | Ctrl+Shift+T |
 | Close Tab | Cmd+W | Ctrl+Shift+W |
-| Close Other Tabs | — | — |
 | Next Tab | Cmd+Shift+] | Ctrl+Tab |
 | Previous Tab | Cmd+Shift+[ | Ctrl+Shift+Tab |
 | Switch to Tab 1-9 | Cmd+1-9 | Ctrl+1-9 |
+| Quick Launch | Cmd+G | Ctrl+Shift+G |
 | Copy | Cmd+C | Ctrl+Shift+C |
 | Copy as HTML | Cmd+Shift+C | — |
 | Paste | Cmd+V | Ctrl+Shift+V |
@@ -123,6 +124,125 @@ See [docs/configuration.md](docs/configuration.md) for detailed configuration op
 | Reset Zoom | Cmd+0 | Ctrl+0 |
 
 **Scrollback:** Use mouse wheel or trackpad to scroll through terminal history.
+
+## Quick Launch
+
+Press **Cmd+G** (macOS) or **Ctrl+Shift+G** (Linux/Windows) to open the Quick Launch overlay. It provides a fuzzy search over your tab templates, letting you instantly open a new tab or switch to an existing one.
+
+- Type to filter templates by name
+- Use **Arrow keys** or **Tab**/**Shift+Tab** to navigate results
+- Press **Enter** to launch, **Escape** to dismiss
+
+## Tab Templates
+
+Tab templates are defined in `sticky_tabs.toml` in your [configuration directory](#configuration). Each template pre-configures a tab with a command, working directory, color, and other settings.
+
+```toml
+[[tabs]]
+name = "Claude"
+command = "claude"
+color = "#7c3aed"
+unique = true
+keep_open = true
+
+[[tabs]]
+name = "Project"
+working_directory = "~/projects/myapp"
+color = "#22c55e"
+
+[[tabs]]
+name = "Dev Server"
+command = "npm"
+args = ["run", "dev"]
+working_directory = "~/projects/myapp"
+keep_open = true
+```
+
+### Template options
+
+| Field | Description |
+|-------|-------------|
+| `name` | Display name shown in Quick Launch and as the tab title |
+| `command` | Command to run (omit for default shell) |
+| `args` | Command arguments (array) |
+| `working_directory` | Initial working directory |
+| `color` | Tab color in hex (`#RRGGBB`) |
+| `theme` | Theme override for this tab |
+| `background_color` | Lock the background color (overrides theme, hex `#RRGGBB`) |
+| `keep_open` | Keep the tab open after the process exits |
+| `unique` | Singleton mode — only one instance of this tab can exist at a time |
+| `auto_start` | Automatically open this tab when cterm starts |
+| `env` | Extra environment variables (table) |
+| `docker` | Docker container config (see below) |
+| `ssh` | SSH remote config (see below) |
+
+### Singleton tabs (`unique = true`)
+
+When a template has `unique = true`, launching it via Quick Launch will **switch to the existing tab** if one is already open, instead of creating a duplicate. This is ideal for tools that should only run once, like AI assistants or long-running servers.
+
+Combined with Quick Launch, this creates a "go to or open" workflow: press **Cmd+G**, type a few characters, hit **Enter**, and you're either switched to your running session or a new one is started — no need to hunt through tabs.
+
+### Docker templates
+
+Templates can launch shells inside Docker containers. Set the `docker` field with a mode (`exec`, `run`, or `devcontainer`):
+
+```toml
+[[tabs]]
+name = "Dev Container"
+color = "#0db7ed"
+unique = true
+[tabs.docker]
+mode = "devcontainer"
+image = "ubuntu:24.04"
+project_dir = "~/projects/myapp"
+shell = "/bin/bash"
+mount_ssh = true
+```
+
+| Field | Description |
+|-------|-------------|
+| `mode` | `exec` (attach to running container), `run` (start new), or `devcontainer` |
+| `container` | Container name/ID (exec mode) |
+| `image` | Image name with tag (run/devcontainer mode) |
+| `shell` | Shell to use inside the container |
+| `project_dir` | Project directory to mount (devcontainer mode) |
+| `docker_args` | Additional docker arguments (array) |
+| `auto_remove` | Remove container on exit (default: true) |
+| `mount_claude_config` | Mount Claude config into container (default: true) |
+| `mount_ssh` | Mount SSH keys into container (default: false) |
+| `mount_gitconfig` | Mount git config into container (default: true) |
+| `workdir` | Working directory inside container |
+
+### SSH templates
+
+Templates can open SSH connections with port forwarding, jump hosts, and more:
+
+```toml
+[[tabs]]
+name = "Production"
+color = "#22c55e"
+unique = true
+[tabs.ssh]
+host = "prod.example.com"
+username = "deploy"
+identity_file = "~/.ssh/prod_key"
+```
+
+| Field | Description |
+|-------|-------------|
+| `host` | Remote host (required) |
+| `port` | SSH port (default: 22) |
+| `username` | SSH username |
+| `identity_file` | Path to private key |
+| `remote_command` | Command to execute on the remote host |
+| `local_forwards` | Local port forwards (array, format: `"local:host:remote"`) |
+| `remote_forwards` | Remote port forwards (array) |
+| `dynamic_forward` | SOCKS proxy port |
+| `jump_host` | Bastion/jump host |
+| `agent_forward` | Forward SSH agent (default: false) |
+| `x11_forward` | Forward X11 (default: false) |
+| `options` | Extra SSH options as key-value pairs (table, passed as `-o`) |
+| `extra_args` | Additional raw SSH arguments (array) |
 
 ## Terminal Compatibility
 
@@ -218,13 +338,14 @@ cterm supports DECDLD (DEC Download) for custom character sets:
 ```
 cterm/
 ├── crates/
-│   ├── cterm-core/     # Core terminal emulation (parser, screen, PTY)
-│   ├── cterm-ui/       # UI abstraction traits
-│   ├── cterm-app/      # Application logic (config, sessions, upgrades, crash recovery)
-│   ├── cterm-cocoa/    # Native macOS UI using AppKit/CoreGraphics
-│   ├── cterm-gtk/      # GTK4 UI implementation (Linux)
-│   └── cterm-win32/    # Native Windows UI using Win32/Direct2D
-└── docs/               # Documentation
+│   ├── cterm-core/      # Core terminal emulation (parser, screen, PTY)
+│   ├── cterm-ui/        # UI abstraction traits
+│   ├── cterm-app/       # Application logic (config, sessions, upgrades, crash recovery)
+│   ├── cterm-cocoa/     # Native macOS UI using AppKit/CoreGraphics
+│   ├── cterm-gtk/       # GTK4 UI implementation (Linux)
+│   ├── cterm-win32/     # Native Windows UI using Win32/Direct2D
+│   └── cterm-headless/  # Headless terminal daemon (ctermd)
+└── docs/                # Documentation
 ```
 
 The modular architecture enables:
@@ -234,6 +355,7 @@ The modular architecture enables:
 - **cterm-cocoa**: Native macOS implementation using AppKit and CoreGraphics
 - **cterm-gtk**: GTK4-specific rendering and widgets (Linux)
 - **cterm-win32**: Native Windows implementation using Win32 and Direct2D
+- **cterm-headless**: Headless terminal daemon for remote access (ctermd)
 
 ## Built-in Themes
 
@@ -255,11 +377,12 @@ Custom themes can be added as TOML files in the `themes/` configuration subdirec
 - [x] Windows native UI (Win32/Direct2D)
 - [x] Seamless upgrades (macOS/Linux/Windows)
 - [x] Copy as HTML with formatting
+- [x] Tab templates with Quick Launch
+- [x] Docker and SSH templates
+- [x] Auto-update with release notes
 
 ### Future
 
-- Native SSH client
-- ctermd client (connect to headless terminal daemon)
 - Split panes
 - Plugin system
 
