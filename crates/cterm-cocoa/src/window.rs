@@ -12,7 +12,7 @@ use objc2_app_kit::{
     NSWindowDelegate, NSWindowStyleMask, NSWindowTabbingMode,
 };
 use objc2_foundation::{
-    MainThreadMarker, NSNotification, NSObjectProtocol, NSPoint, NSRect, NSSize, NSString,
+    MainThreadMarker, NSArray, NSNotification, NSObjectProtocol, NSPoint, NSRect, NSSize, NSString,
 };
 
 use cterm_app::config::Config;
@@ -21,7 +21,7 @@ use cterm_ui::theme::Theme;
 
 use cterm_core::Terminal;
 
-use crate::quick_open::{QuickOpenOverlay, QUICK_OPEN_HEIGHT};
+use crate::quick_open::{OpenTabEntry, QuickOpenOverlay, QUICK_OPEN_HEIGHT};
 use crate::terminal_view::TerminalView;
 
 /// Window state stored in ivars
@@ -462,12 +462,15 @@ impl CtermWindow {
         self.ivars().has_active_bell.get()
     }
 
-    /// Show the Quick Open overlay for template selection
+    /// Show the Quick Open overlay for template selection and tab switching
     pub fn show_quick_open(&self) {
         let mtm = MainThreadMarker::from(self);
 
         // Load templates
         let templates = cterm_app::config::load_sticky_tabs().unwrap_or_default();
+
+        // Collect open tabs with custom names
+        let open_tabs = self.collect_open_tabs();
 
         // Create the overlay if it doesn't exist
         if self.ivars().quick_open.borrow().is_none() {
@@ -480,6 +483,14 @@ impl CtermWindow {
                 let window = &*window_ptr;
                 window.open_template_tab(&template);
             });
+
+            // Set up callback for switching to an open tab
+            overlay.set_on_switch_tab(move |target_ptr| unsafe {
+                let target_window = target_ptr as *const NSWindow;
+                let _: () = msg_send![target_window, makeKeyAndOrderFront: std::ptr::null::<objc2::runtime::AnyObject>()];
+            });
+
+            overlay.set_open_tabs(open_tabs);
 
             // Add to window content view
             if let Some(content_view) = self.contentView() {
@@ -500,9 +511,9 @@ impl CtermWindow {
 
             *self.ivars().quick_open.borrow_mut() = Some(overlay);
         } else {
-            // Update templates in case they changed
+            // Update templates and open tabs in case they changed
             if let Some(ref overlay) = *self.ivars().quick_open.borrow() {
-                overlay.set_templates(templates);
+                overlay.set_templates_and_tabs(templates, open_tabs);
             }
         }
 
@@ -510,6 +521,37 @@ impl CtermWindow {
         if let Some(ref overlay) = *self.ivars().quick_open.borrow() {
             overlay.show();
         }
+    }
+
+    /// Collect open tabs with custom names for Quick Open
+    fn collect_open_tabs(&self) -> Vec<OpenTabEntry> {
+        let mut entries = Vec::new();
+
+        // Get all tabbed windows in this window group
+        let tabbed_windows: Option<Retained<NSArray<NSWindow>>> =
+            unsafe { msg_send![self, tabbedWindows] };
+
+        if let Some(windows) = tabbed_windows {
+            for window in windows.iter() {
+                // Try to cast to CtermWindow and check for custom title
+                let window_ptr = Retained::as_ptr(&window) as *const CtermWindow;
+                let cterm_window: &CtermWindow = unsafe { &*window_ptr };
+
+                if let Some(terminal_view) = cterm_window.active_terminal() {
+                    if terminal_view.is_title_locked() {
+                        let title = window.title().to_string();
+                        if !title.is_empty() {
+                            entries.push(OpenTabEntry {
+                                name: title,
+                                window_ptr: Retained::as_ptr(&window) as usize,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+
+        entries
     }
 
     /// Open a new tab from a template (helper for Quick Open)

@@ -1,6 +1,7 @@
 //! Quick Open overlay for rapidly searching and opening tab templates
 //!
-//! Shows a VS Code-style overlay at the top of the window for filtering templates.
+//! Shows a VS Code-style overlay at the top of the window for filtering
+//! templates and open tabs with custom names.
 
 use cterm_app::config::StickyTabConfig;
 use cterm_app::{template_type_indicator, QuickOpenMatcher, TemplateMatch};
@@ -23,20 +24,60 @@ pub const QUICK_OPEN_HEIGHT: f64 = 250.0;
 /// Maximum number of results to display
 const MAX_RESULTS: usize = 8;
 
+/// An open tab that can be switched to via Quick Open
+#[derive(Debug, Clone)]
+pub struct OpenTabEntry {
+    /// Display name (the custom title)
+    pub name: String,
+    /// Window pointer as usize for identification
+    pub window_ptr: usize,
+}
+
+/// A filtered result in Quick Open - either a template or an open tab
+#[derive(Debug, Clone)]
+enum QuickOpenEntry {
+    Template(Box<TemplateMatch>),
+    OpenTab {
+        entry: OpenTabEntry,
+        score: i32,
+        match_positions: Vec<usize>,
+    },
+}
+
+impl QuickOpenEntry {
+    fn name(&self) -> &str {
+        match self {
+            QuickOpenEntry::Template(m) => &m.template.name,
+            QuickOpenEntry::OpenTab { entry, .. } => &entry.name,
+        }
+    }
+
+    fn score(&self) -> i32 {
+        match self {
+            QuickOpenEntry::Template(m) => m.score,
+            QuickOpenEntry::OpenTab { score, .. } => *score,
+        }
+    }
+}
+
 /// Ivars for the Quick Open overlay
 pub struct QuickOpenOverlayIvars {
     /// Search text field
     search_field: RefCell<Option<Retained<NSTextField>>>,
     /// Results container stack view
     results_container: RefCell<Option<Retained<NSStackView>>>,
-    /// Currently filtered templates
-    filtered: RefCell<Vec<TemplateMatch>>,
+    /// Currently filtered entries (templates + open tabs)
+    filtered: RefCell<Vec<QuickOpenEntry>>,
     /// All available templates
     templates: RefCell<Vec<StickyTabConfig>>,
+    /// Currently open tabs with custom names
+    open_tabs: RefCell<Vec<OpenTabEntry>>,
     /// Currently selected index
     selected_index: Cell<usize>,
     /// Callback when a template is selected
     on_select: RefCell<Option<Box<dyn Fn(StickyTabConfig)>>>,
+    /// Callback when an open tab is selected (receives window pointer)
+    on_switch_tab: RefCell<Option<Box<dyn Fn(usize)>>>,
     /// Result row views for highlighting
     result_rows: RefCell<Vec<Retained<NSView>>>,
 }
@@ -153,8 +194,10 @@ impl QuickOpenOverlay {
             results_container: RefCell::new(None),
             filtered: RefCell::new(Vec::new()),
             templates: RefCell::new(templates),
+            open_tabs: RefCell::new(Vec::new()),
             selected_index: Cell::new(0),
             on_select: RefCell::new(None),
+            on_switch_tab: RefCell::new(None),
             result_rows: RefCell::new(Vec::new()),
         });
 
@@ -196,7 +239,8 @@ impl QuickOpenOverlay {
             NSSize::new(search_width, search_height),
         );
         let search_field = unsafe { NSTextField::initWithFrame(mtm.alloc(), search_frame) };
-        search_field.setPlaceholderString(Some(&NSString::from_str("Search templates...")));
+        search_field
+            .setPlaceholderString(Some(&NSString::from_str("Search templates and tabs...")));
         search_field.setBezeled(true);
         search_field.setEditable(true);
         search_field.setSelectable(true);
@@ -296,20 +340,121 @@ impl QuickOpenOverlay {
             .map(|f| f.stringValue().to_string())
             .unwrap_or_default();
 
+        // Filter templates
         let templates = self.ivars().templates.borrow().clone();
         let matcher = QuickOpenMatcher::new(templates);
-        let filtered = matcher.filter(&query);
+        let template_matches = matcher.filter(&query);
+
+        // Filter open tabs using the same fuzzy matching logic
+        let open_tabs = self.ivars().open_tabs.borrow().clone();
+        let tab_matches = Self::filter_open_tabs(&open_tabs, &query);
+
+        // Merge results: open tabs first (with score boost), then templates
+        let mut entries: Vec<QuickOpenEntry> = Vec::new();
+        for m in tab_matches {
+            entries.push(m);
+        }
+        for m in template_matches {
+            entries.push(QuickOpenEntry::Template(Box::new(m)));
+        }
+
+        // Sort by score descending, then name ascending
+        entries.sort_by(|a, b| {
+            b.score()
+                .cmp(&a.score())
+                .then_with(|| a.name().cmp(b.name()))
+        });
 
         // Limit to MAX_RESULTS
-        let filtered: Vec<TemplateMatch> = filtered.into_iter().take(MAX_RESULTS).collect();
+        entries.truncate(MAX_RESULTS);
 
-        *self.ivars().filtered.borrow_mut() = filtered;
+        *self.ivars().filtered.borrow_mut() = entries;
 
         // Reset selection to first item
         self.ivars().selected_index.set(0);
 
         // Rebuild result rows
         self.rebuild_results();
+    }
+
+    /// Filter open tabs by query string (same logic as QuickOpenMatcher)
+    fn filter_open_tabs(tabs: &[OpenTabEntry], query: &str) -> Vec<QuickOpenEntry> {
+        if query.is_empty() {
+            return tabs
+                .iter()
+                .map(|t| QuickOpenEntry::OpenTab {
+                    entry: t.clone(),
+                    score: 50, // Slightly above 0 so open tabs show before unmatched templates
+                    match_positions: Vec::new(),
+                })
+                .collect();
+        }
+
+        let query_lower = query.to_lowercase();
+        tabs.iter()
+            .filter_map(|tab| {
+                let name_lower = tab.name.to_lowercase();
+
+                // Exact match
+                if name_lower == query_lower {
+                    return Some(QuickOpenEntry::OpenTab {
+                        entry: tab.clone(),
+                        score: 1050, // Higher than template exact match
+                        match_positions: (0..tab.name.len()).collect(),
+                    });
+                }
+
+                // Prefix match
+                if name_lower.starts_with(&query_lower) {
+                    return Some(QuickOpenEntry::OpenTab {
+                        entry: tab.clone(),
+                        score: 550 + query_lower.len() as i32 * 10,
+                        match_positions: (0..query_lower.len()).collect(),
+                    });
+                }
+
+                // Substring match
+                if let Some(pos) = name_lower.find(&query_lower) {
+                    return Some(QuickOpenEntry::OpenTab {
+                        entry: tab.clone(),
+                        score: 250 + (100 - pos as i32).max(0),
+                        match_positions: (pos..pos + query_lower.len()).collect(),
+                    });
+                }
+
+                // Fuzzy match
+                let mut match_positions = Vec::new();
+                let mut name_chars = name_lower.char_indices().peekable();
+                let mut last_match_pos: Option<usize> = None;
+                let mut consecutive_bonus = 0i32;
+
+                for query_char in query_lower.chars() {
+                    let mut found = false;
+                    for (pos, name_char) in name_chars.by_ref() {
+                        if name_char == query_char {
+                            if let Some(last) = last_match_pos {
+                                if pos == last + 1 {
+                                    consecutive_bonus += 20;
+                                }
+                            }
+                            match_positions.push(pos);
+                            last_match_pos = Some(pos);
+                            found = true;
+                            break;
+                        }
+                    }
+                    if !found {
+                        return None;
+                    }
+                }
+
+                Some(QuickOpenEntry::OpenTab {
+                    entry: tab.clone(),
+                    score: 150 + consecutive_bonus + match_positions.len() as i32 * 5,
+                    match_positions,
+                })
+            })
+            .collect()
     }
 
     /// Rebuild the results UI
@@ -330,9 +475,9 @@ impl QuickOpenOverlay {
         let selected_idx = self.ivars().selected_index.get();
 
         if filtered.is_empty() {
-            // Show "No templates" message
+            // Show "No results" message
             if let Some(ref container) = *self.ivars().results_container.borrow() {
-                let label = self.create_result_row(mtm, "No templates found", "", false);
+                let label = self.create_result_row(mtm, "No results found", "", false);
                 container.addArrangedSubview(&label);
                 self.ivars().result_rows.borrow_mut().push(label);
             }
@@ -340,14 +485,15 @@ impl QuickOpenOverlay {
         }
 
         if let Some(ref container) = *self.ivars().results_container.borrow() {
-            for (idx, match_result) in filtered.iter().enumerate() {
-                let indicator = template_type_indicator(&match_result.template);
-                let row = self.create_result_row(
-                    mtm,
-                    &match_result.template.name,
-                    indicator,
-                    idx == selected_idx,
-                );
+            for (idx, entry) in filtered.iter().enumerate() {
+                let (name, indicator) = match entry {
+                    QuickOpenEntry::Template(m) => (
+                        m.template.name.as_str(),
+                        template_type_indicator(&m.template),
+                    ),
+                    QuickOpenEntry::OpenTab { entry, .. } => (entry.name.as_str(), "\u{25B6}"),
+                };
+                let row = self.create_result_row(mtm, name, indicator, idx == selected_idx);
                 container.addArrangedSubview(&row);
                 self.ivars().result_rows.borrow_mut().push(row);
             }
@@ -504,23 +650,52 @@ impl QuickOpenOverlay {
         let filtered = self.ivars().filtered.borrow();
         let selected_idx = self.ivars().selected_index.get();
 
-        if let Some(match_result) = filtered.get(selected_idx) {
-            let template = match_result.template.clone();
-            drop(filtered);
-
-            // Hide first
-            self.hide();
-
-            // Call callback
-            if let Some(ref callback) = *self.ivars().on_select.borrow() {
-                callback(template);
+        if let Some(entry) = filtered.get(selected_idx) {
+            match entry {
+                QuickOpenEntry::Template(m) => {
+                    let template = m.template.clone();
+                    drop(filtered);
+                    self.hide();
+                    if let Some(ref callback) = *self.ivars().on_select.borrow() {
+                        callback(template);
+                    }
+                }
+                QuickOpenEntry::OpenTab { entry, .. } => {
+                    let window_ptr = entry.window_ptr;
+                    drop(filtered);
+                    self.hide();
+                    if let Some(ref callback) = *self.ivars().on_switch_tab.borrow() {
+                        callback(window_ptr);
+                    }
+                }
             }
         }
+    }
+
+    /// Set the callback for switching to an open tab
+    pub fn set_on_switch_tab<F>(&self, callback: F)
+    where
+        F: Fn(usize) + 'static,
+    {
+        *self.ivars().on_switch_tab.borrow_mut() = Some(Box::new(callback));
     }
 
     /// Update templates list
     pub fn set_templates(&self, templates: Vec<StickyTabConfig>) {
         *self.ivars().templates.borrow_mut() = templates;
+        self.update_filter();
+    }
+
+    /// Update the list of open tabs with custom names
+    pub fn set_open_tabs(&self, tabs: Vec<OpenTabEntry>) {
+        *self.ivars().open_tabs.borrow_mut() = tabs;
+        self.update_filter();
+    }
+
+    /// Update both templates and open tabs at once (avoids double filter)
+    pub fn set_templates_and_tabs(&self, templates: Vec<StickyTabConfig>, tabs: Vec<OpenTabEntry>) {
+        *self.ivars().templates.borrow_mut() = templates;
+        *self.ivars().open_tabs.borrow_mut() = tabs;
         self.update_filter();
     }
 
