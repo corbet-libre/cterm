@@ -110,6 +110,11 @@ impl CGRenderer {
 
             for col in 0..cols {
                 if let Some(cell) = screen.get_cell_with_scrollback(absolute_line, col) {
+                    // Skip wide char spacers - background handled by the wide cell
+                    if cell.is_wide_spacer() {
+                        continue;
+                    }
+
                     let x = col as f64 * self.cell_width;
                     let y = row as f64 * self.cell_height;
 
@@ -137,9 +142,16 @@ impl CGRenderer {
                         (self.color_to_rgb(&cell.fg), self.color_to_rgb(&cell.bg))
                     };
 
+                    // Use double width for wide characters
+                    let bg_width = if cell.is_wide() {
+                        self.cell_width * 2.0
+                    } else {
+                        self.cell_width
+                    };
+
                     // Draw cell background if not default or if selected/inverted
                     if !cell.bg.is_default() || is_inverted || is_selected {
-                        self.draw_cell_background_rgb(x, y, &bg_color);
+                        self.draw_cell_background_sized(x, y, bg_width, &bg_color);
                     }
 
                     // Draw character
@@ -380,9 +392,13 @@ impl CGRenderer {
     }
 
     fn draw_cell_background_rgb(&self, x: f64, y: f64, rgb: &Rgb) {
+        self.draw_cell_background_sized(x, y, self.cell_width, rgb);
+    }
+
+    fn draw_cell_background_sized(&self, x: f64, y: f64, width: f64, rgb: &Rgb) {
         let rect = NSRect::new(
             NSPoint::new(x, y),
-            NSSize::new(self.cell_width, self.cell_height),
+            NSSize::new(width, self.cell_height),
         );
         unsafe {
             let ns_color = Self::ns_color(rgb.r, rgb.g, rgb.b);
