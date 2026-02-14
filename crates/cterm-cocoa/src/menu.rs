@@ -412,11 +412,12 @@ fn create_terminal_menu(mtm: MainThreadMarker) -> Retained<NSMenuItem> {
     menu.addItem(&NSMenuItem::separatorItem(mtm));
 
     // Set Title
-    menu.addItem(&create_menu_item(
+    menu.addItem(&create_menu_item_with_key(
         mtm,
         "Set Title...",
         Some(sel!(setTerminalTitle:)),
-        "",
+        "T",
+        NSEventModifierFlags::Command.union(NSEventModifierFlags::Shift),
     ));
 
     // Set Tab Color
