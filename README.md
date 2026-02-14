@@ -166,6 +166,7 @@ keep_open = true
 | `command` | Command to run (omit for default shell) |
 | `args` | Command arguments (array) |
 | `working_directory` | Initial working directory |
+| `git_remote` | Git URL to clone if `working_directory` doesn't exist |
 | `color` | Tab color in hex (`#RRGGBB`) |
 | `theme` | Theme override for this tab |
 | `background_color` | Lock the background color (overrides theme, hex `#RRGGBB`) |
