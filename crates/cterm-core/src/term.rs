@@ -2,10 +2,14 @@
 //!
 //! Provides a high-level interface for terminal emulation.
 
+use crate::color::ColorPalette;
 use crate::parser::Parser;
 use crate::pty::{Pty, PtyConfig, PtyError, PtySize};
-use crate::screen::{ClipboardOperation, Screen, ScreenConfig, SearchResult};
+use crate::screen::{ClipboardOperation, ColorQuery, Screen, ScreenConfig, SearchResult};
 use crate::{KeyEventKind, KeyboardEnhancementFlags};
+use std::time::{Duration, Instant};
+
+const APPLICATION_SYNC_UPDATE_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// Events emitted by the terminal
 #[derive(Debug, Clone)]
@@ -20,6 +24,11 @@ pub enum TerminalEvent {
     ContentChanged,
     /// Clipboard operation requested (OSC 52)
     ClipboardRequest(ClipboardOperation),
+    /// Frontend theme color requested through OSC 10-12.
+    ColorQuery {
+        target: ColorQuery,
+        dynamic_color: Option<crate::color::Rgb>,
+    },
 }
 
 /// Terminal configuration
@@ -41,6 +50,8 @@ pub struct Terminal {
     pty: Option<Pty>,
     write_fn: Option<WriteFn>,
     last_title: String,
+    synchronized_update_deadline: Option<Instant>,
+    content_change_pending: bool,
 }
 
 impl Terminal {
@@ -52,6 +63,8 @@ impl Terminal {
             pty: None,
             write_fn: None,
             last_title: String::new(),
+            synchronized_update_deadline: None,
+            content_change_pending: false,
         }
     }
 
@@ -81,6 +94,8 @@ impl Terminal {
             pty: Some(pty),
             write_fn: None,
             last_title: String::new(),
+            synchronized_update_deadline: None,
+            content_change_pending: false,
         })
     }
 
@@ -135,6 +150,8 @@ impl Terminal {
             }
         }
 
+        self.answer_color_queries(&events);
+
         events
     }
 
@@ -142,6 +159,7 @@ impl Terminal {
     /// query replies a second time. The daemon is the authoritative responder.
     pub fn process_mirror(&mut self, data: &[u8]) -> Vec<TerminalEvent> {
         let (events, _responses) = self.process_collecting(data);
+        self.answer_color_queries(&events);
         events
     }
 
@@ -154,7 +172,19 @@ impl Terminal {
     pub fn process_collecting(&mut self, data: &[u8]) -> (Vec<TerminalEvent>, Vec<Vec<u8>>) {
         let mut events = Vec::new();
 
+        let sync_generation = self.screen.sync_update_generation();
         self.parser.parse(&mut self.screen, data);
+
+        if self.screen.modes.application_sync_updates {
+            if self.screen.sync_update_generation() != sync_generation
+                || self.synchronized_update_deadline.is_none()
+            {
+                self.synchronized_update_deadline =
+                    Some(Instant::now() + APPLICATION_SYNC_UPDATE_TIMEOUT);
+            }
+        } else {
+            self.synchronized_update_deadline = None;
+        }
 
         // Collect any pending responses for the caller to write back to the PTY
         let responses = if self.screen.has_pending_responses() {
@@ -170,6 +200,15 @@ impl Terminal {
             }
         }
 
+        if self.screen.has_color_queries() {
+            for (target, dynamic_color) in self.screen.take_color_queries() {
+                events.push(TerminalEvent::ColorQuery {
+                    target,
+                    dynamic_color,
+                });
+            }
+        }
+
         // Check for bell
         if self.screen.bell {
             self.screen.bell = false;
@@ -182,12 +221,77 @@ impl Terminal {
             events.push(TerminalEvent::TitleChanged(self.last_title.clone()));
         }
 
-        // Always emit content changed if there was data
+        // Coalesce rendering while an application synchronized update is in
+        // progress. Other events and protocol replies are never delayed.
         if !data.is_empty() {
+            self.content_change_pending = true;
+        }
+        let content_changed = if self.screen.modes.application_sync_updates {
+            self.expire_synchronized_update_at(Instant::now())
+        } else {
+            std::mem::take(&mut self.content_change_pending)
+        };
+        if content_changed {
             events.push(TerminalEvent::ContentChanged);
         }
 
         (events, responses)
+    }
+
+    fn answer_color_queries(&mut self, events: &[TerminalEvent]) {
+        if !self.screen.has_base_palette() {
+            return;
+        }
+
+        for event in events {
+            let TerminalEvent::ColorQuery {
+                target,
+                dynamic_color,
+            } = event
+            else {
+                continue;
+            };
+            let color = dynamic_color.unwrap_or_else(|| self.screen.base_query_color(*target));
+            let response = format!("\x1b]{};{}\x1b\\", target.osc_code(), color.to_osc_spec());
+            if let Err(error) = self.write(response.as_bytes()) {
+                log::error!("Failed to answer OSC color query: {}", error);
+            }
+        }
+    }
+
+    /// Set the frontend theme used to answer OSC 10-12 color queries.
+    pub fn set_base_palette(&mut self, palette: ColorPalette) {
+        self.screen.set_base_palette(palette);
+    }
+
+    /// Deadline for the active application synchronized update, if any.
+    /// Frontends use this to drive the fail-safe even when PTY output stops.
+    pub fn synchronized_update_deadline(&self) -> Option<Instant> {
+        self.screen
+            .modes
+            .application_sync_updates
+            .then_some(self.synchronized_update_deadline)
+            .flatten()
+    }
+
+    /// End an application synchronized update once its one-second fail-safe
+    /// expires. Returns true when deferred screen damage should be rendered.
+    pub fn expire_synchronized_update(&mut self) -> bool {
+        self.expire_synchronized_update_at(Instant::now())
+    }
+
+    fn expire_synchronized_update_at(&mut self, now: Instant) -> bool {
+        if !self.screen.modes.application_sync_updates
+            || !self
+                .synchronized_update_deadline
+                .is_some_and(|deadline| now >= deadline)
+        {
+            return false;
+        }
+
+        self.screen.set_application_sync_updates(false);
+        self.synchronized_update_deadline = None;
+        std::mem::take(&mut self.content_change_pending)
     }
 
     /// Write input to the PTY (keyboard input)
@@ -411,6 +515,10 @@ impl Terminal {
                     Some(csi_u_key(c as u32, modifiers, kind, report_events))
                 } else if kind == KeyEventKind::Release {
                     None
+                } else if let Some(sequence) =
+                    modify_other_key(c, modifiers, self.screen.modes.modify_other_keys)
+                {
+                    Some(sequence)
                 } else {
                     self.handle_legacy_key(key, modifiers)
                 }
@@ -497,6 +605,20 @@ impl Terminal {
                 .or_else(|| self.handle_non_release_legacy(key, modifiers, kind)),
             Key::F(n) => enhanced_function_key(n, modifiers, kind, report_events)
                 .or_else(|| self.handle_non_release_legacy(key, modifiers, kind)),
+            Key::NumpadDigit(_)
+            | Key::NumpadDecimal
+            | Key::NumpadDivide
+            | Key::NumpadMultiply
+            | Key::NumpadSubtract
+            | Key::NumpadAdd
+            | Key::NumpadEnter => {
+                if disambiguate || report_events {
+                    kitty_numpad_code(key)
+                        .map(|code| csi_u_key(code, modifiers, kind, report_events))
+                } else {
+                    self.handle_non_release_legacy(key, modifiers, kind)
+                }
+            }
         }
     }
 
@@ -537,23 +659,13 @@ impl Terminal {
 
     fn handle_legacy_key(&self, key: Key, modifiers: Modifiers) -> Option<Vec<u8>> {
         let app_cursor = self.screen.modes.application_cursor;
-        let _app_keypad = self.screen.modes.application_keypad;
+        let app_keypad = self.screen.modes.application_keypad;
 
         match key {
             Key::Char(c) => {
                 if modifiers.contains(Modifiers::CTRL) {
                     // Control characters
-                    let ctrl_char = match c.to_ascii_lowercase() {
-                        'a'..='z' => Some(c.to_ascii_lowercase() as u8 - b'a' + 1),
-                        '[' => Some(0x1b),
-                        '\\' => Some(0x1c),
-                        ']' => Some(0x1d),
-                        '^' => Some(0x1e),
-                        '_' => Some(0x1f),
-                        _ => None,
-                    };
-
-                    ctrl_char.map(|b| vec![b])
+                    legacy_control_char(c).map(|byte| vec![byte])
                 } else if modifiers.contains(Modifiers::ALT) {
                     // Alt + char = Escape + char
                     let mut buf = String::from('\x1b');
@@ -605,8 +717,61 @@ impl Terminal {
             Key::Insert => Some(tilde_key(2, modifiers)),
             Key::Delete => Some(tilde_key(3, modifiers)),
             Key::F(n) => Some(function_key(n, modifiers)),
+            Key::NumpadDigit(digit) if digit <= 9 => {
+                let application_suffix = b'p' + digit;
+                let normal = b'0' + digit;
+                Some(keypad_key(
+                    application_suffix,
+                    normal,
+                    modifiers,
+                    app_keypad,
+                ))
+            }
+            Key::NumpadDecimal => Some(keypad_key(b'n', b'.', modifiers, app_keypad)),
+            Key::NumpadDivide => Some(keypad_key(b'o', b'/', modifiers, app_keypad)),
+            Key::NumpadMultiply => Some(keypad_key(b'j', b'*', modifiers, app_keypad)),
+            Key::NumpadSubtract => Some(keypad_key(b'm', b'-', modifiers, app_keypad)),
+            Key::NumpadAdd => Some(keypad_key(b'k', b'+', modifiers, app_keypad)),
+            Key::NumpadEnter => Some(keypad_key(b'M', b'\r', modifiers, app_keypad)),
+            Key::NumpadDigit(_) => None,
         }
     }
+}
+
+/// Encode a numeric-keypad key.  In application mode this follows the VT220
+/// SS3 keypad table, including foot/xterm's modifier parameter spelling.
+fn keypad_key(
+    application_suffix: u8,
+    normal: u8,
+    modifiers: Modifiers,
+    application: bool,
+) -> Vec<u8> {
+    if application {
+        let modifier = modifier_param(modifiers);
+        if modifier == 1 {
+            vec![0x1b, b'O', application_suffix]
+        } else {
+            format!("\x1bO{modifier}{}", application_suffix as char).into_bytes()
+        }
+    } else if modifiers.contains(Modifiers::ALT) {
+        vec![0x1b, normal]
+    } else {
+        vec![normal]
+    }
+}
+
+/// Kitty keyboard protocol functional-key code for physical keypad keys.
+fn kitty_numpad_code(key: Key) -> Option<u32> {
+    Some(match key {
+        Key::NumpadDigit(digit @ 0..=9) => 57399 + u32::from(digit),
+        Key::NumpadDecimal => 57409,
+        Key::NumpadDivide => 57410,
+        Key::NumpadMultiply => 57411,
+        Key::NumpadSubtract => 57412,
+        Key::NumpadAdd => 57413,
+        Key::NumpadEnter => 57414,
+        _ => return None,
+    })
 }
 
 fn csi_u_key(
@@ -620,6 +785,39 @@ fn csi_u_key(
         format!("\x1b[{codepoint};{modifier}:{}u", kind.protocol_value()).into_bytes()
     } else {
         format!("\x1b[{codepoint};{modifier}u").into_bytes()
+    }
+}
+
+/// Encode xterm's unambiguous modified-character form. Level 1 preserves
+/// well-known control bytes and only encodes Ctrl combinations which would
+/// otherwise disappear; level 2 also encodes Ctrl/Alt and shifted ASCII
+/// letters, matching foot's behavior.
+fn modify_other_key(c: char, modifiers: Modifiers, level: u8) -> Option<Vec<u8>> {
+    if level == 0 || modifiers.contains(Modifiers::SUPER) {
+        return None;
+    }
+
+    let ctrl = modifiers.contains(Modifiers::CTRL);
+    let alt = modifiers.contains(Modifiers::ALT);
+    let shifted_ascii_letter = modifiers.contains(Modifiers::SHIFT) && c.is_ascii_uppercase();
+    let encode = if level >= 2 {
+        ctrl || alt || shifted_ascii_letter
+    } else {
+        ctrl && legacy_control_char(c).is_none()
+    };
+
+    encode.then(|| format!("\x1b[27;{};{}~", modifier_param(modifiers), c as u32).into_bytes())
+}
+
+fn legacy_control_char(c: char) -> Option<u8> {
+    match c.to_ascii_lowercase() {
+        'a'..='z' => Some(c.to_ascii_lowercase() as u8 - b'a' + 1),
+        '[' => Some(0x1b),
+        '\\' => Some(0x1c),
+        ']' => Some(0x1d),
+        '^' => Some(0x1e),
+        '_' => Some(0x1f),
+        _ => None,
     }
 }
 
@@ -778,6 +976,13 @@ pub enum Key {
     Insert,
     Delete,
     F(u8),
+    NumpadDigit(u8),
+    NumpadDecimal,
+    NumpadDivide,
+    NumpadMultiply,
+    NumpadSubtract,
+    NumpadAdd,
+    NumpadEnter,
 }
 
 bitflags::bitflags! {
@@ -809,8 +1014,8 @@ mod tests {
 
         term.process(b"Hello, World!");
 
-        assert_eq!(term.screen().get_cell(0, 0).unwrap().c, 'H');
-        assert_eq!(term.screen().get_cell(0, 12).unwrap().c, '!');
+        assert_eq!(term.screen().get_cell(0, 0).unwrap().text(), "H");
+        assert_eq!(term.screen().get_cell(0, 12).unwrap().text(), "!");
     }
 
     #[test]
@@ -837,7 +1042,7 @@ mod tests {
             responses.is_empty(),
             "plain text must not generate PTY responses"
         );
-        assert_eq!(term.screen().get_cell(0, 0).unwrap().c, 'H');
+        assert_eq!(term.screen().get_cell(0, 0).unwrap().text(), "H");
     }
 
     #[test]
@@ -850,7 +1055,7 @@ mod tests {
         assert_eq!(
             responses,
             [
-                b"\x1b[?62;4c".to_vec(),
+                b"\x1b[?62;4;22;52c".to_vec(),
                 b"\x1b[6;20;10t".to_vec(),
                 b"\x1b[0n".to_vec(),
             ]
@@ -881,6 +1086,76 @@ mod tests {
         term.process_mirror(b"\x1b[c\x1b[16t\x1b[5n");
 
         assert!(writes.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn daemon_mirror_answers_theme_color_queries_in_the_frontend() {
+        use crate::color::{ColorPalette, Rgb};
+
+        let writes = Arc::new(Mutex::new(Vec::new()));
+        let observed = Arc::clone(&writes);
+        let mut term = Terminal::new(80, 24, ScreenConfig::default());
+        let mut palette = ColorPalette::default_dark();
+        palette.foreground = Rgb::new(0x12, 0x34, 0x56);
+        palette.background = Rgb::new(0x78, 0x9a, 0xbc);
+        palette.cursor = Rgb::new(0xde, 0xf0, 0x11);
+        term.set_base_palette(palette);
+        term.set_write_fn(Box::new(move |data| {
+            observed.lock().unwrap().extend_from_slice(data);
+            Ok(())
+        }));
+
+        term.process_mirror(b"\x1b]10;?\x1b\\\x1b]11;?\x07\x1b]12;?\x1b\\");
+
+        assert_eq!(
+            writes.lock().unwrap().as_slice(),
+            b"\x1b]10;rgb:1212/3434/5656\x1b\\\
+              \x1b]11;rgb:7878/9a9a/bcbc\x1b\\\
+              \x1b]12;rgb:dede/f0f0/1111\x1b\\"
+        );
+    }
+
+    #[test]
+    fn color_query_replies_preserve_stream_order() {
+        use crate::color::{ColorPalette, Rgb};
+
+        let writes = Arc::new(Mutex::new(Vec::new()));
+        let observed = Arc::clone(&writes);
+        let mut term = Terminal::new(80, 24, ScreenConfig::default());
+        let mut palette = ColorPalette::default_dark();
+        palette.foreground = Rgb::new(0x12, 0x34, 0x56);
+        term.set_base_palette(palette);
+        term.set_write_fn(Box::new(move |data| {
+            observed.lock().unwrap().extend_from_slice(data);
+            Ok(())
+        }));
+
+        term.process_mirror(
+            b"\x1b]10;?\x1b\\\x1b]10;#abc\x1b\\\x1b]10;?\x1b\\\x1b]110\x1b\\\x1b]10;?\x1b\\",
+        );
+
+        assert_eq!(
+            writes.lock().unwrap().as_slice(),
+            b"\x1b]10;rgb:1212/3434/5656\x1b\\\
+              \x1b]10;rgb:aaaa/bbbb/cccc\x1b\\\
+              \x1b]10;rgb:1212/3434/5656\x1b\\"
+        );
+    }
+
+    #[test]
+    fn daemon_authority_does_not_answer_ui_color_queries() {
+        let mut term = Terminal::new(80, 24, ScreenConfig::default());
+
+        let (events, responses) = term.process_collecting(b"\x1b]10;?\x1b\\");
+
+        assert!(responses.is_empty());
+        assert!(events.iter().any(|event| matches!(
+            event,
+            TerminalEvent::ColorQuery {
+                target: ColorQuery::Foreground,
+                dynamic_color: None,
+            }
+        )));
     }
 
     #[test]
@@ -935,6 +1210,85 @@ mod tests {
     }
 
     #[test]
+    fn application_keypad_uses_vt_sequences_and_modifiers() {
+        let mut term = Terminal::new(80, 24, ScreenConfig::default());
+
+        assert_eq!(
+            term.handle_key(Key::NumpadDigit(0), Modifiers::empty()),
+            Some(b"0".to_vec())
+        );
+        assert_eq!(
+            term.handle_key(Key::NumpadEnter, Modifiers::empty()),
+            Some(b"\r".to_vec())
+        );
+
+        term.process(b"\x1b=");
+        assert_eq!(
+            term.handle_key(Key::NumpadDigit(0), Modifiers::empty()),
+            Some(b"\x1bOp".to_vec())
+        );
+        assert_eq!(
+            term.handle_key(Key::NumpadAdd, Modifiers::CTRL),
+            Some(b"\x1bO5k".to_vec())
+        );
+        assert_eq!(
+            term.handle_key(Key::NumpadEnter, Modifiers::SHIFT | Modifiers::ALT),
+            Some(b"\x1bO4M".to_vec())
+        );
+    }
+
+    #[test]
+    fn modify_other_keys_matches_foot_levels() {
+        let mut term = Terminal::new(80, 24, ScreenConfig::default());
+
+        assert_eq!(
+            term.handle_key(Key::Char('i'), Modifiers::CTRL),
+            Some(vec![b'\t'])
+        );
+        assert_eq!(
+            term.handle_key(Key::Char('1'), Modifiers::CTRL),
+            Some(b"\x1b[27;5;49~".to_vec())
+        );
+        assert_eq!(
+            term.handle_key(Key::Char('x'), Modifiers::ALT),
+            Some(b"\x1bx".to_vec())
+        );
+
+        term.process_mirror(b"\x1b[>4;2m");
+        assert_eq!(
+            term.handle_key(Key::Char('i'), Modifiers::CTRL),
+            Some(b"\x1b[27;5;105~".to_vec())
+        );
+        assert_eq!(
+            term.handle_key(Key::Char('x'), Modifiers::ALT),
+            Some(b"\x1b[27;3;120~".to_vec())
+        );
+        assert_eq!(
+            term.handle_key(Key::Char('A'), Modifiers::SHIFT),
+            Some(b"\x1b[27;2;65~".to_vec())
+        );
+    }
+
+    #[test]
+    fn kitty_keyboard_reports_physical_keypad_codes() {
+        let mut term = Terminal::new(80, 24, ScreenConfig::default());
+        term.process(b"\x1b[>3u");
+
+        assert_eq!(
+            term.handle_key_event(Key::NumpadDigit(0), Modifiers::empty(), KeyEventKind::Press,),
+            Some(b"\x1b[57399;1:1u".to_vec())
+        );
+        assert_eq!(
+            term.handle_key_event(Key::NumpadAdd, Modifiers::CTRL, KeyEventKind::Repeat),
+            Some(b"\x1b[57413;5:2u".to_vec())
+        );
+        assert_eq!(
+            term.handle_key_event(Key::NumpadEnter, Modifiers::empty(), KeyEventKind::Release,),
+            Some(b"\x1b[57414;1:3u".to_vec())
+        );
+    }
+
+    #[test]
     fn kitty_keyboard_masks_unsupported_all_key_mode_and_separates_screens() {
         let mut term = Terminal::new(80, 24, ScreenConfig::default());
 
@@ -949,6 +1303,57 @@ mod tests {
     }
 
     #[test]
+    fn synchronized_updates_coalesce_content_until_commit() {
+        let mut term = Terminal::new(80, 24, ScreenConfig::default());
+
+        let events = term.process_mirror(b"\x1b[?2026hfirst");
+        assert!(term.screen().modes.application_sync_updates);
+        assert!(!events
+            .iter()
+            .any(|event| matches!(event, TerminalEvent::ContentChanged)));
+        assert!(term.synchronized_update_deadline().is_some());
+
+        let events = term.process_mirror(b" second\x1b[?2026l");
+        assert!(!term.screen().modes.application_sync_updates);
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, TerminalEvent::ContentChanged))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn synchronized_update_fail_safe_releases_deferred_damage() {
+        let mut term = Terminal::new(80, 24, ScreenConfig::default());
+        term.process_mirror(b"\x1b[?2026hpartial");
+        term.synchronized_update_deadline = Some(Instant::now());
+
+        assert!(term.expire_synchronized_update());
+        assert!(!term.screen().modes.application_sync_updates);
+        assert!(term.synchronized_update_deadline().is_none());
+        assert!(!term.expire_synchronized_update());
+    }
+
+    #[test]
+    fn synchronized_update_legacy_dcs_spelling_is_supported() {
+        let mut term = Terminal::new(80, 24, ScreenConfig::default());
+
+        let events = term.process_mirror(b"\x1bP=1s\x1b\\frame");
+        assert!(term.screen().modes.application_sync_updates);
+        assert!(!events
+            .iter()
+            .any(|event| matches!(event, TerminalEvent::ContentChanged)));
+
+        let events = term.process_mirror(b"\x1bP=2s\x1b\\");
+        assert!(!term.screen().modes.application_sync_updates);
+        assert!(events
+            .iter()
+            .any(|event| matches!(event, TerminalEvent::ContentChanged)));
+    }
+
+    #[test]
     fn test_terminal_resize() {
         let mut term = Terminal::new(80, 24, ScreenConfig::default());
 
@@ -957,7 +1362,7 @@ mod tests {
 
         assert_eq!(term.cols(), 100);
         assert_eq!(term.rows(), 30);
-        assert_eq!(term.screen().get_cell(0, 0).unwrap().c, 'X');
+        assert_eq!(term.screen().get_cell(0, 0).unwrap().text(), "X");
     }
 
     #[test]

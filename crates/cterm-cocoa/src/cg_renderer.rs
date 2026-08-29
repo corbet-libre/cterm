@@ -10,10 +10,10 @@ use objc2_app_kit::{NSFont, NSFontManager, NSFontTraitMask, NSGraphicsContext};
 use objc2_foundation::{MainThreadMarker, NSPoint, NSRect, NSSize, NSString};
 
 use cterm_core::cell::CellAttrs;
-use cterm_core::color::{Color, Rgb};
+use cterm_core::color::{Color, ColorPalette, Rgb};
 use cterm_core::drcs::DrcsGlyph;
-use cterm_core::Terminal;
 use cterm_core::TerminalImage;
+use cterm_core::{CursorStyle, Terminal};
 use cterm_ui::theme::Theme;
 
 /// CoreGraphics renderer for terminal display
@@ -130,9 +130,15 @@ impl CGRenderer {
         let screen = terminal.screen();
         let cols = screen.width();
         let rows = screen.height();
+        let mut base_palette = self.theme.colors.clone();
+        if let Some(background) = self.background_override {
+            base_palette.background = background;
+        }
+        let palette = screen.resolved_palette(&base_palette);
+        let normal_background = &palette.background;
 
         // Draw background
-        self.draw_background(bounds);
+        self.draw_background(bounds, screen.modes.reverse_video, &palette);
 
         // Draw cells
         for row in 0..rows {
@@ -153,7 +159,9 @@ impl CGRenderer {
                     let is_selected = screen.is_selected(absolute_line, col);
 
                     // XOR selection with INVERSE attribute to determine if colors should be inverted
-                    let is_inverted = cell.attrs.contains(CellAttrs::INVERSE) != is_selected;
+                    let is_inverted = cell.attrs.contains(CellAttrs::INVERSE)
+                        ^ is_selected
+                        ^ screen.modes.reverse_video;
 
                     // Apply bold_is_bright: map base ANSI fg colors to bright variants
                     let fg = if self.bold_is_bright && cell.attrs.contains(CellAttrs::BOLD) {
@@ -170,18 +178,23 @@ impl CGRenderer {
                     let (fg_color, bg_color) = if is_inverted {
                         // Inverted: swap foreground and background
                         let fg_rgb = if cell.bg.is_default() {
-                            self.theme.colors.background
+                            *normal_background
                         } else {
-                            self.color_to_rgb(&cell.bg)
+                            Self::color_to_rgb(&cell.bg, &palette)
                         };
                         let bg_rgb = if fg.is_default() {
-                            self.theme.colors.foreground
+                            palette.foreground
                         } else {
-                            self.color_to_rgb(&fg)
+                            Self::color_to_rgb(&fg, &palette)
                         };
                         (fg_rgb, bg_rgb)
                     } else {
-                        (self.color_to_rgb(&fg), self.color_to_rgb(&cell.bg))
+                        let bg = if cell.bg.is_default() {
+                            *normal_background
+                        } else {
+                            Self::color_to_rgb(&cell.bg, &palette)
+                        };
+                        (Self::color_to_rgb(&fg, &palette), bg)
                     };
 
                     // Apply dim (SGR 2) — halve foreground brightness
@@ -210,23 +223,33 @@ impl CGRenderer {
                     };
 
                     // Draw cell background if not default or if selected/inverted
-                    if !cell.bg.is_default() || is_inverted || is_selected {
+                    if !cell.bg.is_default()
+                        || is_inverted
+                        || is_selected
+                        || screen.modes.reverse_video
+                    {
                         self.draw_cell_background_sized(x, y, char_width, &bg_color);
                     }
 
                     // Draw character
-                    if cell.c != ' ' && cell.c != '\0' {
-                        // Check if this should be a DRCS glyph
-                        if let Some(glyph) = screen.get_drcs_for_char(cell.c) {
+                    if cell.text() != " "
+                        && cell.text() != "\0"
+                        && !cell.attrs.contains(CellAttrs::HIDDEN)
+                    {
+                        // DRCS is defined for individual character positions,
+                        // while normal text may be a full grapheme cluster.
+                        let drcs = cell.single_char().and_then(|c| screen.get_drcs_for_char(c));
+                        if let Some(glyph) = drcs {
                             self.draw_drcs_glyph(glyph, x, y, &fg_color);
                         } else {
-                            self.draw_char_rgb(cell.c, x, y, &fg_color, cell.attrs);
+                            self.draw_text_rgb(cell.text(), x, y, &fg_color, cell.attrs);
                         }
                     }
 
                     // Draw underlines (regular underline attributes or hyperlinks)
                     let has_hyperlink = cell.hyperlink.is_some();
-                    if cell.attrs.has_underline() || has_hyperlink {
+                    let visible = !cell.attrs.contains(CellAttrs::HIDDEN);
+                    if visible && (cell.attrs.has_underline() || has_hyperlink) {
                         // Use hyperlink color (blue) for hyperlinks, otherwise use underline color or fg
                         let underline_color = if has_hyperlink {
                             Rgb {
@@ -235,7 +258,7 @@ impl CGRenderer {
                                 b: 237,
                             } // Cornflower blue for hyperlinks
                         } else if let Some(ref uc) = cell.underline_color {
-                            self.color_to_rgb(uc)
+                            Self::color_to_rgb(uc, &palette)
                         } else {
                             fg_color
                         };
@@ -251,12 +274,12 @@ impl CGRenderer {
                     }
 
                     // Draw strikethrough
-                    if cell.attrs.contains(CellAttrs::STRIKETHROUGH) {
+                    if visible && cell.attrs.contains(CellAttrs::STRIKETHROUGH) {
                         self.draw_strikethrough(x, y, char_width, &fg_color);
                     }
 
                     // Draw overline
-                    if cell.attrs.contains(CellAttrs::OVERLINE) {
+                    if visible && cell.attrs.contains(CellAttrs::OVERLINE) {
                         self.draw_overline(x, y, char_width, &fg_color);
                     }
                 }
@@ -283,7 +306,13 @@ impl CGRenderer {
                 self.cell_width
             };
 
-            self.draw_cursor(cursor_x, cursor_y, cursor_width);
+            self.draw_cursor(
+                cursor_x,
+                cursor_y,
+                cursor_width,
+                cursor.style,
+                &palette.cursor,
+            );
         }
 
         // Draw scrollbar overlay when there is scrollback content
@@ -549,26 +578,17 @@ impl CGRenderer {
         }
     }
 
-    fn draw_background(&self, bounds: NSRect) {
-        // Use background override if set, otherwise use theme background
-        let bg = self
-            .background_override
-            .as_ref()
-            .unwrap_or(&self.theme.colors.background);
+    fn draw_background(&self, bounds: NSRect, reverse_video: bool, palette: &ColorPalette) {
+        let bg = if reverse_video {
+            &palette.foreground
+        } else {
+            &palette.background
+        };
         unsafe {
             let color = Self::ns_color(bg.r, bg.g, bg.b);
             let _: () = msg_send![&*color, setFill];
             let _: () = msg_send![class!(NSBezierPath), fillRect: bounds];
         }
-    }
-
-    fn draw_cell_background(&self, x: f64, y: f64, color: &Color) {
-        let rgb = self.color_to_rgb(color);
-        self.draw_cell_background_rgb(x, y, &rgb);
-    }
-
-    fn draw_cell_background_rgb(&self, x: f64, y: f64, rgb: &Rgb) {
-        self.draw_cell_background_sized(x, y, self.cell_width, rgb);
     }
 
     fn draw_cell_background_sized(&self, x: f64, y: f64, width: f64, rgb: &Rgb) {
@@ -580,8 +600,8 @@ impl CGRenderer {
         }
     }
 
-    fn draw_char_rgb(&self, ch: char, x: f64, y: f64, rgb: &Rgb, attrs: CellAttrs) {
-        let text = NSString::from_str(&ch.to_string());
+    fn draw_text_rgb(&self, value: &str, x: f64, y: f64, rgb: &Rgb, attrs: CellAttrs) {
+        let text = NSString::from_str(value);
 
         let font = match (
             attrs.contains(CellAttrs::BOLD),
@@ -646,9 +666,17 @@ impl CGRenderer {
         }
     }
 
-    fn draw_cursor(&self, x: f64, y: f64, width: f64) {
-        let cursor_color = &self.theme.colors.cursor;
-        let rect = NSRect::new(NSPoint::new(x, y), NSSize::new(width, self.cell_height));
+    fn draw_cursor(&self, x: f64, y: f64, width: f64, style: CursorStyle, cursor_color: &Rgb) {
+        let rect = match style {
+            CursorStyle::Block => {
+                NSRect::new(NSPoint::new(x, y), NSSize::new(width, self.cell_height))
+            }
+            CursorStyle::Underline => NSRect::new(
+                NSPoint::new(x, y + self.cell_height - 2.0),
+                NSSize::new(width, 2.0),
+            ),
+            CursorStyle::Bar => NSRect::new(NSPoint::new(x, y), NSSize::new(2.0, self.cell_height)),
+        };
         unsafe {
             let color = Self::ns_color_alpha(cursor_color.r, cursor_color.g, cursor_color.b, 0.7);
             let _: () = msg_send![&*color, setFill];
@@ -780,33 +808,8 @@ impl CGRenderer {
         }
     }
 
-    fn color_to_rgb(&self, color: &Color) -> Rgb {
-        match color {
-            Color::Default => self.theme.colors.foreground,
-            Color::Rgb(rgb) => *rgb,
-            Color::Ansi(ansi) => self.theme.colors.ansi[*ansi as usize],
-            Color::Indexed(idx) => self.index_to_rgb(*idx),
-        }
-    }
-
-    fn index_to_rgb(&self, idx: u8) -> Rgb {
-        match idx {
-            // First 16 are ANSI colors
-            0..=15 => self.theme.colors.ansi[idx as usize],
-            // 16-231 are a 6x6x6 color cube
-            16..=231 => {
-                let n = idx - 16;
-                let b = (n % 6) * 51;
-                let g = ((n / 6) % 6) * 51;
-                let r = (n / 36) * 51;
-                Rgb::new(r, g, b)
-            }
-            // 232-255 are grayscale
-            232..=255 => {
-                let gray = (idx - 232) * 10 + 8;
-                Rgb::new(gray, gray, gray)
-            }
-        }
+    fn color_to_rgb(color: &Color, palette: &ColorPalette) -> Rgb {
+        color.to_rgb(palette)
     }
 
     /// Update theme colors

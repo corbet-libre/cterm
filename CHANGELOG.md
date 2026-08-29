@@ -9,6 +9,17 @@ is omitted for readability.
 
 ## [Unreleased]
 
+### Changed
+- Establish FSL-1.1-ALv2 as cterm's product license, with Apache-2.0 becoming
+  available automatically after two years per version. Source inherited from
+  KarpelesLab/cterm and Rio/Sugarloaf retains its MIT grants and notices.
+
+### Fixed
+- OSC 10/11/12 color queries now receive theme-accurate replies from the
+  attached frontend. Dynamic foreground, background, and cursor colors support
+  foot-compatible XParseColor forms, reset through OSC 110/111/112, render on
+  every desktop backend, and survive daemon reconnection.
+
 ## [0.0.19] - 2026-07-09
 
 ### Added

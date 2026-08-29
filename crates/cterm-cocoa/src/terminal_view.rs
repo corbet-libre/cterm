@@ -59,6 +59,23 @@ fn terminal_key_for_keycode(keycode: u16) -> Option<Key> {
         0x24 => Key::Enter,
         0x30 => Key::Tab,
         0x35 => Key::Escape,
+        // Numeric keypad (preserve physical identity for DECKPAM and Kitty).
+        0x52 => Key::NumpadDigit(0),
+        0x53 => Key::NumpadDigit(1),
+        0x54 => Key::NumpadDigit(2),
+        0x55 => Key::NumpadDigit(3),
+        0x56 => Key::NumpadDigit(4),
+        0x57 => Key::NumpadDigit(5),
+        0x58 => Key::NumpadDigit(6),
+        0x59 => Key::NumpadDigit(7),
+        0x5B => Key::NumpadDigit(8),
+        0x5C => Key::NumpadDigit(9),
+        0x41 => Key::NumpadDecimal,
+        0x4B => Key::NumpadDivide,
+        0x43 => Key::NumpadMultiply,
+        0x4E => Key::NumpadSubtract,
+        0x45 => Key::NumpadAdd,
+        0x4C => Key::NumpadEnter,
         // Function keys
         0x7A => Key::F(1),
         0x78 => Key::F(2),
@@ -1504,6 +1521,7 @@ impl TerminalView {
         let (cell_width, cell_height) = renderer.cell_size();
 
         let mut terminal = Terminal::new(80, 24, ScreenConfig::default());
+        terminal.set_base_palette(theme.colors.clone());
         terminal.screen_mut().set_cell_height_hint(cell_height);
         terminal.screen_mut().set_cell_width_hint(cell_width);
 
@@ -1567,6 +1585,7 @@ impl TerminalView {
         let (cell_width, cell_height) = renderer.cell_size();
 
         let mut terminal = Terminal::new(80, 24, ScreenConfig::default());
+        terminal.set_base_palette(theme.colors.clone());
         terminal.screen_mut().set_cell_height_hint(cell_height);
         terminal.screen_mut().set_cell_width_hint(cell_width);
 
@@ -1848,6 +1867,7 @@ impl TerminalView {
                                     Ok(chunk) => {
                                         let mut term = terminal.lock();
                                         let events = term.process_mirror(&chunk.data);
+                                        let mut content_changed = false;
 
                                         for event in events {
                                             match event {
@@ -1860,12 +1880,17 @@ impl TerminalView {
                                                 TerminalEvent::Bell => {
                                                     state.bell_changed.store(true, Ordering::Relaxed);
                                                 }
+                                                TerminalEvent::ContentChanged => {
+                                                    content_changed = true;
+                                                }
                                                 _ => {}
                                             }
                                         }
 
                                         drop(term);
-                                        state.needs_redraw.store(true, Ordering::Relaxed);
+                                        if content_changed {
+                                            state.needs_redraw.store(true, Ordering::Relaxed);
+                                        }
                                     }
                                     Err(e) => {
                                         log::error!("Daemon stream error: {}", e);
@@ -1887,6 +1912,7 @@ impl TerminalView {
     }
 
     fn schedule_redraw_check(&self, view_ptr: usize, state: Arc<ViewState>) {
+        let terminal = Arc::clone(&self.ivars().terminal);
         // Start a background thread that periodically triggers redraws on main thread
         std::thread::spawn(move || {
             // Wait briefly for app to initialize
@@ -1898,6 +1924,10 @@ impl TerminalView {
                 if state.view_invalid.load(Ordering::SeqCst) {
                     log::debug!("View invalidated, stopping redraw thread");
                     break;
+                }
+
+                if terminal.lock().expire_synchronized_update() {
+                    state.needs_redraw.store(true, Ordering::Relaxed);
                 }
 
                 // Check if PTY closed - if so, close the window
@@ -2022,6 +2052,11 @@ impl TerminalView {
         if let Some(ref mut renderer) = *self.ivars().renderer.borrow_mut() {
             renderer.set_background_override(color);
         }
+        let mut palette = self.ivars().color_palette.clone();
+        if let Some(background) = color.and_then(cterm_core::Rgb::from_hex) {
+            palette.background = background;
+        }
+        self.ivars().terminal.lock().set_base_palette(palette);
     }
 
     /// Check if the title is locked (user-set or template-set)
@@ -2783,6 +2818,8 @@ mod keyboard_event_tests {
         assert_eq!(terminal_key_for_keycode(0x75), Some(Key::Delete));
         assert_eq!(terminal_key_for_keycode(0x7A), Some(Key::F(1)));
         assert_eq!(terminal_key_for_keycode(0x6F), Some(Key::F(12)));
+        assert_eq!(terminal_key_for_keycode(0x57), Some(Key::NumpadDigit(5)));
+        assert_eq!(terminal_key_for_keycode(0x4C), Some(Key::NumpadEnter));
         assert_eq!(terminal_key_for_keycode(0x00), None);
     }
 

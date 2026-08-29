@@ -323,6 +323,22 @@ enum SpecialKey {
   SPECIAL_KEY_PAGE_DOWN = 12;
   SPECIAL_KEY_INSERT = 13;
   SPECIAL_KEY_DELETE = 14;
+  SPECIAL_KEY_NUMPAD_0 = 15;
+  SPECIAL_KEY_NUMPAD_1 = 16;
+  SPECIAL_KEY_NUMPAD_2 = 17;
+  SPECIAL_KEY_NUMPAD_3 = 18;
+  SPECIAL_KEY_NUMPAD_4 = 19;
+  SPECIAL_KEY_NUMPAD_5 = 20;
+  SPECIAL_KEY_NUMPAD_6 = 21;
+  SPECIAL_KEY_NUMPAD_7 = 22;
+  SPECIAL_KEY_NUMPAD_8 = 23;
+  SPECIAL_KEY_NUMPAD_9 = 24;
+  SPECIAL_KEY_NUMPAD_DECIMAL = 25;
+  SPECIAL_KEY_NUMPAD_DIVIDE = 26;
+  SPECIAL_KEY_NUMPAD_MULTIPLY = 27;
+  SPECIAL_KEY_NUMPAD_SUBTRACT = 28;
+  SPECIAL_KEY_NUMPAD_ADD = 29;
+  SPECIAL_KEY_NUMPAD_ENTER = 30;
 }
 
 message Modifiers {
@@ -379,6 +395,12 @@ message DirtyRowsUpdate {
   optional CursorPosition cursor = 2;
   // Include terminal modes when they changed
   optional TerminalModes modes = 3;
+  // Include the complete image set only when it changed.
+  TerminalImages images = 4;
+}
+
+message TerminalImages {
+  repeated TerminalImage images = 1;
 }
 
 message DirtyRow {
@@ -418,6 +440,20 @@ message GetScreenResponse {
   TerminalModes modes = 7;
   // DRCS soft fonts
   repeated DrcsFont drcs_fonts = 8;
+  // Inline terminal images. Image lines are absolute indexes into the
+  // scrollback-plus-visible buffer represented by this snapshot.
+  repeated TerminalImage images = 9;
+}
+
+message TerminalImage {
+  uint64 id = 1;
+  uint32 col = 2;
+  uint64 line = 3;
+  uint32 cell_width = 4;
+  uint32 cell_height = 5;
+  bytes rgba = 6;
+  uint32 pixel_width = 7;
+  uint32 pixel_height = 8;
 }
 
 // DRCS (Dynamically Redefinable Character Sets) soft font
@@ -526,6 +562,19 @@ message TerminalModes {
   bool charset_g1_active = 7;
   // Active kitty progressive-keyboard flags (supported bits only).
   uint32 keyboard_enhancement_flags = 8;
+  // Rendering and cursor-wrap modes needed by reconnecting clients.
+  bool reverse_video = 9;
+  bool reverse_wrap = 10;
+  uint32 modify_other_keys = 11;
+  // Application-provided OSC 10-12 overrides. The frontend combines these
+  // with its local theme when rendering and answering color queries.
+  DynamicColors dynamic_colors = 12;
+}
+
+message DynamicColors {
+  Color foreground = 1;
+  Color background = 2;
+  Color cursor = 3;
 }
 
 message GetCellRequest {

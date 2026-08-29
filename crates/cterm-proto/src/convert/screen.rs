@@ -2,9 +2,11 @@
 
 use crate::convert::color::{color_to_proto, proto_to_color};
 use crate::proto;
+use cterm_core::cell::Hyperlink;
 use cterm_core::drcs::{DrcsFont, DrcsGlyph};
 use cterm_core::term::Terminal;
-use cterm_core::{Cell, CellAttrs, Screen};
+use cterm_core::{Cell, CellAttrs, Color, ColorQuery, Screen, TerminalImage};
+use std::sync::Arc;
 
 /// Convert cell attributes to proto
 pub fn attrs_to_proto(attrs: CellAttrs) -> proto::CellAttributes {
@@ -81,7 +83,7 @@ pub fn proto_to_attrs(attrs: &proto::CellAttributes) -> CellAttrs {
 /// Convert a cell to proto
 pub fn cell_to_proto(cell: &Cell) -> proto::Cell {
     proto::Cell {
-        char: cell.c.to_string(),
+        char: cell.text().to_owned(),
         fg: Some(color_to_proto(&cell.fg)),
         bg: Some(color_to_proto(&cell.bg)),
         attrs: Some(attrs_to_proto(cell.attrs)),
@@ -157,6 +159,50 @@ pub fn drcs_fonts_to_proto(screen: &Screen) -> Vec<proto::DrcsFont> {
         .collect()
 }
 
+/// Convert a terminal image to its portable RGBA wire representation.
+pub fn terminal_image_to_proto(image: &TerminalImage) -> proto::TerminalImage {
+    proto::TerminalImage {
+        id: image.id,
+        col: image.col as u32,
+        line: image.line as u64,
+        cell_width: image.cell_width as u32,
+        cell_height: image.cell_height as u32,
+        rgba: image.data.as_ref().clone(),
+        pixel_width: image.pixel_width as u32,
+        pixel_height: image.pixel_height as u32,
+    }
+}
+
+/// Convert all stored images in deterministic paint order.
+pub fn terminal_images_to_proto(screen: &Screen) -> Vec<proto::TerminalImage> {
+    screen
+        .images()
+        .into_iter()
+        .map(terminal_image_to_proto)
+        .collect()
+}
+
+/// Validate and convert a wire image back to the shared core representation.
+pub fn proto_to_terminal_image(image: &proto::TerminalImage) -> Option<TerminalImage> {
+    let pixel_width = usize::try_from(image.pixel_width).ok()?;
+    let pixel_height = usize::try_from(image.pixel_height).ok()?;
+    let expected_len = pixel_width.checked_mul(pixel_height)?.checked_mul(4)?;
+    if pixel_width == 0 || pixel_height == 0 || image.rgba.len() != expected_len {
+        return None;
+    }
+
+    Some(TerminalImage {
+        id: image.id,
+        col: usize::try_from(image.col).ok()?,
+        line: usize::try_from(image.line).ok()?,
+        cell_width: usize::try_from(image.cell_width).ok()?.max(1),
+        cell_height: usize::try_from(image.cell_height).ok()?.max(1),
+        data: Arc::new(image.rgba.clone()),
+        pixel_width,
+        pixel_height,
+    })
+}
+
 /// Convert screen to proto representation
 pub fn screen_to_proto(screen: &Screen, include_scrollback: bool) -> proto::GetScreenResponse {
     let cursor = proto::CursorPosition {
@@ -199,6 +245,7 @@ pub fn screen_to_proto(screen: &Screen, include_scrollback: bool) -> proto::GetS
         title: screen.title.clone(),
         modes: Some(modes_to_proto(screen)),
         drcs_fonts: drcs_fonts_to_proto(screen),
+        images: terminal_images_to_proto(screen),
     }
 }
 
@@ -238,6 +285,20 @@ pub fn modes_to_proto(screen: &Screen) -> proto::TerminalModes {
         charset_g1: screen.modes.charset_g1.clone(),
         charset_g1_active: screen.modes.charset_g1_active,
         keyboard_enhancement_flags: u32::from(screen.keyboard_enhancement_flags().bits()),
+        reverse_video: screen.modes.reverse_video,
+        reverse_wrap: screen.modes.reverse_wrap,
+        modify_other_keys: u32::from(screen.modes.modify_other_keys),
+        dynamic_colors: Some(proto::DynamicColors {
+            foreground: screen
+                .dynamic_color(ColorQuery::Foreground)
+                .map(|color| color_to_proto(&Color::Rgb(color))),
+            background: screen
+                .dynamic_color(ColorQuery::Background)
+                .map(|color| color_to_proto(&Color::Rgb(color))),
+            cursor: screen
+                .dynamic_color(ColorQuery::Cursor)
+                .map(|color| color_to_proto(&Color::Rgb(color))),
+        }),
     }
 }
 
@@ -253,8 +314,7 @@ pub fn screen_to_text(
     // Add scrollback if requested
     if include_scrollback {
         for row in screen.scrollback().iter() {
-            let text: String = row.iter().map(|c| c.c).collect();
-            lines.push(text.trim_end().to_string());
+            lines.push(row.text());
         }
     }
 
@@ -264,10 +324,13 @@ pub fn screen_to_text(
     let end = end.min(screen.height());
 
     for row_idx in start..end {
-        let text: String = (0..screen.width())
-            .map(|col| screen.get_cell(row_idx, col).map(|c| c.c).unwrap_or(' '))
-            .collect();
-        lines.push(text.trim_end().to_string());
+        lines.push(
+            screen
+                .grid()
+                .row(row_idx)
+                .map(|row| row.text())
+                .unwrap_or_default(),
+        );
     }
 
     lines
@@ -289,16 +352,7 @@ pub fn apply_screen_snapshot(terminal: &mut Terminal, screen_data: &proto::GetSc
     for (row_idx, row) in screen_data.visible_rows.iter().enumerate() {
         for (col_idx, cell) in row.cells.iter().enumerate() {
             if let Some(grid_cell) = screen.grid_mut().get_mut(row_idx, col_idx) {
-                grid_cell.c = cell.char.chars().next().unwrap_or(' ');
-                if let Some(fg) = &cell.fg {
-                    grid_cell.fg = proto_to_color(fg);
-                }
-                if let Some(bg) = &cell.bg {
-                    grid_cell.bg = proto_to_color(bg);
-                }
-                if let Some(attrs) = &cell.attrs {
-                    grid_cell.attrs = proto_to_attrs(attrs);
-                }
+                apply_proto_cell(grid_cell, cell);
             }
         }
     }
@@ -310,16 +364,7 @@ pub fn apply_screen_snapshot(terminal: &mut Terminal, screen_data: &proto::GetSc
             let mut row = Row::new(screen_data.cols as usize);
             for (col_idx, cell) in proto_row.cells.iter().enumerate() {
                 if let Some(grid_cell) = row.get_mut(col_idx) {
-                    grid_cell.c = cell.char.chars().next().unwrap_or(' ');
-                    if let Some(fg) = &cell.fg {
-                        grid_cell.fg = proto_to_color(fg);
-                    }
-                    if let Some(bg) = &cell.bg {
-                        grid_cell.bg = proto_to_color(bg);
-                    }
-                    if let Some(attrs) = &cell.attrs {
-                        grid_cell.attrs = proto_to_attrs(attrs);
-                    }
+                    apply_proto_cell(grid_cell, cell);
                 }
             }
             screen.scrollback_mut().push_back(row);
@@ -347,6 +392,33 @@ pub fn apply_screen_snapshot(terminal: &mut Terminal, screen_data: &proto::GetSc
         screen.modes.charset_g0 = modes.charset_g0.clone();
         screen.modes.charset_g1 = modes.charset_g1.clone();
         screen.modes.charset_g1_active = modes.charset_g1_active;
+        screen.modes.reverse_video = modes.reverse_video;
+        screen.modes.reverse_wrap = modes.reverse_wrap;
+        screen.modes.modify_other_keys = u8::try_from(modes.modify_other_keys)
+            .unwrap_or(1)
+            .clamp(1, 2);
+        let dynamic_rgb = |color: Option<&proto::Color>| {
+            color.map(proto_to_color).and_then(|color| {
+                if let Color::Rgb(rgb) = color {
+                    Some(rgb)
+                } else {
+                    None
+                }
+            })
+        };
+        let dynamic_colors = modes.dynamic_colors.as_ref();
+        screen.set_dynamic_color(
+            ColorQuery::Foreground,
+            dynamic_rgb(dynamic_colors.and_then(|colors| colors.foreground.as_ref())),
+        );
+        screen.set_dynamic_color(
+            ColorQuery::Background,
+            dynamic_rgb(dynamic_colors.and_then(|colors| colors.background.as_ref())),
+        );
+        screen.set_dynamic_color(
+            ColorQuery::Cursor,
+            dynamic_rgb(dynamic_colors.and_then(|colors| colors.cursor.as_ref())),
+        );
         screen.set_keyboard_enhancement_flags(
             cterm_core::KeyboardEnhancementFlags::from_bits_retain(
                 modes.keyboard_enhancement_flags as u8,
@@ -364,11 +436,46 @@ pub fn apply_screen_snapshot(terminal: &mut Terminal, screen_data: &proto::GetSc
             screen.add_drcs_font(font, 0, font_number);
         }
     }
+
+    screen.replace_images(
+        screen_data
+            .images
+            .iter()
+            .filter_map(proto_to_terminal_image),
+    );
+}
+
+fn apply_proto_cell(cell: &mut Cell, proto_cell: &proto::Cell) {
+    cell.set_text(&proto_cell.char);
+    cell.fg = proto_cell
+        .fg
+        .as_ref()
+        .map(proto_to_color)
+        .unwrap_or(Color::Default);
+    cell.bg = proto_cell
+        .bg
+        .as_ref()
+        .map(proto_to_color)
+        .unwrap_or(Color::Default);
+    cell.attrs = proto_cell
+        .attrs
+        .as_ref()
+        .map(proto_to_attrs)
+        .unwrap_or_default();
+    cell.underline_color = proto_cell.underline_color.as_ref().map(proto_to_color);
+    cell.hyperlink = proto_cell.hyperlink.as_ref().map(|link| {
+        Arc::new(Hyperlink {
+            id: link.id.clone(),
+            uri: link.uri.clone(),
+        })
+    });
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cterm_core::screen::ScreenConfig;
+    use cterm_core::SixelImage;
 
     #[test]
     fn test_attrs_roundtrip() {
@@ -383,5 +490,99 @@ mod tests {
         let cell = Cell::new('A');
         let proto = cell_to_proto(&cell);
         assert_eq!(proto.char, "A");
+    }
+
+    #[test]
+    fn screen_snapshot_roundtrips_images_and_cell_metadata() {
+        let mut source = Terminal::new(4, 2, ScreenConfig::default());
+        source.screen_mut().add_image_with_size(
+            1,
+            0,
+            2,
+            1,
+            SixelImage {
+                data: vec![255, 0, 0, 128, 0, 255, 0, 255],
+                width: 2,
+                height: 1,
+            },
+        );
+        let expected_link = Arc::new(Hyperlink::with_id(
+            "link-1".into(),
+            "https://example.test".into(),
+        ));
+        let source_cell = source.screen_mut().grid_mut().get_mut(1, 0).unwrap();
+        source_cell.set_text("x\u{301}");
+        source_cell.underline_color = Some(Color::rgb(1, 2, 3));
+        source_cell.hyperlink = Some(expected_link.clone());
+        source.screen_mut().modes.reverse_video = true;
+        source.screen_mut().modes.reverse_wrap = false;
+        source.screen_mut().modes.modify_other_keys = 2;
+        source
+            .screen_mut()
+            .set_dynamic_color(ColorQuery::Foreground, Some(cterm_core::Rgb::new(4, 5, 6)));
+        source
+            .screen_mut()
+            .set_dynamic_color(ColorQuery::Background, Some(cterm_core::Rgb::new(7, 8, 9)));
+        source
+            .screen_mut()
+            .set_dynamic_color(ColorQuery::Cursor, Some(cterm_core::Rgb::new(10, 11, 12)));
+
+        let snapshot = screen_to_proto(source.screen(), true);
+        let mut restored = Terminal::new(1, 1, ScreenConfig::default());
+        apply_screen_snapshot(&mut restored, &snapshot);
+
+        assert_eq!(restored.screen().images(), source.screen().images());
+        let restored_cell = restored.screen().get_cell(1, 0).unwrap();
+        assert_eq!(restored_cell.text(), "x\u{301}");
+        assert_eq!(restored_cell.underline_color, Some(Color::rgb(1, 2, 3)));
+        assert_eq!(restored_cell.hyperlink, Some(expected_link));
+        assert!(restored.screen().modes.reverse_video);
+        assert!(!restored.screen().modes.reverse_wrap);
+        assert_eq!(restored.screen().modes.modify_other_keys, 2);
+        assert_eq!(
+            restored.screen().dynamic_color(ColorQuery::Foreground),
+            Some(cterm_core::Rgb::new(4, 5, 6))
+        );
+        assert_eq!(
+            restored.screen().dynamic_color(ColorQuery::Background),
+            Some(cterm_core::Rgb::new(7, 8, 9))
+        );
+        assert_eq!(
+            restored.screen().dynamic_color(ColorQuery::Cursor),
+            Some(cterm_core::Rgb::new(10, 11, 12))
+        );
+    }
+
+    #[test]
+    fn screen_snapshot_clears_absent_dynamic_colors() {
+        let source = Terminal::new(80, 24, ScreenConfig::default());
+        let snapshot = screen_to_proto(source.screen(), true);
+        let mut restored = Terminal::new(80, 24, ScreenConfig::default());
+        restored
+            .screen_mut()
+            .set_dynamic_color(ColorQuery::Foreground, Some(cterm_core::Rgb::new(1, 2, 3)));
+
+        apply_screen_snapshot(&mut restored, &snapshot);
+
+        assert_eq!(
+            restored.screen().dynamic_color(ColorQuery::Foreground),
+            None
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_terminal_image_payloads() {
+        let image = proto::TerminalImage {
+            id: 1,
+            col: 0,
+            line: 0,
+            cell_width: 1,
+            cell_height: 1,
+            rgba: vec![1, 2, 3],
+            pixel_width: 1,
+            pixel_height: 1,
+        };
+
+        assert!(proto_to_terminal_image(&image).is_none());
     }
 }

@@ -6,6 +6,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
+use std::time::{Duration, Instant};
 
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
@@ -18,7 +19,7 @@ use windows::Win32::UI::WindowsAndMessaging::*;
 use cterm_app::config::Config;
 use cterm_app::file_transfer::PendingFileManager;
 use cterm_app::shortcuts::ShortcutManager;
-use cterm_core::color::Rgb;
+use cterm_core::color::{ColorPalette, Rgb};
 use cterm_core::mouse::{encode_mouse_event, MouseButton as ReportButton, MouseModifiers};
 use cterm_core::pty::{PtyConfig, PtySize};
 use cterm_core::screen::{FileTransferOperation, MouseMode, ScreenConfig};
@@ -58,6 +59,7 @@ pub enum DaemonCmd {
 }
 
 const PREVIOUS_KEY_STATE_BIT: usize = 1 << 30;
+const EXTENDED_KEY_BIT: usize = 1 << 24;
 
 /// Classify a Win32 key message without consulting mutable keyboard state.
 fn key_event_kind(msg: u32, key_data: usize) -> Option<KeyEventKind> {
@@ -93,7 +95,12 @@ fn ascii_key_for_vk(vk: u16) -> Option<char> {
     })
 }
 
-fn mapped_terminal_key(vk: u16, modifiers: Modifiers, enhanced_text: bool) -> Option<Key> {
+fn mapped_terminal_key(
+    vk: u16,
+    modifiers: Modifiers,
+    enhanced_text: bool,
+    extended: bool,
+) -> Option<Key> {
     let functional = match vk as i32 {
         winuser::VK_UP => Key::Up,
         winuser::VK_DOWN => Key::Down,
@@ -106,9 +113,18 @@ fn mapped_terminal_key(vk: u16, modifiers: Modifiers, enhanced_text: bool) -> Op
         winuser::VK_INSERT => Key::Insert,
         winuser::VK_DELETE => Key::Delete,
         winuser::VK_BACK => Key::Backspace,
+        winuser::VK_RETURN if extended => Key::NumpadEnter,
         winuser::VK_RETURN => Key::Enter,
         winuser::VK_TAB => Key::Tab,
         winuser::VK_ESCAPE => Key::Escape,
+        value if (winuser::VK_NUMPAD0..=winuser::VK_NUMPAD9).contains(&value) => {
+            Key::NumpadDigit((value - winuser::VK_NUMPAD0) as u8)
+        }
+        winuser::VK_DECIMAL => Key::NumpadDecimal,
+        winuser::VK_DIVIDE => Key::NumpadDivide,
+        winuser::VK_MULTIPLY => Key::NumpadMultiply,
+        winuser::VK_SUBTRACT => Key::NumpadSubtract,
+        winuser::VK_ADD => Key::NumpadAdd,
         value if (winuser::VK_F1..=winuser::VK_F12).contains(&value) => {
             Key::F((value - winuser::VK_F1 + 1) as u8)
         }
@@ -316,7 +332,8 @@ impl WindowState {
             term: opts.term,
         };
 
-        let terminal = Terminal::with_shell(cols, rows, screen_config, &pty_config)?;
+        let mut terminal = Terminal::with_shell(cols, rows, screen_config, &pty_config)?;
+        terminal.set_base_palette(terminal_palette(&self.theme, None));
         let terminal = Arc::new(Mutex::new(terminal));
 
         // Start PTY reader thread
@@ -497,7 +514,11 @@ impl WindowState {
             term: self.config.general.term.clone(),
         };
 
-        let terminal = Terminal::with_shell(cols, rows, screen_config, &pty_config)?;
+        let mut terminal = Terminal::with_shell(cols, rows, screen_config, &pty_config)?;
+        terminal.set_base_palette(terminal_palette(
+            &self.theme,
+            template.background_color.as_deref(),
+        ));
         let terminal = Arc::new(Mutex::new(terminal));
 
         // Start PTY reader thread
@@ -624,7 +645,8 @@ impl WindowState {
             term: self.config.general.term.clone(),
         };
 
-        let terminal = Terminal::with_shell(cols, rows, screen_config, &pty_config)?;
+        let mut terminal = Terminal::with_shell(cols, rows, screen_config, &pty_config)?;
+        terminal.set_base_palette(terminal_palette(&self.theme, None));
         let terminal = Arc::new(Mutex::new(terminal));
 
         let reader_handle = self.start_pty_reader(tab_id, Arc::clone(&terminal));
@@ -686,6 +708,7 @@ impl WindowState {
             scrollback_lines: self.config.general.scrollback_lines,
         };
         let mut terminal = Terminal::new(cols, rows, screen_config);
+        terminal.set_base_palette(terminal_palette(&self.theme, background_color.as_deref()));
         terminal.resize_with_pixels(
             cols,
             rows,
@@ -772,6 +795,7 @@ impl WindowState {
             scrollback_lines: self.config.general.scrollback_lines,
         };
         let mut terminal = Terminal::new(cols, rows, screen_config);
+        terminal.set_base_palette(terminal_palette(&self.theme, None));
 
         // Apply screen snapshot if available
         if let Some(ref screen_data) = screen_snapshot {
@@ -863,6 +887,7 @@ impl WindowState {
             let term = terminal.lock().unwrap();
             term.pty().and_then(|pty| pty.try_clone_reader().ok())
         };
+        let sync_watchdog = spawn_synchronized_update_watchdog(hwnd, tab_id, Arc::clone(&terminal));
 
         thread::spawn(move || {
             let Some(mut reader) = pty_reader else {
@@ -893,9 +918,10 @@ impl WindowState {
                 };
 
                 // Process the data (briefly lock the terminal)
-                {
+                let (content_changed, sync_deadline) = {
                     let mut term = terminal.lock().unwrap();
                     let events = term.process(&buffer[..bytes_read]);
+                    let mut content_changed = false;
 
                     // Handle events
                     for event in events {
@@ -931,19 +957,17 @@ impl WindowState {
                                 }
                                 return;
                             }
+                            TerminalEvent::ContentChanged => content_changed = true,
                             _ => {}
                         }
                     }
-                }
+                    (content_changed, term.synchronized_update_deadline())
+                };
 
-                // Request redraw
-                unsafe {
-                    let _ = PostMessageW(
-                        Some(HWND(hwnd as *mut _)),
-                        WM_APP_PTY_DATA,
-                        WPARAM(tab_id as usize),
-                        LPARAM(0),
-                    );
+                let _ = sync_watchdog.send(sync_deadline);
+
+                if content_changed {
+                    post_message(hwnd, WM_APP_PTY_DATA, tab_id);
                 }
             }
 
@@ -1179,7 +1203,7 @@ impl WindowState {
     /// Handle a physical keyboard event. Text-producing keys deliberately stay
     /// on WM_CHAR so Windows remains authoritative for layouts, dead keys, and
     /// IME composition.
-    pub fn on_key_event(&mut self, vk: u16, kind: KeyEventKind) -> bool {
+    pub fn on_key_event(&mut self, vk: u16, kind: KeyEventKind, extended: bool) -> bool {
         let modifiers = keycode::get_modifiers();
 
         if kind == KeyEventKind::Release {
@@ -1225,7 +1249,7 @@ impl WindowState {
                     .contains(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
             });
 
-        let Some(key) = mapped_terminal_key(vk, modifiers, enhanced_text) else {
+        let Some(key) = mapped_terminal_key(vk, modifiers, enhanced_text, extended) else {
             return false;
         };
         let core_modifiers = CoreModifiers::from_bits_truncate(modifiers.bits());
@@ -2439,6 +2463,49 @@ impl WindowState {
     }
 }
 
+/// Start one deadline-driven synchronized-update watchdog for a terminal.
+/// New deadlines replace old ones, so rapid application frames never create
+/// an unbounded collection of sleeping threads.
+fn spawn_synchronized_update_watchdog(
+    hwnd: usize,
+    tab_id: u64,
+    terminal: Arc<Mutex<Terminal>>,
+) -> std::sync::mpsc::Sender<Option<Instant>> {
+    let (tx, rx) = std::sync::mpsc::channel::<Option<Instant>>();
+    thread::spawn(move || {
+        let mut deadline: Option<Instant> = None;
+        loop {
+            let message = match deadline {
+                Some(target) => rx.recv_timeout(target.saturating_duration_since(Instant::now())),
+                None => match rx.recv() {
+                    Ok(value) => {
+                        deadline = value;
+                        continue;
+                    }
+                    Err(_) => break,
+                },
+            };
+
+            match message {
+                Ok(value) => deadline = value,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    let (redraw, next_deadline) = {
+                        let mut term = terminal.lock().unwrap();
+                        let redraw = term.expire_synchronized_update();
+                        (redraw, term.synchronized_update_deadline())
+                    };
+                    deadline = next_deadline;
+                    if redraw {
+                        post_message(hwnd, WM_APP_PTY_DATA, tab_id);
+                    }
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+            }
+        }
+    });
+    tx
+}
+
 /// Window class name
 pub const WINDOW_CLASS: &str = "ctermWindow";
 
@@ -2945,12 +3012,20 @@ async fn run_daemon_io_loop(
             match session.stream_output().await {
                 Ok(mut stream) => {
                     use futures::StreamExt;
-                    while let Some(result) = stream.next().await {
-                        match result {
-                            Ok(chunk) => {
-                                {
+                    let mut sync_watchdog =
+                        tokio::time::interval(Duration::from_millis(16));
+                    sync_watchdog.set_missed_tick_behavior(
+                        tokio::time::MissedTickBehavior::Skip,
+                    );
+                    loop {
+                        tokio::select! {
+                            result = stream.next() => {
+                                let Some(result) = result else { break };
+                                match result {
+                                    Ok(chunk) => {
                                     let mut term = terminal.lock().unwrap();
                                     let events = term.process_mirror(&chunk.data);
+                                    let mut content_changed = false;
                                     for event in events {
                                         match event {
                                             TerminalEvent::TitleChanged(_) => {
@@ -2959,15 +3034,25 @@ async fn run_daemon_io_loop(
                                             TerminalEvent::Bell => {
                                                 post_message(hwnd, WM_APP_BELL, tab_id);
                                             }
+                                            TerminalEvent::ContentChanged => content_changed = true,
                                             _ => {}
                                         }
                                     }
+                                    drop(term);
+                                    if content_changed {
+                                        post_message(hwnd, WM_APP_PTY_DATA, tab_id);
+                                    }
+                                    }
+                                    Err(e) => {
+                                        log::error!("Daemon output stream error: {}", e);
+                                        break;
+                                    }
                                 }
-                                post_message(hwnd, WM_APP_PTY_DATA, tab_id);
                             }
-                            Err(e) => {
-                                log::error!("Daemon output stream error: {}", e);
-                                break;
+                            _ = sync_watchdog.tick() => {
+                                if terminal.lock().unwrap().expire_synchronized_update() {
+                                    post_message(hwnd, WM_APP_PTY_DATA, tab_id);
+                                }
                             }
                         }
                     }
@@ -3067,9 +3152,10 @@ extern "system" fn window_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPA
 
         WM_KEYDOWN | WM_SYSKEYDOWN | WM_KEYUP | WM_SYSKEYUP => {
             let vk = (wparam.0 & 0xFFFF) as u16;
-            let kind = key_event_kind(msg, lparam.0 as usize)
+            let key_data = lparam.0 as usize;
+            let kind = key_event_kind(msg, key_data)
                 .expect("matched messages always have a key-event kind");
-            if state.on_key_event(vk, kind) {
+            if state.on_key_event(vk, kind, key_data & EXTENDED_KEY_BIT != 0) {
                 LRESULT(0)
             } else {
                 unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
@@ -3260,6 +3346,15 @@ fn parse_hex_color(hex: &str) -> Option<Rgb> {
     Some(Rgb::new(r, g, b))
 }
 
+fn terminal_palette(theme: &Theme, background: Option<&str>) -> ColorPalette {
+    let mut palette = theme.colors.clone();
+    palette.cursor = theme.cursor.color;
+    if let Some(background) = background.and_then(Rgb::from_hex) {
+        palette.background = background;
+    }
+    palette
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3282,32 +3377,51 @@ mod tests {
     #[test]
     fn physical_mapping_keeps_layout_text_on_wm_char() {
         assert_eq!(
-            mapped_terminal_key(winuser::VK_UP as u16, Modifiers::empty(), false),
+            mapped_terminal_key(winuser::VK_UP as u16, Modifiers::empty(), false, false),
             Some(Key::Up)
         );
         assert_eq!(
-            mapped_terminal_key(winuser::VK_F12 as u16, Modifiers::empty(), false),
+            mapped_terminal_key(winuser::VK_F12 as u16, Modifiers::empty(), false, false),
             Some(Key::F(12))
         );
-        assert_eq!(mapped_terminal_key(0x41, Modifiers::empty(), false), None);
         assert_eq!(
-            mapped_terminal_key(winuser::VK_OEM_1 as u16, Modifiers::CTRL, false),
+            mapped_terminal_key(0x41, Modifiers::empty(), false, false),
             None
+        );
+        assert_eq!(
+            mapped_terminal_key(winuser::VK_OEM_1 as u16, Modifiers::CTRL, false, false,),
+            None
+        );
+    }
+
+    #[test]
+    fn physical_mapping_preserves_numeric_keypad_identity() {
+        assert_eq!(
+            mapped_terminal_key(winuser::VK_NUMPAD7 as u16, Modifiers::empty(), false, false,),
+            Some(Key::NumpadDigit(7))
+        );
+        assert_eq!(
+            mapped_terminal_key(winuser::VK_ADD as u16, Modifiers::empty(), false, false,),
+            Some(Key::NumpadAdd)
+        );
+        assert_eq!(
+            mapped_terminal_key(winuser::VK_RETURN as u16, Modifiers::empty(), false, true,),
+            Some(Key::NumpadEnter)
         );
     }
 
     #[test]
     fn legacy_ctrl_letters_and_enhanced_ascii_are_mapped_exactly() {
         assert_eq!(
-            mapped_terminal_key(0x41, Modifiers::CTRL, false),
+            mapped_terminal_key(0x41, Modifiers::CTRL, false, false),
             Some(Key::Char('a'))
         );
         assert_eq!(
-            mapped_terminal_key(0x5a, Modifiers::CTRL | Modifiers::SHIFT, false),
+            mapped_terminal_key(0x5a, Modifiers::CTRL | Modifiers::SHIFT, false, false),
             Some(Key::Char('z'))
         );
         assert_eq!(
-            mapped_terminal_key(0x41, Modifiers::CTRL | Modifiers::ALT, false),
+            mapped_terminal_key(0x41, Modifiers::CTRL | Modifiers::ALT, false, false),
             None
         );
         assert_eq!(
@@ -3315,11 +3429,12 @@ mod tests {
                 winuser::VK_OEM_1 as u16,
                 Modifiers::CTRL | Modifiers::SHIFT,
                 true,
+                false,
             ),
             Some(Key::Char(';'))
         );
         assert_eq!(
-            mapped_terminal_key(0x32, Modifiers::ALT, true),
+            mapped_terminal_key(0x32, Modifiers::ALT, true, false),
             Some(Key::Char('2'))
         );
     }

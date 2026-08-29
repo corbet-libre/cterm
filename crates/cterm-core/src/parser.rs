@@ -6,6 +6,7 @@
 //! Special handling is provided for OSC 1337 (iTerm2) file transfers
 //! which are intercepted before VTE to enable streaming large files.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use vte::Params;
 
@@ -16,8 +17,8 @@ use crate::image_decode::decode_image;
 use crate::iterm2::{Iterm2Dimension, Iterm2FileParams};
 use crate::keyboard::KeyboardEnhancementFlags;
 use crate::screen::{
-    ClearMode, ClipboardOperation, ClipboardSelection, CursorStyle, LineClearMode, MouseMode,
-    Screen,
+    ClearMode, ClipboardOperation, ClipboardSelection, ColorQuery, CursorStyle, LineClearMode,
+    MouseMode, Screen,
 };
 use crate::sixel::{SixelDecoder, SixelImage};
 use crate::streaming_file::StreamingFileReceiver;
@@ -34,7 +35,13 @@ enum DcsState {
     },
     /// DECDLD (soft font download) in progress
     Decdld { decoder: DecdldDecoder },
+    /// XTGETTCAP terminfo capability query in progress
+    Xtgettcap { buffer: Vec<u8>, overflowed: bool },
+    /// DECRQSS request-status-string query in progress
+    Decrqss { query: Vec<u8> },
 }
+
+const XTGETTCAP_MAX_REQUEST_SIZE: usize = 64 * 1024;
 
 /// State for intercepting OSC 1337 File transfers before VTE buffers them
 #[derive(Debug, Default)]
@@ -58,6 +65,10 @@ enum Osc1337State {
 pub struct Parser {
     state_machine: vte::Parser,
     dcs_state: DcsState,
+    /// Most recent graphic character for ECMA-48 REP.
+    last_printed: Option<char>,
+    /// Saved DEC private modes for xterm XTSAVE/XTRESTORE.
+    saved_dec_modes: HashMap<usize, bool>,
     /// State for intercepting OSC 1337 File sequences
     osc_1337_state: Osc1337State,
     /// Whether an OSC 1337 string terminator (BEL or ESC \) was seen
@@ -75,6 +86,8 @@ impl Parser {
         Self {
             state_machine: vte::Parser::new(),
             dcs_state: DcsState::None,
+            last_printed: None,
+            saved_dec_modes: HashMap::new(),
             osc_1337_state: Osc1337State::None,
             osc_1337_terminated: false,
         }
@@ -100,6 +113,8 @@ impl Parser {
             let mut performer = ScreenPerformer {
                 screen,
                 dcs_state: &mut self.dcs_state,
+                last_printed: &mut self.last_printed,
+                saved_dec_modes: &mut self.saved_dec_modes,
             };
             self.state_machine.advance(&mut performer, byte);
         }
@@ -355,10 +370,14 @@ impl Parser {
 struct ScreenPerformer<'a> {
     screen: &'a mut Screen,
     dcs_state: &'a mut DcsState,
+    last_printed: &'a mut Option<char>,
+    saved_dec_modes: &'a mut HashMap<usize, bool>,
 }
 
 impl vte::Perform for ScreenPerformer<'_> {
     fn print(&mut self, c: char) {
+        let c = self.screen.map_active_charset_char(c);
+        *self.last_printed = Some(c);
         self.screen.put_char(c);
     }
 
@@ -370,11 +389,7 @@ impl vte::Perform for ScreenPerformer<'_> {
                 log::debug!("Bell");
             }
             // Backspace (BS)
-            0x08 => {
-                if self.screen.cursor.col > 0 {
-                    self.screen.cursor.col -= 1;
-                }
-            }
+            0x08 => self.screen.backspace(),
             // Horizontal Tab (HT)
             0x09 => {
                 self.screen.tab_forward(1);
@@ -430,6 +445,26 @@ impl vte::Perform for ScreenPerformer<'_> {
                     start_row: self.screen.cursor.row,
                 };
             }
+            // Legacy application synchronized-update protocol.  Mode 2026 is
+            // preferred, but foot supports this spelling for compatibility.
+            's' if intermediates == b"=" => match params_vec.first().copied() {
+                Some(1) => self.screen.set_application_sync_updates(true),
+                Some(2) => self.screen.set_application_sync_updates(false),
+                _ => {}
+            },
+            // Query the builtin terminal capability set.
+            'q' if intermediates == b"+" => {
+                *self.dcs_state = DcsState::Xtgettcap {
+                    buffer: Vec::new(),
+                    overflowed: false,
+                };
+            }
+            // Request status string (DECSTBM, SGR, or DECSCUSR).
+            'q' if intermediates == b"$" => {
+                *self.dcs_state = DcsState::Decrqss {
+                    query: Vec::with_capacity(2),
+                };
+            }
             // DECDLD (soft font download): DCS Pfn;Pcn;Pe;Pcmw;Pss;Pt;Pcmh;Pcss {
             '{' if intermediates.is_empty() => {
                 log::debug!("Starting DECDLD sequence, params: {:?}", params_vec);
@@ -454,6 +489,21 @@ impl vte::Perform for ScreenPerformer<'_> {
             }
             DcsState::Decdld { ref mut decoder } => {
                 decoder.put(byte);
+            }
+            DcsState::Xtgettcap {
+                ref mut buffer,
+                ref mut overflowed,
+            } => {
+                if buffer.len() < XTGETTCAP_MAX_REQUEST_SIZE {
+                    buffer.push(byte);
+                } else {
+                    *overflowed = true;
+                }
+            }
+            DcsState::Decrqss { ref mut query } => {
+                if query.len() < 2 {
+                    query.push(byte);
+                }
             }
             DcsState::None => {}
         }
@@ -503,8 +553,9 @@ impl vte::Perform for ScreenPerformer<'_> {
 
                     // Handle cursor positioning based on DECSDM mode
                     if self.screen.modes.sixel_scrolling {
-                        // Sixel scrolling enabled: cursor moves to last row of image, column 0
-                        // VT340 behavior: cursor at first column of last image row
+                        // Sixel scrolling enabled: place the cursor on the last
+                        // image row.  By default it remains at the image's left
+                        // edge; xterm mode 8452 moves it just to the right.
                         let last_image_row = img_row + rows_spanned.saturating_sub(1);
 
                         if last_image_row >= self.screen.height() {
@@ -515,7 +566,11 @@ impl vte::Perform for ScreenPerformer<'_> {
                         } else {
                             self.screen.cursor.row = last_image_row;
                         }
-                        self.screen.cursor.col = 0;
+                        self.screen.cursor.col = if self.screen.modes.sixel_cursor_right {
+                            (img_col + cols_spanned).min(self.screen.width().saturating_sub(1))
+                        } else {
+                            img_col
+                        };
                     }
                     // If sixel_scrolling is false, cursor stays where it was (start_col, start_row)
                 }
@@ -537,6 +592,20 @@ impl vte::Perform for ScreenPerformer<'_> {
                     // Store the font in the screen
                     self.screen.add_drcs_font(font, erase_control, font_number);
                 }
+            }
+            DcsState::Xtgettcap { buffer, overflowed } => {
+                let response = if overflowed {
+                    b"\x1bP0+r\x1b\\".to_vec()
+                } else {
+                    xtgettcap_response(&buffer, self.screen.width(), self.screen.height())
+                };
+                if !response.is_empty() {
+                    self.screen.queue_response(response);
+                }
+            }
+            DcsState::Decrqss { query } => {
+                self.screen
+                    .queue_response(decrqss_response(&query, self.screen));
             }
             DcsState::None => {}
         }
@@ -598,33 +667,27 @@ impl vte::Perform for ScreenPerformer<'_> {
             // Set/query colors (10-19)
             // OSC 10 = foreground, 11 = background, 12 = cursor
             10..=12 => {
-                if params.len() > 1 {
-                    let query = std::str::from_utf8(params[1]).unwrap_or("");
-                    if query == "?" {
-                        // Color query - respond with current color
-                        // Format: OSC Ps ; rgb:RRRR/GGGG/BBBB ST
-                        // We respond with a placeholder since actual colors are in the UI layer
-                        let color_name = match command {
-                            10 => "foreground",
-                            11 => "background",
-                            12 => "cursor",
-                            _ => "unknown",
-                        };
-                        log::trace!("Color query for {}", color_name);
-                        // Queue a color query response event
-                        // The actual response will be generated by the UI layer
-                        // which has access to the theme colors
-                        self.screen.queue_color_query(command as u8);
-                    } else {
-                        // Color setting - log but don't implement
-                        // Dynamic color setting is rarely used
-                        log::trace!("Color set OSC {}: {}", command, query);
+                for (offset, value) in params.iter().skip(1).enumerate() {
+                    let Some(target) = ColorQuery::from_osc_code(command + offset as u32) else {
+                        break;
+                    };
+                    let value = std::str::from_utf8(value).unwrap_or("");
+                    if value == "?" {
+                        self.screen.queue_color_query(target.osc_code());
+                    } else if let Some(color) = Rgb::from_xparse_color(value) {
+                        self.screen.set_dynamic_color(target, Some(color));
                     }
                 }
             }
             // Other color OSCs (13-19) - less common
             13..=19 => {
                 log::trace!("Unhandled color OSC: {}", command);
+            }
+            // Reset dynamic default foreground/background/cursor colors.
+            110..=112 => {
+                if let Some(target) = ColorQuery::from_osc_code(command - 100) {
+                    self.screen.set_dynamic_color(target, None);
+                }
             }
             // iTerm2 inline images and file transfer (1337)
             1337 => {
@@ -690,13 +753,13 @@ impl vte::Perform for ScreenPerformer<'_> {
                 let n = first_param(&params_vec, 1) as i32;
                 self.screen.move_cursor_relative(-n, 0);
             }
-            // Cursor Down (CUD)
-            ('B', []) => {
+            // Cursor Down (CUD) / Vertical Position Relative (VPR)
+            ('B', []) | ('e', []) => {
                 let n = first_param(&params_vec, 1) as i32;
                 self.screen.move_cursor_relative(n, 0);
             }
-            // Cursor Forward (CUF)
-            ('C', []) => {
+            // Cursor Forward (CUF) / Horizontal Position Relative (HPR)
+            ('C', []) | ('a', []) => {
                 let n = first_param(&params_vec, 1) as i32;
                 self.screen.move_cursor_relative(0, n);
             }
@@ -717,8 +780,8 @@ impl vte::Perform for ScreenPerformer<'_> {
                 self.screen.move_cursor_relative(-n, 0);
                 self.screen.cursor.col = 0;
             }
-            // Cursor Horizontal Absolute (CHA)
-            ('G', []) => {
+            // Cursor Horizontal Absolute (CHA) / Horizontal Position Absolute (HPA)
+            ('G', []) | ('`', []) => {
                 let col = first_param(&params_vec, 1).saturating_sub(1);
                 self.screen.cursor.col = col.min(self.screen.width().saturating_sub(1));
             }
@@ -787,6 +850,17 @@ impl vte::Perform for ScreenPerformer<'_> {
                     }
                 }
             }
+            // Repeat the preceding graphic character (REP). Bound the repeat
+            // count to one screen, matching foot's denial-of-service guard.
+            ('b', []) => {
+                if let Some(c) = *self.last_printed {
+                    let max_count = self.screen.width().saturating_mul(self.screen.height());
+                    let count = first_param(&params_vec, 1).min(max_count);
+                    for _ in 0..count {
+                        self.screen.put_char(c);
+                    }
+                }
+            }
             // Cursor Backward Tabulation (CBT)
             ('Z', []) => {
                 let n = first_param(&params_vec, 1);
@@ -818,6 +892,31 @@ impl vte::Perform for ScreenPerformer<'_> {
             ('m', []) => {
                 self.handle_sgr(&params_vec);
             }
+            // Set xterm modifyOtherKeys. foot treats every value except 2 as
+            // its backwards-compatible level 1.
+            ('m', [b'>']) => {
+                if first_param(&params_vec, 0) == 4 {
+                    self.screen.modes.modify_other_keys = if second_param(&params_vec, 1) == 2 {
+                        2
+                    } else {
+                        1
+                    };
+                }
+            }
+            // Query xterm keyboard modifier resources (XTQMODKEYS).
+            ('m', [b'?']) => {
+                if first_param(&params_vec, 0) == 4 {
+                    let level = self.screen.modes.modify_other_keys;
+                    self.screen
+                        .queue_response(format!("\x1b[>4;{level}m").into_bytes());
+                }
+            }
+            // Reset xterm keyboard modifier resource to foot's level 1.
+            ('n', [b'>']) => {
+                if first_param(&params_vec, 2) == 4 {
+                    self.screen.modes.modify_other_keys = 1;
+                }
+            }
             // Device Status Report (DSR)
             ('n', []) => {
                 let mode = first_param(&params_vec, 0);
@@ -838,12 +937,26 @@ impl vte::Perform for ScreenPerformer<'_> {
                     }
                 }
             }
-            // Primary Device Attributes (DA1). DEC capability 4 advertises
-            // Sixel graphics support and is consumed by ratatui-image.
+            // Primary Device Attributes (DA1). Advertise only capabilities
+            // implemented end to end: Sixel, ANSI color, and OSC 52.
             ('c', []) => {
                 let mode = first_param(&params_vec, 0);
                 if mode == 0 {
-                    self.screen.queue_response(b"\x1b[?62;4c".to_vec());
+                    self.screen.queue_response(b"\x1b[?62;4;22;52c".to_vec());
+                }
+            }
+            // Secondary Device Attributes (DA2): VT220 plus cterm version.
+            ('c', [b'>']) => {
+                if first_param(&params_vec, 0) == 0 {
+                    self.screen
+                        .queue_response(secondary_device_attributes().into_bytes());
+                }
+            }
+            // Tertiary Device Attributes (DA3): four-byte manufacturer ID.
+            ('c', [b'=']) => {
+                if first_param(&params_vec, 0) == 0 {
+                    self.screen
+                        .queue_response(b"\x1bP!|4354524D\x1b\\".to_vec());
                 }
             }
             // Set Top and Bottom Margins (DECSTBM)
@@ -867,14 +980,35 @@ impl vte::Perform for ScreenPerformer<'_> {
             }
             // Window manipulation (XTWINOPS)
             ('t', []) => {
-                if first_param(&params_vec, 0) == 16 {
-                    // Report character cell size in pixels: CSI 6;height;width t.
-                    let height = self.screen.cell_height_hint().round().max(1.0) as usize;
-                    let width = self.screen.cell_width_hint().round().max(1.0) as usize;
-                    self.screen
-                        .queue_response(format!("\x1b[6;{height};{width}t").into_bytes());
+                let operation = first_param(&params_vec, 0);
+                let cell_height = self.screen.cell_height_hint().round().max(1.0) as usize;
+                let cell_width = self.screen.cell_width_hint().round().max(1.0) as usize;
+                let rows = self.screen.height();
+                let cols = self.screen.width();
+                let response = match operation {
+                    11 => Some("\x1b[1t".to_string()),
+                    13 => Some("\x1b[3;0;0t".to_string()),
+                    14 if params_vec.get(1).copied().unwrap_or(0) != 2 => Some(format!(
+                        "\x1b[4;{};{}t",
+                        rows.saturating_mul(cell_height),
+                        cols.saturating_mul(cell_width)
+                    )),
+                    16 => Some(format!("\x1b[6;{cell_height};{cell_width}t")),
+                    18 => Some(format!("\x1b[8;{rows};{cols}t")),
+                    _ => None,
+                };
+                if let Some(response) = response {
+                    self.screen.queue_response(response.into_bytes());
                 } else {
-                    log::trace!("Window manipulation: {:?}", params_vec);
+                    log::trace!("Window manipulation: {params_vec:?}");
+                }
+            }
+            // XTVERSION terminal name/version report.
+            ('q', [b'>']) => {
+                if first_param(&params_vec, 0) == 0 {
+                    self.screen.queue_response(
+                        format!("\x1bP>|cterm({})\x1b\\", env!("CARGO_PKG_VERSION")).into_bytes(),
+                    );
                 }
             }
             // Query the active kitty keyboard progressive-enhancement flags.
@@ -907,6 +1041,34 @@ impl vte::Perform for ScreenPerformer<'_> {
                 };
                 self.screen.set_keyboard_enhancement_flags(flags);
             }
+            // Save DEC private modes (XTSAVE).
+            ('s', [b'?']) => {
+                for &mode in &params_vec {
+                    if mode == 1048 {
+                        self.screen.save_cursor();
+                        continue;
+                    }
+                    match self.dec_private_mode_status(mode) {
+                        1 => {
+                            self.saved_dec_modes.insert(mode, true);
+                        }
+                        2 => {
+                            self.saved_dec_modes.insert(mode, false);
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            // Restore DEC private modes (XTRESTORE).
+            ('r', [b'?']) => {
+                for &mode in &params_vec {
+                    if mode == 1048 {
+                        self.screen.restore_cursor();
+                    } else if let Some(enabled) = self.saved_dec_modes.get(&mode).copied() {
+                        self.handle_dec_mode(mode, enabled);
+                    }
+                }
+            }
             // Set Mode (SM) / Reset Mode (RM)
             ('h', [b'?']) | ('l', [b'?']) => {
                 let set = action == 'h';
@@ -914,12 +1076,28 @@ impl vte::Perform for ScreenPerformer<'_> {
                     self.handle_dec_mode(param, set);
                 }
             }
+            // Request DEC private mode status (DECRQM).  Capability probing is
+            // common in modern TUIs, so distinguish unsupported modes from
+            // modes which are currently reset.
+            ('p', [b'?', b'$']) => {
+                let mode = first_param(&params_vec, 0);
+                let status = self.dec_private_mode_status(mode);
+                self.screen
+                    .queue_response(format!("\x1b[?{mode};{status}$y").into_bytes());
+            }
             // ANSI modes
             ('h', []) | ('l', []) => {
                 let set = action == 'h';
                 for &param in &params_vec {
                     self.handle_ansi_mode(param, set);
                 }
+            }
+            // Request ECMA-48/ANSI mode status (DECRQM).
+            ('p', [b'$']) => {
+                let mode = first_param(&params_vec, 0);
+                let status = self.ansi_mode_status(mode);
+                self.screen
+                    .queue_response(format!("\x1b[{mode};{status}$y").into_bytes());
             }
             // Soft reset (DECSTR)
             ('p', [b'!']) => {
@@ -1063,6 +1241,203 @@ impl vte::Perform for ScreenPerformer<'_> {
             }
         }
     }
+}
+
+enum XtgettcapCapability {
+    Boolean,
+    Value(Vec<u8>),
+}
+
+fn secondary_device_attributes() -> String {
+    format!(
+        "\x1b[>1;{:0>2}{:0>2}{:0>2};0c",
+        env!("CARGO_PKG_VERSION_MAJOR"),
+        env!("CARGO_PKG_VERSION_MINOR"),
+        env!("CARGO_PKG_VERSION_PATCH")
+    )
+}
+
+fn decrqss_response(query: &[u8], screen: &Screen) -> Vec<u8> {
+    let setting = match query {
+        b"r" => format!(
+            "{};{}r",
+            screen.scroll_region().top + 1,
+            screen.scroll_region().bottom
+        ),
+        b"m" => sgr_status_string(screen),
+        b" q" => {
+            let mode = match (screen.cursor.style, screen.cursor.blink) {
+                (CursorStyle::Block, true) => 1,
+                (CursorStyle::Block, false) => 2,
+                (CursorStyle::Underline, true) => 3,
+                (CursorStyle::Underline, false) => 4,
+                (CursorStyle::Bar, true) => 5,
+                (CursorStyle::Bar, false) => 6,
+            };
+            format!("{mode} q")
+        }
+        _ => return b"\x1bP0$r\x1b\\".to_vec(),
+    };
+
+    format!("\x1bP1$r{setting}\x1b\\").into_bytes()
+}
+
+fn sgr_status_string(screen: &Screen) -> String {
+    let mut attributes = vec!["0".to_string()];
+    let attrs = screen.style.attrs;
+
+    for (flag, value) in [
+        (CellAttrs::BOLD, "1"),
+        (CellAttrs::DIM, "2"),
+        (CellAttrs::ITALIC, "3"),
+        (CellAttrs::BLINK, "5"),
+        (CellAttrs::INVERSE, "7"),
+        (CellAttrs::HIDDEN, "8"),
+        (CellAttrs::STRIKETHROUGH, "9"),
+        (CellAttrs::OVERLINE, "53"),
+    ] {
+        if attrs.contains(flag) {
+            attributes.push(value.to_string());
+        }
+    }
+
+    let underline = if attrs.contains(CellAttrs::DOUBLE_UNDERLINE) {
+        Some("4:2")
+    } else if attrs.contains(CellAttrs::CURLY_UNDERLINE) {
+        Some("4:3")
+    } else if attrs.contains(CellAttrs::DOTTED_UNDERLINE) {
+        Some("4:4")
+    } else if attrs.contains(CellAttrs::DASHED_UNDERLINE) {
+        Some("4:5")
+    } else if attrs.contains(CellAttrs::UNDERLINE) {
+        Some("4")
+    } else {
+        None
+    };
+    if let Some(underline) = underline {
+        attributes.push(underline.to_string());
+    }
+
+    if let Some(color) = sgr_color_status(screen.style.fg, 38, 30, 90) {
+        attributes.push(color);
+    }
+    if let Some(color) = sgr_color_status(screen.style.bg, 48, 40, 100) {
+        attributes.push(color);
+    }
+    if let Some(color) = screen
+        .style
+        .underline_color
+        .and_then(|color| sgr_color_status(color, 58, 0, 0))
+    {
+        attributes.push(color);
+    }
+
+    attributes.join(";") + "m"
+}
+
+fn sgr_color_status(color: Color, extended: usize, base: usize, bright: usize) -> Option<String> {
+    match color {
+        Color::Default => None,
+        Color::Ansi(color) if (color as usize) < 8 => Some((base + color as usize).to_string()),
+        Color::Ansi(color) => Some((bright + color as usize - 8).to_string()),
+        Color::Indexed(index) => Some(format!("{extended}:5:{index}")),
+        Color::Rgb(rgb) => Some(format!("{extended}:2::{}:{}:{}", rgb.r, rgb.g, rgb.b)),
+    }
+}
+
+/// Build foot/xterm-compatible XTGETTCAP replies. The shape and parsing are
+/// adapted from Rio; the table deliberately contains only capabilities cterm
+/// implements end to end.
+fn xtgettcap_response(request: &[u8], cols: usize, lines: usize) -> Vec<u8> {
+    if request.is_empty() {
+        return b"\x1bP0+r\x1b\\".to_vec();
+    }
+
+    let mut response = Vec::new();
+    for encoded_name in request.split(|byte| *byte == b';') {
+        let Some(name) = decode_hex(encoded_name) else {
+            continue;
+        };
+
+        match xtgettcap_capability(&name, cols, lines) {
+            Some(XtgettcapCapability::Boolean) => {
+                response.extend_from_slice(b"\x1bP1+r");
+                response.extend_from_slice(encoded_name);
+                response.extend_from_slice(b"\x1b\\");
+            }
+            Some(XtgettcapCapability::Value(value)) => {
+                response.extend_from_slice(b"\x1bP1+r");
+                response.extend_from_slice(encoded_name);
+                response.push(b'=');
+                encode_hex_into(&value, &mut response);
+                response.extend_from_slice(b"\x1b\\");
+            }
+            None => {
+                response.extend_from_slice(b"\x1bP0+r");
+                response.extend_from_slice(encoded_name);
+                response.extend_from_slice(b"\x1b\\");
+            }
+        }
+    }
+
+    response
+}
+
+fn decode_hex(encoded: &[u8]) -> Option<Vec<u8>> {
+    if !encoded.len().is_multiple_of(2) {
+        return None;
+    }
+
+    encoded
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|[high, low]| {
+            let high = (*high as char).to_digit(16)?;
+            let low = (*low as char).to_digit(16)?;
+            Some(((high << 4) | low) as u8)
+        })
+        .collect()
+}
+
+fn encode_hex_into(bytes: &[u8], output: &mut Vec<u8>) {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    output.reserve(bytes.len() * 2);
+    for byte in bytes {
+        output.push(HEX[(byte >> 4) as usize]);
+        output.push(HEX[(byte & 0x0f) as usize]);
+    }
+}
+
+fn xtgettcap_capability(name: &[u8], cols: usize, lines: usize) -> Option<XtgettcapCapability> {
+    use XtgettcapCapability::{Boolean, Value};
+
+    let value = match name {
+        b"TN" | b"name" => Value(b"cterm".to_vec()),
+        b"Co" | b"colors" => Value(b"256".to_vec()),
+        b"pa" | b"pairs" => Value(b"32767".to_vec()),
+        b"RGB" => Value(b"8/8/8".to_vec()),
+        b"co" | b"cols" => Value(cols.to_string().into_bytes()),
+        b"li" | b"lines" => Value(lines.to_string().into_bytes()),
+        b"it" => Value(b"8".to_vec()),
+        b"OTbs" | b"bs" | b"am" | b"bce" | b"km" | b"mir" | b"msgr" | b"xenl" | b"xn" | b"AX"
+        | b"XT" | b"XF" | b"npc" | b"Tc" | b"sixel" | b"iterm2" => Boolean,
+        b"Ss" => Value(b"\x1b[%p1%d q".to_vec()),
+        b"Se" => Value(b"\x1b[0 q".to_vec()),
+        b"Smulx" => Value(b"\x1b[4:%p1%dm".to_vec()),
+        b"rep" => Value(b"%p1%c\x1b[%p2%{1}%-%db".to_vec()),
+        b"Sync" => Value(b"\x1bP=%p1%ds\x1b\\".to_vec()),
+        b"kxIN" => Value(b"\x1b[I".to_vec()),
+        b"kxOUT" => Value(b"\x1b[O".to_vec()),
+        b"BE" => Value(b"\x1b[?2004h".to_vec()),
+        b"BD" => Value(b"\x1b[?2004l".to_vec()),
+        b"PS" => Value(b"\x1b[200~".to_vec()),
+        b"PE" => Value(b"\x1b[201~".to_vec()),
+        b"Ms" => Value(b"\x1b]52;%p1%s;%p2%s\x07".to_vec()),
+        _ => return None,
+    };
+
+    Some(value)
 }
 
 impl ScreenPerformer<'_> {
@@ -1247,9 +1622,9 @@ impl ScreenPerformer<'_> {
         // Standard character sets return None (use built-in)
         // B = ASCII, 0 = DEC Special Graphics, etc.
         match (intermediates, final_char) {
-            ([], b'B') => None, // ASCII
-            ([], b'0') => None, // DEC Special Graphics (handled separately)
-            ([], b'A') => None, // UK
+            ([], b'B') => None,                  // ASCII
+            ([], b'0') => Some("0".to_string()), // DEC Special Graphics
+            ([], b'A') => None,                  // UK
             _ => {
                 // Build designator string for DRCS lookup
                 let mut designator = String::new();
@@ -1442,14 +1817,26 @@ impl ScreenPerformer<'_> {
                 self.screen.modes.origin_mode = set;
                 self.screen.move_cursor(0, 0);
             }
+            // DECSCNM - Reverse screen mode
+            5 => {
+                self.screen.modes.reverse_video = set;
+                self.screen.dirty = true;
+            }
             // DECAWM - Auto Wrap Mode
             7 => self.screen.modes.auto_wrap = set,
+            // Reverse Wraparound Mode
+            45 => self.screen.modes.reverse_wrap = set,
             // X10 Mouse Reporting
             9 => {
                 self.screen.modes.mouse_mode = if set { MouseMode::X10 } else { MouseMode::None };
             }
             // DECTCEM - Show Cursor
             25 => self.screen.modes.show_cursor = set,
+            // Cursor blinking mode
+            12 => self.screen.cursor.blink = set,
+            // DECNKM - Numeric Keypad Mode.  This is equivalent to DECKPAM /
+            // DECKPNM, but expressed as a DEC private mode.
+            66 => self.screen.modes.application_keypad = set,
             // DECSDM - Sixel Display Mode (mode 80)
             // Note: The VT340 manual was wrong - 'set' actually DISABLES scrolling
             // When set (h): sixel scrolling OFF (image at top-left, no scroll)
@@ -1487,8 +1874,8 @@ impl ScreenPerformer<'_> {
             1006 => self.screen.modes.sgr_mouse = set,
             // Alternate Scroll Mode: wheel -> cursor keys on the alternate screen
             1007 => self.screen.modes.alternate_scroll = set,
-            // Alternate Screen Buffer
-            1047 => {
+            // Alternate Screen Buffer.  Mode 47 is the older xterm spelling.
+            47 | 1047 => {
                 if set {
                     self.screen.enter_alternate_screen();
                 } else {
@@ -1516,9 +1903,67 @@ impl ScreenPerformer<'_> {
             }
             // Bracketed Paste Mode
             2004 => self.screen.modes.bracketed_paste = set,
+            // Application synchronized updates
+            2026 => self.screen.set_application_sync_updates(set),
+            // xterm Sixel Cursor Right of Graphics
+            8452 => self.screen.modes.sixel_cursor_right = set,
             _ => {
                 log::trace!("Unknown DEC mode: {} = {}", mode, set);
             }
+        }
+    }
+
+    /// Return a DECRPM status value for a DEC private mode.
+    ///
+    /// 0 = unrecognized, 1 = set, 2 = reset, 3 = permanently set,
+    /// 4 = permanently reset.
+    fn dec_private_mode_status(&self, mode: usize) -> u8 {
+        let enabled = match mode {
+            1 => self.screen.modes.application_cursor,
+            5 => self.screen.modes.reverse_video,
+            6 => self.screen.modes.origin_mode,
+            7 => self.screen.modes.auto_wrap,
+            45 => self.screen.modes.reverse_wrap,
+            9 => self.screen.modes.mouse_mode == MouseMode::X10,
+            12 => self.screen.cursor.blink,
+            25 => self.screen.modes.show_cursor,
+            47 | 1047 | 1049 => self.screen.modes.alternate_screen,
+            66 => self.screen.modes.application_keypad,
+            // DECSDM is set when sixel scrolling is disabled.
+            80 => !self.screen.modes.sixel_scrolling,
+            1000 => self.screen.modes.mouse_mode == MouseMode::Normal,
+            1002 => self.screen.modes.mouse_mode == MouseMode::ButtonEvent,
+            1003 => self.screen.modes.mouse_mode == MouseMode::AnyEvent,
+            1004 => self.screen.modes.focus_events,
+            1006 => self.screen.modes.sgr_mouse,
+            1007 => self.screen.modes.alternate_scroll,
+            2004 => self.screen.modes.bracketed_paste,
+            2026 => self.screen.modes.application_sync_updates,
+            8452 => self.screen.modes.sixel_cursor_right,
+            // Recognized legacy encodings which cterm deliberately never uses.
+            67 | 1001 | 1005 => return 4,
+            _ => return 0,
+        };
+
+        if enabled {
+            1
+        } else {
+            2
+        }
+    }
+
+    /// Return a DECRPM status value for an ECMA-48/ANSI mode.
+    fn ansi_mode_status(&self, mode: usize) -> u8 {
+        let enabled = match mode {
+            4 => self.screen.modes.insert_mode,
+            20 => self.screen.modes.line_feed_mode,
+            _ => return 0,
+        };
+
+        if enabled {
+            1
+        } else {
+            2
         }
     }
 
@@ -1580,8 +2025,8 @@ mod tests {
 
         parser.parse(&mut screen, b"Hello");
 
-        assert_eq!(screen.get_cell(0, 0).unwrap().c, 'H');
-        assert_eq!(screen.get_cell(0, 4).unwrap().c, 'o');
+        assert_eq!(screen.get_cell(0, 0).unwrap().text(), "H");
+        assert_eq!(screen.get_cell(0, 4).unwrap().text(), "o");
         assert_eq!(screen.cursor.col, 5);
     }
 
@@ -1595,6 +2040,92 @@ mod tests {
 
         assert_eq!(screen.cursor.row, 5);
         assert_eq!(screen.cursor.col, 10);
+    }
+
+    #[test]
+    fn test_foot_relative_cursor_aliases_and_repeat() {
+        let mut screen = make_screen();
+        let mut parser = Parser::new();
+
+        parser.parse(&mut screen, b"\x1b[2;2H\x1b[3a\x1b[2e\x1b[7`");
+        assert_eq!((screen.cursor.row, screen.cursor.col), (3, 6));
+
+        parser.parse(&mut screen, b"x\x1b[5b");
+        assert_eq!(screen.grid().row(3).unwrap().text(), "      xxxxxx");
+        assert_eq!(screen.cursor.col, 12);
+    }
+
+    #[test]
+    fn test_device_and_window_reports_match_foot_shapes() {
+        let mut screen = make_screen();
+        let mut parser = Parser::new();
+
+        parser.parse(
+            &mut screen,
+            b"\x1b[c\x1b[>c\x1b[=c\x1b[>q\x1b[11t\x1b[13t\x1b[14t\x1b[16t\x1b[18t",
+        );
+
+        assert_eq!(
+            screen.take_pending_responses(),
+            vec![
+                b"\x1b[?62;4;22;52c".to_vec(),
+                secondary_device_attributes().into_bytes(),
+                b"\x1bP!|4354524D\x1b\\".to_vec(),
+                format!("\x1bP>|cterm({})\x1b\\", env!("CARGO_PKG_VERSION")).into_bytes(),
+                b"\x1b[1t".to_vec(),
+                b"\x1b[3;0;0t".to_vec(),
+                b"\x1b[4;384;640t".to_vec(),
+                b"\x1b[6;16;8t".to_vec(),
+                b"\x1b[8;24;80t".to_vec(),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_modify_other_keys_set_query_and_reset() {
+        let mut screen = make_screen();
+        let mut parser = Parser::new();
+
+        parser.parse(&mut screen, b"\x1b[?4m");
+        assert_eq!(screen.take_pending_responses(), vec![b"\x1b[>4;1m"]);
+
+        parser.parse(&mut screen, b"\x1b[>4;2m\x1b[?4m");
+        assert_eq!(screen.modes.modify_other_keys, 2);
+        assert_eq!(screen.take_pending_responses(), vec![b"\x1b[>4;2m"]);
+
+        parser.parse(&mut screen, b"\x1b[>4n\x1b[?4m");
+        assert_eq!(screen.modes.modify_other_keys, 1);
+        assert_eq!(screen.take_pending_responses(), vec![b"\x1b[>4;1m"]);
+    }
+
+    #[test]
+    fn test_decrqss_reports_scroll_style_and_cursor_state() {
+        let mut screen = make_screen();
+        let mut parser = Parser::new();
+
+        parser.parse(
+            &mut screen,
+            concat!(
+                "\x1b[3;20r",
+                "\x1b[1;3;4:3;38;2;1;2;3;48;5;42;58;2;4;5;6m",
+                "\x1b[5 q",
+                "\x1bP$qm\x1b\\",
+                "\x1bP$qr\x1b\\",
+                "\x1bP$q q\x1b\\",
+                "\x1bP$qz\x1b\\",
+            )
+            .as_bytes(),
+        );
+
+        assert_eq!(
+            screen.take_pending_responses(),
+            vec![
+                b"\x1bP1$r0;1;3;4:3;38:2::1:2:3;48:5:42;58:2::4:5:6m\x1b\\".to_vec(),
+                b"\x1bP1$r3;20r\x1b\\".to_vec(),
+                b"\x1bP1$r5 q\x1b\\".to_vec(),
+                b"\x1bP0$r\x1b\\".to_vec(),
+            ]
+        );
     }
 
     #[test]
@@ -1637,6 +2168,51 @@ mod tests {
     }
 
     #[test]
+    fn test_dynamic_default_colors_match_foot() {
+        let mut screen = make_screen();
+        let mut parser = Parser::new();
+
+        parser.parse(
+            &mut screen,
+            b"\x1b]10;#123\x1b\\\x1b]11;rgb:40/80/c0\x07\x1b]12;#abcdef\x1b\\",
+        );
+        assert_eq!(
+            screen.dynamic_color(ColorQuery::Foreground),
+            Some(Rgb::new(0x11, 0x22, 0x33))
+        );
+        assert_eq!(
+            screen.dynamic_color(ColorQuery::Background),
+            Some(Rgb::new(0x40, 0x80, 0xc0))
+        );
+        assert_eq!(
+            screen.dynamic_color(ColorQuery::Cursor),
+            Some(Rgb::new(0xab, 0xcd, 0xef))
+        );
+
+        parser.parse(&mut screen, b"\x1b]110\x1b\\\x1b]111\x1b\\\x1b]112\x1b\\");
+        assert_eq!(screen.dynamic_color(ColorQuery::Foreground), None);
+        assert_eq!(screen.dynamic_color(ColorQuery::Background), None);
+        assert_eq!(screen.dynamic_color(ColorQuery::Cursor), None);
+    }
+
+    #[test]
+    fn test_dynamic_color_multi_parameter_and_invalid_specs() {
+        let mut screen = make_screen();
+        let mut parser = Parser::new();
+
+        parser.parse(&mut screen, b"\x1b]10;#102030;#405060;bogus\x1b\\");
+        assert_eq!(
+            screen.dynamic_color(ColorQuery::Foreground),
+            Some(Rgb::new(0x10, 0x20, 0x30))
+        );
+        assert_eq!(
+            screen.dynamic_color(ColorQuery::Background),
+            Some(Rgb::new(0x40, 0x50, 0x60))
+        );
+        assert_eq!(screen.dynamic_color(ColorQuery::Cursor), None);
+    }
+
+    #[test]
     fn test_clear_screen() {
         let mut screen = make_screen();
         let mut parser = Parser::new();
@@ -1645,7 +2221,7 @@ mod tests {
         parser.parse(&mut screen, b"\x1b[2J"); // Clear all
 
         for col in 0..5 {
-            assert_eq!(screen.get_cell(0, col).unwrap().c, ' ');
+            assert_eq!(screen.get_cell(0, col).unwrap().text(), " ");
         }
     }
 
@@ -1709,7 +2285,7 @@ mod tests {
 
         parser.parse(&mut screen, b"\x1b[?1049l"); // Exit alternate
         assert!(!screen.modes.alternate_screen);
-        assert_eq!(screen.get_cell(0, 0).unwrap().c, 'P');
+        assert_eq!(screen.get_cell(0, 0).unwrap().text(), "P");
     }
 
     #[test]
@@ -1739,5 +2315,174 @@ mod tests {
         assert!(!screen.modes.alternate_scroll);
         parser.parse(&mut screen, b"\x1b[?1007h"); // re-enable
         assert!(screen.modes.alternate_scroll);
+    }
+
+    #[test]
+    fn test_dec_private_mode_queries_track_state() {
+        let mut screen = make_screen();
+        let mut parser = Parser::new();
+
+        parser.parse(&mut screen, b"\x1b[?7$p");
+        assert_eq!(screen.take_pending_responses(), vec![b"\x1b[?7;1$y"]);
+
+        parser.parse(&mut screen, b"\x1b[?7l\x1b[?7$p");
+        assert_eq!(screen.take_pending_responses(), vec![b"\x1b[?7;2$y"]);
+
+        parser.parse(&mut screen, b"\x1b[?5h\x1b[?5$p");
+        assert!(screen.modes.reverse_video);
+        assert_eq!(screen.take_pending_responses(), vec![b"\x1b[?5;1$y"]);
+
+        parser.parse(&mut screen, b"\x1b[?5l\x1b[?5$p");
+        assert!(!screen.modes.reverse_video);
+        assert_eq!(screen.take_pending_responses(), vec![b"\x1b[?5;2$y"]);
+
+        parser.parse(&mut screen, b"\x1b[?45$p");
+        assert_eq!(screen.take_pending_responses(), vec![b"\x1b[?45;1$y"]);
+
+        parser.parse(&mut screen, b"\x1b[?45l\x1b[?45$p");
+        assert_eq!(screen.take_pending_responses(), vec![b"\x1b[?45;2$y"]);
+
+        parser.parse(&mut screen, b"\x1b[?1005$p");
+        assert_eq!(screen.take_pending_responses(), vec![b"\x1b[?1005;4$y"]);
+
+        parser.parse(&mut screen, b"\x1b[?2026$p");
+        assert_eq!(screen.take_pending_responses(), vec![b"\x1b[?2026;2$y"]);
+    }
+
+    #[test]
+    fn test_xtsave_and_xtrestore_preserve_private_modes_and_cursor() {
+        let mut screen = make_screen();
+        let mut parser = Parser::new();
+
+        parser.parse(&mut screen, b"\x1b[?1h\x1b[?45l\x1b[?2004h\x1b[?1;45;2004s");
+        parser.parse(&mut screen, b"\x1b[?1l\x1b[?45h\x1b[?2004l\x1b[?1;45;2004r");
+        assert!(screen.modes.application_cursor);
+        assert!(!screen.modes.reverse_wrap);
+        assert!(screen.modes.bracketed_paste);
+
+        parser.parse(&mut screen, b"\x1b[8;12H\x1b[?1048s\x1b[1;1H\x1b[?1048r");
+        assert_eq!((screen.cursor.row, screen.cursor.col), (7, 11));
+    }
+
+    #[test]
+    fn test_xtgettcap_reports_only_supported_capabilities() {
+        let mut screen = make_screen();
+        let mut parser = Parser::new();
+
+        parser.parse(
+            &mut screen,
+            b"\x1bP+q544E;436F;524742;636F;6C69;616D;5858\x1b\\",
+        );
+
+        assert_eq!(
+            screen.take_pending_responses(),
+            vec![concat!(
+                "\x1bP1+r544E=637465726D\x1b\\",
+                "\x1bP1+r436F=323536\x1b\\",
+                "\x1bP1+r524742=382F382F38\x1b\\",
+                "\x1bP1+r636F=3830\x1b\\",
+                "\x1bP1+r6C69=3234\x1b\\",
+                "\x1bP1+r616D\x1b\\",
+                "\x1bP0+r5858\x1b\\",
+            )
+            .as_bytes()]
+        );
+    }
+
+    #[test]
+    fn test_xtgettcap_empty_and_malformed_queries_are_bounded() {
+        let mut screen = make_screen();
+        let mut parser = Parser::new();
+
+        parser.parse(&mut screen, b"\x1bP+q\x1b\\");
+        assert_eq!(screen.take_pending_responses(), vec![b"\x1bP0+r\x1b\\"]);
+
+        parser.parse(&mut screen, b"\x1bP+qnot-hex\x1b\\");
+        assert!(screen.take_pending_responses().is_empty());
+    }
+
+    #[test]
+    fn test_backspace_reverse_wrap_matches_foot() {
+        let mut screen = make_screen();
+        let mut parser = Parser::new();
+
+        parser.parse(&mut screen, b"\x1b[2;1H\x08");
+        assert_eq!((screen.cursor.row, screen.cursor.col), (0, 79));
+
+        parser.parse(&mut screen, b"\x1b[?45l\x1b[2;1H\x08");
+        assert_eq!((screen.cursor.row, screen.cursor.col), (1, 0));
+
+        parser.parse(&mut screen, b"\x1b[?45h\x1b[?7l\x1b[2;1H\x08");
+        assert_eq!((screen.cursor.row, screen.cursor.col), (1, 0));
+
+        parser.parse(&mut screen, b"\x1b[?7h\x1b[2;24r\x1b[2;1H\x08");
+        assert_eq!((screen.cursor.row, screen.cursor.col), (1, 0));
+    }
+
+    #[test]
+    fn test_ansi_mode_queries_track_state() {
+        let mut screen = make_screen();
+        let mut parser = Parser::new();
+
+        parser.parse(&mut screen, b"\x1b[4$p");
+        assert_eq!(screen.take_pending_responses(), vec![b"\x1b[4;2$y"]);
+
+        parser.parse(&mut screen, b"\x1b[4h\x1b[4$p");
+        assert_eq!(screen.take_pending_responses(), vec![b"\x1b[4;1$y"]);
+
+        parser.parse(&mut screen, b"\x1b[9999$p");
+        assert_eq!(screen.take_pending_responses(), vec![b"\x1b[9999;0$y"]);
+    }
+
+    #[test]
+    fn test_legacy_alternate_screen_and_numeric_keypad_modes() {
+        let mut screen = make_screen();
+        let mut parser = Parser::new();
+
+        parser.parse(&mut screen, b"\x1b[?47h\x1b[?47$p");
+        assert!(screen.modes.alternate_screen);
+        assert_eq!(screen.take_pending_responses(), vec![b"\x1b[?47;1$y"]);
+
+        parser.parse(&mut screen, b"\x1b[?47l\x1b[?66h\x1b[?66$p");
+        assert!(!screen.modes.alternate_screen);
+        assert!(screen.modes.application_keypad);
+        assert_eq!(screen.take_pending_responses(), vec![b"\x1b[?66;1$y"]);
+    }
+
+    #[test]
+    fn test_dec_special_graphics_maps_g0_and_g1_like_foot() {
+        let mut screen = make_screen();
+        let mut parser = Parser::new();
+
+        parser.parse(
+            &mut screen,
+            b"\x1b(0ABCabcdefghijklmnopqrstuvwxyzDEF\r\n\x1b(Bhello",
+        );
+        assert_eq!(
+            screen.grid().row(0).unwrap().text().trim_end(),
+            "ABC▒␉␌␍␊°±␤␋┘┐┌└┼⎺⎻─⎼⎽├┤┴┬│≤≥DEF"
+        );
+        assert_eq!(screen.grid().row(1).unwrap().text().trim_end(), "hello");
+
+        let mut screen = make_screen();
+        parser.parse(&mut screen, b"\x1b)0\x0eSO-lqk\x0f-SI");
+        assert_eq!(screen.grid().row(0).unwrap().text().trim_end(), "SO-┌─┐-SI");
+    }
+
+    #[test]
+    fn test_sixel_cursor_position_matches_mode_8452() {
+        let mut screen = make_screen();
+        let mut parser = Parser::new();
+
+        // Draw a one-cell sixel from column 5.  The DEC default leaves the
+        // cursor at the image's left edge, not at column zero.
+        parser.parse(&mut screen, b"\x1b[6G\x1bPq~\x1b\\");
+        assert_eq!(screen.cursor.col, 5);
+
+        parser.parse(&mut screen, b"\x1b[?8452h\x1b[6G\x1bPq~\x1b\\");
+        assert_eq!(screen.cursor.col, 6);
+
+        parser.parse(&mut screen, b"\x1b[?8452$p");
+        assert_eq!(screen.take_pending_responses(), vec![b"\x1b[?8452;1$y"]);
     }
 }

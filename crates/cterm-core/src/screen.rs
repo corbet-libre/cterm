@@ -3,7 +3,8 @@
 //! Manages the visible grid and scrollback history, handling resize
 //! and scroll operations.
 
-use crate::cell::{Cell, CellStyle};
+use crate::cell::{Cell, CellAttrs, CellStyle, MAX_GRAPHEME_BYTES};
+use crate::color::{ColorPalette, Rgb};
 use crate::drcs::{DrcsFont, DrcsGlyph};
 use crate::grid::{Grid, Row};
 use crate::keyboard::KeyboardEnhancementFlags;
@@ -11,6 +12,8 @@ use crate::sixel::SixelImage;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
+use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 /// Configuration for the screen
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -62,6 +65,14 @@ impl ScrollRegion {
     }
 }
 
+const fn default_enabled() -> bool {
+    true
+}
+
+const fn default_modify_other_keys() -> u8 {
+    1
+}
+
 /// Terminal modes that affect behavior
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct TerminalModes {
@@ -71,6 +82,13 @@ pub struct TerminalModes {
     pub application_keypad: bool,
     /// Auto-wrap mode (DECAWM)
     pub auto_wrap: bool,
+    /// Reverse screen mode (DECSCNM)
+    #[serde(default)]
+    pub reverse_video: bool,
+    /// Reverse-wrap mode (DEC private mode 45). When enabled together with
+    /// auto-wrap, backspace at the left edge moves to the previous line.
+    #[serde(default = "default_enabled")]
+    pub reverse_wrap: bool,
     /// Origin mode (DECOM)
     pub origin_mode: bool,
     /// Insert mode (IRM)
@@ -89,6 +107,12 @@ pub struct TerminalModes {
     pub alternate_scroll: bool,
     /// Bracketed paste mode
     pub bracketed_paste: bool,
+    /// xterm modifyOtherKeys level. foot supports level 1 (default) and 2.
+    #[serde(default = "default_modify_other_keys")]
+    pub modify_other_keys: u8,
+    /// Application synchronized updates (DEC private mode 2026)
+    #[serde(default)]
+    pub application_sync_updates: bool,
     /// Focus events reporting
     pub focus_events: bool,
     /// Alternate screen buffer active
@@ -99,6 +123,10 @@ pub struct TerminalModes {
     /// When true (default), sixel images start at cursor and can scroll
     /// When false, sixel images start at top-left and don't scroll
     pub sixel_scrolling: bool,
+    /// Position the cursor to the right of newly drawn sixels (mode 8452)
+    /// instead of at the image's left edge on the following text row.
+    #[serde(default)]
+    pub sixel_cursor_right: bool,
     /// G0 character set designator (None = standard ASCII)
     pub charset_g0: Option<String>,
     /// G1 character set designator (None = standard)
@@ -164,6 +192,25 @@ pub enum ColorQuery {
     Background,
     /// Query cursor color (OSC 12)
     Cursor,
+}
+
+impl ColorQuery {
+    pub const fn from_osc_code(code: u32) -> Option<Self> {
+        match code {
+            10 => Some(Self::Foreground),
+            11 => Some(Self::Background),
+            12 => Some(Self::Cursor),
+            _ => None,
+        }
+    }
+
+    pub const fn osc_code(self) -> u8 {
+        match self {
+            Self::Foreground => 10,
+            Self::Background => 11,
+            Self::Cursor => 12,
+        }
+    }
 }
 
 /// File transfer operation for iTerm2 OSC 1337 protocol
@@ -345,7 +392,7 @@ impl Selection {
 }
 
 /// A terminal image (from Sixel or other protocols)
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TerminalImage {
     /// Unique image ID
     pub id: u64,
@@ -409,7 +456,15 @@ pub struct Screen {
     /// Pending clipboard operations from OSC 52
     pending_clipboard_ops: Vec<ClipboardOperation>,
     /// Pending color queries (OSC 10-12)
-    pending_color_queries: Vec<ColorQuery>,
+    pending_color_queries: Vec<(ColorQuery, Option<Rgb>)>,
+    /// UI theme used when replying to color queries. The headless daemon does
+    /// not set this; the attached frontend is authoritative for theme colors.
+    base_palette: ColorPalette,
+    base_palette_configured: bool,
+    /// Application-provided overrides from OSC 10-12.
+    dynamic_foreground: Option<Rgb>,
+    dynamic_background: Option<Rgb>,
+    dynamic_cursor: Option<Rgb>,
     /// Current text selection (if any)
     pub selection: Option<Selection>,
     /// Terminal images (Sixel, etc.)
@@ -430,9 +485,136 @@ pub struct Screen {
     keyboard_alt_stack: Vec<KeyboardEnhancementFlags>,
     /// DRCS fonts (soft fonts) keyed by designator
     drcs_fonts: HashMap<String, DrcsFont>,
-    /// Total number of lines ever pushed to scrollback (monotonically increasing).
-    /// Used to compute correct absolute line numbers for image pruning.
-    scrollback_total_pushed: usize,
+    /// Incremented whenever an application starts (or restarts) a synchronized
+    /// update, allowing Terminal to re-arm its fail-safe deadline.
+    sync_update_generation: u64,
+}
+
+/// Reflowed physical rows plus a mapping from old cell coordinates to their
+/// new location. The mapping is shared by the cursor, selection, viewport and
+/// image anchors so resize cannot silently detach metadata from its text.
+struct ReflowedRows {
+    rows: Vec<Row>,
+    old_row_origins: Vec<(usize, usize)>,
+    logical_boundaries: Vec<Vec<(usize, usize)>>,
+    new_width: usize,
+}
+
+impl ReflowedRows {
+    fn map_position(&self, row: usize, col: usize) -> (usize, usize) {
+        let Some(&(logical_line, row_offset)) = self
+            .old_row_origins
+            .get(row.min(self.old_row_origins.len().saturating_sub(1)))
+        else {
+            return (0, 0);
+        };
+        let boundaries = &self.logical_boundaries[logical_line];
+        let offset = row_offset.saturating_add(col);
+
+        if let Some(&position) = boundaries.get(offset) {
+            return position;
+        }
+
+        // A cursor or selection may sit in the unoccupied tail of a row. The
+        // tail is not stored as text, so extend from the final mapped boundary.
+        let &(row, col) = boundaries.last().unwrap_or(&(0, 0));
+        let extra = offset.saturating_sub(boundaries.len().saturating_sub(1));
+        let columns = col.saturating_add(extra);
+        (row + columns / self.new_width, columns % self.new_width)
+    }
+}
+
+fn reflow_rows(rows: &[Row], old_width: usize, new_width: usize) -> ReflowedRows {
+    let new_width = new_width.max(1);
+    let mut output = Vec::new();
+    let mut old_row_origins = vec![(0, 0); rows.len()];
+    let mut logical_boundaries = Vec::new();
+    let mut group_start = 0;
+
+    while group_start < rows.len() {
+        let logical_line = logical_boundaries.len();
+        let mut group_end = group_start;
+        while group_end + 1 < rows.len() && rows[group_end + 1].wrapped {
+            group_end += 1;
+        }
+
+        let mut cells = Vec::new();
+        for row_index in group_start..=group_end {
+            old_row_origins[row_index] = (logical_line, (row_index - group_start) * old_width);
+            let continues = row_index < group_end;
+            let used = if continues {
+                rows[row_index].len()
+            } else {
+                rows[row_index]
+                    .iter()
+                    .rposition(|cell| !cell.is_empty())
+                    .map_or(0, |index| index + 1)
+            };
+
+            cells.extend(
+                rows[row_index]
+                    .iter()
+                    .take(used)
+                    .filter(|cell| !cell.is_wide_spacer())
+                    .cloned(),
+            );
+        }
+
+        let first_row_index = output.len();
+        let mut row = Row::new(new_width);
+        row.wrapped = rows[group_start].wrapped;
+        let mut col = 0;
+        let mut boundaries = vec![(first_row_index, 0)];
+
+        for mut cell in cells {
+            let cell_width = if cell.is_wide() && new_width > 1 {
+                2
+            } else {
+                1
+            };
+
+            if col > 0 && col + cell_width > new_width || col == new_width {
+                output.push(row);
+                row = Row::new(new_width);
+                row.wrapped = true;
+                col = 0;
+                if let Some(boundary) = boundaries.last_mut() {
+                    *boundary = (output.len(), 0);
+                }
+            }
+
+            cell.attrs.remove(CellAttrs::WIDE_SPACER);
+            row[col] = cell.clone();
+
+            if cell_width == 2 {
+                let mut spacer = cell;
+                spacer.set_char(' ');
+                spacer.attrs.remove(CellAttrs::WIDE);
+                spacer.attrs.insert(CellAttrs::WIDE_SPACER);
+                row[col + 1] = spacer;
+            }
+
+            for step in 1..=cell_width {
+                boundaries.push((output.len(), col + step));
+            }
+            col += cell_width;
+        }
+
+        output.push(row);
+        logical_boundaries.push(boundaries);
+        group_start = group_end + 1;
+    }
+
+    if output.is_empty() {
+        output.push(Row::new(new_width));
+    }
+
+    ReflowedRows {
+        rows: output,
+        old_row_origins,
+        logical_boundaries,
+        new_width,
+    }
 }
 
 impl Screen {
@@ -440,9 +622,11 @@ impl Screen {
     pub fn new(width: usize, height: usize, config: ScreenConfig) -> Self {
         let modes = TerminalModes {
             auto_wrap: true,
+            reverse_wrap: true,
             show_cursor: true,
             sixel_scrolling: true,  // Sixel scrolling enabled by default
             alternate_scroll: true, // Alternate-screen wheel-to-arrows enabled by default
+            modify_other_keys: 1,
             ..Default::default()
         };
 
@@ -472,9 +656,16 @@ impl Screen {
             pending_responses: Vec::new(),
             pending_clipboard_ops: Vec::new(),
             pending_color_queries: Vec::new(),
+            base_palette: ColorPalette::default(),
+            base_palette_configured: false,
+            dynamic_foreground: None,
+            dynamic_background: None,
+            dynamic_cursor: None,
             selection: None,
             images: HashMap::new(),
-            next_image_id: 0,
+            // Zero is reserved as an invalid/sentinel identifier by native UI
+            // code, so real terminal images always start at one.
+            next_image_id: 1,
             pending_file_transfers: Vec::new(),
             next_file_transfer_id: 0,
             cell_height_hint: 16.0, // Default assumption
@@ -482,8 +673,22 @@ impl Screen {
             keyboard_main_stack: Vec::new(),
             keyboard_alt_stack: Vec::new(),
             drcs_fonts: HashMap::new(),
-            scrollback_total_pushed: 0,
+            sync_update_generation: 0,
         }
+    }
+
+    /// Change application synchronized-update mode.  Repeated enable requests
+    /// deliberately advance the generation so the one-second fail-safe is
+    /// restarted, matching foot's behavior.
+    pub(crate) fn set_application_sync_updates(&mut self, enabled: bool) {
+        self.modes.application_sync_updates = enabled;
+        if enabled {
+            self.sync_update_generation = self.sync_update_generation.wrapping_add(1);
+        }
+    }
+
+    pub(crate) fn sync_update_generation(&self) -> u64 {
+        self.sync_update_generation
     }
 
     /// Queue a response to be sent back through the PTY
@@ -568,17 +773,73 @@ impl Screen {
             12 => ColorQuery::Cursor,
             _ => return,
         };
-        self.pending_color_queries.push(query);
+        let dynamic_color = self.dynamic_color(query);
+        self.pending_color_queries.push((query, dynamic_color));
     }
 
     /// Take all pending color queries (drains the queue)
-    pub fn take_color_queries(&mut self) -> Vec<ColorQuery> {
+    pub fn take_color_queries(&mut self) -> Vec<(ColorQuery, Option<Rgb>)> {
         std::mem::take(&mut self.pending_color_queries)
     }
 
     /// Check if there are pending color queries
     pub fn has_color_queries(&self) -> bool {
         !self.pending_color_queries.is_empty()
+    }
+
+    /// Set the frontend's configured palette for OSC query replies.
+    pub fn set_base_palette(&mut self, palette: ColorPalette) {
+        self.base_palette = palette;
+        self.base_palette_configured = true;
+    }
+
+    /// Whether this terminal mirror has a frontend palette and may answer OSC
+    /// color queries. The daemon intentionally leaves this false.
+    pub fn has_base_palette(&self) -> bool {
+        self.base_palette_configured
+    }
+
+    /// Set or reset an application-provided default color.
+    pub fn set_dynamic_color(&mut self, target: ColorQuery, color: Option<Rgb>) {
+        match target {
+            ColorQuery::Foreground => self.dynamic_foreground = color,
+            ColorQuery::Background => self.dynamic_background = color,
+            ColorQuery::Cursor => self.dynamic_cursor = color,
+        }
+        self.dirty = true;
+    }
+
+    /// Return an application-provided default color override.
+    pub fn dynamic_color(&self, target: ColorQuery) -> Option<Rgb> {
+        match target {
+            ColorQuery::Foreground => self.dynamic_foreground,
+            ColorQuery::Background => self.dynamic_background,
+            ColorQuery::Cursor => self.dynamic_cursor,
+        }
+    }
+
+    /// Resolve dynamic terminal defaults over a frontend theme palette.
+    pub fn resolved_palette(&self, base: &ColorPalette) -> ColorPalette {
+        let mut palette = base.clone();
+        if let Some(color) = self.dynamic_foreground {
+            palette.foreground = color;
+        }
+        if let Some(color) = self.dynamic_background {
+            palette.background = color;
+        }
+        if let Some(color) = self.dynamic_cursor {
+            palette.cursor = color;
+        }
+        palette
+    }
+
+    /// Return one queried color from the frontend's configured palette.
+    pub fn base_query_color(&self, target: ColorQuery) -> Rgb {
+        match target {
+            ColorQuery::Foreground => self.base_palette.foreground,
+            ColorQuery::Background => self.base_palette.background,
+            ColorQuery::Cursor => self.base_palette.cursor,
+        }
     }
 
     /// Queue a file transfer operation (from OSC 1337 with inline=0)
@@ -760,6 +1021,8 @@ impl Screen {
 
     /// Resize the screen
     pub fn resize(&mut self, width: usize, height: usize) {
+        let width = width.max(1);
+        let height = height.max(1);
         if width == self.width() && height == self.height() {
             return;
         }
@@ -769,10 +1032,31 @@ impl Screen {
         let old_scroll_bottom = self.scroll_region.bottom;
         let old_width = self.width();
 
-        self.grid.resize(width, height);
+        if self.modes.alternate_screen {
+            // Alternate-screen applications own their layout and generally
+            // repaint after SIGWINCH. Keep their active coordinates stable,
+            // but reflow the hidden primary buffer immediately so returning
+            // from the application cannot reveal truncated history.
+            let primary = self
+                .alternate_grid
+                .take()
+                .unwrap_or_else(|| Grid::new(old_width, old_height));
+            let alt_grid = std::mem::replace(&mut self.grid, primary);
+            let primary_cursor = self.alt_saved_cursor.take().unwrap_or_default();
+            let alt_cursor = std::mem::replace(&mut self.cursor, primary_cursor);
 
-        if let Some(ref mut alt) = self.alternate_grid {
-            alt.resize(width, height);
+            self.resize_primary_grid(old_width, width, height);
+
+            let resized_primary = std::mem::replace(&mut self.grid, alt_grid);
+            let resized_primary_cursor = std::mem::replace(&mut self.cursor, alt_cursor);
+            self.alternate_grid = Some(resized_primary);
+            self.alt_saved_cursor = Some(resized_primary_cursor);
+
+            self.grid.resize(width, height);
+            self.cursor.col = self.cursor.col.min(width.saturating_sub(1));
+            self.cursor.row = self.cursor.row.min(height.saturating_sub(1));
+        } else {
+            self.resize_primary_grid(old_width, width, height);
         }
 
         // Update scroll region
@@ -784,10 +1068,6 @@ impl Screen {
         }
         self.scroll_region.top = self.scroll_region.top.min(height.saturating_sub(1));
 
-        // Clamp cursor position
-        self.cursor.col = self.cursor.col.min(width.saturating_sub(1));
-        self.cursor.row = self.cursor.row.min(height.saturating_sub(1));
-
         // Resize tab stops array to match new width
         self.tab_stops.resize(width, false);
         // Set default tab stops (every 8 columns) for new columns
@@ -796,6 +1076,100 @@ impl Screen {
         }
 
         self.dirty = true;
+    }
+
+    fn resize_primary_grid(&mut self, old_width: usize, width: usize, height: usize) {
+        let old_scrollback_len = self.scrollback.len();
+        let old_scroll_offset = self.scroll_offset;
+        let old_visible_top = old_scrollback_len.saturating_sub(old_scroll_offset);
+        let old_rows: Vec<Row> = self
+            .scrollback
+            .iter()
+            .chain(self.grid.iter())
+            .cloned()
+            .collect();
+        let mut reflowed = reflow_rows(&old_rows, old_width, width);
+
+        let old_cursor_line = old_scrollback_len + self.cursor.row;
+        let (cursor_line, cursor_col) = reflowed.map_position(old_cursor_line, self.cursor.col);
+        let viewport_start = cursor_line.saturating_sub(height.saturating_sub(1));
+        let viewport_end = viewport_start + height;
+        if reflowed.rows.len() < viewport_end {
+            reflowed.rows.resize_with(viewport_end, || Row::new(width));
+        }
+
+        let front_drop = viewport_start.saturating_sub(self.config.scrollback_lines);
+        let new_scrollback_len = viewport_start - front_drop;
+
+        let remap_point = |point: SelectionPoint| -> Option<SelectionPoint> {
+            let source_col = if point.col == COL_END_OF_ROW {
+                old_width.saturating_sub(1)
+            } else {
+                point.col.min(old_width)
+            };
+            let (line, col) = reflowed.map_position(point.line, source_col);
+            if line < front_drop || line >= viewport_end {
+                return None;
+            }
+            Some(SelectionPoint::new(
+                line - front_drop,
+                if point.col == COL_END_OF_ROW {
+                    COL_END_OF_ROW
+                } else {
+                    col.min(width.saturating_sub(1))
+                },
+            ))
+        };
+
+        self.selection = self.selection.take().and_then(|selection| {
+            Some(Selection {
+                anchor: remap_point(selection.anchor)?,
+                end: remap_point(selection.end)?,
+                mode: selection.mode,
+                anchor_end: selection.anchor_end.and_then(remap_point),
+            })
+        });
+
+        self.images.retain(|_, image| {
+            let (line, col) = reflowed.map_position(image.line, image.col);
+            if line < front_drop || line >= viewport_end {
+                return false;
+            }
+            image.line = line - front_drop;
+            image.col = col.min(width.saturating_sub(1));
+            true
+        });
+
+        if let Some(saved) = self.saved_cursor.as_mut() {
+            let (line, col) = reflowed.map_position(old_scrollback_len + saved.row, saved.col);
+            saved.row = line.saturating_sub(viewport_start).min(height - 1);
+            saved.col = col.min(width - 1);
+        }
+
+        let mapped_visible_top = reflowed.map_position(old_visible_top, 0).0;
+        self.scroll_offset = if old_scroll_offset == 0 {
+            0
+        } else {
+            let relative_top = mapped_visible_top.saturating_sub(front_drop);
+            new_scrollback_len.saturating_sub(relative_top.min(new_scrollback_len))
+        };
+
+        self.scrollback = reflowed.rows[front_drop..viewport_start]
+            .iter()
+            .cloned()
+            .collect();
+        let mut grid = Grid::new(width, height);
+        for (index, row) in reflowed.rows[viewport_start..viewport_end]
+            .iter()
+            .cloned()
+            .enumerate()
+        {
+            grid[index] = row;
+        }
+        self.grid = grid;
+
+        self.cursor.row = cursor_line.saturating_sub(viewport_start).min(height - 1);
+        self.cursor.col = cursor_col.min(width - 1);
     }
 
     /// Get a cell at the given position
@@ -813,12 +1187,35 @@ impl Screen {
         }
     }
 
+    /// Move the cursor left for a C0 BS control, including DEC reverse-wrap.
+    pub(crate) fn backspace(&mut self) {
+        if self.cursor.col > 0 {
+            self.cursor.col -= 1;
+        } else if self.modes.reverse_wrap
+            && self.modes.auto_wrap
+            && self.cursor.row > self.scroll_region.top
+        {
+            self.cursor.row -= 1;
+            self.cursor.col = self.width().saturating_sub(1);
+        }
+    }
+
     /// Put a character at the current cursor position
     pub fn put_char(&mut self, c: char) {
-        let width = unicode_width::UnicodeWidthChar::width(c).unwrap_or(1);
+        let c = self.map_active_charset_char(c);
+
+        if self.try_extend_previous_grapheme(c) {
+            return;
+        }
+
+        let width = UnicodeWidthChar::width(c).unwrap_or(0).min(2);
+        if width == 0 {
+            return;
+        }
 
         // Handle auto-wrap
-        if self.cursor.col >= self.width() {
+        if self.cursor.col >= self.width() || (width > 1 && self.cursor.col + width > self.width())
+        {
             if self.modes.auto_wrap {
                 self.carriage_return();
                 self.line_feed();
@@ -838,27 +1235,118 @@ impl Screen {
         // Clear selection if writing to a selected row
         self.clear_selection_if_row_selected(self.cursor.row);
 
+        self.clear_wide_cell_at(self.cursor.row, self.cursor.col);
+
         // Write the character
         if let Some(cell) = self.grid.get_mut(self.cursor.row, self.cursor.col) {
-            cell.c = c;
+            cell.set_char(c);
             self.style.apply_to(cell);
 
             if width > 1 {
-                cell.attrs.insert(crate::cell::CellAttrs::WIDE);
+                cell.attrs.insert(CellAttrs::WIDE);
             }
         }
 
         // Handle wide characters (write spacer in next cell)
         if width > 1 && self.cursor.col + 1 < self.width() {
             if let Some(cell) = self.grid.get_mut(self.cursor.row, self.cursor.col + 1) {
-                cell.c = ' ';
-                cell.attrs = crate::cell::CellAttrs::WIDE_SPACER;
+                cell.set_char(' ');
+                self.style.apply_to(cell);
+                cell.attrs.remove(CellAttrs::WIDE);
+                cell.attrs.insert(CellAttrs::WIDE_SPACER);
             }
         }
 
         // Advance cursor
         self.cursor.col += width;
         self.dirty = true;
+    }
+
+    /// Extend the preceding cell when the next scalar belongs to the same
+    /// Unicode extended grapheme cluster.
+    fn try_extend_previous_grapheme(&mut self, c: char) -> bool {
+        let screen_width = self.width();
+        if screen_width == 0 {
+            return false;
+        }
+
+        let cursor_follows_cell = self.cursor.col > 0;
+        let mut col = self.cursor.col.min(screen_width).saturating_sub(1);
+        if self
+            .grid
+            .get(self.cursor.row, col)
+            .is_some_and(Cell::is_wide_spacer)
+        {
+            col = col.saturating_sub(1);
+        }
+
+        let Some(cell) = self.grid.get(self.cursor.row, col) else {
+            return false;
+        };
+        if cell.text().len() + c.len_utf8() > MAX_GRAPHEME_BYTES {
+            return UnicodeWidthChar::width(c).unwrap_or(0) == 0;
+        }
+
+        let old_width = if cell.is_wide() { 2 } else { 1 };
+        let mut candidate = String::with_capacity(cell.text().len() + c.len_utf8());
+        candidate.push_str(cell.text());
+        candidate.push(c);
+        if UnicodeSegmentation::graphemes(candidate.as_str(), true).count() != 1 {
+            return false;
+        }
+
+        let new_width = UnicodeWidthStr::width(candidate.as_str()).clamp(1, 2);
+        let Some(cell) = self.grid.get_mut(self.cursor.row, col) else {
+            return false;
+        };
+        if !cell.append_char(c) {
+            return true;
+        }
+        cell.attrs.remove(CellAttrs::WIDE | CellAttrs::WIDE_SPACER);
+        if new_width == 2 {
+            cell.attrs.insert(CellAttrs::WIDE);
+        }
+
+        if new_width == 2 && old_width == 1 && col + 1 < screen_width {
+            if let Some(spacer) = self.grid.get_mut(self.cursor.row, col + 1) {
+                spacer.reset();
+                self.style.apply_to(spacer);
+                spacer.attrs.remove(CellAttrs::WIDE);
+                spacer.attrs.insert(CellAttrs::WIDE_SPACER);
+            }
+        } else if new_width == 1 && old_width == 2 && col + 1 < screen_width {
+            if let Some(spacer) = self.grid.get_mut(self.cursor.row, col + 1) {
+                spacer.reset();
+            }
+        }
+
+        if cursor_follows_cell {
+            self.cursor.col = if new_width > old_width {
+                (self.cursor.col + new_width - old_width).min(screen_width)
+            } else {
+                self.cursor.col.saturating_sub(old_width - new_width)
+            };
+        }
+        self.dirty = true;
+        true
+    }
+
+    /// Remove both halves of a wide cell before overwriting either half.
+    fn clear_wide_cell_at(&mut self, row: usize, col: usize) {
+        let attrs = match self.grid.get(row, col) {
+            Some(cell) => cell.attrs,
+            None => return,
+        };
+
+        if attrs.contains(CellAttrs::WIDE) {
+            if let Some(spacer) = self.grid.get_mut(row, col + 1) {
+                spacer.reset();
+            }
+        } else if attrs.contains(CellAttrs::WIDE_SPACER) && col > 0 {
+            if let Some(wide) = self.grid.get_mut(row, col - 1) {
+                wide.reset();
+            }
+        }
     }
 
     /// Insert blank cells at cursor, shifting existing cells right
@@ -911,8 +1399,11 @@ impl Screen {
                     self.scrollback.pop_front();
                     lines_removed += 1;
                 }
-                self.scrollback.push_back(row);
-                self.scrollback_total_pushed += 1;
+                if self.config.scrollback_lines > 0 {
+                    self.scrollback.push_back(row);
+                } else {
+                    lines_removed += 1;
+                }
             }
 
             // If user is viewing scrollback (not at bottom), adjust scroll_offset
@@ -945,10 +1436,19 @@ impl Screen {
                         }
                     }
                 }
-            }
 
-            // Prune images that have scrolled off the top of the scrollback buffer
-            self.prune_old_images();
+                // Image anchors use the same buffer-relative line coordinates
+                // as selections. Drop images whose anchor was evicted and
+                // shift the surviving anchors with the text.
+                self.images.retain(|_, image| {
+                    if image.line < lines_removed {
+                        false
+                    } else {
+                        image.line -= lines_removed;
+                        true
+                    }
+                });
+            }
         }
 
         self.dirty = true;
@@ -1193,9 +1693,11 @@ impl Screen {
         self.style = CellStyle::default();
         self.modes = TerminalModes {
             auto_wrap: true,
+            reverse_wrap: true,
             show_cursor: true,
             sixel_scrolling: true,
             alternate_scroll: true,
+            modify_other_keys: 1,
             ..Default::default()
         };
         self.title.clear();
@@ -1203,6 +1705,9 @@ impl Screen {
         self.dirty = true;
         self.scroll_offset = 0;
         self.images.clear();
+        self.dynamic_foreground = None;
+        self.dynamic_background = None;
+        self.dynamic_cursor = None;
         self.drcs_fonts.clear();
         self.keyboard_main_stack.clear();
         self.keyboard_alt_stack.clear();
@@ -1374,9 +1879,6 @@ impl Screen {
 
         self.images.insert(id, image);
         self.dirty = true;
-
-        // Prune old images that have scrolled too far
-        self.prune_old_images();
     }
 
     /// Clear grid cells that will be covered by an image
@@ -1394,8 +1896,8 @@ impl Screen {
                         break;
                     }
                     // Clear the cell but keep it as a space (not truly empty)
-                    grid_row[c].c = ' ';
-                    grid_row[c].attrs = crate::cell::CellAttrs::empty();
+                    grid_row[c].set_char(' ');
+                    grid_row[c].attrs = CellAttrs::empty();
                 }
             }
         }
@@ -1412,31 +1914,62 @@ impl Screen {
         let first_visible_line = scrollback_len.saturating_sub(self.scroll_offset);
         let last_visible_line = first_visible_line + height;
 
-        self.images
+        let mut images: Vec<_> = self
+            .images
             .values()
             .filter(|img| {
                 // Image is visible if any part of it overlaps with the viewport
                 let img_top = img.line;
-                let img_rows = self.image_rows_for_height(img.pixel_height).max(1);
+                let img_rows = img.cell_height.max(1);
                 let img_bottom = img.line + img_rows;
 
                 img_bottom > first_visible_line && img_top < last_visible_line
             })
-            .collect()
+            .collect();
+
+        // HashMap iteration order is deliberately unspecified. Images are
+        // painted from oldest to newest so overlapping graphics are stable and
+        // a later image consistently appears on top on every backend.
+        images.sort_unstable_by_key(|image| image.id);
+        images
     }
 
     /// Calculate the visible row for an image (relative to current viewport)
     ///
     /// Returns None if the image is not in the visible area.
-    pub fn image_visible_row(&self, image: &TerminalImage) -> Option<usize> {
+    pub fn image_visible_row(&self, image: &TerminalImage) -> Option<isize> {
         let scrollback_len = self.scrollback.len();
         let first_visible_line = scrollback_len.saturating_sub(self.scroll_offset);
+        let last_visible_line = first_visible_line + self.height();
+        let image_bottom = image.line + image.cell_height.max(1);
 
-        if image.line >= first_visible_line && image.line < first_visible_line + self.height() {
-            Some(image.line - first_visible_line)
+        if image_bottom > first_visible_line && image.line < last_visible_line {
+            Some(image.line as isize - first_visible_line as isize)
         } else {
             None
         }
+    }
+
+    /// Get all stored images in deterministic paint order.
+    pub fn images(&self) -> Vec<&TerminalImage> {
+        let mut images: Vec<_> = self.images.values().collect();
+        images.sort_unstable_by_key(|image| image.id);
+        images
+    }
+
+    /// Replace the stored image set from a daemon or relaunch snapshot.
+    pub fn replace_images<I>(&mut self, images: I)
+    where
+        I: IntoIterator<Item = TerminalImage>,
+    {
+        self.images.clear();
+        let mut largest_id = 0;
+        for image in images {
+            largest_id = largest_id.max(image.id);
+            self.images.insert(image.id, image);
+        }
+        self.next_image_id = largest_id.saturating_add(1).max(1);
+        self.dirty = true;
     }
 
     /// Get the image at a given visible row and column position
@@ -1465,23 +1998,6 @@ impl Screen {
     /// Get an image by its ID
     pub fn image_by_id(&self, id: u64) -> Option<&TerminalImage> {
         self.images.get(&id)
-    }
-
-    /// Prune images that have scrolled off the top of the scrollback buffer
-    fn prune_old_images(&mut self) {
-        if self.images.is_empty() {
-            return;
-        }
-
-        // Image line numbers are absolute (scrollback.len() + row at creation time),
-        // so they grow monotonically. When scrollback is at capacity, old lines are
-        // discarded from the front. The minimum valid line is the total lines ever
-        // pushed minus the max scrollback capacity.
-        let min_valid_line = self
-            .scrollback_total_pushed
-            .saturating_sub(self.config.scrollback_lines);
-
-        self.images.retain(|_, img| img.line >= min_valid_line);
     }
 
     /// Clear all images (called on screen clear)
@@ -1610,6 +2126,51 @@ impl Screen {
         }
     }
 
+    /// Translate the DEC Special Graphics set to Unicode. This table is
+    /// adapted from Rio's tested Rust implementation and matches foot's VT100
+    /// behavior for G0/G1 line drawing.
+    pub(crate) fn map_active_charset_char(&self, c: char) -> char {
+        if self.active_charset_designator() != Some("0") {
+            return c;
+        }
+
+        match c {
+            '_' => ' ',
+            '`' => '◆',
+            'a' => '▒',
+            'b' => '\u{2409}',
+            'c' => '\u{240c}',
+            'd' => '\u{240d}',
+            'e' => '\u{240a}',
+            'f' => '°',
+            'g' => '±',
+            'h' => '\u{2424}',
+            'i' => '\u{240b}',
+            'j' => '┘',
+            'k' => '┐',
+            'l' => '┌',
+            'm' => '└',
+            'n' => '┼',
+            'o' => '⎺',
+            'p' => '⎻',
+            'q' => '─',
+            'r' => '⎼',
+            's' => '⎽',
+            't' => '├',
+            'u' => '┤',
+            'v' => '┴',
+            'w' => '┬',
+            'x' => '│',
+            'y' => '≤',
+            'z' => '≥',
+            '{' => 'π',
+            '|' => '≠',
+            '}' => '£',
+            '~' => '·',
+            _ => c,
+        }
+    }
+
     /// Check if a character should be rendered as DRCS and get its glyph
     pub fn get_drcs_for_char(&self, c: char) -> Option<&DrcsGlyph> {
         // DRCS characters are typically in the range 0x21-0x7E (33-126)
@@ -1651,7 +2212,7 @@ impl Screen {
             );
         }
 
-        let center_char = row.get(col).map(|c| c.c).unwrap_or(' ');
+        let center_char = row.get(col).map(Cell::first_char).unwrap_or(' ');
 
         // If we clicked on a non-word character, just select that character
         if !Self::is_word_char(center_char) {
@@ -1668,7 +2229,7 @@ impl Screen {
             if start_col > 0 {
                 let r = self.get_row_by_absolute_line(start_line).unwrap();
                 if let Some(cell) = r.get(start_col - 1) {
-                    if Self::is_word_char(cell.c) {
+                    if Self::is_word_char(cell.first_char()) {
                         start_col -= 1;
                         continue;
                     }
@@ -1686,7 +2247,7 @@ impl Screen {
                     let prev_len = prev_row.len();
                     if prev_len > 0 {
                         if let Some(cell) = prev_row.get(prev_len - 1) {
-                            if Self::is_word_char(cell.c) {
+                            if Self::is_word_char(cell.first_char()) {
                                 start_line -= 1;
                                 start_col = prev_len - 1;
                                 continue;
@@ -1706,7 +2267,7 @@ impl Screen {
             let r_len = r.len();
             if end_col < r_len - 1 {
                 if let Some(cell) = r.get(end_col + 1) {
-                    if Self::is_word_char(cell.c) {
+                    if Self::is_word_char(cell.first_char()) {
                         end_col += 1;
                         continue;
                     }
@@ -1717,7 +2278,7 @@ impl Screen {
             if let Some(next_row) = self.get_row_by_absolute_line(end_line + 1) {
                 if next_row.wrapped {
                     if let Some(cell) = next_row.get(0) {
-                        if Self::is_word_char(cell.c) {
+                        if Self::is_word_char(cell.first_char()) {
                             end_line += 1;
                             end_col = 0;
                             continue;
@@ -1916,15 +2477,18 @@ impl Screen {
                 if let Some(cell) = row.get(col) {
                     // Skip wide character spacers
                     if !cell.attrs.contains(crate::cell::CellAttrs::WIDE_SPACER) {
-                        result.push(cell.c);
+                        result.push_str(cell.text());
                     }
                 }
             }
 
-            // Add newline between lines
-            // For block selection: always add newlines between lines
-            // For normal selection: skip newline after wrapped lines
-            if line_idx < end_line && (is_block || !row.wrapped) {
+            // A row marks itself as wrapped when it continues the preceding
+            // row, so the following row decides whether this boundary emits
+            // a newline. Block selection always preserves physical rows.
+            let next_is_wrapped = self
+                .get_row_by_absolute_line(line_idx + 1)
+                .is_some_and(|next| next.wrapped);
+            if line_idx < end_line && (is_block || !next_is_wrapped) {
                 result.push('\n');
             }
         }
@@ -2099,13 +2663,15 @@ impl Screen {
                     }
 
                     // Append character (HTML-escaped)
-                    match cell.c {
-                        '<' => result.push_str("&lt;"),
-                        '>' => result.push_str("&gt;"),
-                        '&' => result.push_str("&amp;"),
-                        '"' => result.push_str("&quot;"),
-                        '\'' => result.push_str("&#39;"),
-                        c => result.push(c),
+                    for c in cell.text().chars() {
+                        match c {
+                            '<' => result.push_str("&lt;"),
+                            '>' => result.push_str("&gt;"),
+                            '&' => result.push_str("&amp;"),
+                            '"' => result.push_str("&quot;"),
+                            '\'' => result.push_str("&#39;"),
+                            c => result.push(c),
+                        }
                     }
                 }
             }
@@ -2118,8 +2684,10 @@ impl Screen {
                 last_attrs = None;
             }
 
-            // Add newline between lines
-            if line_idx < end_line && (is_block || !row.wrapped) {
+            let next_is_wrapped = self
+                .get_row_by_absolute_line(line_idx + 1)
+                .is_some_and(|next| next.wrapped);
+            if line_idx < end_line && (is_block || !next_is_wrapped) {
                 result.push('\n');
             }
         }
@@ -2194,15 +2762,264 @@ mod tests {
     }
 
     #[test]
+    fn terminal_images_have_stable_nonzero_ids() {
+        let mut screen = Screen::new(10, 3, ScreenConfig::default());
+        let image = || SixelImage {
+            data: vec![255, 0, 0, 255],
+            width: 1,
+            height: 1,
+        };
+
+        screen.add_image_with_size(0, 0, 1, 1, image());
+        screen.add_image_with_size(1, 0, 1, 1, image());
+
+        let ids: Vec<_> = screen.images().iter().map(|image| image.id).collect();
+        assert_eq!(ids, vec![1, 2]);
+    }
+
+    #[test]
+    fn partially_scrolled_image_remains_visible() {
+        let mut screen = Screen::new(10, 2, ScreenConfig::default());
+        screen.add_image_with_size(
+            0,
+            0,
+            1,
+            2,
+            SixelImage {
+                data: vec![255, 0, 0, 255],
+                width: 1,
+                height: 1,
+            },
+        );
+
+        screen.cursor.row = 1;
+        screen.line_feed();
+
+        let image = screen.visible_images()[0];
+        assert_eq!(screen.image_visible_row(image), Some(-1));
+    }
+
+    #[test]
+    fn restored_image_ids_continue_without_collisions() {
+        let mut screen = Screen::new(10, 2, ScreenConfig::default());
+        screen.replace_images([TerminalImage {
+            id: 7,
+            col: 0,
+            line: 0,
+            cell_width: 1,
+            cell_height: 1,
+            data: Arc::new(vec![0, 255, 0, 255]),
+            pixel_width: 1,
+            pixel_height: 1,
+        }]);
+
+        screen.add_image_with_size(
+            1,
+            0,
+            1,
+            1,
+            SixelImage {
+                data: vec![255, 0, 0, 255],
+                width: 1,
+                height: 1,
+            },
+        );
+
+        let ids: Vec<_> = screen.images().iter().map(|image| image.id).collect();
+        assert_eq!(ids, vec![7, 8]);
+    }
+
+    #[test]
     fn test_put_char() {
         let mut screen = Screen::new(80, 24, ScreenConfig::default());
 
         screen.put_char('H');
         screen.put_char('i');
 
-        assert_eq!(screen.get_cell(0, 0).unwrap().c, 'H');
-        assert_eq!(screen.get_cell(0, 1).unwrap().c, 'i');
+        assert_eq!(screen.get_cell(0, 0).unwrap().text(), "H");
+        assert_eq!(screen.get_cell(0, 1).unwrap().text(), "i");
         assert_eq!(screen.cursor.col, 2);
+    }
+
+    #[test]
+    fn combines_unicode_scalars_into_grapheme_cells() {
+        let mut screen = Screen::new(8, 2, ScreenConfig::default());
+
+        for c in "e\u{301}👩\u{200d}💻🇨🇭".chars() {
+            screen.put_char(c);
+        }
+
+        assert_eq!(screen.get_cell(0, 0).unwrap().text(), "e\u{301}");
+        assert_eq!(screen.get_cell(0, 1).unwrap().text(), "👩\u{200d}💻");
+        assert!(screen.get_cell(0, 1).unwrap().is_wide());
+        assert!(screen.get_cell(0, 2).unwrap().is_wide_spacer());
+        assert_eq!(screen.get_cell(0, 3).unwrap().text(), "🇨🇭");
+        assert!(screen.get_cell(0, 3).unwrap().is_wide());
+        assert!(screen.get_cell(0, 4).unwrap().is_wide_spacer());
+        assert_eq!(screen.cursor.col, 5);
+        assert_eq!(
+            screen.grid().row(0).unwrap().text(),
+            "e\u{301}👩\u{200d}💻🇨🇭"
+        );
+    }
+
+    #[test]
+    fn bounds_combining_character_growth_per_cell() {
+        let mut screen = Screen::new(8, 2, ScreenConfig::default());
+        screen.put_char('e');
+        for _ in 0..100 {
+            screen.put_char('\u{301}');
+        }
+
+        assert!(screen.get_cell(0, 0).unwrap().text().len() <= MAX_GRAPHEME_BYTES);
+        assert_eq!(screen.cursor.col, 1);
+    }
+
+    #[test]
+    fn wraps_wide_grapheme_before_last_column() {
+        let mut screen = Screen::new(4, 2, ScreenConfig::default());
+        for c in "abc界".chars() {
+            screen.put_char(c);
+        }
+
+        assert_eq!(screen.grid().row(0).unwrap().text(), "abc");
+        assert_eq!(screen.grid().row(1).unwrap().text(), "界");
+        assert!(screen.grid().row(1).unwrap().wrapped);
+        assert_eq!(screen.cursor.row, 1);
+        assert_eq!(screen.cursor.col, 2);
+    }
+
+    #[test]
+    fn resize_reflows_wrapped_graphemes_and_cursor() {
+        let mut screen = Screen::new(4, 2, ScreenConfig::default());
+        for c in "abcdefgh".chars() {
+            screen.put_char(c);
+        }
+
+        screen.resize(3, 3);
+        assert_eq!(screen.grid()[0].text(), "abc");
+        assert_eq!(screen.grid()[1].text(), "def");
+        assert_eq!(screen.grid()[2].text(), "gh");
+        assert!(!screen.grid()[0].wrapped);
+        assert!(screen.grid()[1].wrapped);
+        assert!(screen.grid()[2].wrapped);
+        assert_eq!((screen.cursor.row, screen.cursor.col), (2, 2));
+
+        screen.resize(6, 2);
+        assert_eq!(screen.grid()[0].text(), "abcdef");
+        assert_eq!(screen.grid()[1].text(), "gh");
+        assert_eq!((screen.cursor.row, screen.cursor.col), (1, 2));
+    }
+
+    #[test]
+    fn resize_moves_only_required_top_rows_into_scrollback() {
+        let mut screen = Screen::new(4, 4, ScreenConfig::default());
+        for line in ['1', '2', '3', '4'] {
+            screen.put_char(line);
+            if line != '4' {
+                screen.carriage_return();
+                screen.line_feed();
+            }
+        }
+
+        screen.resize(4, 2);
+        assert_eq!(screen.scrollback().len(), 2);
+        assert_eq!(screen.scrollback()[0].text(), "1");
+        assert_eq!(screen.scrollback()[1].text(), "2");
+        assert_eq!(screen.grid()[0].text(), "3");
+        assert_eq!(screen.grid()[1].text(), "4");
+        assert_eq!(screen.cursor.row, 1);
+
+        screen.resize(4, 4);
+        assert!(screen.scrollback().is_empty());
+        assert_eq!(screen.grid()[0].text(), "1");
+        assert_eq!(screen.grid()[3].text(), "4");
+        assert_eq!(screen.cursor.row, 3);
+    }
+
+    #[test]
+    fn resize_never_splits_wide_graphemes() {
+        let mut screen = Screen::new(4, 2, ScreenConfig::default());
+        for c in "ab界".chars() {
+            screen.put_char(c);
+        }
+
+        screen.resize(3, 2);
+        assert_eq!(screen.grid()[0].text(), "ab");
+        assert_eq!(screen.grid()[1].text(), "界");
+        assert!(screen.grid()[1][0].is_wide());
+        assert!(screen.grid()[1][1].is_wide_spacer());
+    }
+
+    #[test]
+    fn resize_keeps_selection_attached_to_reflowed_text() {
+        let mut screen = Screen::new(4, 2, ScreenConfig::default());
+        for c in "abcdefgh".chars() {
+            screen.put_char(c);
+        }
+        screen.start_selection(0, 1, SelectionMode::Char);
+        screen.extend_selection(1, 2);
+        assert_eq!(screen.get_selected_text().as_deref(), Some("bcdefg"));
+
+        screen.resize(3, 3);
+        assert_eq!(screen.get_selected_text().as_deref(), Some("bcdefg"));
+    }
+
+    #[test]
+    fn resize_reflows_hidden_primary_screen() {
+        let mut screen = Screen::new(4, 2, ScreenConfig::default());
+        for c in "abcdefgh".chars() {
+            screen.put_char(c);
+        }
+        screen.enter_alternate_screen();
+
+        screen.resize(3, 3);
+        screen.exit_alternate_screen();
+
+        assert_eq!(screen.grid()[0].text(), "abc");
+        assert_eq!(screen.grid()[1].text(), "def");
+        assert_eq!(screen.grid()[2].text(), "gh");
+        assert_eq!((screen.cursor.row, screen.cursor.col), (2, 2));
+    }
+
+    #[test]
+    fn resize_moves_image_anchor_with_reflowed_cells() {
+        let mut screen = Screen::new(4, 2, ScreenConfig::default());
+        for c in "abcde".chars() {
+            screen.put_char(c);
+        }
+        screen.add_image_with_size(
+            0,
+            1,
+            1,
+            1,
+            SixelImage {
+                data: vec![255, 0, 0, 255],
+                width: 1,
+                height: 1,
+            },
+        );
+
+        screen.resize(3, 3);
+
+        let image = screen.images()[0];
+        assert_eq!((image.line, image.col), (1, 1));
+        assert_eq!(screen.image_visible_row(image), Some(1));
+    }
+
+    #[test]
+    fn zero_scrollback_configuration_retains_no_rows() {
+        let mut screen = Screen::new(
+            4,
+            1,
+            ScreenConfig {
+                scrollback_lines: 0,
+            },
+        );
+        screen.put_char('a');
+        screen.line_feed();
+
+        assert!(screen.scrollback().is_empty());
     }
 
     #[test]
@@ -2233,9 +3050,40 @@ mod tests {
         screen.line_feed(); // This should scroll
 
         assert_eq!(screen.scrollback.len(), 1);
-        assert_eq!(screen.scrollback[0][0].c, '1');
-        assert_eq!(screen.grid()[0][0].c, '2');
-        assert_eq!(screen.grid()[1][0].c, '3');
+        assert_eq!(screen.scrollback[0][0].text(), "1");
+        assert_eq!(screen.grid()[0][0].text(), "2");
+        assert_eq!(screen.grid()[1][0].text(), "3");
+    }
+
+    #[test]
+    fn visible_rows_resolve_into_scrollback() {
+        let mut screen = Screen::new(4, 2, ScreenConfig::default());
+
+        for line in ['1', '2', '3'] {
+            screen.put_char(line);
+            screen.carriage_return();
+            screen.line_feed();
+        }
+
+        assert_eq!(screen.scrollback.len(), 2);
+        screen.scroll_offset = 2;
+
+        let first_line = screen.visible_row_to_absolute_line(0);
+        let second_line = screen.visible_row_to_absolute_line(1);
+        assert_eq!(
+            screen
+                .get_cell_with_scrollback(first_line, 0)
+                .unwrap()
+                .text(),
+            "1"
+        );
+        assert_eq!(
+            screen
+                .get_cell_with_scrollback(second_line, 0)
+                .unwrap()
+                .text(),
+            "2"
+        );
     }
 
     #[test]
@@ -2246,13 +3094,13 @@ mod tests {
         screen.enter_alternate_screen();
 
         // Alternate screen should be empty
-        assert_eq!(screen.get_cell(0, 0).unwrap().c, ' ');
+        assert_eq!(screen.get_cell(0, 0).unwrap().text(), " ");
 
         screen.put_char('B');
         screen.exit_alternate_screen();
 
         // Should restore primary with 'A'
-        assert_eq!(screen.get_cell(0, 0).unwrap().c, 'A');
+        assert_eq!(screen.get_cell(0, 0).unwrap().text(), "A");
     }
 
     #[test]
@@ -2262,7 +3110,7 @@ mod tests {
         screen.put_char('X');
         screen.clear(ClearMode::All);
 
-        assert_eq!(screen.get_cell(0, 0).unwrap().c, ' ');
+        assert_eq!(screen.get_cell(0, 0).unwrap().text(), " ");
     }
 
     /// Helper: create a screen with text on the first line

@@ -14,11 +14,12 @@ use parking_lot::Mutex;
 
 use cterm_app::config::Config;
 use cterm_core::cell::CellAttrs;
-use cterm_core::color::{Color, Rgb};
+use cterm_core::color::{Color, ColorPalette, Rgb};
 use cterm_core::mouse::{encode_mouse_event, MouseButton, MouseModifiers};
 use cterm_core::screen::{ClipboardOperation, CursorStyle, MouseMode, ScreenConfig};
 use cterm_core::term::{Key, Modifiers, Terminal, TerminalEvent};
 use cterm_core::{KeyEventKind, KeyboardEnhancementFlags};
+use cterm_ui::sprite::{Sprite, SpriteCache};
 use cterm_ui::theme::Theme;
 
 /// Cell dimensions calculated from font metrics
@@ -52,6 +53,7 @@ pub struct TerminalWidget {
     font_size: Rc<RefCell<f64>>,
     default_font_size: f64,
     cell_dims: Rc<RefCell<CellDimensions>>,
+    sprite_cache: Rc<RefCell<SpriteCache>>,
     /// Optional background color override (from template)
     background_override: Rc<RefCell<Option<cterm_core::color::Rgb>>>,
     /// Input method preedit (composition) state
@@ -181,6 +183,9 @@ impl TerminalWidget {
             }
         });
         *self.background_override.borrow_mut() = rgb;
+        self.terminal
+            .lock()
+            .set_base_palette(frontend_palette(&self.theme, rgb));
         // Trigger redraw to apply new background
         self.drawing_area.queue_draw();
     }
@@ -216,6 +221,7 @@ impl TerminalWidget {
     fn update_cell_dimensions(&self, font_size: f64) {
         let new_dims = calculate_cell_dimensions(&self.font_family, font_size);
         *self.cell_dims.borrow_mut() = new_dims;
+        self.sprite_cache.borrow_mut().clear();
     }
 
     /// Reset the terminal (soft reset - keeps scrollback)
@@ -227,6 +233,8 @@ impl TerminalWidget {
         screen.style = cterm_core::cell::CellStyle::default();
         screen.modes = cterm_core::screen::TerminalModes {
             auto_wrap: true,
+            reverse_wrap: true,
+            modify_other_keys: 1,
             show_cursor: true,
             ..Default::default()
         };
@@ -486,6 +494,7 @@ impl TerminalWidget {
         let cell_dims = Rc::clone(&self.cell_dims);
         let background_override = Rc::clone(&self.background_override);
         let preedit = Rc::clone(&self.preedit);
+        let sprite_cache = Rc::clone(&self.sprite_cache);
 
         self.drawing_area
             .set_draw_func(move |_area, cr, _width, _height| {
@@ -499,7 +508,15 @@ impl TerminalWidget {
                     cell_dims: dims,
                     background_override: bg_override,
                 };
-                draw_terminal(cr, &terminal, &theme, &render_config, &preedit_state);
+                let mut sprites = sprite_cache.borrow_mut();
+                draw_terminal(
+                    cr,
+                    &terminal,
+                    &theme,
+                    &render_config,
+                    &preedit_state,
+                    &mut sprites,
+                );
             });
     }
 
@@ -1342,6 +1359,7 @@ impl TerminalWidget {
 
         // Create a Terminal with no PTY — write callback forwards via channel
         let mut terminal = Terminal::new(80, 24, ScreenConfig::default());
+        terminal.set_base_palette(frontend_palette(theme, None));
         terminal.screen_mut().set_cell_width_hint(cell_dims.width);
         terminal.screen_mut().set_cell_height_hint(cell_dims.height);
         let write_tx = cmd_tx.clone();
@@ -1361,6 +1379,7 @@ impl TerminalWidget {
             font_size: Rc::new(RefCell::new(font_size)),
             default_font_size: font_size,
             cell_dims,
+            sprite_cache: Rc::new(RefCell::new(SpriteCache::default())),
             background_override: Rc::new(RefCell::new(None)),
             on_exit: Rc::new(RefCell::new(None)),
             on_bell: Rc::new(RefCell::new(None)),
@@ -1406,6 +1425,7 @@ impl TerminalWidget {
 
         // Create a Terminal with no PTY
         let mut terminal = Terminal::new(80, 24, ScreenConfig::default());
+        terminal.set_base_palette(frontend_palette(theme, None));
         terminal.screen_mut().set_cell_width_hint(cell_dims.width);
         terminal.screen_mut().set_cell_height_hint(cell_dims.height);
 
@@ -1436,6 +1456,7 @@ impl TerminalWidget {
             font_size: Rc::new(RefCell::new(font_size)),
             default_font_size: font_size,
             cell_dims,
+            sprite_cache: Rc::new(RefCell::new(SpriteCache::default())),
             background_override: Rc::new(RefCell::new(None)),
             on_exit: Rc::new(RefCell::new(None)),
             on_bell: Rc::new(RefCell::new(None)),
@@ -1730,6 +1751,7 @@ impl TerminalWidget {
                     PtyMessage::Data(data) => {
                         let mut term = terminal_main.lock();
                         let events = term.process_mirror(&data);
+                        let mut content_changed = false;
 
                         for event in events {
                             match event {
@@ -1774,8 +1796,11 @@ impl TerminalWidget {
                                         callback(title);
                                     }
                                 }
-                                TerminalEvent::ContentChanged | TerminalEvent::ProcessExited(_) => {
-                                }
+                                TerminalEvent::ContentChanged => content_changed = true,
+                                TerminalEvent::ProcessExited(_) => {}
+                                // process_mirror already answered this through
+                                // the daemon write callback.
+                                TerminalEvent::ColorQuery { .. } => {}
                             }
                         }
 
@@ -1795,8 +1820,10 @@ impl TerminalWidget {
                             }
                         }
 
-                        terminal_main.lock().screen_mut().dirty = false;
-                        drawing_area.queue_draw();
+                        if content_changed {
+                            terminal_main.lock().screen_mut().dirty = false;
+                            drawing_area.queue_draw();
+                        }
                     }
                     PtyMessage::Bell => {
                         if let Some(ref callback) = *on_bell.borrow() {
@@ -1811,6 +1838,10 @@ impl TerminalWidget {
                         return glib::ControlFlow::Break;
                     }
                 }
+            }
+            if terminal_main.lock().expire_synchronized_update() {
+                terminal_main.lock().screen_mut().dirty = false;
+                drawing_area.queue_draw();
             }
             glib::ControlFlow::Continue
         });
@@ -1925,16 +1956,21 @@ fn draw_terminal(
     theme: &Theme,
     config: &RenderConfig<'_>,
     preedit: &PreeditState,
+    sprite_cache: &mut SpriteCache,
 ) {
     let term = terminal.lock();
     let screen = term.screen();
-    let palette = &theme.colors;
+    let palette = frontend_palette(theme, config.background_override);
+    let palette = screen.resolved_palette(&palette);
+    let palette = &palette;
 
-    // Draw background (use override if set, otherwise use theme)
-    let bg = config
-        .background_override
-        .as_ref()
-        .unwrap_or(&palette.background);
+    // Dynamic OSC colors override the configured theme/template palette.
+    let normal_background = &palette.background;
+    let bg = if screen.modes.reverse_video {
+        &palette.foreground
+    } else {
+        normal_background
+    };
     let (r, g, b) = bg.to_f64();
     cr.set_source_rgb(r, g, b);
     cr.paint().ok();
@@ -1981,10 +2017,38 @@ fn draw_terminal(
             let is_selected = screen.is_selected(absolute_line, col_idx);
 
             // Determine if cell has INVERSE attribute (XOR with selection)
-            let is_inverted = cell.attrs.contains(CellAttrs::INVERSE) != is_selected;
+            let is_inverted =
+                cell.attrs.contains(CellAttrs::INVERSE) ^ is_selected ^ screen.modes.reverse_video;
+            let char_width = if cell.attrs.contains(CellAttrs::WIDE) {
+                cell_width * 2.0
+            } else {
+                cell_width
+            };
+
+            let fg_color = if is_inverted {
+                if cell.bg == Color::Default {
+                    *normal_background
+                } else {
+                    cell.bg.to_rgb(palette)
+                }
+            } else if cell.hyperlink.is_some() && cell.fg == Color::Default {
+                Rgb::new(100, 149, 237)
+            } else if cell.fg == Color::Default {
+                palette.foreground
+            } else {
+                cell.fg.to_rgb(palette)
+            };
+            let fg_color = if cell.attrs.contains(CellAttrs::DIM) {
+                Rgb::new(fg_color.r / 2, fg_color.g / 2, fg_color.b / 2)
+            } else {
+                fg_color
+            };
 
             // Draw background (always draw for selected cells to show highlight)
-            let needs_bg = cell.bg != Color::Default || is_inverted || is_selected;
+            let needs_bg = cell.bg != Color::Default
+                || is_inverted
+                || is_selected
+                || screen.modes.reverse_video;
 
             if needs_bg {
                 let bg_color = if is_inverted {
@@ -1994,6 +2058,8 @@ fn draw_terminal(
                     } else {
                         cell.fg.to_rgb(palette)
                     }
+                } else if cell.bg == Color::Default {
+                    *normal_background
                 } else {
                     cell.bg.to_rgb(palette)
                 };
@@ -2001,84 +2067,63 @@ fn draw_terminal(
                 let (r, g, b) = bg_color.to_f64();
                 cr.set_source_rgb(r, g, b);
 
-                let char_width = if cell.attrs.contains(CellAttrs::WIDE) {
-                    cell_width * 2.0
-                } else {
-                    cell_width
-                };
-
                 cr.rectangle(x, y, char_width, cell_height);
                 cr.fill().ok();
             }
 
             // Draw character
-            if cell.c != ' ' {
-                let fg_color = if is_inverted {
-                    // Inverted: use background color as foreground
-                    cell.bg.to_rgb(palette)
-                } else if cell.hyperlink.is_some() && cell.fg == Color::Default {
-                    // Cornflower blue for hyperlinks with default fg
-                    Rgb::new(100, 149, 237)
-                } else if cell.fg == Color::Default {
-                    palette.foreground
+            if cell.text() != " " && !cell.attrs.contains(CellAttrs::HIDDEN) {
+                let sprite_width = cell_width.round().max(1.0) as u32;
+                let sprite_height = cell_height.round().max(1.0) as u32;
+                if let Some(sprite) = cell
+                    .single_char()
+                    .and_then(|c| sprite_cache.get(c as u32, sprite_width, sprite_height))
+                {
+                    draw_sprite(cr, sprite, x, y, cell_width, cell_height, &fg_color);
                 } else {
-                    cell.fg.to_rgb(palette)
-                };
+                    let (r, g, b) = fg_color.to_f64();
+                    cr.set_source_rgb(r, g, b);
 
-                // Apply dim
-                let fg_color = if cell.attrs.contains(CellAttrs::DIM) {
-                    Rgb::new(
-                        (fg_color.r as f64 * 0.5) as u8,
-                        (fg_color.g as f64 * 0.5) as u8,
-                        (fg_color.b as f64 * 0.5) as u8,
-                    )
-                } else {
-                    fg_color
-                };
+                    // Apply text attributes to font
+                    let attrs = pango::AttrList::new();
 
-                let (r, g, b) = fg_color.to_f64();
-                cr.set_source_rgb(r, g, b);
-
-                // Apply text attributes to font
-                let attrs = pango::AttrList::new();
-
-                if cell.attrs.contains(CellAttrs::BOLD) {
-                    let attr = pango::AttrInt::new_weight(pango::Weight::Bold);
-                    attrs.insert(attr);
-                }
-
-                if cell.attrs.contains(CellAttrs::ITALIC) {
-                    let attr = pango::AttrInt::new_style(pango::Style::Italic);
-                    attrs.insert(attr);
-                }
-
-                if cell.attrs.contains(CellAttrs::UNDERLINE) || cell.hyperlink.is_some() {
-                    let attr = pango::AttrInt::new_underline(pango::Underline::Single);
-                    attrs.insert(attr);
-                    if cell.hyperlink.is_some() {
-                        // Cornflower blue for hyperlinks
-                        let attr =
-                            pango::AttrColor::new_underline_color(100 * 256, 149 * 256, 237 * 256);
+                    if cell.attrs.contains(CellAttrs::BOLD) {
+                        let attr = pango::AttrInt::new_weight(pango::Weight::Bold);
                         attrs.insert(attr);
                     }
+
+                    if cell.attrs.contains(CellAttrs::ITALIC) {
+                        let attr = pango::AttrInt::new_style(pango::Style::Italic);
+                        attrs.insert(attr);
+                    }
+
+                    layout.set_attributes(Some(&attrs));
+                    layout.set_text(cell.text());
+
+                    cr.move_to(x, y);
+                    pangocairo::functions::show_layout(cr, &layout);
+
+                    // Reset attributes
+                    layout.set_attributes(None::<&pango::AttrList>);
                 }
+            }
 
-                if cell.attrs.contains(CellAttrs::STRIKETHROUGH) {
-                    let attr = pango::AttrInt::new_strikethrough(true);
-                    attrs.insert(attr);
-                }
-
-                layout.set_attributes(Some(&attrs));
-                layout.set_text(&cell.c.to_string());
-
-                cr.move_to(x, y);
-                pangocairo::functions::show_layout(cr, &layout);
-
-                // Reset attributes
-                layout.set_attributes(None::<&pango::AttrList>);
+            if !cell.attrs.contains(CellAttrs::HIDDEN) {
+                draw_cell_decorations(
+                    cr,
+                    cell,
+                    (x, y),
+                    (char_width, cell_height),
+                    &fg_color,
+                    palette,
+                );
             }
         }
     }
+
+    // Images replace the cells beneath them and must therefore be composited
+    // after the text grid but before the cursor and overlays.
+    draw_terminal_images(cr, screen, cell_width, cell_height);
 
     // Draw cursor
     if screen.modes.show_cursor && scroll_offset == 0 {
@@ -2086,7 +2131,7 @@ fn draw_terminal(
         let x = cursor.col as f64 * cell_width;
         let y = cursor.row as f64 * cell_height;
 
-        let (r, g, b) = theme.cursor.color.to_f64();
+        let (r, g, b) = palette.cursor.to_f64();
         cr.set_source_rgb(r, g, b);
 
         match cursor.style {
@@ -2096,10 +2141,10 @@ fn draw_terminal(
 
                 // Draw character under cursor with inverted color
                 if let Some(cell) = screen.get_cell(cursor.row, cursor.col) {
-                    if cell.c != ' ' {
+                    if cell.text() != " " && !cell.attrs.contains(CellAttrs::HIDDEN) {
                         let (r, g, b) = theme.cursor.text_color.to_f64();
                         cr.set_source_rgb(r, g, b);
-                        layout.set_text(&cell.c.to_string());
+                        layout.set_text(cell.text());
                         cr.move_to(x, y);
                         pangocairo::functions::show_layout(cr, &layout);
                     }
@@ -2201,6 +2246,190 @@ fn draw_terminal(
     }
 }
 
+fn frontend_palette(theme: &Theme, background: Option<Rgb>) -> ColorPalette {
+    let mut palette = theme.colors.clone();
+    palette.cursor = theme.cursor.color;
+    if let Some(background) = background {
+        palette.background = background;
+    }
+    palette
+}
+
+fn draw_cell_decorations(
+    cr: &cairo::Context,
+    cell: &cterm_core::Cell,
+    origin: (f64, f64),
+    size: (f64, f64),
+    foreground: &Rgb,
+    palette: &cterm_core::color::ColorPalette,
+) {
+    let (x, y) = origin;
+    let (width, height) = size;
+    let has_hyperlink = cell.hyperlink.is_some();
+    if cell.attrs.has_underline() || has_hyperlink {
+        let color = if has_hyperlink {
+            Rgb::new(100, 149, 237)
+        } else if let Some(color) = cell.underline_color {
+            color.to_rgb(palette)
+        } else {
+            *foreground
+        };
+        let (red, green, blue) = color.to_f64();
+        let underline_y = y + height - 2.0;
+        cr.set_source_rgb(red, green, blue);
+        cr.set_line_width(1.0);
+
+        if cell.attrs.contains(CellAttrs::CURLY_UNDERLINE) {
+            let mut current_x = x;
+            let mut rising = true;
+            cr.move_to(current_x, underline_y + 1.0);
+            while current_x < x + width {
+                current_x = (current_x + 2.0).min(x + width);
+                cr.line_to(
+                    current_x,
+                    if rising {
+                        underline_y - 1.0
+                    } else {
+                        underline_y + 1.0
+                    },
+                );
+                rising = !rising;
+            }
+        } else {
+            if cell.attrs.contains(CellAttrs::DOTTED_UNDERLINE) {
+                cr.set_dash(&[1.0, 2.0], 0.0);
+            } else if cell.attrs.contains(CellAttrs::DASHED_UNDERLINE) {
+                cr.set_dash(&[4.0, 2.0], 0.0);
+            }
+            cr.move_to(x, underline_y);
+            cr.line_to(x + width, underline_y);
+        }
+        cr.stroke().ok();
+        cr.set_dash(&[], 0.0);
+
+        if cell.attrs.contains(CellAttrs::DOUBLE_UNDERLINE) {
+            cr.move_to(x, underline_y - 2.0);
+            cr.line_to(x + width, underline_y - 2.0);
+            cr.stroke().ok();
+        }
+    }
+
+    let (red, green, blue) = foreground.to_f64();
+    cr.set_source_rgb(red, green, blue);
+    cr.set_line_width(1.0);
+    if cell.attrs.contains(CellAttrs::STRIKETHROUGH) {
+        cr.move_to(x, y + height / 2.0);
+        cr.line_to(x + width, y + height / 2.0);
+        cr.stroke().ok();
+    }
+    if cell.attrs.contains(CellAttrs::OVERLINE) {
+        cr.move_to(x, y + 1.0);
+        cr.line_to(x + width, y + 1.0);
+        cr.stroke().ok();
+    }
+}
+
+fn draw_sprite(
+    cr: &cairo::Context,
+    sprite: &Sprite,
+    x: f64,
+    y: f64,
+    cell_width: f64,
+    cell_height: f64,
+    color: &Rgb,
+) {
+    let width = usize::from(sprite.width);
+    let height = usize::from(sprite.height);
+    let (red, green, blue) = color.to_f64();
+
+    cr.save().ok();
+    cr.translate(x, y);
+    cr.scale(cell_width / width as f64, cell_height / height as f64);
+
+    for (row_index, row) in sprite.bytes.chunks_exact(width).enumerate() {
+        let mut column = 0;
+        while column < width {
+            let alpha = row[column];
+            let start = column;
+            while column < width && row[column] == alpha {
+                column += 1;
+            }
+            if alpha == 0 {
+                continue;
+            }
+            cr.set_source_rgba(red, green, blue, f64::from(alpha) / 255.0);
+            cr.rectangle(start as f64, row_index as f64, (column - start) as f64, 1.0);
+            cr.fill().ok();
+        }
+    }
+
+    cr.restore().ok();
+}
+
+/// Draw the terminal's decoded inline images with Cairo.
+fn draw_terminal_images(
+    cr: &cairo::Context,
+    screen: &cterm_core::Screen,
+    cell_width: f64,
+    cell_height: f64,
+) {
+    for image in screen.visible_images() {
+        let Some(visible_row) = screen.image_visible_row(image) else {
+            continue;
+        };
+        let Ok(width) = i32::try_from(image.pixel_width) else {
+            log::warn!("Terminal image {} is too wide for Cairo", image.id);
+            continue;
+        };
+        let Ok(height) = i32::try_from(image.pixel_height) else {
+            log::warn!("Terminal image {} is too tall for Cairo", image.id);
+            continue;
+        };
+        let expected_len = image
+            .pixel_width
+            .checked_mul(image.pixel_height)
+            .and_then(|pixels| pixels.checked_mul(4));
+        if expected_len != Some(image.data.len()) {
+            log::warn!("Terminal image {} has invalid RGBA data", image.id);
+            continue;
+        }
+
+        let Some(pixels) = cterm_ui::rgba_to_premultiplied_bgra(image.data.as_slice()) else {
+            log::warn!("Terminal image {} has invalid RGBA data", image.id);
+            continue;
+        };
+        let Ok(stride) = cairo::Format::ARgb32.stride_for_width(image.pixel_width as u32) else {
+            log::warn!("Terminal image {} has an invalid Cairo stride", image.id);
+            continue;
+        };
+        let Ok(surface) = cairo::ImageSurface::create_for_data(
+            pixels,
+            cairo::Format::ARgb32,
+            width,
+            height,
+            stride,
+        ) else {
+            log::warn!(
+                "Failed to create a Cairo surface for terminal image {}",
+                image.id
+            );
+            continue;
+        };
+
+        let x = image.col as f64 * cell_width;
+        let y = visible_row as f64 * cell_height;
+        if cr.save().is_err() {
+            continue;
+        }
+        cr.rectangle(x, y, image.pixel_width as f64, image.pixel_height as f64);
+        cr.clip();
+        if cr.set_source_surface(&surface, x, y).is_ok() {
+            let _ = cr.paint();
+        }
+        let _ = cr.restore();
+    }
+}
+
 /// Extract mouse-report modifier bits from a GTK modifier state.
 fn gtk_state_to_mouse_mods(state: gdk::ModifierType) -> MouseModifiers {
     MouseModifiers {
@@ -2288,7 +2517,23 @@ fn keyval_to_key(keyval: gdk::Key) -> Option<Key> {
         GK::Insert => Key::Insert,
         GK::Delete => Key::Delete,
         GK::BackSpace => Key::Backspace,
-        GK::Return | GK::KP_Enter => Key::Enter,
+        GK::Return => Key::Enter,
+        GK::KP_0 => Key::NumpadDigit(0),
+        GK::KP_1 => Key::NumpadDigit(1),
+        GK::KP_2 => Key::NumpadDigit(2),
+        GK::KP_3 => Key::NumpadDigit(3),
+        GK::KP_4 => Key::NumpadDigit(4),
+        GK::KP_5 => Key::NumpadDigit(5),
+        GK::KP_6 => Key::NumpadDigit(6),
+        GK::KP_7 => Key::NumpadDigit(7),
+        GK::KP_8 => Key::NumpadDigit(8),
+        GK::KP_9 => Key::NumpadDigit(9),
+        GK::KP_Decimal => Key::NumpadDecimal,
+        GK::KP_Divide => Key::NumpadDivide,
+        GK::KP_Multiply => Key::NumpadMultiply,
+        GK::KP_Subtract => Key::NumpadSubtract,
+        GK::KP_Add => Key::NumpadAdd,
+        GK::KP_Enter => Key::NumpadEnter,
         GK::Tab | GK::ISO_Left_Tab => Key::Tab,
         GK::Escape => Key::Escape,
         GK::F1 => Key::F(1),

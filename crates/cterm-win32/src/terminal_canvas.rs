@@ -5,7 +5,7 @@
 use std::collections::HashMap;
 
 use cterm_core::color::{Color, Rgb};
-use cterm_core::{Cell, CellAttrs, Screen, Selection};
+use cterm_core::{Cell, CellAttrs, CursorStyle, Screen};
 use cterm_ui::theme::Theme;
 use windows::core::{Interface, PCWSTR};
 use windows::Win32::Foundation::{HWND, RECT};
@@ -15,7 +15,8 @@ use windows::Win32::Graphics::Direct2D::Common::{
 };
 use windows::Win32::Graphics::Direct2D::{
     D2D1CreateFactory, ID2D1Factory, ID2D1HwndRenderTarget, ID2D1RenderTarget,
-    ID2D1SolidColorBrush, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE, D2D1_FACTORY_OPTIONS,
+    ID2D1SolidColorBrush, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE,
+    D2D1_BITMAP_INTERPOLATION_MODE_NEAREST_NEIGHBOR, D2D1_BITMAP_PROPERTIES, D2D1_FACTORY_OPTIONS,
     D2D1_FACTORY_TYPE_SINGLE_THREADED, D2D1_FEATURE_LEVEL_DEFAULT,
     D2D1_HWND_RENDER_TARGET_PROPERTIES, D2D1_PRESENT_OPTIONS_NONE, D2D1_RENDER_TARGET_PROPERTIES,
     D2D1_RENDER_TARGET_TYPE_DEFAULT, D2D1_RENDER_TARGET_USAGE_NONE,
@@ -23,8 +24,9 @@ use windows::Win32::Graphics::Direct2D::{
 };
 use windows::Win32::Graphics::DirectWrite::{
     DWriteCreateFactory, IDWriteFactory, IDWriteTextFormat, IDWriteTextLayout,
-    DWRITE_FACTORY_TYPE_SHARED, DWRITE_FONT_STRETCH_NORMAL, DWRITE_FONT_STYLE_NORMAL,
-    DWRITE_FONT_WEIGHT_BOLD, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_TEXT_METRICS,
+    DWRITE_FACTORY_TYPE_SHARED, DWRITE_FONT_STRETCH_NORMAL, DWRITE_FONT_STYLE_ITALIC,
+    DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_WEIGHT_BOLD, DWRITE_FONT_WEIGHT_NORMAL,
+    DWRITE_TEXT_METRICS,
 };
 use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM;
 use windows::Win32::UI::WindowsAndMessaging::GetClientRect;
@@ -56,6 +58,8 @@ pub struct TerminalRenderer {
     render_target: Option<ID2D1HwndRenderTarget>,
     text_format: Option<IDWriteTextFormat>,
     text_format_bold: Option<IDWriteTextFormat>,
+    text_format_italic: Option<IDWriteTextFormat>,
+    text_format_bold_italic: Option<IDWriteTextFormat>,
     cell_dims: CellDimensions,
     font_size: f32,
     font_family: String,
@@ -93,6 +97,8 @@ impl TerminalRenderer {
             render_target: None,
             text_format: None,
             text_format_bold: None,
+            text_format_italic: None,
+            text_format_bold_italic: None,
             cell_dims: CellDimensions::default(),
             font_size,
             font_family: font_family.to_string(),
@@ -172,6 +178,8 @@ impl TerminalRenderer {
 
         let mut text_format = None;
         let mut text_format_bold = None;
+        let mut text_format_italic = None;
+        let mut text_format_bold_italic = None;
 
         for font_family in &font_families {
             let font_family_wide: Vec<u16> = font_family
@@ -179,39 +187,30 @@ impl TerminalRenderer {
                 .chain(std::iter::once(0))
                 .collect();
 
-            // Try to create normal text format
-            let result = unsafe {
+            let create_format = |weight, style| unsafe {
                 self.dwrite_factory.CreateTextFormat(
                     PCWSTR(font_family_wide.as_ptr()),
                     None,
-                    DWRITE_FONT_WEIGHT_NORMAL,
-                    DWRITE_FONT_STYLE_NORMAL,
+                    weight,
+                    style,
                     DWRITE_FONT_STRETCH_NORMAL,
                     scaled_font_size,
                     PCWSTR(locale.as_ptr()),
                 )
             };
 
-            if let Ok(tf) = result {
-                // Also create bold variant
-                let bold_result = unsafe {
-                    self.dwrite_factory.CreateTextFormat(
-                        PCWSTR(font_family_wide.as_ptr()),
-                        None,
-                        DWRITE_FONT_WEIGHT_BOLD,
-                        DWRITE_FONT_STYLE_NORMAL,
-                        DWRITE_FONT_STRETCH_NORMAL,
-                        scaled_font_size,
-                        PCWSTR(locale.as_ptr()),
-                    )
-                };
-
-                if let Ok(tfb) = bold_result {
-                    text_format = Some(tf);
-                    text_format_bold = Some(tfb);
-                    log::info!("Using font: {}", font_family);
-                    break;
-                }
+            if let (Ok(normal), Ok(bold), Ok(italic), Ok(bold_italic)) = (
+                create_format(DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_STYLE_NORMAL),
+                create_format(DWRITE_FONT_WEIGHT_BOLD, DWRITE_FONT_STYLE_NORMAL),
+                create_format(DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_STYLE_ITALIC),
+                create_format(DWRITE_FONT_WEIGHT_BOLD, DWRITE_FONT_STYLE_ITALIC),
+            ) {
+                text_format = Some(normal);
+                text_format_bold = Some(bold);
+                text_format_italic = Some(italic);
+                text_format_bold_italic = Some(bold_italic);
+                log::info!("Using font: {}", font_family);
+                break;
             }
         }
 
@@ -221,6 +220,8 @@ impl TerminalRenderer {
             windows::core::Error::new(windows::core::HRESULT(-1), msg)
         })?;
         let text_format_bold = text_format_bold.unwrap();
+        let text_format_italic = text_format_italic.unwrap();
+        let text_format_bold_italic = text_format_bold_italic.unwrap();
 
         // Measure cell dimensions using 'M' character
         let test_char: Vec<u16> = "M".encode_utf16().collect();
@@ -240,6 +241,8 @@ impl TerminalRenderer {
 
         self.text_format = Some(text_format);
         self.text_format_bold = Some(text_format_bold);
+        self.text_format_italic = Some(text_format_italic);
+        self.text_format_bold_italic = Some(text_format_bold_italic);
 
         Ok(())
     }
@@ -310,27 +313,29 @@ impl TerminalRenderer {
             return Ok(());
         }
 
+        let palette = self.resolved_palette(screen);
+
         // Begin drawing
         unsafe {
             let rt = self.render_target.as_ref().unwrap();
             rt.BeginDraw();
 
             // Clear with background color (use override if set)
-            let bg = self
-                .background_override
-                .as_ref()
-                .unwrap_or(&self.theme.colors.background);
-            let bg_color = rgb_to_d2d_color(*bg);
+            let bg = if screen.modes.reverse_video {
+                palette.foreground
+            } else {
+                palette.background
+            };
+            let bg_color = rgb_to_d2d_color(bg);
             rt.Clear(Some(&bg_color));
         }
 
         // Draw grid cells
         self.draw_grid(screen)?;
 
-        // Draw selection
-        if let Some(selection) = screen.selection.clone() {
-            self.draw_selection(screen, &selection)?;
-        }
+        // Inline images replace their underlying cells and are composited
+        // before the cursor, matching the Cocoa and GTK renderers.
+        self.draw_images(screen)?;
 
         // Draw cursor
         self.draw_cursor(screen)?;
@@ -344,27 +349,90 @@ impl TerminalRenderer {
         Ok(())
     }
 
+    /// Draw decoded SIXEL and other inline images through Direct2D.
+    fn draw_images(&self, screen: &Screen) -> windows::core::Result<()> {
+        let rt = self.render_target.clone().unwrap();
+        let base: ID2D1RenderTarget = rt.cast()?;
+        let bitmap_properties = D2D1_BITMAP_PROPERTIES {
+            pixelFormat: D2D1_PIXEL_FORMAT {
+                format: DXGI_FORMAT_B8G8R8A8_UNORM,
+                alphaMode: D2D1_ALPHA_MODE_PREMULTIPLIED,
+            },
+            dpiX: 96.0,
+            dpiY: 96.0,
+        };
+
+        for image in screen.visible_images() {
+            let Some(visible_row) = screen.image_visible_row(image) else {
+                continue;
+            };
+            let Some(pitch) = image
+                .pixel_width
+                .checked_mul(4)
+                .and_then(|pitch| u32::try_from(pitch).ok())
+            else {
+                log::warn!("Terminal image {} has an invalid Direct2D pitch", image.id);
+                continue;
+            };
+            let Some(pixels) = cterm_ui::rgba_to_premultiplied_bgra(image.data.as_slice()) else {
+                log::warn!("Terminal image {} has invalid RGBA data", image.id);
+                continue;
+            };
+            let Ok(width) = u32::try_from(image.pixel_width) else {
+                log::warn!("Terminal image {} is too wide for Direct2D", image.id);
+                continue;
+            };
+            let Ok(height) = u32::try_from(image.pixel_height) else {
+                log::warn!("Terminal image {} is too tall for Direct2D", image.id);
+                continue;
+            };
+
+            let bitmap = unsafe {
+                base.CreateBitmap(
+                    D2D_SIZE_U { width, height },
+                    Some(pixels.as_ptr().cast()),
+                    pitch,
+                    &bitmap_properties,
+                )?
+            };
+            let x = image.col as f32 * self.cell_dims.width;
+            let y = visible_row as f32 * self.cell_dims.height;
+            let destination = D2D_RECT_F {
+                left: x,
+                top: y,
+                right: x + image.pixel_width as f32,
+                bottom: y + image.pixel_height as f32,
+            };
+
+            unsafe {
+                base.DrawBitmap(
+                    &bitmap,
+                    Some(&destination),
+                    1.0,
+                    D2D1_BITMAP_INTERPOLATION_MODE_NEAREST_NEIGHBOR,
+                    None,
+                );
+            }
+        }
+
+        Ok(())
+    }
+
     /// Draw the terminal grid
     fn draw_grid(&mut self, screen: &Screen) -> windows::core::Result<()> {
         let grid = screen.grid();
-        let scroll_offset = screen.scroll_offset;
         let rows = grid.height();
         let cols = grid.width();
 
         for row in 0..rows {
-            let grid_row = if scroll_offset > 0 {
-                row.saturating_sub(scroll_offset)
-            } else {
-                row
-            };
-
-            if grid_row >= rows {
-                continue;
-            }
+            let absolute_line = screen.visible_row_to_absolute_line(row);
 
             for col in 0..cols {
-                if let Some(cell) = grid.get(grid_row, col) {
-                    self.draw_cell(row, col, cell)?;
+                if let Some(cell) = screen.get_cell_with_scrollback(absolute_line, col) {
+                    if cell.is_wide_spacer() {
+                        continue;
+                    }
+                    self.draw_cell(row, col, absolute_line, cell, screen)?;
                 }
             }
         }
@@ -373,35 +441,60 @@ impl TerminalRenderer {
     }
 
     /// Draw a single cell
-    fn draw_cell(&mut self, row: usize, col: usize, cell: &Cell) -> windows::core::Result<()> {
+    fn draw_cell(
+        &mut self,
+        row: usize,
+        col: usize,
+        absolute_line: usize,
+        cell: &Cell,
+        screen: &Screen,
+    ) -> windows::core::Result<()> {
         let x = col as f32 * self.cell_dims.width;
         let y = row as f32 * self.cell_dims.height;
 
         let attrs = cell.attrs;
-        let (fg, bg) = self.resolve_colors(cell);
+        let is_selected = screen.is_selected(absolute_line, col);
+        let (fg, bg) = self.resolve_colors(cell, screen, screen.modes.reverse_video, is_selected);
+        let palette = self.resolved_palette(screen);
+        let cell_width = if cell.is_wide() {
+            self.cell_dims.width * 2.0
+        } else {
+            self.cell_dims.width
+        };
 
         // Get brushes first (this mutably borrows self temporarily)
-        let bg_brush = if bg != self.theme.colors.background {
+        let canvas_background = if screen.modes.reverse_video {
+            palette.foreground
+        } else {
+            palette.background
+        };
+        let bg_brush = if bg != canvas_background || is_selected {
             Some(self.get_brush(bg)?)
         } else {
             None
         };
 
-        let c = cell.c;
+        let text = cell.text();
         let has_hyperlink = cell.hyperlink.is_some();
-        let needs_fg = c != ' ' && c != '\0'
+        let needs_fg = text != " " && text != "\0"
             || attrs.has_underline()
             || has_hyperlink
-            || attrs.contains(CellAttrs::STRIKETHROUGH);
+            || attrs.intersects(CellAttrs::STRIKETHROUGH | CellAttrs::OVERLINE);
         let fg_brush = if needs_fg {
             Some(self.get_brush(fg)?)
         } else {
             None
         };
 
-        // Separate brush for hyperlink underline (cornflower blue)
-        let hyperlink_brush = if has_hyperlink {
-            Some(self.get_brush(Rgb::new(100, 149, 237))?)
+        let underline_brush = if attrs.has_underline() || has_hyperlink {
+            let color = if has_hyperlink {
+                Rgb::new(100, 149, 237)
+            } else if let Some(color) = cell.underline_color {
+                color.to_rgb(&palette)
+            } else {
+                fg
+            };
+            Some(self.get_brush(color)?)
         } else {
             None
         };
@@ -415,28 +508,31 @@ impl TerminalRenderer {
             let rect = D2D_RECT_F {
                 left: x,
                 top: y,
-                right: x + self.cell_dims.width,
+                right: x + cell_width,
                 bottom: y + self.cell_dims.height,
             };
             unsafe { base.FillRectangle(&rect, brush) };
         }
 
         // Draw character
-        if c != ' ' && c != '\0' {
-            let text_format = if attrs.contains(CellAttrs::BOLD) {
-                self.text_format_bold.as_ref().unwrap()
-            } else {
-                self.text_format.as_ref().unwrap()
+        if text != " " && text != "\0" && !attrs.contains(CellAttrs::HIDDEN) {
+            let text_format = match (
+                attrs.contains(CellAttrs::BOLD),
+                attrs.contains(CellAttrs::ITALIC),
+            ) {
+                (true, true) => self.text_format_bold_italic.as_ref().unwrap(),
+                (true, false) => self.text_format_bold.as_ref().unwrap(),
+                (false, true) => self.text_format_italic.as_ref().unwrap(),
+                (false, false) => self.text_format.as_ref().unwrap(),
             };
 
-            let mut buf = [0u16; 2];
-            let text: &[u16] = c.encode_utf16(&mut buf);
+            let utf16: Vec<u16> = text.encode_utf16().collect();
 
             let layout: IDWriteTextLayout = unsafe {
                 self.dwrite_factory.CreateTextLayout(
-                    text,
+                    &utf16,
                     text_format,
-                    self.cell_dims.width * 2.0, // Allow for wide chars
+                    cell_width,
                     self.cell_dims.height,
                 )?
             };
@@ -453,36 +549,43 @@ impl TerminalRenderer {
         }
 
         // Draw underline (also for hyperlinks)
-        if attrs.has_underline() || has_hyperlink {
+        let visible = !attrs.contains(CellAttrs::HIDDEN);
+        if visible && (attrs.has_underline() || has_hyperlink) {
             let underline_y = y + self.cell_dims.baseline + 2.0;
-            let brush = if has_hyperlink {
-                hyperlink_brush.as_ref().unwrap()
-            } else {
-                fg_brush.as_ref().unwrap()
-            };
+            self.draw_underline_pattern(
+                &base,
+                underline_brush.as_ref().unwrap(),
+                x,
+                x + cell_width,
+                underline_y,
+                attrs,
+            );
+        }
+
+        // Draw strikethrough
+        if visible && attrs.contains(CellAttrs::STRIKETHROUGH) {
+            let strike_y = y + self.cell_dims.height / 2.0;
             unsafe {
                 base.DrawLine(
-                    D2D_POINT_2F { x, y: underline_y },
+                    D2D_POINT_2F { x, y: strike_y },
                     D2D_POINT_2F {
-                        x: x + self.cell_dims.width,
-                        y: underline_y,
+                        x: x + cell_width,
+                        y: strike_y,
                     },
-                    brush,
+                    fg_brush.as_ref().unwrap(),
                     1.0,
                     None,
                 )
             };
         }
 
-        // Draw strikethrough
-        if attrs.contains(CellAttrs::STRIKETHROUGH) {
-            let strike_y = y + self.cell_dims.height / 2.0;
+        if visible && attrs.contains(CellAttrs::OVERLINE) {
             unsafe {
                 base.DrawLine(
-                    D2D_POINT_2F { x, y: strike_y },
+                    D2D_POINT_2F { x, y: y + 1.0 },
                     D2D_POINT_2F {
-                        x: x + self.cell_dims.width,
-                        y: strike_y,
+                        x: x + cell_width,
+                        y: y + 1.0,
                     },
                     fg_brush.as_ref().unwrap(),
                     1.0,
@@ -495,18 +598,26 @@ impl TerminalRenderer {
     }
 
     /// Resolve foreground and background colors from a cell
-    fn resolve_colors(&self, cell: &Cell) -> (Rgb, Rgb) {
-        let palette = &self.theme.colors;
+    fn resolve_colors(
+        &self,
+        cell: &Cell,
+        screen: &Screen,
+        reverse_video: bool,
+        selected: bool,
+    ) -> (Rgb, Rgb) {
+        let palette = self.resolved_palette(screen);
+        let normal_background = palette.background;
 
-        let mut fg = cell.fg.to_rgb(palette);
+        let mut fg = cell.fg.to_rgb(&palette);
         let mut bg = if cell.bg == Color::Default {
-            palette.background
+            normal_background
         } else {
-            cell.bg.to_rgb(palette)
+            cell.bg.to_rgb(&palette)
         };
 
         // Handle inverse
-        if cell.attrs.contains(CellAttrs::INVERSE) {
+        let is_inverted = cell.attrs.contains(CellAttrs::INVERSE) ^ reverse_video ^ selected;
+        if is_inverted {
             std::mem::swap(&mut fg, &mut bg);
         }
 
@@ -516,66 +627,69 @@ impl TerminalRenderer {
         }
 
         // Cornflower blue for hyperlinks with default foreground
-        if cell.hyperlink.is_some()
-            && cell.fg == Color::Default
-            && !cell.attrs.contains(CellAttrs::INVERSE)
-        {
+        if cell.hyperlink.is_some() && cell.fg == Color::Default && !is_inverted {
             fg = Rgb::new(100, 149, 237);
         }
 
         (fg, bg)
     }
 
-    /// Draw selection highlight
-    fn draw_selection(
-        &mut self,
-        screen: &Screen,
-        selection: &Selection,
-    ) -> windows::core::Result<()> {
-        let selection_color = self.theme.colors.selection;
-        let brush = self.get_brush(selection_color)?;
+    fn draw_underline_pattern(
+        &self,
+        target: &ID2D1RenderTarget,
+        brush: &ID2D1SolidColorBrush,
+        start_x: f32,
+        end_x: f32,
+        y: f32,
+        attrs: CellAttrs,
+    ) {
+        let draw_segment = |from_x: f32, from_y: f32, to_x: f32, to_y: f32| unsafe {
+            target.DrawLine(
+                D2D_POINT_2F {
+                    x: from_x,
+                    y: from_y,
+                },
+                D2D_POINT_2F { x: to_x, y: to_y },
+                brush,
+                1.0,
+                None,
+            )
+        };
 
-        let (start, end) = selection.ordered();
-        let rows = screen.grid().height();
-        let cols = screen.grid().width();
-
-        // Clone and cast to parent interface to access methods
-        let rt = self.render_target.clone().unwrap();
-        let base: ID2D1RenderTarget = rt.cast()?;
-
-        for line in start.line..=end.line {
-            if line >= rows {
-                continue;
+        if attrs.contains(CellAttrs::CURLY_UNDERLINE) {
+            let mut x = start_x;
+            let mut rising = true;
+            while x < end_x {
+                let next = (x + 2.0).min(end_x);
+                let next_y = if rising { y - 1.0 } else { y + 1.0 };
+                draw_segment(x, if rising { y + 1.0 } else { y - 1.0 }, next, next_y);
+                rising = !rising;
+                x = next;
             }
-
-            let start_col = if line == start.line { start.col } else { 0 };
-            let end_col = if line == end.line {
-                end.col
-            } else {
-                cols.saturating_sub(1)
-            };
-
-            let x = start_col as f32 * self.cell_dims.width;
-            let y = line as f32 * self.cell_dims.height;
-            let width = ((end_col - start_col + 1) as f32) * self.cell_dims.width;
-
-            let rect = D2D_RECT_F {
-                left: x,
-                top: y,
-                right: x + width,
-                bottom: y + self.cell_dims.height,
-            };
-
-            unsafe { base.FillRectangle(&rect, &brush) };
+        } else if attrs.contains(CellAttrs::DOTTED_UNDERLINE) {
+            let mut x = start_x;
+            while x < end_x {
+                draw_segment(x, y, (x + 1.0).min(end_x), y);
+                x += 3.0;
+            }
+        } else if attrs.contains(CellAttrs::DASHED_UNDERLINE) {
+            let mut x = start_x;
+            while x < end_x {
+                draw_segment(x, y, (x + 4.0).min(end_x), y);
+                x += 6.0;
+            }
+        } else {
+            draw_segment(start_x, y, end_x, y);
+            if attrs.contains(CellAttrs::DOUBLE_UNDERLINE) {
+                draw_segment(start_x, y + 2.0, end_x, y + 2.0);
+            }
         }
-
-        Ok(())
     }
 
     /// Draw the cursor
     fn draw_cursor(&mut self, screen: &Screen) -> windows::core::Result<()> {
         // Check DECTCEM mode for cursor visibility
-        if !screen.modes.show_cursor {
+        if !screen.modes.show_cursor || screen.scroll_offset > 0 {
             return Ok(());
         }
 
@@ -584,14 +698,28 @@ impl TerminalRenderer {
         let x = cursor.col as f32 * self.cell_dims.width;
         let y = cursor.row as f32 * self.cell_dims.height;
 
-        let cursor_color = self.theme.cursor.color;
+        let cursor_color = self.resolved_palette(screen).cursor;
         let brush = self.get_brush(cursor_color)?;
 
-        let rect = D2D_RECT_F {
-            left: x,
-            top: y,
-            right: x + self.cell_dims.width,
-            bottom: y + self.cell_dims.height,
+        let rect = match cursor.style {
+            CursorStyle::Block => D2D_RECT_F {
+                left: x,
+                top: y,
+                right: x + self.cell_dims.width,
+                bottom: y + self.cell_dims.height,
+            },
+            CursorStyle::Underline => D2D_RECT_F {
+                left: x,
+                top: y + self.cell_dims.height - 2.0,
+                right: x + self.cell_dims.width,
+                bottom: y + self.cell_dims.height,
+            },
+            CursorStyle::Bar => D2D_RECT_F {
+                left: x,
+                top: y,
+                right: x + 2.0,
+                bottom: y + self.cell_dims.height,
+            },
         };
 
         // Clone and cast to parent interface to access methods
@@ -603,22 +731,25 @@ impl TerminalRenderer {
             base.FillRectangle(&rect, &brush);
         }
 
-        // Draw the character under cursor with inverted color
+        if cursor.style != CursorStyle::Block {
+            return Ok(());
+        }
+
+        // Draw the character under a block cursor with inverted color.
         let grid = screen.grid();
         if let Some(cell) = grid.get(cursor.row, cursor.col) {
-            let c = cell.c;
+            let text = cell.text();
 
-            if c != ' ' && c != '\0' {
+            if text != " " && text != "\0" && !cell.attrs.contains(CellAttrs::HIDDEN) {
                 let text_color = self.theme.cursor.text_color;
                 let text_brush = self.get_brush(text_color)?;
 
                 let text_format = self.text_format.as_ref().unwrap();
-                let mut buf = [0u16; 2];
-                let text: &[u16] = c.encode_utf16(&mut buf);
+                let utf16: Vec<u16> = text.encode_utf16().collect();
 
                 let layout: IDWriteTextLayout = unsafe {
                     self.dwrite_factory.CreateTextLayout(
-                        text,
+                        &utf16,
                         text_format,
                         self.cell_dims.width * 2.0,
                         self.cell_dims.height,
@@ -633,6 +764,14 @@ impl TerminalRenderer {
         }
 
         Ok(())
+    }
+
+    fn resolved_palette(&self, screen: &Screen) -> cterm_core::ColorPalette {
+        let mut base = self.theme.colors.clone();
+        if let Some(background) = self.background_override {
+            base.background = background;
+        }
+        screen.resolved_palette(&base)
     }
 
     /// Update the theme

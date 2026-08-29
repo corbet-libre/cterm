@@ -104,9 +104,9 @@ fi
 export RUST_LOG=debug
 export CTERM_LOG_FILE="$OUTPUT_DIR/cterm.log"
 
-# Start cterm in background (disable watchdog for CI testing)
+# Start cterm in background
 log "Starting cterm..."
-"$CTERM_PATH" --no-watchdog &
+"$CTERM_PATH" &
 CTERM_PID=$!
 log "Process started with PID: $CTERM_PID"
 
@@ -191,6 +191,14 @@ sleep 1
 
 # Take screenshot after command execution
 take_screenshot "03_after_enter"
+
+# A screenshot artifact alone only proves that screencapture ran. Requiring the
+# terminal window to change after input catches frozen/native-renderer failures.
+if cmp -s "$OUTPUT_DIR/01_startup.png" "$OUTPUT_DIR/03_after_enter.png"; then
+    log "ERROR: Terminal screenshot did not change after command input"
+    exit 1
+fi
+log "Renderer produced a changed frame after command input"
 
 # Type another command
 log "Typing 'ls -la'..."
