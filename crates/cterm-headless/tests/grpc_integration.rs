@@ -2,12 +2,44 @@
 //!
 //! These tests spawn a ctermd server and test the gRPC API.
 
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
 use std::time::Duration;
 
 use cterm_headless::proto::terminal_service_client::TerminalServiceClient;
 use cterm_headless::proto::*;
-use tonic::transport::Channel;
+use tonic::transport::{Channel, Endpoint};
+
+fn ctermd_path() -> std::path::PathBuf {
+    let workspace_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap();
+
+    let debug_path = if cfg!(windows) {
+        workspace_root.join("target/debug/ctermd.exe")
+    } else {
+        workspace_root.join("target/debug/ctermd")
+    };
+    let release_path = if cfg!(windows) {
+        workspace_root.join("target/release/ctermd.exe")
+    } else {
+        workspace_root.join("target/release/ctermd")
+    };
+
+    if debug_path.exists() {
+        debug_path
+    } else if release_path.exists() {
+        release_path
+    } else {
+        panic!(
+            "ctermd binary not found. Tried:\n  {}\n  {}\nPlease build with: cargo build -p cterm-headless",
+            debug_path.display(),
+            release_path.display()
+        );
+    }
+}
 
 /// Helper to find an available port
 fn find_available_port() -> u16 {
@@ -23,45 +55,27 @@ struct CtermdServer {
 
 impl CtermdServer {
     fn spawn() -> Self {
+        Self::spawn_with_identity("cterm")
+    }
+
+    fn spawn_with_identity(identity: &str) -> Self {
         let port = find_available_port();
 
-        // Find the ctermd binary - workspace root is 2 levels up from this crate
-        let workspace_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .unwrap()
-            .parent()
-            .unwrap();
+        let ctermd_path = ctermd_path();
 
-        let debug_path = if cfg!(windows) {
-            workspace_root.join("target/debug/ctermd.exe")
-        } else {
-            workspace_root.join("target/debug/ctermd")
-        };
-
-        let release_path = if cfg!(windows) {
-            workspace_root.join("target/release/ctermd.exe")
-        } else {
-            workspace_root.join("target/release/ctermd")
-        };
-
-        let ctermd_path = if debug_path.exists() {
-            debug_path
-        } else if release_path.exists() {
-            release_path
-        } else {
-            panic!(
-                "ctermd binary not found. Tried:\n  {}\n  {}\nPlease build with: cargo build -p cterm-headless",
-                debug_path.display(),
-                release_path.display()
-            );
-        };
-
-        let child = Command::new(&ctermd_path)
-            .args(["--tcp", "--port", &port.to_string(), "--bind", "127.0.0.1"])
-            .spawn()
-            .unwrap_or_else(|e| {
-                panic!("Failed to spawn ctermd at {}: {}", ctermd_path.display(), e)
-            });
+        let mut command = Command::new(&ctermd_path);
+        command.args([
+            "--tcp",
+            "--port",
+            &port.to_string(),
+            "--bind",
+            "127.0.0.1",
+            "--identity",
+            identity,
+        ]);
+        let child = command.spawn().unwrap_or_else(|e| {
+            panic!("Failed to spawn ctermd at {}: {}", ctermd_path.display(), e)
+        });
 
         // Give the server time to start
         std::thread::sleep(Duration::from_millis(500));
@@ -71,6 +85,227 @@ impl CtermdServer {
 
     fn address(&self) -> String {
         format!("http://127.0.0.1:{}", self.port)
+    }
+}
+
+fn write_auth_file(directory: &Path, byte: u8) -> PathBuf {
+    let path = directory.join(format!("daemon-auth-{byte:02x}"));
+    let secret = format!("{byte:02x}").repeat(32);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        std::fs::set_permissions(directory, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::write(&path, &secret).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+    #[cfg(windows)]
+    {
+        use std::io::Write;
+        use std::os::windows::fs::OpenOptionsExt;
+
+        const FILE_ALL_ACCESS: u32 = 0x001f_01ff;
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .access_mode(FILE_ALL_ACCESS)
+            .open(&path)
+            .unwrap();
+        cterm_proto::set_private_daemon_auth_file_acl(&file).unwrap();
+        file.write_all(secret.as_bytes()).unwrap();
+        file.sync_all().unwrap();
+    }
+    path
+}
+
+#[tokio::test]
+async fn test_handshake_reports_exact_protocol_version_and_daemon_identity() {
+    let server = CtermdServer::spawn_with_identity("managed-integration");
+    let mut client = connect(&server.address()).await;
+    let response = client
+        .handshake(HandshakeRequest {
+            client_id: "integration-test".to_string(),
+            client_version: env!("CARGO_PKG_VERSION").to_string(),
+            protocol_version: cterm_proto::PROTOCOL_VERSION,
+            daemon_auth_challenge: Vec::new(),
+        })
+        .await
+        .expect("handshake failed")
+        .into_inner();
+
+    assert_eq!(response.daemon_version, env!("CARGO_PKG_VERSION"));
+    assert_eq!(response.protocol_version, cterm_proto::PROTOCOL_VERSION);
+    assert_eq!(response.daemon_identity, "managed-integration");
+    assert!(response.daemon_auth_proof.is_empty());
+}
+
+#[tokio::test]
+async fn test_authenticated_handshake_is_fresh_and_does_not_echo_secret() {
+    let directory = tempfile::tempdir().unwrap();
+    let auth_file = write_auth_file(directory.path(), 0x42);
+    let secret = cterm_proto::load_daemon_auth_secret(&auth_file).unwrap();
+    let socket_path = if cfg!(windows) {
+        PathBuf::from(format!(
+            r"\\.\pipe\cterm-auth-proof-{}",
+            uuid::Uuid::new_v4()
+        ))
+    } else {
+        directory.path().join("authenticated.sock")
+    };
+    let _server = LocalCtermdServer::spawn(&socket_path, "managed-integration", Some(&auth_file));
+    let mut client = connect_local_transport(&socket_path).await;
+
+    let first_request = HandshakeRequest {
+        client_id: "integration-test".to_string(),
+        client_version: env!("CARGO_PKG_VERSION").to_string(),
+        protocol_version: cterm_proto::PROTOCOL_VERSION,
+        daemon_auth_challenge: vec![1; cterm_proto::DAEMON_AUTH_CHALLENGE_BYTES],
+    };
+    let first_response = client
+        .handshake(first_request.clone())
+        .await
+        .expect("authenticated handshake failed")
+        .into_inner();
+    assert!(cterm_proto::verify_managed_daemon_auth_proof(
+        &secret,
+        &first_request,
+        &first_response,
+    ));
+    assert_ne!(first_response.daemon_auth_proof, vec![0x42; 32]);
+
+    let second_request = HandshakeRequest {
+        daemon_auth_challenge: vec![2; cterm_proto::DAEMON_AUTH_CHALLENGE_BYTES],
+        ..first_request.clone()
+    };
+    let second_response = client
+        .handshake(second_request.clone())
+        .await
+        .expect("second authenticated handshake failed")
+        .into_inner();
+    assert!(cterm_proto::verify_managed_daemon_auth_proof(
+        &secret,
+        &second_request,
+        &second_response,
+    ));
+    assert!(!cterm_proto::verify_managed_daemon_auth_proof(
+        &secret,
+        &second_request,
+        &first_response,
+    ));
+    assert_ne!(
+        first_response.daemon_auth_proof,
+        second_response.daemon_auth_proof
+    );
+
+    let missing_challenge = HandshakeRequest {
+        daemon_auth_challenge: Vec::new(),
+        ..first_request
+    };
+    assert!(client.handshake(missing_challenge).await.is_err());
+}
+
+#[tokio::test]
+async fn test_managed_daemon_launches_on_the_exact_local_transport() {
+    let temp = tempfile::tempdir().unwrap();
+    let socket_path = if cfg!(windows) {
+        std::path::PathBuf::from(format!(
+            r"\\.\pipe\cterm-managed-integration-{}",
+            uuid::Uuid::new_v4()
+        ))
+    } else {
+        temp.path().join("managed.sock")
+    };
+    let auth_file = write_auth_file(temp.path(), 0x42);
+    let config = cterm_client::ManagedDaemonConfig::new(
+        socket_path.clone(),
+        ctermd_path(),
+        "managed-integration".to_string(),
+        auth_file,
+    )
+    .unwrap();
+
+    let connection = cterm_client::DaemonConnection::connect_managed(&config)
+        .await
+        .expect("managed daemon connection failed");
+    assert_eq!(connection.info().socket_path.as_ref(), Some(&socket_path));
+    assert_eq!(connection.info().daemon_identity, "managed-integration");
+    assert_eq!(
+        connection.info().protocol_version,
+        cterm_proto::PROTOCOL_VERSION
+    );
+    assert_eq!(connection.info().daemon_version, env!("CARGO_PKG_VERSION"));
+
+    let relaunch_error = connection.relaunch_daemon("").await.unwrap_err();
+    assert!(matches!(
+        relaunch_error,
+        cterm_client::ClientError::Grpc(status)
+            if status.code() == tonic::Code::FailedPrecondition
+    ));
+    connection.shutdown(false).await.unwrap();
+}
+
+struct LocalCtermdServer {
+    child: Child,
+}
+
+impl LocalCtermdServer {
+    fn spawn(socket_path: &Path, identity: &str, auth_file: Option<&Path>) -> Self {
+        let mut command = Command::new(ctermd_path());
+        command
+            .arg("--listen")
+            .arg(socket_path)
+            .arg("--foreground")
+            .arg("--identity")
+            .arg(identity);
+        if let Some(path) = auth_file {
+            command.arg("--daemon-auth-file").arg(path);
+        }
+        let child = command.spawn().expect("failed to spawn local ctermd");
+        std::thread::sleep(Duration::from_millis(500));
+        Self { child }
+    }
+}
+
+impl Drop for LocalCtermdServer {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+#[tokio::test]
+async fn test_managed_connection_rejects_wrong_or_missing_server_proof() {
+    for server_secret in [Some(0x11), None] {
+        let directory = tempfile::tempdir().unwrap();
+        let socket_path = if cfg!(windows) {
+            PathBuf::from(format!(
+                r"\\.\pipe\cterm-auth-rejection-{}",
+                uuid::Uuid::new_v4()
+            ))
+        } else {
+            directory.path().join("managed.sock")
+        };
+        let server_auth = server_secret.map(|byte| write_auth_file(directory.path(), byte));
+        let client_auth = write_auth_file(directory.path(), 0x42);
+        let _server =
+            LocalCtermdServer::spawn(&socket_path, "managed-integration", server_auth.as_deref());
+        let config = cterm_client::ManagedDaemonConfig::new(
+            socket_path,
+            ctermd_path(),
+            "managed-integration".to_string(),
+            client_auth,
+        )
+        .unwrap();
+
+        let error = match cterm_client::DaemonConnection::connect_managed(&config).await {
+            Ok(_) => panic!("managed connection accepted an invalid server proof"),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            error,
+            cterm_client::ClientError::DaemonAuthenticationFailed
+        ));
     }
 }
 
@@ -94,6 +329,44 @@ async fn connect(addr: &str) -> TerminalServiceClient<Channel> {
         }
     }
     unreachable!()
+}
+
+async fn connect_local_transport(path: &Path) -> TerminalServiceClient<Channel> {
+    let endpoint = Endpoint::try_from("http://[::]:50051").unwrap();
+
+    #[cfg(unix)]
+    let channel = {
+        let path = path.to_owned();
+        endpoint
+            .connect_with_connector(tower::service_fn(move |_| {
+                let path = path.clone();
+                async move {
+                    tokio::net::UnixStream::connect(path)
+                        .await
+                        .map(hyper_util::rt::TokioIo::new)
+                }
+            }))
+            .await
+            .unwrap()
+    };
+
+    #[cfg(windows)]
+    let channel = {
+        let name = path.to_string_lossy().into_owned();
+        endpoint
+            .connect_with_connector(tower::service_fn(move |_| {
+                let name = name.clone();
+                async move {
+                    tokio::net::windows::named_pipe::ClientOptions::new()
+                        .open(&name)
+                        .map(hyper_util::rt::TokioIo::new)
+                }
+            }))
+            .await
+            .unwrap()
+    };
+
+    TerminalServiceClient::new(channel)
 }
 
 #[tokio::test]

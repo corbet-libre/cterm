@@ -10,7 +10,11 @@ async fn main() -> anyhow::Result<()> {
 
     // Handle --print-socket-path: print and exit
     if cli.print_socket_path {
-        let path = cterm_headless::cli::default_socket_path();
+        let path = cli
+            .socket_path
+            .as_ref()
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(cterm_headless::cli::default_socket_path);
         println!("{}", path.display());
         return Ok(());
     }
@@ -25,7 +29,9 @@ async fn main() -> anyhow::Result<()> {
     log::info!("ctermd starting...");
 
     let relaunch_state_path = cli.relaunch_state.clone();
-    let config = cli.to_server_config();
+    let config = cli
+        .to_server_config()
+        .map_err(|error| anyhow::anyhow!(error))?;
 
     // Daemonize if not running in foreground and not using TCP
     #[cfg(unix)]

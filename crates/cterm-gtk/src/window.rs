@@ -74,6 +74,15 @@ fn show_upgrade_error_dialog(window: &ApplicationWindow, error: &dyn std::fmt::D
     dialog.present();
 }
 
+fn reject_managed_secondary_action(action: &str) -> bool {
+    if crate::get_args().managed {
+        log::warn!("Ignoring {action} request in managed mode");
+        true
+    } else {
+        false
+    }
+}
+
 impl CtermWindow {
     /// Create a new window
     pub fn new(app: &Application, config: &Config, theme: &Theme) -> Self {
@@ -97,12 +106,17 @@ impl CtermWindow {
         let main_box = GtkBox::new(Orientation::Vertical, 0);
 
         // Create menu bar
-        let menu_model = menu::create_menu_model_with_options(config.general.show_debug_menu);
+        let menu_model = menu::create_menu_model_with_options(
+            config.general.show_debug_menu,
+            crate::get_args().updater_enabled(),
+            crate::get_args().managed,
+        );
         let menu_bar = PopoverMenuBar::from_model(Some(&menu_model));
         main_box.append(&menu_bar);
 
         // Create tab bar
         let tab_bar = TabBar::new();
+        tab_bar.set_new_tab_visible(!crate::get_args().managed);
         main_box.append(tab_bar.widget());
 
         // Create notification bar for file transfers (initially hidden)
@@ -206,11 +220,16 @@ impl CtermWindow {
 
         let main_box = GtkBox::new(Orientation::Vertical, 0);
 
-        let menu_model = menu::create_menu_model_with_options(config.general.show_debug_menu);
+        let menu_model = menu::create_menu_model_with_options(
+            config.general.show_debug_menu,
+            crate::get_args().updater_enabled(),
+            crate::get_args().managed,
+        );
         let menu_bar = PopoverMenuBar::from_model(Some(&menu_model));
         main_box.append(&menu_bar);
 
         let tab_bar = TabBar::new();
+        tab_bar.set_new_tab_visible(!crate::get_args().managed);
         main_box.append(tab_bar.widget());
 
         let notification_bar = NotificationBar::new();
@@ -327,6 +346,9 @@ impl CtermWindow {
             let notification_bar = self.notification_bar.clone();
             let action = gio::SimpleAction::new("new-tab", None);
             action.connect_activate(move |_, _| {
+                if reject_managed_secondary_action("new tab") {
+                    return;
+                }
                 // Get info from the active terminal
                 let (cwd, daemon_socket) = {
                     let tabs_borrow = tabs.borrow();
@@ -367,6 +389,9 @@ impl CtermWindow {
             let theme = theme.clone();
             let action = gio::SimpleAction::new("new-window", None);
             action.connect_activate(move |_, _| {
+                if reject_managed_secondary_action("new window") {
+                    return;
+                }
                 let cfg = config.borrow();
                 if let Some(gtk_app) = app.downcast_ref::<Application>() {
                     let new_win = CtermWindow::new(gtk_app, &cfg, &theme);
@@ -415,6 +440,9 @@ impl CtermWindow {
             let quick_open = self.quick_open.clone();
             let action = gio::SimpleAction::new("quick-open", None);
             action.connect_activate(move |_, _| {
+                if reject_managed_secondary_action("quick open") {
+                    return;
+                }
                 // Load templates and show overlay
                 let templates = cterm_app::config::load_sticky_tabs().unwrap_or_default();
                 quick_open.set_templates(templates);
@@ -437,6 +465,9 @@ impl CtermWindow {
             let notification_bar = self.notification_bar.clone();
             let action = gio::SimpleAction::new("docker-picker", None);
             action.connect_activate(move |_, _| {
+                if reject_managed_secondary_action("Docker terminal") {
+                    return;
+                }
                 let notebook = notebook.clone();
                 let tabs = Rc::clone(&tabs);
                 let next_tab_id = Rc::clone(&next_tab_id);
@@ -499,6 +530,9 @@ impl CtermWindow {
             let notification_bar = self.notification_bar.clone();
             let action = gio::SimpleAction::new("attach-session", None);
             action.connect_activate(move |_, _| {
+                if reject_managed_secondary_action("session attach") {
+                    return;
+                }
                 let notebook = notebook.clone();
                 let tabs = Rc::clone(&tabs);
                 let next_tab_id = Rc::clone(&next_tab_id);
@@ -543,6 +577,9 @@ impl CtermWindow {
             let notification_bar = self.notification_bar.clone();
             let action = gio::SimpleAction::new("ssh-connect", None);
             action.connect_activate(move |_, _| {
+                if reject_managed_secondary_action("SSH session") {
+                    return;
+                }
                 let notebook = notebook.clone();
                 let tabs = Rc::clone(&tabs);
                 let next_tab_id = Rc::clone(&next_tab_id);
@@ -627,6 +664,9 @@ impl CtermWindow {
             let window_clone = window.clone();
             let action = gio::SimpleAction::new("manage-remotes", None);
             action.connect_activate(move |_, _| {
+                if reject_managed_secondary_action("remote management") {
+                    return;
+                }
                 crate::remotes_dialog::show_remotes_dialog(&window_clone, || {
                     log::info!("Remotes configuration saved");
                 });
@@ -960,6 +1000,9 @@ impl CtermWindow {
                 Some(&glib::VariantType::new("s").unwrap()),
             );
             action.connect_activate(move |_, param| {
+                if reject_managed_secondary_action("tool shortcut") {
+                    return;
+                }
                 if let Some(idx_str) = param.and_then(|p| p.get::<String>()) {
                     if let Ok(idx) = idx_str.parse::<usize>() {
                         if let Ok(shortcuts) = cterm_app::config::load_tool_shortcuts() {
@@ -1012,6 +1055,9 @@ impl CtermWindow {
             let menu_bar_clone = menu_bar.clone();
             let action = gio::SimpleAction::new("preferences", None);
             action.connect_activate(move |_, _| {
+                if reject_managed_secondary_action("preferences") {
+                    return;
+                }
                 let cfg = config.borrow().clone();
                 let config_for_save = Rc::clone(&config);
                 let menu_bar = menu_bar_clone.clone();
@@ -1024,7 +1070,12 @@ impl CtermWindow {
                         log::info!("Configuration saved to disk");
                     }
                     // Rebuild menu bar to reflect debug menu preference
-                    menu::rebuild_menu_bar(&menu_bar, new_config.general.show_debug_menu);
+                    menu::rebuild_menu_bar(
+                        &menu_bar,
+                        new_config.general.show_debug_menu,
+                        crate::get_args().updater_enabled(),
+                        crate::get_args().managed,
+                    );
                     // Update internal config state
                     *config_for_save.borrow_mut() = new_config;
                 });
@@ -1033,7 +1084,7 @@ impl CtermWindow {
         }
 
         // Check for updates action
-        {
+        if crate::get_args().updater_enabled() {
             let window_clone = window.clone();
             let action = gio::SimpleAction::new("check-updates", None);
             action.connect_activate(move |_, _| {
@@ -1043,7 +1094,7 @@ impl CtermWindow {
         }
 
         // Execute upgrade action (called from update dialog)
-        {
+        if crate::get_args().updater_enabled() {
             let tabs = Rc::clone(&tabs);
             let window_clone = window.clone();
             let notebook_upgrade = notebook.clone();
@@ -1147,6 +1198,9 @@ impl CtermWindow {
             let remote_manager = self.remote_manager.clone();
             let action = gio::SimpleAction::new("tab-templates", None);
             action.connect_activate(move |_, _| {
+                if reject_managed_secondary_action("tab templates") {
+                    return;
+                }
                 let notebook = notebook.clone();
                 let tabs = Rc::clone(&tabs);
                 let next_tab_id = Rc::clone(&next_tab_id);
@@ -1201,6 +1255,10 @@ impl CtermWindow {
             let window_clone = window.clone();
             let action = gio::SimpleAction::new("debug-relaunch", None);
             action.connect_activate(move |_, _| {
+                if !crate::get_args().updater_enabled() {
+                    log::warn!("Ignoring debug relaunch request in managed mode");
+                    return;
+                }
                 log::info!("Debug: Re-launching cterm for seamless upgrade test");
 
                 // Use the executable path captured at startup (immune to binary replacement)
@@ -1233,6 +1291,10 @@ impl CtermWindow {
             // Re-launch ctermd - trigger daemon exec-in-place relaunch
             let action = gio::SimpleAction::new("debug-relaunch-daemon", None);
             action.connect_activate(move |_, _| {
+                if !crate::get_args().updater_enabled() {
+                    log::warn!("Ignoring debug daemon relaunch request in managed mode");
+                    return;
+                }
                 log::info!("Debug: Requesting ctermd relaunch");
                 std::thread::spawn(|| {
                     let rt = tokio::runtime::Builder::new_current_thread()
@@ -1273,6 +1335,10 @@ impl CtermWindow {
             // Kill Local ctermd - force shutdown the local daemon
             let action = gio::SimpleAction::new("debug-kill-daemon", None);
             action.connect_activate(move |_, _| {
+                if !crate::get_args().updater_enabled() {
+                    log::warn!("Ignoring debug daemon shutdown request in managed mode");
+                    return;
+                }
                 log::info!("Debug: Requesting ctermd force shutdown");
                 std::thread::spawn(|| {
                     let rt = tokio::runtime::Builder::new_current_thread()
@@ -1382,6 +1448,9 @@ impl CtermWindow {
                 if let Some(action) = shortcuts.match_event(key, modifiers) {
                     match action {
                         Action::NewTab => {
+                            if reject_managed_secondary_action("new-tab shortcut") {
+                                return glib::Propagation::Stop;
+                            }
                             let (cwd, daemon_socket) = {
                                 let tabs_borrow = tabs.borrow();
                                 if let Some(page_idx) = notebook.current_page() {
@@ -1820,6 +1889,9 @@ impl CtermWindow {
         let remote_manager = self.remote_manager.clone();
 
         self.quick_open.set_on_select(move |template| {
+            if reject_managed_secondary_action("quick-open selection") {
+                return;
+            }
             create_tab_from_template(
                 &notebook,
                 &tabs,
@@ -1853,6 +1925,9 @@ impl CtermWindow {
 
         // New tab button
         self.tab_bar.set_on_new_tab(move || {
+            if reject_managed_secondary_action("new-tab button") {
+                return;
+            }
             // Get info from the active terminal
             let (cwd, daemon_socket) = {
                 let tabs_borrow = tabs.borrow();
@@ -2075,6 +2150,9 @@ impl CtermWindow {
 
     /// Create a new tab
     pub fn new_tab(&self) {
+        if reject_managed_secondary_action("new tab") {
+            return;
+        }
         create_new_tab(
             &self.notebook,
             &self.tabs,

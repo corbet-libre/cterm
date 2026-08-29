@@ -105,11 +105,101 @@ fi
 pub struct DaemonInfo {
     pub daemon_id: String,
     pub daemon_version: String,
+    pub protocol_version: u32,
+    pub daemon_identity: String,
     pub hostname: String,
     pub is_local: bool,
     /// Socket path used for this connection (allows reconnecting from a different runtime).
     /// Set for Unix socket and SSH-tunneled connections; None for TCP.
     pub socket_path: Option<PathBuf>,
+}
+
+/// Exact local-daemon contract for an embedded or managed cterm product.
+///
+/// Unlike the default desktop mode, this never searches `PATH`, requires a
+/// stable daemon identity, and requires the UI and daemon package versions to
+/// match exactly in addition to the wire protocol version.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ManagedDaemonConfig {
+    pub socket_path: PathBuf,
+    pub executable: PathBuf,
+    pub identity: String,
+    pub auth_file: PathBuf,
+    auth_secret: cterm_proto::DaemonAuthSecret,
+}
+
+impl ManagedDaemonConfig {
+    pub fn new(
+        socket_path: PathBuf,
+        executable: PathBuf,
+        identity: String,
+        auth_file: PathBuf,
+    ) -> std::result::Result<Self, String> {
+        if socket_path.as_os_str().is_empty() {
+            return Err("managed daemon socket cannot be empty".to_string());
+        }
+        if socket_path.to_str().is_none() {
+            return Err("managed daemon socket must be valid Unicode".to_string());
+        }
+        if !executable.is_absolute() {
+            return Err("managed daemon executable must resolve to an absolute path".to_string());
+        }
+        if !executable.is_file() {
+            return Err(format!(
+                "managed daemon executable does not exist: {}",
+                executable.display()
+            ));
+        }
+        if identity.is_empty()
+            || identity.len() > 128
+            || !identity
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+        {
+            return Err(
+                "managed daemon identity must be 1-128 ASCII letters, digits, '.', '_' or '-'"
+                    .to_string(),
+            );
+        }
+        #[cfg(windows)]
+        if !socket_path.to_string_lossy().starts_with(r"\\.\pipe\") {
+            return Err("managed Windows daemon socket must be \\\\.\\pipe\\...".to_string());
+        }
+        #[cfg(unix)]
+        if !socket_path.is_absolute() {
+            return Err("managed daemon socket must be an absolute path".to_string());
+        }
+        let auth_secret = cterm_proto::load_daemon_auth_secret(&auth_file).map_err(|error| {
+            format!(
+                "invalid managed daemon authentication file {}: {error}",
+                auth_file.display()
+            )
+        })?;
+
+        Ok(Self {
+            socket_path,
+            executable,
+            identity,
+            auth_file,
+            auth_secret,
+        })
+    }
+}
+
+static MANAGED_DAEMON: std::sync::OnceLock<ManagedDaemonConfig> = std::sync::OnceLock::new();
+
+/// Install the process-wide local-daemon contract before any UI connection.
+pub fn configure_managed_daemon(config: ManagedDaemonConfig) -> std::result::Result<(), String> {
+    if let Some(existing) = MANAGED_DAEMON.get() {
+        return if existing == &config {
+            Ok(())
+        } else {
+            Err("managed daemon was already configured differently".to_string())
+        };
+    }
+    MANAGED_DAEMON
+        .set(config)
+        .map_err(|_| "managed daemon was already configured".to_string())
 }
 
 /// Handle for a native (puressh) SSH tunnel. Allows another part of the app
@@ -169,8 +259,16 @@ impl DaemonConnection {
     ///
     /// On Unix, connects via Unix socket. On Windows, connects via named pipe.
     pub async fn connect_local() -> Result<Self> {
+        if let Some(config) = MANAGED_DAEMON.get() {
+            return Self::connect_managed(config).await;
+        }
         let socket_path = socket::default_socket_path();
         Self::connect_unix(&socket_path, true).await
+    }
+
+    /// Connect using an exact managed-product daemon contract.
+    pub async fn connect_managed(config: &ManagedDaemonConfig) -> Result<Self> {
+        Self::connect_path(&config.socket_path, true, Some(config)).await
     }
 
     /// Connect to ctermd via a specific socket/pipe path.
@@ -187,22 +285,42 @@ impl DaemonConnection {
             return Self::connect_via_ssh(socket_path, opener).await;
         }
 
+        let managed = MANAGED_DAEMON
+            .get()
+            .filter(|config| config.socket_path == socket_path);
+        Self::connect_path(socket_path, auto_start, managed).await
+    }
+
+    async fn connect_path(
+        socket_path: &Path,
+        auto_start: bool,
+        managed: Option<&ManagedDaemonConfig>,
+    ) -> Result<Self> {
         // Try connecting first
-        match Self::try_connect(socket_path).await {
+        match Self::try_connect(socket_path, managed).await {
             Ok(conn) => Ok(conn),
             // A wedged daemon (socket exists and accepts connections, but never answers
             // the handshake) must NOT trigger auto-start: spawning a second ctermd would
             // just fail to bind the same socket and exit, and we'd keep retrying against
             // the wedged one. Surface it immediately so the UI can report it.
-            Err(e @ ClientError::DaemonUnresponsive(_)) => Err(e),
+            Err(e @ ClientError::DaemonUnresponsive(_))
+            | Err(e @ ClientError::VersionMismatch { .. })
+            | Err(e @ ClientError::ProtocolMismatch { .. })
+            | Err(e @ ClientError::DaemonIdentityMismatch { .. })
+            | Err(e @ ClientError::DaemonAuthenticationFailed) => Err(e),
             Err(_) if auto_start => {
                 // Try to start the daemon
-                Self::start_daemon(socket_path)?;
+                Self::start_daemon(socket_path, managed)?;
                 // Retry connection with backoff
                 for i in 0..20 {
                     tokio::time::sleep(std::time::Duration::from_millis(100 * (i + 1))).await;
-                    if let Ok(conn) = Self::try_connect(socket_path).await {
-                        return Ok(conn);
+                    match Self::try_connect(socket_path, managed).await {
+                        Ok(conn) => return Ok(conn),
+                        Err(e @ ClientError::VersionMismatch { .. })
+                        | Err(e @ ClientError::ProtocolMismatch { .. })
+                        | Err(e @ ClientError::DaemonIdentityMismatch { .. })
+                        | Err(e @ ClientError::DaemonAuthenticationFailed) => return Err(e),
+                        Err(_) => {}
                     }
                 }
                 Err(ClientError::DaemonNotRunning(
@@ -220,7 +338,7 @@ impl DaemonConnection {
             .connect()
             .await?;
 
-        Self::handshake(channel, None).await
+        Self::handshake(channel, None, None).await
     }
 
     /// Connect to a remote ctermd via SSH socket forwarding.
@@ -364,24 +482,30 @@ impl DaemonConnection {
                     CONNECT_TIMEOUT.as_secs()
                 ))
             })??;
-        Self::handshake(channel, Some(key.to_owned())).await
+        Self::handshake(channel, Some(key.to_owned()), None).await
     }
 
     /// Try to connect to the daemon at the given path (platform-dispatched).
-    async fn try_connect(socket_path: &Path) -> Result<Self> {
+    async fn try_connect(
+        socket_path: &Path,
+        managed: Option<&ManagedDaemonConfig>,
+    ) -> Result<Self> {
         #[cfg(unix)]
         {
-            Self::try_connect_unix(socket_path).await
+            Self::try_connect_unix(socket_path, managed).await
         }
         #[cfg(windows)]
         {
-            Self::try_connect_named_pipe(socket_path).await
+            Self::try_connect_named_pipe(socket_path, managed).await
         }
     }
 
     /// Try to connect to an existing Unix socket
     #[cfg(unix)]
-    async fn try_connect_unix(socket_path: &Path) -> Result<Self> {
+    async fn try_connect_unix(
+        socket_path: &Path,
+        managed: Option<&ManagedDaemonConfig>,
+    ) -> Result<Self> {
         if !socket_path.exists() {
             return Err(ClientError::Connection(format!(
                 "Socket not found: {}",
@@ -409,12 +533,15 @@ impl DaemonConnection {
                 ))
             })??;
 
-        Self::handshake(channel, Some(socket_path.to_owned())).await
+        Self::handshake(channel, Some(socket_path.to_owned()), managed).await
     }
 
     /// Try to connect to an existing named pipe (Windows)
     #[cfg(windows)]
-    async fn try_connect_named_pipe(pipe_path: &Path) -> Result<Self> {
+    async fn try_connect_named_pipe(
+        pipe_path: &Path,
+        managed: Option<&ManagedDaemonConfig>,
+    ) -> Result<Self> {
         let pipe_name = pipe_path.to_string_lossy().to_string();
         let endpoint = tonic::transport::Endpoint::try_from("http://[::]:0")
             .map_err(|e| ClientError::Connection(e.to_string()))?;
@@ -435,34 +562,49 @@ impl DaemonConnection {
                     CONNECT_TIMEOUT.as_secs()
                 ))
             })??;
-        Self::handshake(channel, Some(pipe_path.to_owned())).await
+        Self::handshake(channel, Some(pipe_path.to_owned()), managed).await
     }
 
     /// Perform the initial handshake with the daemon
-    async fn handshake(channel: Channel, socket_path: Option<PathBuf>) -> Result<Self> {
+    async fn handshake(
+        channel: Channel,
+        socket_path: Option<PathBuf>,
+        managed: Option<&ManagedDaemonConfig>,
+    ) -> Result<Self> {
         let mut client =
             TerminalServiceClient::new(channel).max_decoding_message_size(64 * 1024 * 1024);
 
-        let response = tokio::time::timeout(
-            HANDSHAKE_TIMEOUT,
-            client.handshake(HandshakeRequest {
-                client_id: uuid::Uuid::new_v4().to_string(),
-                client_version: env!("CARGO_PKG_VERSION").to_string(),
-                protocol_version: 1,
-            }),
-        )
-        .await
-        .map_err(|_| {
-            ClientError::DaemonUnresponsive(format!(
-                "handshake timed out after {}s",
-                HANDSHAKE_TIMEOUT.as_secs()
-            ))
-        })??;
+        let mut daemon_auth_challenge = Vec::new();
+        if managed.is_some() {
+            daemon_auth_challenge.resize(cterm_proto::DAEMON_AUTH_CHALLENGE_BYTES, 0);
+            getrandom::fill(&mut daemon_auth_challenge).map_err(|error| {
+                ClientError::Connection(format!(
+                    "cannot generate managed daemon authentication challenge: {error}"
+                ))
+            })?;
+        }
+        let request = HandshakeRequest {
+            client_id: uuid::Uuid::new_v4().to_string(),
+            client_version: env!("CARGO_PKG_VERSION").to_string(),
+            protocol_version: cterm_proto::PROTOCOL_VERSION,
+            daemon_auth_challenge,
+        };
+        let response = tokio::time::timeout(HANDSHAKE_TIMEOUT, client.handshake(request.clone()))
+            .await
+            .map_err(|_| {
+                ClientError::DaemonUnresponsive(format!(
+                    "handshake timed out after {}s",
+                    HANDSHAKE_TIMEOUT.as_secs()
+                ))
+            })??;
 
         let resp = response.into_inner();
+        Self::verify_handshake(&request, &resp, managed)?;
         let info = DaemonInfo {
             daemon_id: resp.daemon_id,
             daemon_version: resp.daemon_version,
+            protocol_version: resp.protocol_version,
+            daemon_identity: resp.daemon_identity,
             hostname: resp.hostname,
             is_local: resp.is_local,
             socket_path,
@@ -481,14 +623,64 @@ impl DaemonConnection {
         })
     }
 
+    fn verify_handshake(
+        request: &HandshakeRequest,
+        response: &HandshakeResponse,
+        managed: Option<&ManagedDaemonConfig>,
+    ) -> Result<()> {
+        if response.protocol_version != cterm_proto::PROTOCOL_VERSION {
+            return Err(ClientError::ProtocolMismatch {
+                daemon: response.protocol_version,
+                client: cterm_proto::PROTOCOL_VERSION,
+            });
+        }
+
+        if let Some(config) = managed {
+            let client_version = env!("CARGO_PKG_VERSION");
+            if response.daemon_version != client_version {
+                return Err(ClientError::VersionMismatch {
+                    daemon: response.daemon_version.clone(),
+                    client: client_version.to_string(),
+                });
+            }
+            if response.daemon_identity != config.identity {
+                return Err(ClientError::DaemonIdentityMismatch {
+                    expected: config.identity.clone(),
+                    actual: response.daemon_identity.clone(),
+                });
+            }
+            if request.daemon_auth_challenge.len() != cterm_proto::DAEMON_AUTH_CHALLENGE_BYTES
+                || !cterm_proto::verify_managed_daemon_auth_proof(
+                    &config.auth_secret,
+                    request,
+                    response,
+                )
+            {
+                return Err(ClientError::DaemonAuthenticationFailed);
+            }
+        }
+
+        Ok(())
+    }
+
     /// Start a local ctermd daemon process
-    fn start_daemon(socket_path: &Path) -> Result<()> {
-        let ctermd = Self::find_ctermd()?;
+    fn start_daemon(socket_path: &Path, managed: Option<&ManagedDaemonConfig>) -> Result<()> {
+        let mut command = Self::daemon_command(socket_path, managed)?;
+        let ctermd = command.get_program().to_owned();
 
-        log::info!("Starting ctermd: {}", ctermd.display());
+        log::info!("Starting ctermd: {}", Path::new(&ctermd).display());
 
-        Command::new(&ctermd)
-            .args(["--listen", &socket_path.to_string_lossy(), "--foreground"])
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+
+            // cterm is a GUI-subsystem application on Windows. Without this
+            // flag, starting the console-subsystem daemon opens an unrelated
+            // console window alongside the managed terminal window.
+            command.creation_flags(windows_sys::Win32::System::Threading::CREATE_NO_WINDOW);
+        }
+
+        command
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
@@ -496,12 +688,30 @@ impl DaemonConnection {
             .map_err(|e| {
                 ClientError::DaemonNotRunning(format!(
                     "Failed to spawn {}: {}",
-                    ctermd.display(),
+                    Path::new(&ctermd).display(),
                     e
                 ))
             })?;
 
         Ok(())
+    }
+
+    fn daemon_command(
+        socket_path: &Path,
+        managed: Option<&ManagedDaemonConfig>,
+    ) -> Result<Command> {
+        let ctermd = match managed {
+            Some(config) => config.executable.clone(),
+            None => Self::find_ctermd()?,
+        };
+
+        let mut command = Command::new(&ctermd);
+        command.arg("--listen").arg(socket_path).arg("--foreground");
+        if let Some(config) = managed {
+            command.args(["--identity", &config.identity]);
+            command.arg("--daemon-auth-file").arg(&config.auth_file);
+        }
+        Ok(command)
     }
 
     /// Find the ctermd binary
@@ -855,5 +1065,180 @@ impl tokio::io::AsyncWrite for SshChannelIo {
         _cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<std::io::Result<()>> {
         std::task::Poll::Ready(Ok(()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn write_auth_file(directory: &Path, byte: u8) -> PathBuf {
+        let path = directory.join("daemon-auth");
+        let secret = format!("{byte:02x}").repeat(32);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            std::fs::write(&path, &secret).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        #[cfg(windows)]
+        {
+            use std::io::Write;
+            use std::os::windows::fs::OpenOptionsExt;
+
+            const FILE_ALL_ACCESS: u32 = 0x001f_01ff;
+            let mut file = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create_new(true)
+                .access_mode(FILE_ALL_ACCESS)
+                .open(&path)
+                .unwrap();
+            cterm_proto::set_private_daemon_auth_file_acl(&file).unwrap();
+            file.write_all(secret.as_bytes()).unwrap();
+        }
+        path
+    }
+
+    fn managed_config(identity: &str) -> (tempfile::TempDir, ManagedDaemonConfig) {
+        let dir = tempfile::tempdir().unwrap();
+        let executable = dir.path().join(if cfg!(windows) {
+            "ctermd.exe"
+        } else {
+            "ctermd"
+        });
+        std::fs::write(&executable, b"test daemon").unwrap();
+        let socket_path = if cfg!(windows) {
+            PathBuf::from(r"\\.\pipe\cterm-test-managed")
+        } else {
+            dir.path().join("ctermd.sock")
+        };
+        let auth_file = write_auth_file(dir.path(), 0x42);
+        let config =
+            ManagedDaemonConfig::new(socket_path, executable, identity.to_string(), auth_file)
+                .expect("valid managed config");
+        (dir, config)
+    }
+
+    fn handshake_request(challenge: u8) -> HandshakeRequest {
+        HandshakeRequest {
+            client_id: "client".to_string(),
+            client_version: env!("CARGO_PKG_VERSION").to_string(),
+            protocol_version: cterm_proto::PROTOCOL_VERSION,
+            daemon_auth_challenge: vec![challenge; cterm_proto::DAEMON_AUTH_CHALLENGE_BYTES],
+        }
+    }
+
+    fn handshake(
+        config: &ManagedDaemonConfig,
+        request: &HandshakeRequest,
+        identity: &str,
+    ) -> HandshakeResponse {
+        let mut response = HandshakeResponse {
+            daemon_id: "instance".to_string(),
+            daemon_version: env!("CARGO_PKG_VERSION").to_string(),
+            is_local: true,
+            hostname: "localhost".to_string(),
+            protocol_version: cterm_proto::PROTOCOL_VERSION,
+            daemon_identity: identity.to_string(),
+            daemon_auth_proof: Vec::new(),
+        };
+        response.daemon_auth_proof =
+            cterm_proto::managed_daemon_auth_proof(&config.auth_secret, request, &response);
+        response
+    }
+
+    #[test]
+    fn managed_command_uses_only_the_exact_executable_endpoint_and_identity() {
+        let (_dir, config) = managed_config("product-alpha");
+        let command = DaemonConnection::daemon_command(&config.socket_path, Some(&config)).unwrap();
+        let args: Vec<_> = command.get_args().map(|arg| arg.to_owned()).collect();
+
+        assert_eq!(command.get_program(), config.executable.as_os_str());
+        assert_eq!(
+            args,
+            [
+                "--listen".into(),
+                config.socket_path.as_os_str().to_owned(),
+                "--foreground".into(),
+                "--identity".into(),
+                "product-alpha".into(),
+                "--daemon-auth-file".into(),
+                config.auth_file.as_os_str().to_owned(),
+            ]
+        );
+        let secret = "42".repeat(32);
+        assert!(!args.iter().any(|argument| argument == secret.as_str()));
+    }
+
+    #[test]
+    fn managed_handshake_requires_exact_protocol_version_and_identity() {
+        let (_dir, config) = managed_config("product-alpha");
+        let request = handshake_request(1);
+        assert!(DaemonConnection::verify_handshake(
+            &request,
+            &handshake(&config, &request, "product-alpha"),
+            Some(&config),
+        )
+        .is_ok());
+
+        let mut wrong_protocol = handshake(&config, &request, "product-alpha");
+        wrong_protocol.protocol_version += 1;
+        assert!(matches!(
+            DaemonConnection::verify_handshake(&request, &wrong_protocol, Some(&config)),
+            Err(ClientError::ProtocolMismatch { .. })
+        ));
+
+        let mut wrong_version = handshake(&config, &request, "product-alpha");
+        wrong_version.daemon_version = "0.0.0".to_string();
+        assert!(matches!(
+            DaemonConnection::verify_handshake(&request, &wrong_version, Some(&config)),
+            Err(ClientError::VersionMismatch { .. })
+        ));
+
+        assert!(matches!(
+            DaemonConnection::verify_handshake(
+                &request,
+                &handshake(&config, &request, "other-product"),
+                Some(&config),
+            ),
+            Err(ClientError::DaemonIdentityMismatch { .. })
+        ));
+
+        let replayed = handshake(&config, &request, "product-alpha");
+        let next_request = handshake_request(2);
+        assert!(matches!(
+            DaemonConnection::verify_handshake(&next_request, &replayed, Some(&config)),
+            Err(ClientError::DaemonAuthenticationFailed)
+        ));
+
+        let mut missing_proof = handshake(&config, &request, "product-alpha");
+        missing_proof.daemon_auth_proof.clear();
+        assert!(matches!(
+            DaemonConnection::verify_handshake(&request, &missing_proof, Some(&config)),
+            Err(ClientError::DaemonAuthenticationFailed)
+        ));
+    }
+
+    #[test]
+    fn managed_config_rejects_unsafe_or_ambiguous_values() {
+        let (_dir, config) = managed_config("safe.identity-1");
+        assert_eq!(config.identity, "safe.identity-1");
+
+        assert!(ManagedDaemonConfig::new(
+            config.socket_path.clone(),
+            PathBuf::from("ctermd"),
+            "safe".to_string(),
+            config.auth_file.clone(),
+        )
+        .is_err());
+        assert!(ManagedDaemonConfig::new(
+            config.socket_path,
+            config.executable,
+            "contains spaces".to_string(),
+            config.auth_file,
+        )
+        .is_err());
     }
 }
