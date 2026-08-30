@@ -26,12 +26,14 @@
 pub mod app;
 pub mod cg_renderer;
 pub mod clipboard;
+mod desktop_notification;
 pub mod dialogs;
 pub mod file_transfer;
 pub mod log_capture;
 pub mod log_viewer;
 pub mod menu;
 pub mod notification_bar;
+mod panes;
 pub mod preferences;
 pub mod quick_open;
 pub mod remotes_dialog;

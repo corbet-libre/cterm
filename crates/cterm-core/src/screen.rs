@@ -4,13 +4,14 @@
 //! and scroll operations.
 
 use crate::cell::{Cell, CellAttrs, CellStyle, MAX_GRAPHEME_BYTES};
-use crate::color::{ColorPalette, Rgb};
+use crate::color::{Color, ColorPalette, Rgb};
 use crate::drcs::{DrcsFont, DrcsGlyph};
 use crate::grid::{Grid, Row};
 use crate::keyboard::KeyboardEnhancementFlags;
 use crate::sixel::SixelImage;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
@@ -73,6 +74,29 @@ const fn default_modify_other_keys() -> u8 {
     1
 }
 
+/// Visual theme class reported through foot's CSI ? 996 n extension.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ThemeAppearance {
+    #[default]
+    Dark,
+    Light,
+}
+
+/// Native window visibility reported through foot's CSI ? 998 n extension.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum WindowVisibility {
+    #[default]
+    Visible,
+    Hidden,
+}
+
+/// State owned by the native frontend but needed for terminal protocol replies.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FrontendState {
+    pub appearance: ThemeAppearance,
+    pub visibility: WindowVisibility,
+}
+
 /// Terminal modes that affect behavior
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct TerminalModes {
@@ -99,8 +123,10 @@ pub struct TerminalModes {
     pub show_cursor: bool,
     /// Mouse reporting mode
     pub mouse_mode: MouseMode,
-    /// SGR mouse encoding (mode 1006) - uses CSI < format instead of X10
-    pub sgr_mouse: bool,
+    /// Mouse-coordinate encoding selected by DEC private modes 1006, 1015,
+    /// and 1016.
+    #[serde(default)]
+    pub mouse_encoding: MouseEncoding,
     /// Alternate scroll mode (mode 1007): on the alternate screen, translate the
     /// scroll wheel into cursor-key input when the application isn't tracking the
     /// mouse. Enabled by default so pagers (less/man) scroll out of the box.
@@ -113,6 +139,12 @@ pub struct TerminalModes {
     /// Application synchronized updates (DEC private mode 2026)
     #[serde(default)]
     pub application_sync_updates: bool,
+    /// Report native theme changes (DEC private mode 2031).
+    #[serde(default)]
+    pub theme_change_reports: bool,
+    /// Report native window visibility changes (DEC private mode 2033).
+    #[serde(default)]
+    pub visibility_change_reports: bool,
     /// Focus events reporting
     pub focus_events: bool,
     /// Alternate screen buffer active
@@ -127,6 +159,10 @@ pub struct TerminalModes {
     /// instead of at the image's left edge on the following text row.
     #[serde(default)]
     pub sixel_cursor_right: bool,
+    /// Give every Sixel image a fresh palette (DEC private mode 1070).
+    /// Resetting the mode shares palette definitions between images.
+    #[serde(default = "default_enabled")]
+    pub sixel_private_palette: bool,
     /// G0 character set designator (None = standard ASCII)
     pub charset_g0: Option<String>,
     /// G1 character set designator (None = standard)
@@ -160,6 +196,20 @@ pub enum MouseMode {
     AnyEvent,
 }
 
+/// Encoding used for mouse reports.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum MouseEncoding {
+    /// Legacy X11-compatible `CSI M` byte encoding.
+    #[default]
+    Normal,
+    /// SGR cell coordinates (DEC private mode 1006).
+    Sgr,
+    /// URXVT decimal cell coordinates (DEC private mode 1015).
+    Urxvt,
+    /// SGR pixel coordinates (DEC private mode 1016).
+    SgrPixels,
+}
+
 /// Clipboard selection type for OSC 52
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ClipboardSelection {
@@ -183,9 +233,11 @@ pub enum ClipboardOperation {
     Query { selection: ClipboardSelection },
 }
 
-/// Color query type (OSC 10-12)
+/// Color query type (OSC 4 and OSC 10-12)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ColorQuery {
+    /// Query one entry in the 256-color palette (OSC 4)
+    Palette(u8),
     /// Query foreground color (OSC 10)
     Foreground,
     /// Query background color (OSC 11)
@@ -206,11 +258,47 @@ impl ColorQuery {
 
     pub const fn osc_code(self) -> u8 {
         match self {
+            Self::Palette(_) => 4,
             Self::Foreground => 10,
             Self::Background => 11,
             Self::Cursor => 12,
         }
     }
+}
+
+/// Native urgency requested by Kitty OSC 99.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum NotificationUrgency {
+    Low,
+    #[default]
+    Normal,
+    Critical,
+}
+
+/// A desktop notification requested by a terminal application.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DesktopNotification {
+    /// Stable Kitty notification identifier, when supplied.
+    pub id: Option<String>,
+    /// Short heading shown by the native notification service.
+    pub title: String,
+    /// Optional detail text shown below the heading.
+    pub body: String,
+    /// Requested native urgency.
+    pub urgency: NotificationUrgency,
+    /// Requested expiry in milliseconds; negative/absent means native default.
+    pub expire_time: Option<i32>,
+    /// Suppress notification sound.
+    pub muted: bool,
+    /// Focus the terminal when the notification is activated.
+    pub focus: bool,
+}
+
+/// A native notification operation emitted by the terminal parser.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DesktopNotificationAction {
+    Show(DesktopNotification),
+    Close(String),
 }
 
 /// File transfer operation for iTerm2 OSC 1337 protocol
@@ -455,16 +543,26 @@ pub struct Screen {
     pending_responses: Vec<Vec<u8>>,
     /// Pending clipboard operations from OSC 52
     pending_clipboard_ops: Vec<ClipboardOperation>,
-    /// Pending color queries (OSC 10-12)
+    /// Pending desktop notifications from OSC 9/777/99.
+    pending_notifications: Vec<DesktopNotificationAction>,
+    /// Pending color queries (OSC 4 and OSC 10-12)
     pending_color_queries: Vec<(ColorQuery, Option<Rgb>)>,
-    /// UI theme used when replying to color queries. The headless daemon does
-    /// not set this; the attached frontend is authoritative for theme colors.
+    /// Frontend theme used for authoritative OSC color-query replies.
     base_palette: ColorPalette,
-    base_palette_configured: bool,
+    /// Native frontend state used for theme and visibility protocol replies.
+    frontend_state: FrontendState,
     /// Application-provided overrides from OSC 10-12.
     dynamic_foreground: Option<Rgb>,
     dynamic_background: Option<Rgb>,
     dynamic_cursor: Option<Rgb>,
+    /// Application-provided overrides from OSC 4, indexed by palette entry.
+    dynamic_palette: [Option<Rgb>; 256],
+    /// xterm color-palette stack. The index is one-based, matching the wire
+    /// protocol; zero means no current entry.
+    color_stack: Vec<DynamicColorState>,
+    color_stack_index: usize,
+    /// Shell-reported working directory from OSC 7.
+    current_working_directory: Option<PathBuf>,
     /// Current text selection (if any)
     pub selection: Option<Selection>,
     /// Terminal images (Sixel, etc.)
@@ -488,6 +586,14 @@ pub struct Screen {
     /// Incremented whenever an application starts (or restarts) a synchronized
     /// update, allowing Terminal to re-arm its fail-safe deadline.
     sync_update_generation: u64,
+}
+
+#[derive(Debug, Clone)]
+struct DynamicColorState {
+    foreground: Option<Rgb>,
+    background: Option<Rgb>,
+    cursor: Option<Rgb>,
+    palette: Box<[Option<Rgb>; 256]>,
 }
 
 /// Reflowed physical rows plus a mapping from old cell coordinates to their
@@ -545,10 +651,18 @@ fn reflow_rows(rows: &[Row], old_width: usize, new_width: usize) -> ReflowedRows
             let used = if continues {
                 rows[row_index].len()
             } else {
-                rows[row_index]
+                let text_end = rows[row_index]
                     .iter()
                     .rposition(|cell| !cell.is_empty())
-                    .map_or(0, |index| index + 1)
+                    .map_or(0, |index| index + 1);
+                let marker_end = rows[row_index]
+                    .shell_integration
+                    .command_start
+                    .into_iter()
+                    .chain(rows[row_index].shell_integration.command_end)
+                    .max()
+                    .unwrap_or(0);
+                text_end.max(marker_end).min(rows[row_index].len())
             };
 
             cells.extend(
@@ -609,12 +723,52 @@ fn reflow_rows(rows: &[Row], old_width: usize, new_width: usize) -> ReflowedRows
         output.push(Row::new(new_width));
     }
 
-    ReflowedRows {
+    let mut reflowed = ReflowedRows {
         rows: output,
         old_row_origins,
         logical_boundaries,
         new_width,
+    };
+
+    // Shell markers refer to positions in the old grid. Remap them through
+    // the same boundary table as cursors, selections and image anchors.
+    let shell_markers: Vec<_> = rows
+        .iter()
+        .enumerate()
+        .map(|(row, source)| {
+            let prompt_row = source
+                .shell_integration
+                .prompt_marker
+                .then(|| reflowed.map_position(row, 0).0);
+            let command_start = source
+                .shell_integration
+                .command_start
+                .map(|col| reflowed.map_position(row, col));
+            let command_end = source
+                .shell_integration
+                .command_end
+                .map(|col| reflowed.map_position(row, col));
+            (prompt_row, command_start, command_end)
+        })
+        .collect();
+
+    for (prompt_row, command_start, command_end) in shell_markers {
+        if let Some(row) = prompt_row.and_then(|row| reflowed.rows.get_mut(row)) {
+            row.shell_integration.prompt_marker = true;
+        }
+        if let Some((row, col)) = command_start {
+            if let Some(row) = reflowed.rows.get_mut(row) {
+                row.shell_integration.command_start = Some(col.min(new_width));
+            }
+        }
+        if let Some((row, col)) = command_end {
+            if let Some(row) = reflowed.rows.get_mut(row) {
+                row.shell_integration.command_end = Some(col.min(new_width));
+            }
+        }
     }
+
+    reflowed
 }
 
 impl Screen {
@@ -624,7 +778,8 @@ impl Screen {
             auto_wrap: true,
             reverse_wrap: true,
             show_cursor: true,
-            sixel_scrolling: true,  // Sixel scrolling enabled by default
+            sixel_scrolling: true, // Sixel scrolling enabled by default
+            sixel_private_palette: true,
             alternate_scroll: true, // Alternate-screen wheel-to-arrows enabled by default
             modify_other_keys: 1,
             ..Default::default()
@@ -655,12 +810,17 @@ impl Screen {
             tab_stops: Self::default_tab_stops(width),
             pending_responses: Vec::new(),
             pending_clipboard_ops: Vec::new(),
+            pending_notifications: Vec::new(),
             pending_color_queries: Vec::new(),
             base_palette: ColorPalette::default(),
-            base_palette_configured: false,
+            frontend_state: FrontendState::default(),
             dynamic_foreground: None,
             dynamic_background: None,
             dynamic_cursor: None,
+            dynamic_palette: [None; 256],
+            color_stack: Vec::new(),
+            color_stack_index: 0,
+            current_working_directory: None,
             selection: None,
             images: HashMap::new(),
             // Zero is reserved as an invalid/sentinel identifier by native UI
@@ -765,7 +925,29 @@ impl Screen {
         !self.pending_clipboard_ops.is_empty()
     }
 
-    /// Queue a color query (from OSC 10-12)
+    /// Queue a native desktop notification requested by terminal output.
+    pub fn queue_notification(&mut self, notification: DesktopNotification) {
+        self.pending_notifications
+            .push(DesktopNotificationAction::Show(notification));
+    }
+
+    /// Queue removal of a previously identified native notification.
+    pub fn queue_notification_close(&mut self, id: String) {
+        self.pending_notifications
+            .push(DesktopNotificationAction::Close(id));
+    }
+
+    /// Drain all pending desktop notification requests.
+    pub fn take_notifications(&mut self) -> Vec<DesktopNotificationAction> {
+        std::mem::take(&mut self.pending_notifications)
+    }
+
+    /// Check whether terminal output queued desktop notifications.
+    pub fn has_notifications(&self) -> bool {
+        !self.pending_notifications.is_empty()
+    }
+
+    /// Queue a default-color query (from OSC 10-12)
     pub fn queue_color_query(&mut self, osc_code: u8) {
         let query = match osc_code {
             10 => ColorQuery::Foreground,
@@ -775,6 +957,13 @@ impl Screen {
         };
         let dynamic_color = self.dynamic_color(query);
         self.pending_color_queries.push((query, dynamic_color));
+    }
+
+    /// Queue one 256-color palette query (OSC 4).
+    pub fn queue_palette_query(&mut self, index: u8) {
+        let query = ColorQuery::Palette(index);
+        self.pending_color_queries
+            .push((query, self.dynamic_color(query)));
     }
 
     /// Take all pending color queries (drains the queue)
@@ -790,18 +979,57 @@ impl Screen {
     /// Set the frontend's configured palette for OSC query replies.
     pub fn set_base_palette(&mut self, palette: ColorPalette) {
         self.base_palette = palette;
-        self.base_palette_configured = true;
     }
 
-    /// Whether this terminal mirror has a frontend palette and may answer OSC
-    /// color queries. The daemon intentionally leaves this false.
-    pub fn has_base_palette(&self) -> bool {
-        self.base_palette_configured
+    /// Return the frontend-owned state used by terminal protocol reports.
+    pub fn frontend_state(&self) -> FrontendState {
+        self.frontend_state
+    }
+
+    /// Update the native theme class and report a change when requested.
+    pub fn set_theme_appearance(&mut self, appearance: ThemeAppearance) {
+        if self.frontend_state.appearance == appearance {
+            return;
+        }
+        self.frontend_state.appearance = appearance;
+        if self.modes.theme_change_reports {
+            self.queue_theme_report();
+        }
+    }
+
+    /// Update native visibility and report a change when requested.
+    pub fn set_window_visibility(&mut self, visibility: WindowVisibility) {
+        if self.frontend_state.visibility == visibility {
+            return;
+        }
+        self.frontend_state.visibility = visibility;
+        if self.modes.visibility_change_reports {
+            self.queue_visibility_report();
+        }
+    }
+
+    /// Queue foot's current-theme report (1 = dark, 2 = light).
+    pub fn queue_theme_report(&mut self) {
+        let value = match self.frontend_state.appearance {
+            ThemeAppearance::Dark => 1,
+            ThemeAppearance::Light => 2,
+        };
+        self.queue_response(format!("\x1b[?997;{value}n").into_bytes());
+    }
+
+    /// Queue foot's current-visibility report (1 = visible, 2 = hidden).
+    pub fn queue_visibility_report(&mut self) {
+        let value = match self.frontend_state.visibility {
+            WindowVisibility::Visible => 1,
+            WindowVisibility::Hidden => 2,
+        };
+        self.queue_response(format!("\x1b[?999;{value}n").into_bytes());
     }
 
     /// Set or reset an application-provided default color.
     pub fn set_dynamic_color(&mut self, target: ColorQuery, color: Option<Rgb>) {
         match target {
+            ColorQuery::Palette(index) => self.dynamic_palette[index as usize] = color,
             ColorQuery::Foreground => self.dynamic_foreground = color,
             ColorQuery::Background => self.dynamic_background = color,
             ColorQuery::Cursor => self.dynamic_cursor = color,
@@ -812,6 +1040,7 @@ impl Screen {
     /// Return an application-provided default color override.
     pub fn dynamic_color(&self, target: ColorQuery) -> Option<Rgb> {
         match target {
+            ColorQuery::Palette(index) => self.dynamic_palette[index as usize],
             ColorQuery::Foreground => self.dynamic_foreground,
             ColorQuery::Background => self.dynamic_background,
             ColorQuery::Cursor => self.dynamic_cursor,
@@ -821,6 +1050,11 @@ impl Screen {
     /// Resolve dynamic terminal defaults over a frontend theme palette.
     pub fn resolved_palette(&self, base: &ColorPalette) -> ColorPalette {
         let mut palette = base.clone();
+        for (index, color) in self.dynamic_palette[..16].iter().enumerate() {
+            if let Some(color) = color {
+                palette.ansi[index] = *color;
+            }
+        }
         if let Some(color) = self.dynamic_foreground {
             palette.foreground = color;
         }
@@ -833,9 +1067,95 @@ impl Screen {
         palette
     }
 
+    /// Resolve a cell color, including all OSC 4 palette overrides.
+    pub fn resolve_color(&self, color: Color, palette: &ColorPalette) -> Rgb {
+        match color {
+            Color::Ansi(ansi) => {
+                self.dynamic_palette[ansi as usize].unwrap_or_else(|| color.to_rgb(palette))
+            }
+            Color::Indexed(index) => {
+                self.dynamic_palette[index as usize].unwrap_or_else(|| color.to_rgb(palette))
+            }
+            _ => color.to_rgb(palette),
+        }
+    }
+
+    /// Reset every application-provided OSC 4 palette override.
+    pub fn reset_dynamic_palette(&mut self) {
+        self.dynamic_palette.fill(None);
+        self.dirty = true;
+    }
+
+    /// Iterate over the active OSC 4 palette overrides.
+    pub fn dynamic_palette_colors(&self) -> impl Iterator<Item = (u8, Rgb)> + '_ {
+        self.dynamic_palette
+            .iter()
+            .enumerate()
+            .filter_map(|(index, color)| color.map(|color| (index as u8, color)))
+    }
+
+    fn dynamic_color_state(&self) -> DynamicColorState {
+        DynamicColorState {
+            foreground: self.dynamic_foreground,
+            background: self.dynamic_background,
+            cursor: self.dynamic_cursor,
+            palette: Box::new(self.dynamic_palette),
+        }
+    }
+
+    /// Save the active application palette in an xterm color-stack slot.
+    /// Slot zero means the entry after the current one; explicit slots are
+    /// one-based and capped at xterm/foot's 128-entry limit.
+    pub(crate) fn push_color_palette(&mut self, slot: usize) {
+        const MAX_COLOR_STACK_DEPTH: usize = 128;
+
+        let slot = if slot == 0 {
+            self.color_stack_index.saturating_add(1)
+        } else {
+            slot
+        }
+        .min(MAX_COLOR_STACK_DEPTH);
+        let state = self.dynamic_color_state();
+
+        if self.color_stack.len() < slot {
+            self.color_stack.resize(slot, state.clone());
+        }
+        self.color_stack_index = slot;
+        self.color_stack[slot - 1] = state;
+    }
+
+    /// Restore an xterm color-stack slot. Slot zero pops the current entry.
+    pub(crate) fn pop_color_palette(&mut self, slot: usize) {
+        let slot = if slot == 0 {
+            self.color_stack_index
+        } else {
+            slot
+        };
+        let Some(state) = slot
+            .checked_sub(1)
+            .and_then(|index| self.color_stack.get(index))
+            .cloned()
+        else {
+            return;
+        };
+
+        self.color_stack_index = slot - 1;
+        self.dynamic_foreground = state.foreground;
+        self.dynamic_background = state.background;
+        self.dynamic_cursor = state.cursor;
+        self.dynamic_palette = *state.palette;
+        self.dirty = true;
+    }
+
+    /// Return the current one-based xterm color-stack entry and allocated size.
+    pub(crate) fn color_palette_stack_status(&self) -> (usize, usize) {
+        (self.color_stack_index, self.color_stack.len())
+    }
+
     /// Return one queried color from the frontend's configured palette.
     pub fn base_query_color(&self, target: ColorQuery) -> Rgb {
         match target {
+            ColorQuery::Palette(index) => Color::Indexed(index).to_rgb(&self.base_palette),
             ColorQuery::Foreground => self.base_palette.foreground,
             ColorQuery::Background => self.base_palette.background,
             ColorQuery::Cursor => self.base_palette.cursor,
@@ -1612,11 +1932,271 @@ impl Screen {
         };
 
         if let Some(row) = self.grid.row_mut(cursor_row) {
-            for col in start..end.min(width) {
-                row[col].reset();
+            if matches!(mode, LineClearMode::All) {
+                row.clear();
+            } else {
+                for col in start..end.min(width) {
+                    row[col].reset();
+                }
             }
         }
         self.dirty = true;
+    }
+
+    /// Apply the DEC-supported SGR attribute subset to an inclusive rectangle.
+    ///
+    /// DECCARA deliberately affects only bold, underline, blink and inverse;
+    /// colors and all other attributes remain untouched. This matches VT400
+    /// behavior and foot's implementation.
+    pub(crate) fn change_rectangular_attributes(
+        &mut self,
+        top: usize,
+        left: usize,
+        bottom: usize,
+        right: usize,
+        params: &[usize],
+    ) {
+        if top > bottom || left > right {
+            return;
+        }
+
+        self.clear_selection_if_rows_selected(top, bottom);
+        for row_index in top..=bottom.min(self.height().saturating_sub(1)) {
+            let Some(row) = self.grid.row_mut(row_index) else {
+                continue;
+            };
+            for col in left..=right.min(row.len().saturating_sub(1)) {
+                let attrs = &mut row[col].attrs;
+                for &param in params {
+                    match param {
+                        0 => {
+                            attrs.remove(CellAttrs::BOLD | CellAttrs::BLINK | CellAttrs::INVERSE);
+                            attrs.clear_underline();
+                        }
+                        1 => attrs.insert(CellAttrs::BOLD),
+                        4 => {
+                            attrs.clear_underline();
+                            attrs.insert(CellAttrs::UNDERLINE);
+                        }
+                        5 => attrs.insert(CellAttrs::BLINK),
+                        7 => attrs.insert(CellAttrs::INVERSE),
+                        22 => attrs.remove(CellAttrs::BOLD),
+                        24 => attrs.clear_underline(),
+                        25 => attrs.remove(CellAttrs::BLINK),
+                        27 => attrs.remove(CellAttrs::INVERSE),
+                        _ => {}
+                    }
+                }
+            }
+        }
+        self.dirty = true;
+    }
+
+    /// Invert the DEC-supported SGR attribute subset in an inclusive rectangle.
+    pub(crate) fn reverse_rectangular_attributes(
+        &mut self,
+        top: usize,
+        left: usize,
+        bottom: usize,
+        right: usize,
+        params: &[usize],
+    ) {
+        if top > bottom || left > right {
+            return;
+        }
+
+        self.clear_selection_if_rows_selected(top, bottom);
+        for row_index in top..=bottom.min(self.height().saturating_sub(1)) {
+            let Some(row) = self.grid.row_mut(row_index) else {
+                continue;
+            };
+            for col in left..=right.min(row.len().saturating_sub(1)) {
+                let attrs = &mut row[col].attrs;
+                for &param in params {
+                    match param {
+                        0 => {
+                            attrs.toggle(CellAttrs::BOLD | CellAttrs::BLINK | CellAttrs::INVERSE);
+                            Self::toggle_basic_underline(attrs);
+                        }
+                        1 => attrs.toggle(CellAttrs::BOLD),
+                        4 => Self::toggle_basic_underline(attrs),
+                        5 => attrs.toggle(CellAttrs::BLINK),
+                        7 => attrs.toggle(CellAttrs::INVERSE),
+                        _ => {}
+                    }
+                }
+            }
+        }
+        self.dirty = true;
+    }
+
+    fn toggle_basic_underline(attrs: &mut CellAttrs) {
+        if attrs.has_underline() {
+            attrs.clear_underline();
+        } else {
+            attrs.insert(CellAttrs::UNDERLINE);
+        }
+    }
+
+    /// Copy a rectangular cell area using snapshot semantics, so overlapping
+    /// source and destination rectangles behave like `memmove`.
+    pub(crate) fn copy_rectangular_area(
+        &mut self,
+        src_top: usize,
+        src_left: usize,
+        src_bottom: usize,
+        src_right: usize,
+        dst_top: usize,
+        dst_left: usize,
+    ) {
+        if src_top > src_bottom || src_left > src_right {
+            return;
+        }
+
+        let row_count = (src_bottom - src_top + 1).min(self.height().saturating_sub(dst_top));
+        let col_count = (src_right - src_left + 1).min(self.width().saturating_sub(dst_left));
+        if row_count == 0 || col_count == 0 {
+            return;
+        }
+
+        let mut copy = Vec::with_capacity(row_count);
+        for row_index in src_top..src_top + row_count {
+            let Some(row) = self.grid.row(row_index) else {
+                return;
+            };
+            copy.push(
+                (src_left..src_left + col_count)
+                    .map(|col| {
+                        let mut cell = row[col].clone();
+                        // Foot copies cell contents and SGR attributes, but
+                        // deliberately does not copy OSC 8 URI ranges.
+                        cell.hyperlink = None;
+                        cell
+                    })
+                    .collect::<Vec<_>>(),
+            );
+        }
+
+        let dst_bottom = dst_top + row_count - 1;
+        let dst_right = dst_left + col_count - 1;
+        self.clear_selection_if_rows_selected(dst_top, dst_bottom);
+        self.remove_images_overlapping_rectangle(dst_top, dst_left, dst_bottom, dst_right);
+
+        for row_offset in 0..row_count {
+            for col_offset in 0..col_count {
+                self.clear_wide_cell_at(dst_top + row_offset, dst_left + col_offset);
+            }
+        }
+        for (row_offset, cells) in copy.into_iter().enumerate() {
+            if let Some(row) = self.grid.row_mut(dst_top + row_offset) {
+                for (col_offset, cell) in cells.into_iter().enumerate() {
+                    row[dst_left + col_offset] = cell;
+                }
+            }
+            self.repair_wide_cells_in_row(dst_top + row_offset);
+        }
+        self.dirty = true;
+    }
+
+    /// Fill an inclusive rectangle with a single-byte DEC character and the
+    /// current SGR style (DECFRA).
+    pub(crate) fn fill_rectangular_area(
+        &mut self,
+        top: usize,
+        left: usize,
+        bottom: usize,
+        right: usize,
+        c: char,
+    ) {
+        if top > bottom || left > right {
+            return;
+        }
+
+        self.clear_selection_if_rows_selected(top, bottom);
+        self.remove_images_overlapping_rectangle(top, left, bottom, right);
+        let mut fill = Cell::new(c);
+        self.style.apply_to(&mut fill);
+        // OSC 8 is not an SGR attribute and is not applied by DECFRA.
+        fill.hyperlink = None;
+
+        for row_index in top..=bottom.min(self.height().saturating_sub(1)) {
+            for col in left..=right.min(self.width().saturating_sub(1)) {
+                self.clear_wide_cell_at(row_index, col);
+                if let Some(cell) = self.grid.get_mut(row_index, col) {
+                    *cell = fill.clone();
+                }
+            }
+        }
+        self.dirty = true;
+    }
+
+    /// Erase an inclusive rectangle using the current SGR background (DECERA).
+    pub(crate) fn erase_rectangular_area(
+        &mut self,
+        top: usize,
+        left: usize,
+        bottom: usize,
+        right: usize,
+    ) {
+        if top > bottom || left > right {
+            return;
+        }
+
+        self.clear_selection_if_rows_selected(top, bottom);
+        self.remove_images_overlapping_rectangle(top, left, bottom, right);
+        let mut blank = Cell::default();
+        blank.bg = self.style.bg;
+
+        for row_index in top..=bottom.min(self.height().saturating_sub(1)) {
+            for col in left..=right.min(self.width().saturating_sub(1)) {
+                self.clear_wide_cell_at(row_index, col);
+                if let Some(cell) = self.grid.get_mut(row_index, col) {
+                    *cell = blank.clone();
+                }
+            }
+        }
+        self.dirty = true;
+    }
+
+    fn repair_wide_cells_in_row(&mut self, row_index: usize) {
+        let width = self.width();
+        let Some(row) = self.grid.row_mut(row_index) else {
+            return;
+        };
+        for col in 0..width {
+            if row[col].attrs.contains(CellAttrs::WIDE) {
+                if col + 1 >= width || !row[col + 1].attrs.contains(CellAttrs::WIDE_SPACER) {
+                    row[col].reset();
+                }
+            } else if row[col].attrs.contains(CellAttrs::WIDE_SPACER)
+                && (col == 0 || !row[col - 1].attrs.contains(CellAttrs::WIDE))
+            {
+                row[col].reset();
+            }
+        }
+    }
+
+    fn remove_images_overlapping_rectangle(
+        &mut self,
+        top: usize,
+        left: usize,
+        bottom: usize,
+        right: usize,
+    ) {
+        let absolute_top = self.scrollback.len().saturating_add(top);
+        let absolute_bottom = self
+            .scrollback
+            .len()
+            .saturating_add(bottom)
+            .saturating_add(1);
+        self.images.retain(|_, image| {
+            let image_bottom = image.line.saturating_add(image.cell_height.max(1));
+            let image_right = image.col.saturating_add(image.cell_width.max(1));
+            image_bottom <= absolute_top
+                || image.line >= absolute_bottom
+                || image_right <= left
+                || image.col > right
+        });
     }
 
     /// Delete characters at cursor position
@@ -1696,6 +2276,7 @@ impl Screen {
             reverse_wrap: true,
             show_cursor: true,
             sixel_scrolling: true,
+            sixel_private_palette: true,
             alternate_scroll: true,
             modify_other_keys: 1,
             ..Default::default()
@@ -1708,6 +2289,9 @@ impl Screen {
         self.dynamic_foreground = None;
         self.dynamic_background = None;
         self.dynamic_cursor = None;
+        self.dynamic_palette.fill(None);
+        self.color_stack.clear();
+        self.color_stack_index = 0;
         self.drcs_fonts.clear();
         self.keyboard_main_stack.clear();
         self.keyboard_alt_stack.clear();
@@ -1831,6 +2415,126 @@ impl Screen {
         let scrollback_len = self.scrollback.len();
         // If line is in scrollback, return offset; otherwise 0 for visible area
         scrollback_len.saturating_sub(line_idx)
+    }
+
+    /// Mark the current row as the beginning of a shell prompt (OSC 133 A).
+    pub fn mark_shell_prompt(&mut self) {
+        if let Some(row) = self.grid.row_mut(self.cursor.row) {
+            row.shell_integration.prompt_marker = true;
+        }
+    }
+
+    /// Mark the current cursor boundary as the start of command output
+    /// (OSC 133 C).
+    pub fn mark_command_start(&mut self) {
+        if let Some(row) = self.grid.row_mut(self.cursor.row) {
+            row.shell_integration.command_start = Some(self.cursor.col.min(row.len()));
+        }
+    }
+
+    /// Mark the current cursor boundary as the end of command output
+    /// (OSC 133 D).
+    pub fn mark_command_end(&mut self) {
+        if let Some(row) = self.grid.row_mut(self.cursor.row) {
+            row.shell_integration.command_end = Some(self.cursor.col.min(row.len()));
+        }
+    }
+
+    /// Move the viewport to the closest prompt before its current top edge.
+    ///
+    /// This intentionally ignores the alternate screen, matching Foot: prompt
+    /// navigation operates on the normal shell's scrollback only.
+    pub fn scroll_to_previous_prompt(&mut self) -> bool {
+        if self.modes.alternate_screen {
+            return false;
+        }
+
+        let first_visible = self.scrollback.len().saturating_sub(self.scroll_offset);
+        let prompt = (0..first_visible).rev().find(|&line| {
+            self.get_row_by_absolute_line(line)
+                .is_some_and(|row| row.shell_integration.prompt_marker)
+        });
+
+        if let Some(line) = prompt {
+            self.scroll_offset = self.line_to_scroll_offset(line);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Move the viewport to the next prompt after its current top edge.
+    pub fn scroll_to_next_prompt(&mut self) -> bool {
+        if self.modes.alternate_screen || self.scroll_offset == 0 {
+            return false;
+        }
+
+        let first_visible = self.scrollback.len().saturating_sub(self.scroll_offset);
+        let prompt = (first_visible + 1..self.total_lines()).find(|&line| {
+            self.get_row_by_absolute_line(line)
+                .is_some_and(|row| row.shell_integration.prompt_marker)
+        });
+
+        if let Some(line) = prompt {
+            self.scroll_offset = self.line_to_scroll_offset(line);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Extract the output of the most recently completed shell command.
+    ///
+    /// OSC 133 C and D delimit cell boundaries. Wrapped physical rows are
+    /// joined, while hard line breaks are retained.
+    pub fn last_command_output(&self) -> Option<String> {
+        let mut end = None;
+        let mut start = None;
+
+        for line in (0..self.total_lines()).rev() {
+            let row = self.get_row_by_absolute_line(line)?;
+            if let Some(col) = row.shell_integration.command_end {
+                end = Some((line, col.min(row.len())));
+            }
+            if end.is_some() {
+                if let Some(col) = row.shell_integration.command_start {
+                    start = Some((line, col.min(row.len())));
+                    break;
+                }
+            }
+        }
+
+        let ((start_line, start_col), (end_line, end_col)) = (start?, end?);
+        if start_line > end_line || (start_line == end_line && start_col > end_col) {
+            return None;
+        }
+
+        let mut output = String::new();
+        for line in start_line..=end_line {
+            let row = self.get_row_by_absolute_line(line)?;
+            let from = if line == start_line { start_col } else { 0 };
+            let to = if line == end_line { end_col } else { row.len() };
+
+            for cell in row.iter().take(to).skip(from) {
+                if !cell.is_wide_spacer() {
+                    output.push_str(cell.text());
+                }
+            }
+
+            if line < end_line {
+                let next_is_wrapped = self
+                    .get_row_by_absolute_line(line + 1)
+                    .is_some_and(|next| next.wrapped);
+                if !next_is_wrapped {
+                    while output.ends_with(' ') {
+                        output.pop();
+                    }
+                    output.push('\n');
+                }
+            }
+        }
+
+        Some(output)
     }
 
     // ========== Image Methods ==========
@@ -1993,6 +2697,16 @@ impl Screen {
                 && col >= img_left
                 && col < img_right
         })
+    }
+
+    /// Set the shell-reported working directory from OSC 7.
+    pub fn set_current_working_directory(&mut self, path: Option<PathBuf>) {
+        self.current_working_directory = path;
+    }
+
+    /// Return the shell-reported working directory, if available.
+    pub fn current_working_directory(&self) -> Option<&Path> {
+        self.current_working_directory.as_deref()
     }
 
     /// Get an image by its ID
@@ -2602,14 +3316,14 @@ impl Screen {
 
                         // Foreground color (skip if default)
                         if !cell.fg.is_default() {
-                            let rgb = cell.fg.to_rgb(palette);
+                            let rgb = self.resolve_color(cell.fg, palette);
                             style_parts
                                 .push(format!("color: #{:02X}{:02X}{:02X}", rgb.r, rgb.g, rgb.b));
                         }
 
                         // Background color (skip if default)
                         if !cell.bg.is_default() {
-                            let rgb = cell.bg.to_rgb(palette);
+                            let rgb = self.resolve_color(cell.bg, palette);
                             style_parts.push(format!(
                                 "background-color: #{:02X}{:02X}{:02X}",
                                 rgb.r, rgb.g, rgb.b
@@ -2759,6 +3473,35 @@ mod tests {
         assert_eq!(screen.height(), 24);
         assert_eq!(screen.cursor.row, 0);
         assert_eq!(screen.cursor.col, 0);
+    }
+
+    #[test]
+    fn dynamic_palette_resolves_ansi_and_extended_indices() {
+        let mut screen = Screen::new(80, 24, ScreenConfig::default());
+        let base = ColorPalette::default_dark();
+        let ansi = Rgb::new(1, 2, 3);
+        let extended = Rgb::new(4, 5, 6);
+
+        screen.set_dynamic_color(ColorQuery::Palette(1), Some(ansi));
+        screen.set_dynamic_color(ColorQuery::Palette(200), Some(extended));
+
+        let resolved = screen.resolved_palette(&base);
+        assert_eq!(resolved.ansi[1], ansi);
+        assert_eq!(
+            screen.resolve_color(Color::Ansi(crate::AnsiColor::Red), &resolved),
+            ansi
+        );
+        assert_eq!(screen.resolve_color(Color::Indexed(1), &resolved), ansi);
+        assert_eq!(
+            screen.resolve_color(Color::Indexed(200), &resolved),
+            extended
+        );
+
+        screen.reset_dynamic_palette();
+        assert_ne!(
+            screen.resolve_color(Color::Indexed(200), &resolved),
+            extended
+        );
     }
 
     #[test]
@@ -2963,6 +3706,55 @@ mod tests {
 
         screen.resize(3, 3);
         assert_eq!(screen.get_selected_text().as_deref(), Some("bcdefg"));
+    }
+
+    #[test]
+    fn resize_keeps_shell_markers_attached_to_command_output() {
+        let mut screen = Screen::new(6, 3, ScreenConfig::default());
+        for c in "abcdefghi".chars() {
+            screen.put_char(c);
+        }
+        screen.grid_mut()[0].shell_integration.prompt_marker = true;
+        screen.grid_mut()[0].shell_integration.command_start = Some(2);
+        screen.grid_mut()[1].shell_integration.command_end = Some(3);
+        assert_eq!(screen.last_command_output().as_deref(), Some("cdefghi"));
+
+        screen.resize(4, 3);
+
+        assert!(screen.grid()[0].shell_integration.prompt_marker);
+        assert_eq!(screen.grid()[0].shell_integration.command_start, Some(2));
+        assert_eq!(screen.grid()[2].shell_integration.command_end, Some(1));
+        assert_eq!(screen.last_command_output().as_deref(), Some("cdefghi"));
+    }
+
+    #[test]
+    fn shell_prompt_navigation_matches_foot_view_edges() {
+        let mut screen = Screen::new(
+            10,
+            2,
+            ScreenConfig {
+                scrollback_lines: 10,
+            },
+        );
+        for text in ["one", "two", "three", "four"] {
+            screen.mark_shell_prompt();
+            for c in text.chars() {
+                screen.put_char(c);
+            }
+            screen.carriage_return();
+            screen.line_feed();
+        }
+
+        assert_eq!(screen.scroll_offset, 0);
+        assert!(screen.scroll_to_previous_prompt());
+        assert_eq!(screen.scroll_offset, 1);
+        assert!(screen.scroll_to_previous_prompt());
+        assert_eq!(screen.scroll_offset, 2);
+        assert!(screen.scroll_to_next_prompt());
+        assert_eq!(screen.scroll_offset, 1);
+        assert!(screen.scroll_to_next_prompt());
+        assert_eq!(screen.scroll_offset, 0);
+        assert!(!screen.scroll_to_next_prompt());
     }
 
     #[test]

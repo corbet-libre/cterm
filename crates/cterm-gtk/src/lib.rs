@@ -3,12 +3,14 @@
 //! This crate implements the cterm terminal emulator UI using GTK4.
 
 mod app;
+mod desktop_notification;
 mod dialogs;
 mod docker_dialog;
 mod file_transfer;
 mod log_viewer;
 mod menu;
 mod notification_bar;
+mod pane;
 mod quick_open;
 mod remotes_dialog;
 mod session_dialog;
@@ -120,6 +122,15 @@ pub fn run() {
         builder = builder.flags(gio::ApplicationFlags::NON_UNIQUE);
     }
     let app = builder.build();
+
+    let focus_action = gio::SimpleAction::new("focus-terminal", None);
+    let focus_app = app.clone();
+    focus_action.connect_activate(move |_, _| {
+        if let Some(window) = focus_app.active_window() {
+            window.present();
+        }
+    });
+    app.add_action(&focus_action);
 
     // Connect to the activate signal
     app.connect_activate(|app| {

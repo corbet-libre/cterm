@@ -5,7 +5,10 @@
 use crate::color::ColorPalette;
 use crate::parser::Parser;
 use crate::pty::{Pty, PtyConfig, PtyError, PtySize};
-use crate::screen::{ClipboardOperation, ColorQuery, Screen, ScreenConfig, SearchResult};
+use crate::screen::{
+    ClipboardOperation, ColorQuery, DesktopNotificationAction, FrontendState, Screen, ScreenConfig,
+    SearchResult,
+};
 use crate::{KeyEventKind, KeyboardEnhancementFlags};
 use std::time::{Duration, Instant};
 
@@ -24,11 +27,8 @@ pub enum TerminalEvent {
     ContentChanged,
     /// Clipboard operation requested (OSC 52)
     ClipboardRequest(ClipboardOperation),
-    /// Frontend theme color requested through OSC 10-12.
-    ColorQuery {
-        target: ColorQuery,
-        dynamic_color: Option<crate::color::Rgb>,
-    },
+    /// Terminal application requested a native desktop notification.
+    DesktopNotification(DesktopNotificationAction),
 }
 
 /// Terminal configuration
@@ -150,8 +150,6 @@ impl Terminal {
             }
         }
 
-        self.answer_color_queries(&events);
-
         events
     }
 
@@ -159,7 +157,6 @@ impl Terminal {
     /// query replies a second time. The daemon is the authoritative responder.
     pub fn process_mirror(&mut self, data: &[u8]) -> Vec<TerminalEvent> {
         let (events, _responses) = self.process_collecting(data);
-        self.answer_color_queries(&events);
         events
     }
 
@@ -187,7 +184,7 @@ impl Terminal {
         }
 
         // Collect any pending responses for the caller to write back to the PTY
-        let responses = if self.screen.has_pending_responses() {
+        let mut responses = if self.screen.has_pending_responses() {
             self.screen.take_pending_responses()
         } else {
             Vec::new()
@@ -200,12 +197,16 @@ impl Terminal {
             }
         }
 
+        if self.screen.has_notifications() {
+            for notification in self.screen.take_notifications() {
+                events.push(TerminalEvent::DesktopNotification(notification));
+            }
+        }
+
         if self.screen.has_color_queries() {
             for (target, dynamic_color) in self.screen.take_color_queries() {
-                events.push(TerminalEvent::ColorQuery {
-                    target,
-                    dynamic_color,
-                });
+                let color = dynamic_color.unwrap_or_else(|| self.screen.base_query_color(target));
+                responses.push(Self::color_query_response(target, color));
             }
         }
 
@@ -238,30 +239,36 @@ impl Terminal {
         (events, responses)
     }
 
-    fn answer_color_queries(&mut self, events: &[TerminalEvent]) {
-        if !self.screen.has_base_palette() {
-            return;
-        }
-
-        for event in events {
-            let TerminalEvent::ColorQuery {
-                target,
-                dynamic_color,
-            } = event
-            else {
-                continue;
-            };
-            let color = dynamic_color.unwrap_or_else(|| self.screen.base_query_color(*target));
-            let response = format!("\x1b]{};{}\x1b\\", target.osc_code(), color.to_osc_spec());
-            if let Err(error) = self.write(response.as_bytes()) {
-                log::error!("Failed to answer OSC color query: {}", error);
+    fn color_query_response(target: ColorQuery, color: crate::color::Rgb) -> Vec<u8> {
+        match target {
+            ColorQuery::Palette(index) => {
+                format!("\x1b]4;{index};{}\x1b\\", color.to_osc_spec()).into_bytes()
             }
+            _ => format!("\x1b]{};{}\x1b\\", target.osc_code(), color.to_osc_spec()).into_bytes(),
         }
     }
 
     /// Set the frontend theme used to answer OSC 10-12 color queries.
     pub fn set_base_palette(&mut self, palette: ColorPalette) {
         self.screen.set_base_palette(palette);
+    }
+
+    /// Update state owned by an in-process native frontend and send any
+    /// application-requested change reports through this terminal's PTY.
+    pub fn set_frontend_state(&mut self, state: FrontendState) {
+        for response in self.set_frontend_state_collecting(state) {
+            if let Err(error) = self.write(&response) {
+                log::error!("Failed to send frontend state report to PTY: {error}");
+            }
+        }
+    }
+
+    /// Update frontend-owned state while returning reports for a daemon-owned
+    /// PTY, keeping potentially blocking writes outside the terminal lock.
+    pub fn set_frontend_state_collecting(&mut self, state: FrontendState) -> Vec<Vec<u8>> {
+        self.screen.set_theme_appearance(state.appearance);
+        self.screen.set_window_visibility(state.visibility);
+        self.screen.take_pending_responses()
     }
 
     /// Deadline for the active application synchronized update, if any.
@@ -433,10 +440,17 @@ impl Terminal {
         self.pty.as_ref().and_then(|p| p.foreground_process_name())
     }
 
-    /// Get the current working directory of the foreground process
-    #[cfg(unix)]
+    /// Get the shell-reported working directory, falling back to Unix process inspection.
     pub fn foreground_cwd(&self) -> Option<std::path::PathBuf> {
-        self.pty.as_ref().and_then(|p| p.foreground_cwd())
+        if let Some(path) = self.screen.current_working_directory() {
+            return Some(path.to_path_buf());
+        }
+
+        #[cfg(unix)]
+        return self.pty.as_ref().and_then(Pty::foreground_cwd);
+
+        #[cfg(not(unix))]
+        None
     }
 
     /// Get terminal width
@@ -468,6 +482,21 @@ impl Terminal {
     /// Reset viewport to bottom
     pub fn scroll_viewport_to_bottom(&mut self) {
         self.screen.scroll_offset = 0;
+    }
+
+    /// Scroll to the closest shell prompt above the viewport.
+    pub fn scroll_to_previous_prompt(&mut self) -> bool {
+        self.screen.scroll_to_previous_prompt()
+    }
+
+    /// Scroll to the closest shell prompt below the viewport.
+    pub fn scroll_to_next_prompt(&mut self) -> bool {
+        self.screen.scroll_to_next_prompt()
+    }
+
+    /// Return the output delimited by the latest OSC 133 C/D pair.
+    pub fn last_command_output(&self) -> Option<String> {
+        self.screen.last_command_output()
     }
 
     /// Check if viewport is at bottom
@@ -1046,6 +1075,21 @@ mod tests {
     }
 
     #[test]
+    fn process_emits_desktop_notification_actions() {
+        let mut term = Terminal::new(80, 24, ScreenConfig::default());
+
+        let events = term.process_mirror(b"\x1b]99;i=build:p=body;finished\x1b\\");
+
+        assert!(events.iter().any(|event| matches!(
+            event,
+            TerminalEvent::DesktopNotification(DesktopNotificationAction::Show(notification))
+                if notification.id.as_deref() == Some("build")
+                    && notification.title == "finished"
+                    && notification.focus
+        )));
+    }
+
+    #[test]
     fn reports_sixel_and_measured_cell_geometry_in_probe_order() {
         let mut term = Terminal::new(80, 24, ScreenConfig::default());
         term.resize_with_pixels(80, 24, 800, 480);
@@ -1055,7 +1099,7 @@ mod tests {
         assert_eq!(
             responses,
             [
-                b"\x1b[?62;4;22;52c".to_vec(),
+                b"\x1b[?62;4;22;28;52c".to_vec(),
                 b"\x1b[6;20;10t".to_vec(),
                 b"\x1b[0n".to_vec(),
             ]
@@ -1070,7 +1114,7 @@ mod tests {
 
         let images = term.screen().visible_images();
         assert_eq!(images.len(), 1);
-        assert_eq!((images[0].pixel_width, images[0].pixel_height), (1, 6));
+        assert_eq!((images[0].pixel_width, images[0].pixel_height), (1, 12));
     }
 
     #[test]
@@ -1089,7 +1133,7 @@ mod tests {
     }
 
     #[test]
-    fn daemon_mirror_answers_theme_color_queries_in_the_frontend() {
+    fn daemon_mirror_never_answers_theme_color_queries_in_the_frontend() {
         use crate::color::{ColorPalette, Rgb};
 
         let writes = Arc::new(Mutex::new(Vec::new()));
@@ -1107,35 +1151,46 @@ mod tests {
 
         term.process_mirror(b"\x1b]10;?\x1b\\\x1b]11;?\x07\x1b]12;?\x1b\\");
 
+        assert!(writes.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn daemon_authority_returns_palette_queries_in_stream_order() {
+        use crate::color::{ColorPalette, Rgb};
+
+        let mut term = Terminal::new(80, 24, ScreenConfig::default());
+        let mut palette = ColorPalette::default_dark();
+        palette.ansi[1] = Rgb::new(0x10, 0x20, 0x30);
+        term.set_base_palette(palette);
+
+        let (_, responses) = term.process_collecting(
+            b"\x1b]4;1;?;200;?\x1b\\\x1b]4;1;#abc;1;?\x1b\\\x1b]104;1\x1b\\\x1b]4;1;?\x1b\\",
+        );
+
         assert_eq!(
-            writes.lock().unwrap().as_slice(),
-            b"\x1b]10;rgb:1212/3434/5656\x1b\\\
-              \x1b]11;rgb:7878/9a9a/bcbc\x1b\\\
-              \x1b]12;rgb:dede/f0f0/1111\x1b\\"
+            responses.concat().as_slice(),
+            b"\x1b]4;1;rgb:1010/2020/3030\x1b\\\
+              \x1b]4;200;rgb:ffff/0000/d7d7\x1b\\\
+              \x1b]4;1;rgb:aaaa/bbbb/cccc\x1b\\\
+              \x1b]4;1;rgb:1010/2020/3030\x1b\\"
         );
     }
 
     #[test]
-    fn color_query_replies_preserve_stream_order() {
+    fn daemon_color_query_replies_preserve_stream_order() {
         use crate::color::{ColorPalette, Rgb};
 
-        let writes = Arc::new(Mutex::new(Vec::new()));
-        let observed = Arc::clone(&writes);
         let mut term = Terminal::new(80, 24, ScreenConfig::default());
         let mut palette = ColorPalette::default_dark();
         palette.foreground = Rgb::new(0x12, 0x34, 0x56);
         term.set_base_palette(palette);
-        term.set_write_fn(Box::new(move |data| {
-            observed.lock().unwrap().extend_from_slice(data);
-            Ok(())
-        }));
 
-        term.process_mirror(
+        let (_, responses) = term.process_collecting(
             b"\x1b]10;?\x1b\\\x1b]10;#abc\x1b\\\x1b]10;?\x1b\\\x1b]110\x1b\\\x1b]10;?\x1b\\",
         );
 
         assert_eq!(
-            writes.lock().unwrap().as_slice(),
+            responses.concat().as_slice(),
             b"\x1b]10;rgb:1212/3434/5656\x1b\\\
               \x1b]10;rgb:aaaa/bbbb/cccc\x1b\\\
               \x1b]10;rgb:1212/3434/5656\x1b\\"
@@ -1143,19 +1198,90 @@ mod tests {
     }
 
     #[test]
-    fn daemon_authority_does_not_answer_ui_color_queries() {
+    fn daemon_authority_answers_color_queries_without_a_frontend() {
         let mut term = Terminal::new(80, 24, ScreenConfig::default());
 
         let (events, responses) = term.process_collecting(b"\x1b]10;?\x1b\\");
 
-        assert!(responses.is_empty());
-        assert!(events.iter().any(|event| matches!(
-            event,
-            TerminalEvent::ColorQuery {
-                target: ColorQuery::Foreground,
-                dynamic_color: None,
-            }
-        )));
+        assert_eq!(responses.len(), 1);
+        assert_eq!(
+            responses[0],
+            Terminal::color_query_response(
+                ColorQuery::Foreground,
+                ColorPalette::default().foreground
+            )
+        );
+        assert!(events
+            .iter()
+            .all(|event| matches!(event, TerminalEvent::ContentChanged)));
+    }
+
+    #[test]
+    fn foot_theme_and_visibility_queries_report_frontend_state() {
+        use crate::{FrontendState, ThemeAppearance, WindowVisibility};
+
+        let mut term = Terminal::new(80, 24, ScreenConfig::default());
+        let (_, responses) = term.process_collecting(b"\x1b[?996n\x1b[?998n");
+        assert_eq!(
+            responses,
+            [b"\x1b[?997;1n".to_vec(), b"\x1b[?999;1n".to_vec()]
+        );
+
+        let reports = term.set_frontend_state_collecting(FrontendState {
+            appearance: ThemeAppearance::Light,
+            visibility: WindowVisibility::Hidden,
+        });
+        assert!(reports.is_empty());
+
+        let (_, responses) = term.process_collecting(b"\x1b[?996n\x1b[?998n");
+        assert_eq!(
+            responses,
+            [b"\x1b[?997;2n".to_vec(), b"\x1b[?999;2n".to_vec()]
+        );
+    }
+
+    #[test]
+    fn foot_theme_and_visibility_change_modes_report_and_restore() {
+        use crate::{FrontendState, ThemeAppearance, WindowVisibility};
+
+        let mut term = Terminal::new(80, 24, ScreenConfig::default());
+        let (_, responses) =
+            term.process_collecting(b"\x1b[?2031h\x1b[?2033h\x1b[?2031$p\x1b[?2033$p");
+        assert_eq!(
+            responses,
+            [
+                b"\x1b[?999;1n".to_vec(),
+                b"\x1b[?2031;1$y".to_vec(),
+                b"\x1b[?2033;1$y".to_vec(),
+            ]
+        );
+
+        let reports = term.set_frontend_state_collecting(FrontendState {
+            appearance: ThemeAppearance::Light,
+            visibility: WindowVisibility::Hidden,
+        });
+        assert_eq!(
+            reports,
+            [b"\x1b[?997;2n".to_vec(), b"\x1b[?999;2n".to_vec()]
+        );
+
+        let (_, responses) = term.process_collecting(
+            b"\x1b[?2031s\x1b[?2033s\x1b[?2031l\x1b[?2033l\x1b[?2031r\x1b[?2033r",
+        );
+        assert_eq!(responses, [b"\x1b[?999;2n".to_vec()]);
+        assert!(term.screen().modes.theme_change_reports);
+        assert!(term.screen().modes.visibility_change_reports);
+    }
+
+    #[test]
+    fn foreground_cwd_uses_osc7_without_a_local_pty() {
+        let expected = std::env::temp_dir().join("cterm-osc7-cwd");
+        let uri = url::Url::from_file_path(&expected).unwrap();
+        let mut term = Terminal::new(80, 24, ScreenConfig::default());
+
+        term.process_mirror(format!("\x1b]7;{uri}\x1b\\").as_bytes());
+
+        assert_eq!(term.foreground_cwd(), Some(expected));
     }
 
     #[test]

@@ -7,7 +7,7 @@
 //! - Ready to upgrade button
 //! - Error messages
 
-use cterm_app::upgrade::{UpdateError, UpdateInfo, Updater};
+use cterm_app::upgrade::{UpdateError, UpdateInfo, Updater, CTERM_GITHUB_REPOSITORY};
 use gtk4::prelude::*;
 use gtk4::{glib, Align, Box as GtkBox, Button, Label, Orientation, ProgressBar, Spinner, Window};
 use std::cell::RefCell;
@@ -16,9 +16,6 @@ use std::rc::Rc;
 
 /// Current application version
 const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
-
-/// GitHub repository for updates
-const GITHUB_REPO: &str = "KarpelesLab/cterm";
 
 /// State of the update process
 #[derive(Debug, Clone)]
@@ -296,7 +293,7 @@ async fn check_for_updates() -> Result<Option<UpdateInfo>, UpdateError> {
 
     std::thread::spawn(move || {
         let result = (|| {
-            let updater = Updater::new(GITHUB_REPO, CURRENT_VERSION)?;
+            let updater = Updater::new(CTERM_GITHUB_REPOSITORY, CURRENT_VERSION)?;
             updater.check_for_update()
         })();
         let _ = tx.send(result);
@@ -318,8 +315,17 @@ where
 
     std::thread::spawn(move || {
         let result = (|| {
-            let updater = Updater::new(GITHUB_REPO, CURRENT_VERSION)?;
-            updater.download(&info, on_progress)
+            let updater = Updater::new(CTERM_GITHUB_REPOSITORY, CURRENT_VERSION)?;
+            let archive_path = updater.download(&info, on_progress)?;
+            updater.verify(&archive_path, &info)?;
+            let binary_path = Updater::prepare_linux_update(&archive_path)?;
+            if let Err(error) = std::fs::remove_file(&archive_path) {
+                log::warn!(
+                    "Failed to remove downloaded update archive {}: {error}",
+                    archive_path.display()
+                );
+            }
+            Ok(binary_path)
         })();
         let _ = tx.send(result);
     });

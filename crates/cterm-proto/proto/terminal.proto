@@ -20,6 +20,8 @@ service TerminalService {
   // Session Metadata
   rpc SetSessionTitle(SetSessionTitleRequest) returns (SetSessionTitleResponse);
   rpc SetSessionMetadata(SetSessionMetadataRequest) returns (SetSessionMetadataResponse);
+  rpc SetSessionPalette(SetSessionPaletteRequest) returns (SetSessionPaletteResponse);
+  rpc SetSessionFrontendState(SetSessionFrontendStateRequest) returns (SetSessionFrontendStateResponse);
 
   // Input
   rpc WriteInput(WriteInputRequest) returns (WriteInputResponse);
@@ -155,6 +157,14 @@ message CreateSessionRequest {
   // conservative cell-size fallback for older clients.
   uint32 pixel_width = 9;
   uint32 pixel_height = 10;
+
+  // Frontend palette used by the daemon to answer OSC 4/10-12 queries from
+  // the first byte of process output. Omitted by older/non-visual clients.
+  FrontendPalette base_palette = 11;
+
+  // Native frontend state used for foot-compatible theme/visibility reports.
+  FrontendTheme theme_appearance = 12;
+  FrontendVisibility window_visibility = 13;
 }
 
 message CreateSessionResponse {
@@ -266,6 +276,46 @@ message SetSessionMetadataRequest {
 }
 
 message SetSessionMetadataResponse {
+  bool success = 1;
+}
+
+// Complete frontend palette. The ANSI array must contain exactly 16 colors.
+message FrontendPalette {
+  repeated Rgb ansi = 1;
+  Rgb foreground = 2;
+  Rgb background = 3;
+  Rgb cursor = 4;
+  Rgb selection = 5;
+}
+
+message SetSessionPaletteRequest {
+  string session_id = 1;
+  FrontendPalette palette = 2;
+}
+
+message SetSessionPaletteResponse {
+  bool success = 1;
+}
+
+enum FrontendTheme {
+  FRONTEND_THEME_UNSPECIFIED = 0;
+  FRONTEND_THEME_DARK = 1;
+  FRONTEND_THEME_LIGHT = 2;
+}
+
+enum FrontendVisibility {
+  FRONTEND_VISIBILITY_UNSPECIFIED = 0;
+  FRONTEND_VISIBILITY_VISIBLE = 1;
+  FRONTEND_VISIBILITY_HIDDEN = 2;
+}
+
+message SetSessionFrontendStateRequest {
+  string session_id = 1;
+  optional FrontendTheme theme_appearance = 2;
+  optional FrontendVisibility window_visibility = 3;
+}
+
+message SetSessionFrontendStateResponse {
   bool success = 1;
 }
 
@@ -406,6 +456,10 @@ message TerminalImages {
 message DirtyRow {
   uint32 row_index = 1;
   repeated Cell cells = 2;
+  bool wrapped = 3;
+  bool shell_prompt = 4;
+  optional uint32 command_start = 5;
+  optional uint32 command_end = 6;
 }
 
 message CursorUpdate {
@@ -488,6 +542,12 @@ message DrcsGlyph {
 
 message Row {
   repeated Cell cells = 1;
+  // True when this physical row continues the preceding logical line.
+  bool wrapped = 2;
+  // OSC 133 shell-integration metadata.
+  bool shell_prompt = 3;
+  optional uint32 command_start = 4;
+  optional uint32 command_end = 5;
 }
 
 message Cell {
@@ -569,12 +629,41 @@ message TerminalModes {
   // Application-provided OSC 10-12 overrides. The frontend combines these
   // with its local theme when rendering and answering color queries.
   DynamicColors dynamic_colors = 12;
+  // Shell-reported OSC 7 working directory for reconnecting frontends.
+  optional string current_working_directory = 13;
+  bool theme_change_reports = 14;
+  bool visibility_change_reports = 15;
+  MouseTrackingMode mouse_tracking = 16;
+  MouseCoordinateEncoding mouse_encoding = 17;
+}
+
+enum MouseTrackingMode {
+  MOUSE_TRACKING_MODE_UNSPECIFIED = 0;
+  MOUSE_TRACKING_MODE_NONE = 1;
+  MOUSE_TRACKING_MODE_X10 = 2;
+  MOUSE_TRACKING_MODE_NORMAL = 3;
+  MOUSE_TRACKING_MODE_BUTTON_EVENT = 4;
+  MOUSE_TRACKING_MODE_ANY_EVENT = 5;
+}
+
+enum MouseCoordinateEncoding {
+  MOUSE_COORDINATE_ENCODING_UNSPECIFIED = 0;
+  MOUSE_COORDINATE_ENCODING_NORMAL = 1;
+  MOUSE_COORDINATE_ENCODING_SGR = 2;
+  MOUSE_COORDINATE_ENCODING_URXVT = 3;
+  MOUSE_COORDINATE_ENCODING_SGR_PIXELS = 4;
 }
 
 message DynamicColors {
   Color foreground = 1;
   Color background = 2;
   Color cursor = 3;
+  repeated DynamicPaletteColor palette = 4;
+}
+
+message DynamicPaletteColor {
+  uint32 index = 1;
+  Color color = 2;
 }
 
 message GetCellRequest {
@@ -658,7 +747,31 @@ message TerminalEvent {
     // Daemon-injected: an SSH session needs an interactive answer (host key,
     // password, or key passphrase). The client replies via RespondPrompt.
     SessionPromptEvent session_prompt = 6;
+    DesktopNotificationEvent desktop_notification = 7;
   }
+}
+
+message DesktopNotificationEvent {
+  string title = 1;
+  string body = 2;
+  DesktopNotificationAction action = 3;
+  optional string id = 4;
+  DesktopNotificationUrgency urgency = 5;
+  optional int32 expire_time = 6;
+  bool muted = 7;
+  bool focus = 8;
+}
+
+enum DesktopNotificationAction {
+  DESKTOP_NOTIFICATION_ACTION_SHOW = 0;
+  DESKTOP_NOTIFICATION_ACTION_CLOSE = 1;
+}
+
+enum DesktopNotificationUrgency {
+  DESKTOP_NOTIFICATION_URGENCY_UNSPECIFIED = 0;
+  DESKTOP_NOTIFICATION_URGENCY_LOW = 1;
+  DESKTOP_NOTIFICATION_URGENCY_NORMAL = 2;
+  DESKTOP_NOTIFICATION_URGENCY_CRITICAL = 3;
 }
 
 // Kinds of interactive prompt a native SSH session may raise during connect.

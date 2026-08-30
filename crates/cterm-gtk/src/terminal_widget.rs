@@ -15,8 +15,10 @@ use parking_lot::Mutex;
 use cterm_app::config::Config;
 use cterm_core::cell::CellAttrs;
 use cterm_core::color::{Color, ColorPalette, Rgb};
-use cterm_core::mouse::{encode_mouse_event, MouseButton, MouseModifiers};
-use cterm_core::screen::{ClipboardOperation, CursorStyle, MouseMode, ScreenConfig};
+use cterm_core::mouse::{
+    encode_mouse_event, MouseButton, MouseEvent, MouseModifiers, MousePosition,
+};
+use cterm_core::screen::{ClipboardOperation, CursorStyle, MouseEncoding, MouseMode, ScreenConfig};
 use cterm_core::term::{Key, Modifiers, Terminal, TerminalEvent};
 use cterm_core::{KeyEventKind, KeyboardEnhancementFlags};
 use cterm_ui::sprite::{Sprite, SpriteCache};
@@ -123,6 +125,33 @@ impl TerminalWidget {
         }
     }
 
+    /// Report native window visibility to the local terminal or owning daemon.
+    pub fn set_window_visibility(&self, visibility: cterm_core::WindowVisibility) {
+        update_window_visibility(&self.terminal, self.daemon_cmd_tx.as_ref(), visibility);
+    }
+
+    fn setup_visibility_reporting(&self) {
+        let terminal = Arc::clone(&self.terminal);
+        let sender = self.daemon_cmd_tx.clone();
+        self.drawing_area.connect_map(move |_| {
+            update_window_visibility(
+                &terminal,
+                sender.as_ref(),
+                cterm_core::WindowVisibility::Visible,
+            );
+        });
+
+        let terminal = Arc::clone(&self.terminal);
+        let sender = self.daemon_cmd_tx.clone();
+        self.drawing_area.connect_unmap(move |_| {
+            update_window_visibility(
+                &terminal,
+                sender.as_ref(),
+                cterm_core::WindowVisibility::Hidden,
+            );
+        });
+    }
+
     /// Set callback for when the terminal process exits
     pub fn set_on_exit<F: Fn() + 'static>(&self, callback: F) {
         *self.on_exit.borrow_mut() = Some(Box::new(callback));
@@ -171,21 +200,13 @@ impl TerminalWidget {
     /// Set an optional background color override (hex string like "#1a1b26")
     #[allow(dead_code)]
     pub fn set_background_override(&self, color: Option<&str>) {
-        let rgb = color.and_then(|hex| {
-            let hex = hex.trim_start_matches('#');
-            if hex.len() == 6 {
-                let r = u8::from_str_radix(&hex[0..2], 16).ok()?;
-                let g = u8::from_str_radix(&hex[2..4], 16).ok()?;
-                let b = u8::from_str_radix(&hex[4..6], 16).ok()?;
-                Some(cterm_core::color::Rgb::new(r, g, b))
-            } else {
-                None
-            }
-        });
+        let rgb = color.and_then(parse_rgb);
         *self.background_override.borrow_mut() = rgb;
-        self.terminal
-            .lock()
-            .set_base_palette(frontend_palette(&self.theme, rgb));
+        let palette = frontend_palette(&self.theme, rgb);
+        self.terminal.lock().set_base_palette(palette.clone());
+        if let Some(sender) = &self.daemon_cmd_tx {
+            let _ = sender.send(DaemonCommand::SetPalette(palette));
+        }
         // Trigger redraw to apply new background
         self.drawing_area.queue_draw();
     }
@@ -311,6 +332,55 @@ impl TerminalWidget {
         let mut term = self.terminal.lock();
         term.scroll_to_line(result.line);
         drop(term);
+        self.drawing_area.queue_draw();
+    }
+
+    /// Scroll the local viewport up by a fixed number of physical rows.
+    pub fn scroll_viewport_up(&self, lines: usize) {
+        self.terminal.lock().scroll_viewport_up(lines);
+        self.drawing_area.queue_draw();
+    }
+
+    /// Scroll the local viewport down by a fixed number of physical rows.
+    pub fn scroll_viewport_down(&self, lines: usize) {
+        self.terminal.lock().scroll_viewport_down(lines);
+        self.drawing_area.queue_draw();
+    }
+
+    /// Scroll one viewport upward or downward.
+    pub fn scroll_viewport_page(&self, up: bool) {
+        let mut terminal = self.terminal.lock();
+        let lines = terminal.rows().max(1);
+        if up {
+            terminal.scroll_viewport_up(lines);
+        } else {
+            terminal.scroll_viewport_down(lines);
+        }
+        drop(terminal);
+        self.drawing_area.queue_draw();
+    }
+
+    /// Jump to the oldest retained row or back to the live bottom.
+    pub fn scroll_viewport_edge(&self, top: bool) {
+        let mut terminal = self.terminal.lock();
+        if top {
+            terminal.scroll_viewport_up(usize::MAX);
+        } else {
+            terminal.scroll_viewport_to_bottom();
+        }
+        drop(terminal);
+        self.drawing_area.queue_draw();
+    }
+
+    /// Navigate between OSC 133 prompt markers.
+    pub fn scroll_to_shell_prompt(&self, previous: bool) {
+        let mut terminal = self.terminal.lock();
+        if previous {
+            terminal.scroll_to_previous_prompt();
+        } else {
+            terminal.scroll_to_next_prompt();
+        }
+        drop(terminal);
         self.drawing_area.queue_draw();
     }
 
@@ -736,7 +806,7 @@ impl TerminalWidget {
         // `last_cell` is the pointer's current cell, needed by the scroll handler
         // (GTK scroll events carry no coordinates). `pressed_button` is the button
         // currently held, so motion can be reported as a drag and released cleanly.
-        let last_cell = Rc::new(RefCell::new((0usize, 0usize)));
+        let last_position = Rc::new(RefCell::new(MousePosition::default()));
         let pressed_button: Rc<RefCell<Option<MouseButton>>> = Rc::new(RefCell::new(None));
 
         // Mouse click for selection
@@ -787,11 +857,9 @@ impl TerminalWidget {
                 if mouse_tracking_active(&term)
                     && report_mouse(
                         &mut term,
-                        MouseButton::Left,
-                        col,
-                        row,
+                        MouseEvent::Press(MouseButton::Left),
+                        MousePosition::new(col, row, x.floor() as i32, y.floor() as i32),
                         gtk_state_to_mouse_mods(state),
-                        false,
                     )
                 {
                     drop(term);
@@ -826,8 +894,8 @@ impl TerminalWidget {
         click_controller.connect_released(move |gesture, _n_press, x, y| {
             // If this press was forwarded to a mouse-tracking app, report the release
             // and skip the selection-finalize path.
-            if pressed_button_released.borrow().is_some() {
-                *pressed_button_released.borrow_mut() = None;
+            let reported_button = pressed_button_released.borrow_mut().take();
+            if let Some(button) = reported_button {
                 let dims = cell_dims_released.borrow();
                 let col = (x / dims.width).floor() as usize;
                 let row = (y / dims.height).floor() as usize;
@@ -839,11 +907,9 @@ impl TerminalWidget {
                 let mut term = terminal_released.lock();
                 report_mouse(
                     &mut term,
-                    MouseButton::Release,
-                    col,
-                    row,
+                    MouseEvent::Release(button),
+                    MousePosition::new(col, row, x.floor() as i32, y.floor() as i32),
                     gtk_state_to_mouse_mods(state),
-                    false,
                 );
                 return;
             }
@@ -908,11 +974,9 @@ impl TerminalWidget {
                     if mouse_tracking_active(&term)
                         && report_mouse(
                             &mut term,
-                            MouseButton::Right,
-                            col,
-                            row,
+                            MouseEvent::Press(MouseButton::Right),
+                            MousePosition::new(col, row, x.floor() as i32, y.floor() as i32),
                             gtk_state_to_mouse_mods(state),
-                            false,
                         )
                     {
                         drop(term);
@@ -962,11 +1026,9 @@ impl TerminalWidget {
                 let mut term = terminal_rr.lock();
                 report_mouse(
                     &mut term,
-                    MouseButton::Release,
-                    col,
-                    row,
+                    MouseEvent::Release(MouseButton::Right),
+                    MousePosition::new(col, row, x.floor() as i32, y.floor() as i32),
                     gtk_state_to_mouse_mods(state),
-                    false,
                 );
             });
 
@@ -1001,11 +1063,9 @@ impl TerminalWidget {
                     if mouse_tracking_active(&term)
                         && report_mouse(
                             &mut term,
-                            MouseButton::Middle,
-                            col,
-                            row,
+                            MouseEvent::Press(MouseButton::Middle),
+                            MousePosition::new(col, row, x.floor() as i32, y.floor() as i32),
                             gtk_state_to_mouse_mods(state),
-                            false,
                         )
                     {
                         drop(term);
@@ -1056,11 +1116,9 @@ impl TerminalWidget {
                 let mut term = terminal_mr.lock();
                 report_mouse(
                     &mut term,
-                    MouseButton::Release,
-                    col,
-                    row,
+                    MouseEvent::Release(MouseButton::Middle),
+                    MousePosition::new(col, row, x.floor() as i32, y.floor() as i32),
                     gtk_state_to_mouse_mods(state),
-                    false,
                 );
             });
 
@@ -1074,7 +1132,7 @@ impl TerminalWidget {
         let cell_dims_motion = Rc::clone(&cell_dims);
         let drawing_area_motion = self.drawing_area.clone();
         let selecting_motion = Rc::clone(&selecting);
-        let last_cell_motion = Rc::clone(&last_cell);
+        let last_position_motion = Rc::clone(&last_position);
         let pressed_button_motion = Rc::clone(&pressed_button);
 
         motion_controller.connect_motion(move |controller, x, y| {
@@ -1085,8 +1143,9 @@ impl TerminalWidget {
 
             // Track the pointer cell for the scroll handler (scroll events carry no
             // coordinates), and detect whether we moved to a new cell.
-            let prev_cell = *last_cell_motion.borrow();
-            *last_cell_motion.borrow_mut() = (col, row);
+            let position = MousePosition::new(col, row, x.floor() as i32, y.floor() as i32);
+            let previous_position = *last_position_motion.borrow();
+            *last_position_motion.borrow_mut() = position;
 
             let state = controller
                 .current_event()
@@ -1098,15 +1157,34 @@ impl TerminalWidget {
             // the app: report motion (on cell change, to avoid flooding) and swallow it.
             if !shift {
                 if let Some(button) = *pressed_button_motion.borrow() {
-                    if prev_cell != (col, row) {
-                        let mut term = terminal_motion.lock();
+                    let mut term = terminal_motion.lock();
+                    if mouse_position_changed(
+                        term.screen().modes.mouse_encoding,
+                        previous_position,
+                        position,
+                    ) {
                         report_mouse(
                             &mut term,
-                            button,
-                            col,
-                            row,
+                            MouseEvent::Motion(Some(button)),
+                            position,
                             gtk_state_to_mouse_mods(state),
-                            true,
+                        );
+                    }
+                    return;
+                }
+
+                let mut term = terminal_motion.lock();
+                if term.screen().modes.mouse_mode == MouseMode::AnyEvent {
+                    if mouse_position_changed(
+                        term.screen().modes.mouse_encoding,
+                        previous_position,
+                        position,
+                    ) {
+                        report_mouse(
+                            &mut term,
+                            MouseEvent::Motion(None),
+                            position,
+                            gtk_state_to_mouse_mods(state),
                         );
                     }
                     return;
@@ -1155,7 +1233,7 @@ impl TerminalWidget {
             EventControllerScroll::new(gtk4::EventControllerScrollFlags::VERTICAL);
         let terminal_scroll = Arc::clone(&terminal);
         let drawing_area_scroll = self.drawing_area.clone();
-        let last_cell_scroll = Rc::clone(&last_cell);
+        let last_position_scroll = Rc::clone(&last_position);
 
         // Lines of cursor-key / viewport movement per wheel notch.
         const SCROLL_LINES: usize = 3;
@@ -1175,7 +1253,7 @@ impl TerminalWidget {
             if !shift {
                 // 1) Application is tracking the mouse: forward a wheel report.
                 if mouse_tracking_active(&term) {
-                    let (col, row) = *last_cell_scroll.borrow();
+                    let position = *last_position_scroll.borrow();
                     let button = if up {
                         MouseButton::WheelUp
                     } else {
@@ -1183,11 +1261,9 @@ impl TerminalWidget {
                     };
                     report_mouse(
                         &mut term,
-                        button,
-                        col,
-                        row,
+                        MouseEvent::Press(button),
+                        position,
                         gtk_state_to_mouse_mods(state),
-                        false,
                     );
                     return glib::Propagation::Stop;
                 }
@@ -1347,8 +1423,10 @@ impl TerminalWidget {
         drawing_area.set_vexpand(true);
         drawing_area.set_hexpand(true);
 
-        let min_width = (cell_dims.width * 80.0).ceil() as i32;
-        let min_height = (cell_dims.height * 24.0).ceil() as i32;
+        // Keep enough space for a usable split without forcing every pane to
+        // retain the initial 80x24 window size.
+        let min_width = (cell_dims.width * 8.0).ceil() as i32;
+        let min_height = (cell_dims.height * 3.0).ceil() as i32;
         drawing_area.set_size_request(min_width, min_height);
 
         // Capture session ID before session is consumed
@@ -1360,6 +1438,10 @@ impl TerminalWidget {
         // Create a Terminal with no PTY — write callback forwards via channel
         let mut terminal = Terminal::new(80, 24, ScreenConfig::default());
         terminal.set_base_palette(frontend_palette(theme, None));
+        terminal.set_frontend_state(cterm_core::FrontendState {
+            appearance: theme.appearance(),
+            ..Default::default()
+        });
         terminal.screen_mut().set_cell_width_hint(cell_dims.width);
         terminal.screen_mut().set_cell_height_hint(cell_dims.height);
         let write_tx = cmd_tx.clone();
@@ -1391,9 +1473,20 @@ impl TerminalWidget {
 
         let daemon_socket = session.socket_path().map(|p| p.to_owned());
         widget.setup_drawing();
+        widget.setup_visibility_reporting();
         widget.setup_input();
         widget.setup_drop();
-        widget.setup_daemon_reader(sid, cmd_rx, daemon_socket);
+        widget.setup_daemon_reader(
+            sid,
+            cmd_rx,
+            daemon_socket,
+            frontend_palette(theme, None),
+            cterm_core::FrontendState {
+                appearance: theme.appearance(),
+                ..Default::default()
+            },
+            false,
+        );
         widget.setup_daemon_resize(cmd_tx);
 
         widget
@@ -1419,13 +1512,17 @@ impl TerminalWidget {
         drawing_area.set_vexpand(true);
         drawing_area.set_hexpand(true);
 
-        let min_width = (cell_dims.width * 80.0).ceil() as i32;
-        let min_height = (cell_dims.height * 24.0).ceil() as i32;
+        let min_width = (cell_dims.width * 8.0).ceil() as i32;
+        let min_height = (cell_dims.height * 3.0).ceil() as i32;
         drawing_area.set_size_request(min_width, min_height);
 
         // Create a Terminal with no PTY
         let mut terminal = Terminal::new(80, 24, ScreenConfig::default());
         terminal.set_base_palette(frontend_palette(theme, None));
+        terminal.set_frontend_state(cterm_core::FrontendState {
+            appearance: theme.appearance(),
+            ..Default::default()
+        });
         terminal.screen_mut().set_cell_width_hint(cell_dims.width);
         terminal.screen_mut().set_cell_height_hint(cell_dims.height);
 
@@ -1468,9 +1565,20 @@ impl TerminalWidget {
 
         let daemon_socket = recon.handle.socket_path().map(|p| p.to_owned());
         widget.setup_drawing();
+        widget.setup_visibility_reporting();
         widget.setup_input();
         widget.setup_drop();
-        widget.setup_daemon_reader(sid, cmd_rx, daemon_socket);
+        widget.setup_daemon_reader(
+            sid,
+            cmd_rx,
+            daemon_socket,
+            frontend_palette(theme, None),
+            cterm_core::FrontendState {
+                appearance: theme.appearance(),
+                ..Default::default()
+            },
+            true,
+        );
         widget.setup_daemon_resize(cmd_tx);
 
         widget
@@ -1489,6 +1597,9 @@ impl TerminalWidget {
         session_id: String,
         cmd_rx: tokio::sync::mpsc::UnboundedReceiver<DaemonCommand>,
         daemon_socket: Option<std::path::PathBuf>,
+        base_palette: ColorPalette,
+        frontend_state: cterm_core::FrontendState,
+        release_snapshot_attachment: bool,
     ) {
         let drawing_area = self.drawing_area.clone();
 
@@ -1530,6 +1641,25 @@ impl TerminalWidget {
                         return;
                     }
                 };
+
+                // `from_daemon_with_screen` arrived with one attachment used
+                // only to fetch the initial snapshot. The reader attachment is
+                // now live, so balance that temporary count without dropping
+                // the stream we are about to use.
+                if release_snapshot_attachment {
+                    if let Err(error) = session.detach().await {
+                        log::warn!(
+                            "Failed to release snapshot attachment for {session_id}: {error}"
+                        );
+                    }
+                }
+
+                if let Err(error) = session.set_base_palette(&base_palette).await {
+                    log::warn!("Failed to synchronize frontend palette with daemon: {error}");
+                }
+                if let Err(error) = session.set_frontend_state(frontend_state).await {
+                    log::warn!("Failed to synchronize frontend state with daemon: {error}");
+                }
 
                 // Spawn command handler — drains write/resize/destroy commands and forwards to daemon
                 let cmd_session = session.clone();
@@ -1653,6 +1783,16 @@ impl TerminalWidget {
                             DaemonCommand::ClearAlert => {
                                 if let Err(e) = cmd_session.clear_alert().await {
                                     log::error!("Failed to clear alert: {}", e);
+                                }
+                            }
+                            DaemonCommand::SetPalette(palette) => {
+                                if let Err(error) = cmd_session.set_base_palette(&palette).await {
+                                    log::error!("Failed to update daemon palette: {error}");
+                                }
+                            }
+                            DaemonCommand::SetFrontendState(state) => {
+                                if let Err(error) = cmd_session.set_frontend_state(state).await {
+                                    log::error!("Failed to update daemon frontend state: {error}");
                                 }
                             }
                         }
@@ -1796,11 +1936,11 @@ impl TerminalWidget {
                                         callback(title);
                                     }
                                 }
+                                TerminalEvent::DesktopNotification(ref notification) => {
+                                    crate::desktop_notification::handle(notification);
+                                }
                                 TerminalEvent::ContentChanged => content_changed = true,
                                 TerminalEvent::ProcessExited(_) => {}
-                                // process_mirror already answered this through
-                                // the daemon write callback.
-                                TerminalEvent::ColorQuery { .. } => {}
                             }
                         }
 
@@ -1939,6 +2079,30 @@ enum DaemonCommand {
     SetTabColor(String),
     SetTemplateName(String),
     ClearAlert,
+    SetPalette(ColorPalette),
+    SetFrontendState(cterm_core::FrontendState),
+}
+
+fn update_window_visibility(
+    terminal: &Arc<Mutex<Terminal>>,
+    sender: Option<&tokio::sync::mpsc::UnboundedSender<DaemonCommand>>,
+    visibility: cterm_core::WindowVisibility,
+) {
+    let mut terminal = terminal.lock();
+    let mut state = terminal.screen().frontend_state();
+    if state.visibility == visibility {
+        return;
+    }
+    state.visibility = visibility;
+    if sender.is_some() {
+        let _ = terminal.set_frontend_state_collecting(state);
+    } else {
+        terminal.set_frontend_state(state);
+    }
+    drop(terminal);
+    if let Some(sender) = sender {
+        let _ = sender.send(DaemonCommand::SetFrontendState(state));
+    }
 }
 
 /// Rendering parameters for draw_terminal
@@ -2029,14 +2193,14 @@ fn draw_terminal(
                 if cell.bg == Color::Default {
                     *normal_background
                 } else {
-                    cell.bg.to_rgb(palette)
+                    screen.resolve_color(cell.bg, palette)
                 }
             } else if cell.hyperlink.is_some() && cell.fg == Color::Default {
                 Rgb::new(100, 149, 237)
             } else if cell.fg == Color::Default {
                 palette.foreground
             } else {
-                cell.fg.to_rgb(palette)
+                screen.resolve_color(cell.fg, palette)
             };
             let fg_color = if cell.attrs.contains(CellAttrs::DIM) {
                 Rgb::new(fg_color.r / 2, fg_color.g / 2, fg_color.b / 2)
@@ -2056,12 +2220,12 @@ fn draw_terminal(
                     if cell.fg == Color::Default {
                         palette.foreground
                     } else {
-                        cell.fg.to_rgb(palette)
+                        screen.resolve_color(cell.fg, palette)
                     }
                 } else if cell.bg == Color::Default {
                     *normal_background
                 } else {
-                    cell.bg.to_rgb(palette)
+                    screen.resolve_color(cell.bg, palette)
                 };
 
                 let (r, g, b) = bg_color.to_f64();
@@ -2116,6 +2280,7 @@ fn draw_terminal(
                     (char_width, cell_height),
                     &fg_color,
                     palette,
+                    screen,
                 );
             }
         }
@@ -2246,13 +2411,25 @@ fn draw_terminal(
     }
 }
 
-fn frontend_palette(theme: &Theme, background: Option<Rgb>) -> ColorPalette {
+pub(crate) fn frontend_palette(theme: &Theme, background: Option<Rgb>) -> ColorPalette {
     let mut palette = theme.colors.clone();
     palette.cursor = theme.cursor.color;
     if let Some(background) = background {
         palette.background = background;
     }
     palette
+}
+
+pub(crate) fn parse_rgb(hex: &str) -> Option<Rgb> {
+    let hex = hex.trim_start_matches('#');
+    if hex.len() != 6 {
+        return None;
+    }
+    Some(Rgb::new(
+        u8::from_str_radix(&hex[0..2], 16).ok()?,
+        u8::from_str_radix(&hex[2..4], 16).ok()?,
+        u8::from_str_radix(&hex[4..6], 16).ok()?,
+    ))
 }
 
 fn draw_cell_decorations(
@@ -2262,6 +2439,7 @@ fn draw_cell_decorations(
     size: (f64, f64),
     foreground: &Rgb,
     palette: &cterm_core::color::ColorPalette,
+    screen: &cterm_core::Screen,
 ) {
     let (x, y) = origin;
     let (width, height) = size;
@@ -2270,7 +2448,7 @@ fn draw_cell_decorations(
         let color = if has_hyperlink {
             Rgb::new(100, 149, 237)
         } else if let Some(color) = cell.underline_color {
-            color.to_rgb(palette)
+            screen.resolve_color(color, palette)
         } else {
             *foreground
         };
@@ -2449,19 +2627,29 @@ fn mouse_tracking_active(term: &Terminal) -> bool {
 /// consumed (a report was sent), false if mouse reporting is inactive for it.
 fn report_mouse(
     term: &mut Terminal,
-    button: MouseButton,
-    col: usize,
-    row: usize,
+    event: MouseEvent,
+    position: MousePosition,
     mods: MouseModifiers,
-    is_drag: bool,
 ) -> bool {
     let mode = term.screen().modes.mouse_mode;
-    let sgr = term.screen().modes.sgr_mouse;
-    if let Some(seq) = encode_mouse_event(mode, sgr, button, col, row, mods, is_drag) {
+    let encoding = term.screen().modes.mouse_encoding;
+    if let Some(seq) = encode_mouse_event(mode, encoding, event, position, mods) {
         let _ = term.write(&seq);
         true
     } else {
         false
+    }
+}
+
+fn mouse_position_changed(
+    encoding: MouseEncoding,
+    previous: MousePosition,
+    current: MousePosition,
+) -> bool {
+    if encoding == MouseEncoding::SgrPixels {
+        (previous.pixel_x, previous.pixel_y) != (current.pixel_x, current.pixel_y)
+    } else {
+        (previous.col, previous.row) != (current.col, current.row)
     }
 }
 

@@ -36,13 +36,21 @@ take_screenshot() {
 
 send_keys() {
     local text="$1"
+    focus_cterm
     # Use AppleScript to send keystrokes to the frontmost application
     osascript -e "tell application \"System Events\" to keystroke \"$text\""
+}
+
+focus_cterm() {
+    osascript -e "tell application \"System Events\" to set frontmost of (first process whose unix id is $CTERM_PID) to true"
+    sleep 0.15
 }
 
 send_key() {
     local key="$1"
     local modifiers="${2:-}"
+
+    focus_cterm
 
     case "$key" in
         "Return"|"return"|"enter")
@@ -82,6 +90,69 @@ send_key() {
             osascript -e "tell application \"System Events\" to keystroke \"$key\""
             ;;
     esac
+}
+
+send_pane_shortcut() {
+    local key_code="$1"
+    local modifiers="$2"
+
+    # AppleScript keystrokes otherwise follow whichever process most recently
+    # took focus. Screenshot capture and asynchronous native-tab creation can
+    # temporarily resign cterm on hosted runners.
+    focus_cterm
+
+    case "$modifiers" in
+        "ctrl+shift")
+            osascript -e "tell application \"System Events\" to key code $key_code using {control down, shift down}"
+            ;;
+        "ctrl+option")
+            osascript -e "tell application \"System Events\" to key code $key_code using {control down, option down}"
+            ;;
+        "ctrl+option+shift")
+            osascript -e "tell application \"System Events\" to key code $key_code using {control down, option down, shift down}"
+            ;;
+        *)
+            log "ERROR: Unsupported pane shortcut modifiers: $modifiers"
+            exit 1
+            ;;
+    esac
+}
+
+select_pane_menu_item() {
+    local item="$1"
+
+    # macOS reserves some Control+Option combinations for system features, so
+    # hosted runners may consume directional pane shortcuts before AppKit sees
+    # them. Clicking the native menu item still exercises the same production
+    # selector and first-responder path without depending on host key settings.
+    focus_cterm
+    osascript <<EOF
+tell application "System Events"
+    set ctermProcess to first process whose unix id is $CTERM_PID
+    tell ctermProcess
+        click menu item "$item" of menu 1 of menu bar item "Pane" of menu bar 1
+    end tell
+end tell
+EOF
+}
+
+wait_for_cterm_log() {
+    local pattern="$1"
+    local description="$2"
+
+    for _attempt in $(seq 1 40); do
+        if [ -f "$CTERM_LOG_FILE" ] && grep -Eq "$pattern" "$CTERM_LOG_FILE"; then
+            log "$description"
+            return 0
+        fi
+        sleep 0.25
+    done
+
+    log "ERROR: Timed out waiting for cterm log pattern: $pattern"
+    if [ -f "$CTERM_LOG_FILE" ]; then
+        tail -100 "$CTERM_LOG_FILE" | while IFS= read -r line; do log "  $line"; done
+    fi
+    exit 1
 }
 
 log "=== cterm UI Automation Test (macOS) ==="
@@ -217,6 +288,37 @@ sleep 1
 
 # Take screenshot showing tabs
 take_screenshot "05_new_tab"
+
+# Exercise the native AppKit pane host. Key codes avoid keyboard-layout
+# ambiguity on the hosted runner (42=backslash, 27=minus, 36=return,
+# 117=forward delete).
+log "Testing native horizontal pane split..."
+send_pane_shortcut 42 "ctrl+shift"
+wait_for_cterm_log 'Split pane Horizontal' "Horizontal pane split succeeded"
+
+log "Testing native vertical pane split..."
+send_pane_shortcut 27 "ctrl+shift"
+wait_for_cterm_log 'Split pane Vertical' "Vertical pane split succeeded"
+take_screenshot "06_split_panes"
+
+log "Testing directional pane focus..."
+select_pane_menu_item "Focus Up"
+wait_for_cterm_log 'Focused pane .*Up' "Directional pane focus succeeded"
+
+log "Testing pane divider resize..."
+select_pane_menu_item "Resize Down"
+wait_for_cterm_log 'Resized pane .*Down' "Pane divider resize succeeded"
+
+log "Testing pane zoom and unzoom..."
+send_pane_shortcut 36 "ctrl+shift"
+wait_for_cterm_log 'Pane zoom true' "Pane zoom succeeded"
+send_pane_shortcut 36 "ctrl+shift"
+wait_for_cterm_log 'Pane zoom false' "Pane unzoom succeeded"
+
+log "Testing pane close..."
+send_pane_shortcut 117 "ctrl+shift"
+wait_for_cterm_log 'Closed pane' "Pane close succeeded"
+take_screenshot "07_closed_pane"
 
 # Close the window
 log "Closing window..."

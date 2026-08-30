@@ -441,6 +441,11 @@ mod unix {
             }
         }
 
+        /// Try to clone the bidirectional PTY master for dedicated writes.
+        pub fn try_clone_writer(&self) -> io::Result<File> {
+            self.try_clone_reader()
+        }
+
         /// Internal: Create PTY and spawn child process
         unsafe fn create_pty_and_spawn(config: &PtyConfig) -> Result<Self, PtyError> {
             // Open a new PTY pair
@@ -506,31 +511,12 @@ mod unix {
             // Close the master FD in child
             libc::close(master_fd);
 
-            // Create a new session
-            if libc::setsid() < 0 {
+            // Create a session, install the controlling terminal, duplicate it
+            // onto all three standard streams, and close the original slave FD.
+            // The platform implementation handles the BSD-specific session setup
+            // details that a hand-rolled setsid/TIOCSCTTY sequence misses.
+            if libc::login_tty(slave_fd) < 0 {
                 libc::_exit(1);
-            }
-
-            // Set the slave as the controlling terminal
-            // Cast needed: TIOCSCTTY type differs between Linux and macOS
-            if libc::ioctl(slave_fd, libc::TIOCSCTTY as libc::c_ulong, 0) < 0 {
-                libc::_exit(1);
-            }
-
-            // Duplicate slave to stdin/stdout/stderr
-            if libc::dup2(slave_fd, libc::STDIN_FILENO) < 0 {
-                libc::_exit(1);
-            }
-            if libc::dup2(slave_fd, libc::STDOUT_FILENO) < 0 {
-                libc::_exit(1);
-            }
-            if libc::dup2(slave_fd, libc::STDERR_FILENO) < 0 {
-                libc::_exit(1);
-            }
-
-            // Close the original slave FD if it's not one of the standard FDs
-            if slave_fd > libc::STDERR_FILENO {
-                libc::close(slave_fd);
             }
 
             // Close all other inherited file descriptors (PTY masters from other
@@ -683,7 +669,7 @@ mod windows {
     };
     use winapi::um::synchapi::WaitForSingleObject;
     use winapi::um::winbase::{
-        EXTENDED_STARTUPINFO_PRESENT, INFINITE, STARTUPINFOEXW, WAIT_OBJECT_0,
+        EXTENDED_STARTUPINFO_PRESENT, INFINITE, STARTF_USESTDHANDLES, STARTUPINFOEXW, WAIT_OBJECT_0,
     };
     use winapi::um::wincon::COORD;
     use winapi::um::winnt::HANDLE;
@@ -849,6 +835,11 @@ mod windows {
             self.read_pipe.try_clone()
         }
 
+        /// Try to clone the ConPTY input pipe for dedicated writes.
+        pub fn try_clone_writer(&self) -> io::Result<File> {
+            self.write_pipe.try_clone()
+        }
+
         unsafe fn create_conpty(config: &PtyConfig) -> Result<Self, PtyError> {
             // Create pipes for PTY communication
             let mut read_pipe_pty: HANDLE = INVALID_HANDLE_VALUE;
@@ -902,8 +893,8 @@ mod windows {
             let mut attr_list_size: usize = 0;
             InitializeProcThreadAttributeList(ptr::null_mut(), 1, 0, &mut attr_list_size);
 
-            let attr_list = vec![0u8; attr_list_size];
-            let attr_list_ptr = attr_list.as_ptr() as *mut _;
+            let mut attr_list = vec![0u8; attr_list_size];
+            let attr_list_ptr = attr_list.as_mut_ptr() as *mut _;
 
             if InitializeProcThreadAttributeList(attr_list_ptr, 1, 0, &mut attr_list_size) == FALSE
             {
@@ -932,13 +923,20 @@ mod windows {
 
             let mut startup_info: STARTUPINFOEXW = std::mem::zeroed();
             startup_info.StartupInfo.cb = std::mem::size_of::<STARTUPINFOEXW>() as u32;
+            // Prevent Windows from supplying redirected parent standard handles.
+            // A console child can otherwise bypass the pseudoconsole even though
+            // ordinary handle inheritance is disabled.
+            startup_info.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
+            startup_info.StartupInfo.hStdInput = INVALID_HANDLE_VALUE;
+            startup_info.StartupInfo.hStdOutput = INVALID_HANDLE_VALUE;
+            startup_info.StartupInfo.hStdError = INVALID_HANDLE_VALUE;
             startup_info.lpAttributeList = attr_list_ptr;
 
             // Determine command to run
             let command = config.shell.clone().unwrap_or_else(get_default_shell);
             let cmd_line = windows_command_line(&command, &config.args);
 
-            let cmd_wide: Vec<u16> = OsStr::new(&cmd_line)
+            let mut cmd_wide: Vec<u16> = OsStr::new(&cmd_line)
                 .encode_wide()
                 .chain(std::iter::once(0))
                 .collect();
@@ -960,7 +958,7 @@ mod windows {
 
             let result = CreateProcessW(
                 ptr::null(),
-                cmd_wide.as_ptr() as *mut _,
+                cmd_wide.as_mut_ptr(),
                 ptr::null_mut(),
                 ptr::null_mut(),
                 FALSE,
@@ -1275,13 +1273,12 @@ impl Pty {
 
     /// Clone an independent blocking writer over the PTY input, for local PTYs.
     ///
-    /// A duplicated local PTY master fd is bidirectional, so the returned `File` can
-    /// be written to from a dedicated thread without holding any terminal lock. SSH
-    /// backends have no local fd, so this returns `None` and their writes go through
-    /// the regular (under-lock) path.
+    /// Unix duplicates the bidirectional PTY master; Windows duplicates ConPTY's
+    /// dedicated input pipe. SSH backends have no local writer handle, so this
+    /// returns `None` and their writes go through the regular (under-lock) path.
     pub fn try_clone_writer(&self) -> Option<File> {
         match &self.backend {
-            Backend::Local(p) => p.try_clone_reader().ok(),
+            Backend::Local(p) => p.try_clone_writer().ok(),
             Backend::Ssh(_) => None,
         }
     }
@@ -1393,7 +1390,10 @@ mod tests {
                 ..Default::default()
             },
             shell: Some("/bin/sh".to_string()),
-            args: vec!["-c".to_string(), "echo hello".to_string()],
+            args: vec![
+                "-c".to_string(),
+                "test -t 0 && test -t 1 && test -t 2 && echo hello".to_string(),
+            ],
             ..Default::default()
         };
 

@@ -21,14 +21,17 @@ use objc2_foundation::{
 use parking_lot::Mutex;
 
 use cterm_app::config::Config;
+use cterm_app::upgrade::PaneLaunchContext;
+use cterm_app::ShortcutManager;
 use cterm_core::screen::{ScreenConfig, SelectionMode};
 use cterm_core::term::{Key, Modifiers as CoreModifiers, TerminalEvent};
 use cterm_core::{KeyEventKind, KeyboardEnhancementFlags, Terminal};
+use cterm_ui::events::Action;
 use cterm_ui::theme::Theme;
 
 use crate::cg_renderer::CGRenderer;
 use crate::file_transfer::PendingFileManager;
-use crate::mouse::{self, MouseButton, MouseModifiers};
+use crate::mouse::{self, MouseButton, MouseEvent, MouseModifiers, MousePosition};
 use crate::notification_bar::{NotificationBar, NOTIFICATION_BAR_HEIGHT};
 use crate::{clipboard, keycode};
 
@@ -128,7 +131,7 @@ struct ViewState {
     pty_closed: AtomicBool,
     /// Set when the view is being deallocated - threads should stop
     view_invalid: AtomicBool,
-    /// Current terminal title (updated from PTY thread)
+    /// Durable pane display title, updated by OSC only while it is unlocked.
     title: std::sync::RwLock<String>,
     /// Flag indicating title has changed and needs UI update
     title_changed: AtomicBool,
@@ -136,6 +139,8 @@ struct ViewState {
     title_locked: AtomicBool,
     /// Flag indicating bell was triggered and needs UI update
     bell_changed: AtomicBool,
+    /// Notifications parsed on the daemon reader thread and awaiting the main thread.
+    pending_notifications: std::sync::Mutex<Vec<cterm_core::DesktopNotificationAction>>,
 }
 
 impl Default for ViewState {
@@ -148,6 +153,7 @@ impl Default for ViewState {
             title_changed: AtomicBool::new(false),
             title_locked: AtomicBool::new(false),
             bell_changed: AtomicBool::new(false),
+            pending_notifications: std::sync::Mutex::new(Vec::new()),
         }
     }
 }
@@ -161,15 +167,29 @@ enum DaemonCommand {
         pixel_width: u32,
         pixel_height: u32,
     },
+    Detach {
+        completion: std::sync::mpsc::Sender<Result<(), String>>,
+    },
     Destroy,
     SetTitle(String),
     SetTabColor(String),
     SetTemplateName(String),
+    SetPalette(cterm_core::ColorPalette),
+    SetFrontendState(cterm_core::FrontendState),
+}
+
+#[derive(Clone, Default)]
+struct PaneSessionContext {
+    /// Remote daemons safely select their own defaults when an older upgrade
+    /// record has no exact launch context.
+    remote_daemon: bool,
+    launch: Option<PaneLaunchContext>,
 }
 
 /// Terminal view state
 pub struct TerminalViewIvars {
     terminal: Arc<Mutex<Terminal>>,
+    shortcuts: ShortcutManager,
     renderer: RefCell<Option<CGRenderer>>,
     cell_width: f64,
     cell_height: f64,
@@ -181,10 +201,20 @@ pub struct TerminalViewIvars {
     auto_scroll_direction: Cell<i32>,
     /// Last mouse column during auto-scroll drag
     auto_scroll_col: Cell<usize>,
+    /// Last native pointer position used to coalesce cell-based motion reports.
+    last_mouse_position: Cell<Option<MousePosition>>,
     /// Timer for auto-scroll during selection drag
     auto_scroll_timer: RefCell<Option<Retained<objc2_foundation::NSTimer>>>,
     /// Template name (if this view was created from a template)
     template_name: RefCell<Option<String>>,
+    /// Configured remote-manager key used to recreate an SSH daemon connection.
+    remote_name: RefCell<Option<String>>,
+    /// Keep this pane visible after its child process exits.
+    keep_open: Cell<bool>,
+    /// Persistent bell state owned by this pane, not by the native tab/window.
+    bell_active: Cell<bool>,
+    /// Closing a normal pane destroys its daemon session; seamless upgrades detach instead.
+    destroy_on_remove: Cell<bool>,
     /// Daemon session ID for this terminal
     session_id: RefCell<Option<String>>,
     /// Marked text for IME input (Japanese, Chinese, etc.)
@@ -201,6 +231,7 @@ pub struct TerminalViewIvars {
     daemon_cmd_tx: RefCell<Option<tokio::sync::mpsc::UnboundedSender<DaemonCommand>>>,
     /// Socket path for the daemon this terminal is connected to (None = local default)
     daemon_socket: RefCell<Option<std::path::PathBuf>>,
+    pane_session_context: RefCell<PaneSessionContext>,
 }
 
 define_class!(
@@ -256,9 +287,11 @@ define_class!(
                 log::debug!("View being removed from window, marking invalid");
                 self.ivars().state.view_invalid.store(true, Ordering::SeqCst);
 
-                // Destroy the daemon session (kill the PTY process)
-                if let Some(ref tx) = *self.ivars().daemon_cmd_tx.borrow() {
-                    let _ = tx.send(DaemonCommand::Destroy);
+                if self.ivars().destroy_on_remove.get() {
+                    // A user-initiated close owns the session lifecycle.
+                    if let Some(ref tx) = *self.ivars().daemon_cmd_tx.borrow() {
+                        let _ = tx.send(DaemonCommand::Destroy);
+                    }
                 }
 
                 // Take and drop the PTY to close the master FD.
@@ -326,6 +359,56 @@ define_class!(
             let kind = key_event_kind(event.isARepeat());
             let modifiers = keycode::modifiers_from_event(event);
             let core_mods = CoreModifiers::from_bits_truncate(modifiers.bits());
+
+            if let Some(action) = keycode::keycode_from_event(event)
+                .and_then(|key| self.ivars().shortcuts.match_event(key, modifiers))
+            {
+                if self.dispatch_pane_action(action) {
+                    return;
+                }
+                let mut terminal = self.ivars().terminal.lock();
+                let page = terminal.rows().max(1);
+                let handled = match action {
+                    Action::ScrollUp => {
+                        terminal.scroll_viewport_up(1);
+                        true
+                    }
+                    Action::ScrollDown => {
+                        terminal.scroll_viewport_down(1);
+                        true
+                    }
+                    Action::ScrollPageUp => {
+                        terminal.scroll_viewport_up(page);
+                        true
+                    }
+                    Action::ScrollPageDown => {
+                        terminal.scroll_viewport_down(page);
+                        true
+                    }
+                    Action::ScrollToTop => {
+                        terminal.scroll_viewport_up(usize::MAX);
+                        true
+                    }
+                    Action::ScrollToBottom => {
+                        terminal.scroll_viewport_to_bottom();
+                        true
+                    }
+                    Action::PromptPrevious => {
+                        terminal.scroll_to_previous_prompt();
+                        true
+                    }
+                    Action::PromptNext => {
+                        terminal.scroll_to_next_prompt();
+                        true
+                    }
+                    _ => false,
+                };
+                drop(terminal);
+                if handled {
+                    self.set_needs_display();
+                    return;
+                }
+            }
 
             // Clear any stale press for a newly pressed physical key. Repeats retain the
             // original identity so keyUp can report the same key even if the layout changes.
@@ -495,6 +578,17 @@ define_class!(
         fn mouse_down(&self, event: &NSEvent) {
             use objc2_app_kit::NSEventModifierFlags;
 
+            if let Some(window) = self.window() {
+                let began_divider_drag: bool = unsafe {
+                    msg_send![&*window, beginPaneDividerDragAt: event.locationInWindow()]
+                };
+                if began_divider_drag {
+                    self.ivars().is_selecting.set(false);
+                    return;
+                }
+                let _: () = unsafe { msg_send![&*window, focusPaneForView: self] };
+            }
+
             // Convert window coordinates to view coordinates
             let location_in_window = event.locationInWindow();
             let location = self.convert_point_from_view(location_in_window, None);
@@ -521,7 +615,7 @@ define_class!(
             }
 
             // Forward the press to a tracking application (Shift bypasses).
-            if self.report_mouse_button(event, MouseButton::Left, false) {
+            if self.report_mouse_event(event, MouseEvent::Press(MouseButton::Left)) {
                 // Track the drag so mouseDragged/mouseUp keep reporting.
                 self.ivars().is_selecting.set(true);
                 return;
@@ -555,6 +649,13 @@ define_class!(
 
         #[unsafe(method(mouseUp:))]
         fn mouse_up(&self, event: &NSEvent) {
+            if let Some(window) = self.window() {
+                let ended_divider_drag: bool =
+                    unsafe { msg_send![&*window, endPaneDividerDrag] };
+                if ended_divider_drag {
+                    return;
+                }
+            }
             if !self.ivars().is_selecting.get() {
                 return;
             }
@@ -563,7 +664,7 @@ define_class!(
             self.stop_auto_scroll();
 
             // Forward the release to a tracking application (Shift bypasses).
-            if self.report_mouse_button(event, MouseButton::Release, false) {
+            if self.report_mouse_event(event, MouseEvent::Release(MouseButton::Left)) {
                 return;
             }
 
@@ -595,6 +696,14 @@ define_class!(
 
         #[unsafe(method(mouseDragged:))]
         fn mouse_dragged(&self, event: &NSEvent) {
+            if let Some(window) = self.window() {
+                let dragged_divider: bool = unsafe {
+                    msg_send![&*window, dragPaneDividerTo: event.locationInWindow()]
+                };
+                if dragged_divider {
+                    return;
+                }
+            }
             if !self.ivars().is_selecting.get() {
                 return;
             }
@@ -610,7 +719,7 @@ define_class!(
             // Forward drag motion to a tracking application (ButtonEvent /
             // AnyEvent modes); Shift bypasses so a Shift-drag extends a local
             // text selection instead.
-            if self.report_mouse_button(event, MouseButton::Left, true) {
+            if self.report_mouse_event(event, MouseEvent::Motion(Some(MouseButton::Left))) {
                 return;
             }
 
@@ -687,7 +796,7 @@ define_class!(
 
             let terminal = self.ivars().terminal.lock();
             let mouse_mode = terminal.screen().modes.mouse_mode;
-            let sgr_mouse = terminal.screen().modes.sgr_mouse;
+            let mouse_encoding = terminal.screen().modes.mouse_encoding;
             let in_alternate_screen = terminal.screen().modes.alternate_screen;
             let alternate_scroll = terminal.screen().modes.alternate_scroll;
             drop(terminal);
@@ -711,12 +820,15 @@ define_class!(
                     for _ in 0..count {
                         if let Some(seq) = mouse::encode_mouse_event(
                             mouse_mode,
-                            sgr_mouse,
-                            button,
-                            col,
-                            row,
+                            mouse_encoding,
+                            MouseEvent::Press(button),
+                            MousePosition::new(
+                                col,
+                                row,
+                                location.x.floor() as i32,
+                                location.y.floor() as i32,
+                            ),
                             modifiers,
-                            false,
                         ) {
                             self.write_to_pty(&seq);
                         }
@@ -800,6 +912,13 @@ define_class!(
 
             let col = (location.x / self.ivars().cell_width).floor().max(0.0) as usize;
             let row = (location.y / self.ivars().cell_height).floor().max(0.0) as usize;
+
+            let mouse_mode = self.ivars().terminal.lock().screen().modes.mouse_mode;
+            if mouse_mode == cterm_core::MouseMode::AnyEvent
+                && self.report_mouse_event(event, MouseEvent::Motion(None))
+            {
+                return;
+            }
 
             // Check if we're over a hyperlink
             let terminal = self.ivars().terminal.lock();
@@ -983,11 +1102,14 @@ define_class!(
             if response == NSAlertFirstButtonReturn {
                 let new_title = input.stringValue();
                 let title_str = new_title.to_string();
-                if let Some(window) = self.window() {
-                    window.setTitle(&new_title);
+                if let Ok(mut title) = self.ivars().state.title.write() {
+                    *title = title_str.clone();
                 }
                 // Lock the title so OSC sequences won't override it
                 self.ivars().state.title_locked.store(true, Ordering::Relaxed);
+                if let Some(window) = self.window() {
+                    let _: () = unsafe { msg_send![&*window, paneTitleDidChange: self] };
+                }
                 // Persist custom title to daemon
                 if let Some(ref tx) = *self.ivars().daemon_cmd_tx.borrow() {
                     let _ = tx.send(DaemonCommand::SetTitle(title_str));
@@ -1071,7 +1193,7 @@ define_class!(
         fn right_mouse_down(&self, event: &NSEvent) {
             // A tracking application gets the right button; only fall through to
             // cterm's context menus when reporting is off or Shift is held.
-            if self.report_mouse_button(event, MouseButton::Right, false) {
+            if self.report_mouse_event(event, MouseEvent::Press(MouseButton::Right)) {
                 return;
             }
 
@@ -1111,13 +1233,13 @@ define_class!(
         /// Forward right-button release to a tracking application.
         #[unsafe(method(rightMouseUp:))]
         fn right_mouse_up(&self, event: &NSEvent) {
-            self.report_mouse_button(event, MouseButton::Release, false);
+            self.report_mouse_event(event, MouseEvent::Release(MouseButton::Right));
         }
 
         /// Forward right-button drag motion to a tracking application.
         #[unsafe(method(rightMouseDragged:))]
         fn right_mouse_dragged(&self, event: &NSEvent) {
-            self.report_mouse_button(event, MouseButton::Right, true);
+            self.report_mouse_event(event, MouseEvent::Motion(Some(MouseButton::Right)));
         }
 
         /// Forward middle-button (and other) press to a tracking application.
@@ -1126,7 +1248,7 @@ define_class!(
             // Only the middle button (buttonNumber 2) is reported; ignore the
             // rest so we don't misencode extra mouse buttons.
             if event.buttonNumber() == 2 {
-                self.report_mouse_button(event, MouseButton::Middle, false);
+                self.report_mouse_event(event, MouseEvent::Press(MouseButton::Middle));
             }
         }
 
@@ -1134,7 +1256,7 @@ define_class!(
         #[unsafe(method(otherMouseUp:))]
         fn other_mouse_up(&self, event: &NSEvent) {
             if event.buttonNumber() == 2 {
-                self.report_mouse_button(event, MouseButton::Release, false);
+                self.report_mouse_event(event, MouseEvent::Release(MouseButton::Middle));
             }
         }
 
@@ -1142,7 +1264,7 @@ define_class!(
         #[unsafe(method(otherMouseDragged:))]
         fn other_mouse_dragged(&self, event: &NSEvent) {
             if event.buttonNumber() == 2 {
-                self.report_mouse_button(event, MouseButton::Middle, true);
+                self.report_mouse_event(event, MouseEvent::Motion(Some(MouseButton::Middle)));
             }
         }
 
@@ -1442,6 +1564,55 @@ struct ViewInitOptions {
 }
 
 impl TerminalView {
+    fn dispatch_pane_action(&self, action: &Action) -> bool {
+        let Some(window) = self.window() else {
+            return false;
+        };
+        let sender = std::ptr::null::<AnyObject>();
+        unsafe {
+            match action {
+                Action::SplitPane(cterm_ui::SplitDirection::Horizontal) => {
+                    let _: () = msg_send![&*window, splitPaneHorizontal: sender];
+                }
+                Action::SplitPane(cterm_ui::SplitDirection::Vertical) => {
+                    let _: () = msg_send![&*window, splitPaneVertical: sender];
+                }
+                Action::ClosePane => {
+                    let _: () = msg_send![&*window, closePane: sender];
+                }
+                Action::FocusPane(cterm_ui::PaneDirection::Left) => {
+                    let _: () = msg_send![&*window, focusPaneLeft: sender];
+                }
+                Action::FocusPane(cterm_ui::PaneDirection::Right) => {
+                    let _: () = msg_send![&*window, focusPaneRight: sender];
+                }
+                Action::FocusPane(cterm_ui::PaneDirection::Up) => {
+                    let _: () = msg_send![&*window, focusPaneUp: sender];
+                }
+                Action::FocusPane(cterm_ui::PaneDirection::Down) => {
+                    let _: () = msg_send![&*window, focusPaneDown: sender];
+                }
+                Action::ResizePane(cterm_ui::PaneDirection::Left) => {
+                    let _: () = msg_send![&*window, resizePaneLeft: sender];
+                }
+                Action::ResizePane(cterm_ui::PaneDirection::Right) => {
+                    let _: () = msg_send![&*window, resizePaneRight: sender];
+                }
+                Action::ResizePane(cterm_ui::PaneDirection::Up) => {
+                    let _: () = msg_send![&*window, resizePaneUp: sender];
+                }
+                Action::ResizePane(cterm_ui::PaneDirection::Down) => {
+                    let _: () = msg_send![&*window, resizePaneDown: sender];
+                }
+                Action::TogglePaneZoom => {
+                    let _: () = msg_send![&*window, togglePaneZoom: sender];
+                }
+                _ => return false,
+            }
+        }
+        true
+    }
+
     fn terminal_key_event(
         &self,
         key: Key,
@@ -1459,6 +1630,7 @@ impl TerminalView {
         mtm: MainThreadMarker,
         renderer: CGRenderer,
         terminal: Arc<Mutex<Terminal>>,
+        config: &Config,
         theme: &Theme,
         options: ViewInitOptions,
     ) -> (Retained<Self>, Arc<ViewState>) {
@@ -1469,6 +1641,7 @@ impl TerminalView {
         let this = mtm.alloc::<Self>();
         let this = this.set_ivars(TerminalViewIvars {
             terminal: terminal.clone(),
+            shortcuts: ShortcutManager::from_config(&config.shortcuts),
             renderer: RefCell::new(Some(renderer)),
             cell_width,
             cell_height,
@@ -1476,16 +1649,26 @@ impl TerminalView {
             is_selecting: Cell::new(false),
             auto_scroll_direction: Cell::new(0),
             auto_scroll_col: Cell::new(0),
+            last_mouse_position: Cell::new(None),
             auto_scroll_timer: RefCell::new(None),
             template_name: RefCell::new(options.template_name),
+            remote_name: RefCell::new(None),
+            keep_open: Cell::new(false),
+            bell_active: Cell::new(false),
+            destroy_on_remove: Cell::new(true),
             session_id: RefCell::new(None),
             marked_text: RefCell::new(String::new()),
             reported_keys: RefCell::new(HashMap::new()),
             notification_bar: RefCell::new(None),
             file_manager: RefCell::new(PendingFileManager::new()),
-            color_palette: theme.colors.clone(),
+            color_palette: {
+                let mut palette = theme.colors.clone();
+                palette.cursor = theme.cursor.color;
+                palette
+            },
             daemon_cmd_tx: RefCell::new(None),
             daemon_socket: RefCell::new(None),
+            pane_session_context: RefCell::new(PaneSessionContext::default()),
         });
 
         let this: Retained<Self> = unsafe { msg_send![super(this), initWithFrame: frame] };
@@ -1520,13 +1703,20 @@ impl TerminalView {
         );
         let (cell_width, cell_height) = renderer.cell_size();
 
+        let mut base_palette = theme.colors.clone();
+        base_palette.cursor = theme.cursor.color;
         let mut terminal = Terminal::new(80, 24, ScreenConfig::default());
-        terminal.set_base_palette(theme.colors.clone());
+        terminal.set_base_palette(base_palette.clone());
+        terminal.set_frontend_state(cterm_core::FrontendState {
+            appearance: theme.appearance(),
+            ..Default::default()
+        });
         terminal.screen_mut().set_cell_height_hint(cell_height);
         terminal.screen_mut().set_cell_width_hint(cell_width);
 
         // Capture session ID before session is consumed
         let sid = session.session_id().to_string();
+        let session_is_remote = session.is_remote();
 
         // Set up command channel — write/resize callbacks send to the background I/O thread
         let (cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel::<DaemonCommand>();
@@ -1543,6 +1733,7 @@ impl TerminalView {
             mtm,
             renderer,
             terminal.clone(),
+            config,
             theme,
             ViewInitOptions::default(),
         );
@@ -1552,13 +1743,28 @@ impl TerminalView {
         *this.ivars().daemon_cmd_tx.borrow_mut() = Some(cmd_tx);
         let daemon_socket = session.socket_path().map(|p| p.to_owned());
         *this.ivars().daemon_socket.borrow_mut() = daemon_socket.clone();
+        if session_is_remote && daemon_socket.is_some() {
+            this.ivars().pane_session_context.borrow_mut().remote_daemon = true;
+        }
 
         let view_ptr = &*this as *const _ as usize;
 
         // Start daemon I/O thread — owns the connection, handles reads and writes
         let state_clone = state.clone();
+        let frontend_state = cterm_core::FrontendState {
+            appearance: theme.appearance(),
+            ..Default::default()
+        };
         std::thread::spawn(move || {
-            Self::read_daemon_loop(sid, terminal, state_clone, cmd_rx, daemon_socket);
+            Self::read_daemon_loop(
+                sid,
+                terminal,
+                state_clone,
+                cmd_rx,
+                daemon_socket,
+                base_palette,
+                frontend_state,
+            );
         });
 
         this.schedule_redraw_check(view_ptr, state);
@@ -1584,16 +1790,33 @@ impl TerminalView {
         );
         let (cell_width, cell_height) = renderer.cell_size();
 
+        let mut base_palette = theme.colors.clone();
+        base_palette.cursor = theme.cursor.color;
         let mut terminal = Terminal::new(80, 24, ScreenConfig::default());
-        terminal.set_base_palette(theme.colors.clone());
+        terminal.set_base_palette(base_palette.clone());
+        terminal.set_frontend_state(cterm_core::FrontendState {
+            appearance: theme.appearance(),
+            ..Default::default()
+        });
         terminal.screen_mut().set_cell_height_hint(cell_height);
         terminal.screen_mut().set_cell_width_hint(cell_width);
 
         // Apply screen snapshot BEFORE wrapping in Arc<Mutex<>>
         recon.apply_screen(&mut terminal);
+        let restored_title = if !recon.custom_title.is_empty() {
+            recon.custom_title.clone()
+        } else if !recon.title.is_empty() {
+            recon.title.clone()
+        } else {
+            terminal.title().to_string()
+        };
+        let restored_title_locked = !recon.custom_title.is_empty();
+        let restored_template_name =
+            (!recon.template_name.is_empty()).then(|| recon.template_name.clone());
 
         // Capture session ID before session is moved into closures/threads
         let sid = recon.handle.session_id().to_string();
+        let session_is_remote = recon.handle.is_remote();
 
         // Set up command channel — write/resize callbacks send to the background I/O thread
         let (cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel::<DaemonCommand>();
@@ -1610,22 +1833,41 @@ impl TerminalView {
             mtm,
             renderer,
             terminal.clone(),
+            config,
             theme,
             ViewInitOptions::default(),
         );
+        this.set_current_title(restored_title);
+        this.set_title_locked(restored_title_locked);
+        this.set_template_name(restored_template_name);
 
         // Store daemon session ID, command channel, and socket path
         this.set_session_id(Some(sid.clone()));
         *this.ivars().daemon_cmd_tx.borrow_mut() = Some(cmd_tx);
         let daemon_socket = recon.handle.socket_path().map(|p| p.to_owned());
         *this.ivars().daemon_socket.borrow_mut() = daemon_socket.clone();
+        if session_is_remote && daemon_socket.is_some() {
+            this.ivars().pane_session_context.borrow_mut().remote_daemon = true;
+        }
 
         let view_ptr = &*this as *const _ as usize;
 
         // Start daemon I/O thread — owns the connection, handles reads and writes
         let state_clone = state.clone();
+        let frontend_state = cterm_core::FrontendState {
+            appearance: theme.appearance(),
+            ..Default::default()
+        };
         std::thread::spawn(move || {
-            Self::read_daemon_loop(sid, terminal, state_clone, cmd_rx, daemon_socket);
+            Self::read_daemon_loop(
+                sid,
+                terminal,
+                state_clone,
+                cmd_rx,
+                daemon_socket,
+                base_palette,
+                frontend_state,
+            );
         });
 
         this.schedule_redraw_check(view_ptr, state);
@@ -1650,6 +1892,8 @@ impl TerminalView {
         state: Arc<ViewState>,
         cmd_rx: tokio::sync::mpsc::UnboundedReceiver<DaemonCommand>,
         daemon_socket: Option<std::path::PathBuf>,
+        base_palette: cterm_core::ColorPalette,
+        frontend_state: cterm_core::FrontendState,
     ) {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -1687,8 +1931,19 @@ impl TerminalView {
                 }
             };
 
-            // Spawn command handler — drains write/resize/destroy commands and forwards to daemon
+            if let Err(error) = session.set_base_palette(&base_palette).await {
+                log::warn!("Failed to synchronize frontend palette with daemon: {error}");
+            }
+            if let Err(error) = session.set_frontend_state(frontend_state).await {
+                log::warn!("Failed to synchronize frontend state with daemon: {error}");
+            }
+
+            // Commands and process-exit events both cancel the output stream.
+            // Detach must complete before the old UI exits during an upgrade,
+            // otherwise the daemon retains a stale frontend attachment.
+            let exit_notify = Arc::new(tokio::sync::Notify::new());
             let cmd_session = session.clone();
+            let exit_notify_command = Arc::clone(&exit_notify);
             tokio::spawn(async move {
                 let mut cmd_rx = cmd_rx;
 
@@ -1765,11 +2020,21 @@ impl TerminalView {
                                 log::error!("Failed to resize daemon session: {}", e);
                             }
                         }
+                        DaemonCommand::Detach { completion } => {
+                            let result = cmd_session.detach().await.map_err(|error| {
+                                log::warn!("Failed to detach daemon session: {error}");
+                                error.to_string()
+                            });
+                            let _ = completion.send(result);
+                            exit_notify_command.notify_one();
+                            break;
+                        }
                         DaemonCommand::Destroy => {
                             log::info!("Destroying daemon session");
                             if let Err(e) = cmd_session.destroy().await {
                                 log::error!("Failed to destroy daemon session: {}", e);
                             }
+                            exit_notify_command.notify_one();
                             break;
                         }
                         DaemonCommand::SetTitle(title) => {
@@ -1789,12 +2054,19 @@ impl TerminalView {
                                 log::error!("Failed to set template name: {}", e);
                             }
                         }
+                        DaemonCommand::SetPalette(palette) => {
+                            if let Err(error) = cmd_session.set_base_palette(&palette).await {
+                                log::error!("Failed to update daemon palette: {error}");
+                            }
+                        }
+                        DaemonCommand::SetFrontendState(state) => {
+                            if let Err(error) = cmd_session.set_frontend_state(state).await {
+                                log::error!("Failed to update daemon frontend state: {error}");
+                            }
+                        }
                     }
                 }
             });
-
-            // Notify used to cancel the output stream when process exits
-            let exit_notify = Arc::new(tokio::sync::Notify::new());
 
             // Subscribe to event stream (process exit, etc.)
             let event_session = session.clone();
@@ -1872,13 +2144,24 @@ impl TerminalView {
                                         for event in events {
                                             match event {
                                                 TerminalEvent::TitleChanged(ref title) => {
-                                                    if let Ok(mut current_title) = state.title.write() {
-                                                        *current_title = title.clone();
+                                                    // `state.title` is the pane's durable display
+                                                    // title. Once locked, OSC titles must not
+                                                    // replace it merely because this pane later
+                                                    // regains focus or is serialized for upgrade.
+                                                    if !state.title_locked.load(Ordering::Relaxed) {
+                                                        if let Ok(mut current_title) = state.title.write() {
+                                                            *current_title = title.clone();
+                                                        }
+                                                        state.title_changed.store(true, Ordering::Relaxed);
                                                     }
-                                                    state.title_changed.store(true, Ordering::Relaxed);
                                                 }
                                                 TerminalEvent::Bell => {
                                                     state.bell_changed.store(true, Ordering::Relaxed);
+                                                }
+                                                TerminalEvent::DesktopNotification(notification) => {
+                                                    if let Ok(mut pending) = state.pending_notifications.lock() {
+                                                        pending.push(notification);
+                                                    }
                                                 }
                                                 TerminalEvent::ContentChanged => {
                                                     content_changed = true;
@@ -1930,9 +2213,9 @@ impl TerminalView {
                     state.needs_redraw.store(true, Ordering::Relaxed);
                 }
 
-                // Check if PTY closed - if so, close the window
+                // Check if PTY closed and let the owning pane decide its lifecycle.
                 if state.pty_closed.load(Ordering::Relaxed) {
-                    log::info!("PTY closed, closing window");
+                    log::info!("PTY closed");
                     // Only close if view is still valid
                     if !state.view_invalid.load(Ordering::SeqCst) {
                         let state_clone = state.clone();
@@ -1942,8 +2225,10 @@ impl TerminalView {
                             if !state_clone.view_invalid.load(Ordering::SeqCst) && view_ptr != 0 {
                                 unsafe {
                                     let view = &*(view_ptr as *const TerminalView);
-                                    if let Some(window) = view.window() {
-                                        window.close();
+                                    if !view.keep_open() {
+                                        if let Some(window) = view.window() {
+                                            let _: () = msg_send![&*window, paneDidExit: view];
+                                        }
                                     }
                                 }
                             }
@@ -1958,8 +2243,6 @@ impl TerminalView {
                     if !state.title_locked.load(Ordering::Relaxed)
                         && !state.view_invalid.load(Ordering::SeqCst)
                     {
-                        // Get the new title
-                        let new_title = state.title.read().map(|t| t.clone()).unwrap_or_default();
                         let state_clone = state.clone();
                         #[allow(deprecated)]
                         dispatch2::Queue::main().exec_async(move || {
@@ -1967,7 +2250,7 @@ impl TerminalView {
                                 unsafe {
                                     let view = &*(view_ptr as *const TerminalView);
                                     if let Some(window) = view.window() {
-                                        window.setTitle(&NSString::from_str(&new_title));
+                                        let _: () = msg_send![&*window, paneTitleDidChange: view];
                                     }
                                 }
                             }
@@ -1986,23 +2269,7 @@ impl TerminalView {
                             unsafe {
                                 let view = &*(view_ptr as *const TerminalView);
                                 if let Some(window) = view.window() {
-                                    // Only show bell indicator if window is not key (not focused)
-                                    if !window.isKeyWindow() {
-                                        // Get current title and prepend bell emoji if not already present
-                                        let current_title: Retained<NSString> =
-                                            msg_send![&window, title];
-                                        let title_str = current_title.to_string();
-                                        if !title_str.starts_with("🔔 ") {
-                                            let new_title = format!("🔔 {}", title_str);
-                                            window.setTitle(&NSString::from_str(&new_title));
-                                        }
-                                        // Update bell count via our window type
-                                        let window_ptr = Retained::as_ptr(&window)
-                                            as *const crate::window::CtermWindow;
-                                        let cterm_window: &crate::window::CtermWindow =
-                                            &*window_ptr;
-                                        cterm_window.set_bell(true);
-                                    }
+                                    let _: () = msg_send![&*window, paneBellDidRing: view];
                                     // Request attention in the dock
                                     let app = NSApplication::sharedApplication(
                                         MainThreadMarker::new().unwrap(),
@@ -2012,6 +2279,19 @@ impl TerminalView {
                                     );
                                 }
                             }
+                        }
+                    });
+                }
+
+                let notifications = state
+                    .pending_notifications
+                    .lock()
+                    .map(|mut pending| std::mem::take(&mut *pending))
+                    .unwrap_or_default();
+                if !notifications.is_empty() {
+                    dispatch2::Queue::main().exec_async(move || {
+                        for notification in notifications {
+                            crate::desktop_notification::handle(&notification);
                         }
                     });
                 }
@@ -2047,6 +2327,103 @@ impl TerminalView {
         *self.ivars().template_name.borrow_mut() = name;
     }
 
+    /// Return the configured remote-manager key for this pane, if any.
+    pub fn remote_name(&self) -> Option<String> {
+        self.ivars().remote_name.borrow().clone()
+    }
+
+    /// Record the configured remote-manager key used by this pane.
+    pub fn set_remote_name(&self, name: Option<String>) {
+        *self.ivars().remote_name.borrow_mut() = name;
+    }
+
+    /// Return whether this pane remains visible after its child exits.
+    pub fn keep_open(&self) -> bool {
+        self.ivars().keep_open.get()
+    }
+
+    /// Set whether this pane remains visible after its child exits.
+    pub fn set_keep_open(&self, keep_open: bool) {
+        self.ivars().keep_open.set(keep_open);
+    }
+
+    /// Return the pane's durable display title.
+    pub fn current_title(&self) -> String {
+        self.ivars()
+            .state
+            .title
+            .read()
+            .map(|title| title.clone())
+            .unwrap_or_default()
+    }
+
+    /// Seed the pane title when restoring state before new daemon events arrive.
+    pub fn set_current_title(&self, title: String) {
+        if let Ok(mut current) = self.ivars().state.title.write() {
+            *current = title;
+        }
+    }
+
+    /// Stop background view access and destroy the owning daemon session.
+    pub fn destroy_session(&self) {
+        self.ivars().destroy_on_remove.set(true);
+        self.ivars()
+            .state
+            .view_invalid
+            .store(true, Ordering::SeqCst);
+        if let Some(sender) = self.ivars().daemon_cmd_tx.borrow().as_ref() {
+            let _ = sender.send(DaemonCommand::Destroy);
+        }
+        let _pty = self.ivars().terminal.lock().take_pty();
+    }
+
+    /// Begin detaching this frontend for an upgrade without killing its session.
+    /// The receiver completes only after ctermd has decremented the attachment.
+    pub fn prepare_session_for_handoff(
+        &self,
+    ) -> Option<std::sync::mpsc::Receiver<Result<(), String>>> {
+        self.ivars().destroy_on_remove.set(false);
+        let sender = self.ivars().daemon_cmd_tx.borrow().clone()?;
+        let (completion, receiver) = std::sync::mpsc::channel();
+        if sender.send(DaemonCommand::Detach { completion }).is_err() {
+            log::warn!("Could not queue daemon detach before UI upgrade");
+            return None;
+        }
+        Some(receiver)
+    }
+
+    /// Record the exact process/SSH fields used to create this pane.
+    pub fn set_pane_launch_context(&self, launch: PaneLaunchContext) {
+        self.ivars().pane_session_context.borrow_mut().launch = Some(launch);
+    }
+
+    /// Return the launch context for a sibling pane. Remote daemons can safely
+    /// fall back to their own defaults for legacy records; unknown local
+    /// sessions are rejected because inheriting the wrong SSH domain is unsafe.
+    pub fn pane_launch_context(&self) -> Option<PaneLaunchContext> {
+        let context = self.ivars().pane_session_context.borrow();
+        if let Some(launch) = context.launch.as_ref() {
+            Some(launch.clone())
+        } else if context.remote_daemon {
+            Some(PaneLaunchContext::default())
+        } else {
+            None
+        }
+    }
+
+    /// Whether session creation is delegated to a daemon reached over SSH.
+    pub fn is_remote_daemon_pane(&self) -> bool {
+        self.ivars().pane_session_context.borrow().remote_daemon
+    }
+
+    pub fn has_active_bell(&self) -> bool {
+        self.ivars().bell_active.get()
+    }
+
+    pub fn set_active_bell(&self, active: bool) {
+        self.ivars().bell_active.set(active);
+    }
+
     /// Set the background color override (from template configuration)
     pub fn set_background_override(&self, color: Option<&str>) {
         if let Some(ref mut renderer) = *self.ivars().renderer.borrow_mut() {
@@ -2056,7 +2433,29 @@ impl TerminalView {
         if let Some(background) = color.and_then(cterm_core::Rgb::from_hex) {
             palette.background = background;
         }
-        self.ivars().terminal.lock().set_base_palette(palette);
+        self.ivars()
+            .terminal
+            .lock()
+            .set_base_palette(palette.clone());
+        if let Some(sender) = self.ivars().daemon_cmd_tx.borrow().as_ref() {
+            let _ = sender.send(DaemonCommand::SetPalette(palette));
+        }
+    }
+
+    /// Report native window visibility to the local terminal or owning daemon.
+    pub fn set_window_visibility(&self, visibility: cterm_core::WindowVisibility) {
+        let mut terminal = self.ivars().terminal.lock();
+        let mut state = terminal.screen().frontend_state();
+        state.visibility = visibility;
+        if self.ivars().daemon_cmd_tx.borrow().is_some() {
+            let _ = terminal.set_frontend_state_collecting(state);
+        } else {
+            terminal.set_frontend_state(state);
+        }
+        drop(terminal);
+        if let Some(sender) = self.ivars().daemon_cmd_tx.borrow().as_ref() {
+            let _ = sender.send(DaemonCommand::SetFrontendState(state));
+        }
     }
 
     /// Check if the title is locked (user-set or template-set)
@@ -2370,26 +2769,45 @@ impl TerminalView {
     /// (xterm/VTE convention) so text selection, scrollback, and context menus
     /// keep working while an app grabs the mouse. When this returns `false` the
     /// caller falls back to cterm's own local handling.
-    fn report_mouse_button(&self, event: &NSEvent, button: MouseButton, is_drag: bool) -> bool {
-        let shift = event
+    fn report_mouse_event(&self, native_event: &NSEvent, event: MouseEvent) -> bool {
+        let shift = native_event
             .modifierFlags()
             .contains(objc2_app_kit::NSEventModifierFlags::Shift);
         let terminal = self.ivars().terminal.lock();
         let mouse_mode = terminal.screen().modes.mouse_mode;
-        let sgr_mouse = terminal.screen().modes.sgr_mouse;
+        let mouse_encoding = terminal.screen().modes.mouse_encoding;
         drop(terminal);
 
         if shift || !mouse::should_capture_mouse(mouse_mode) {
             return false;
         }
 
-        let location = self.convert_point_from_view(event.locationInWindow(), None);
+        let location = self.convert_point_from_view(native_event.locationInWindow(), None);
         let col = (location.x / self.ivars().cell_width).floor().max(0.0) as usize;
         let row = (location.y / self.ivars().cell_height).floor().max(0.0) as usize;
-        let modifiers = self.get_mouse_modifiers(event);
+        let position = MousePosition::new(
+            col,
+            row,
+            location.x.floor() as i32,
+            location.y.floor() as i32,
+        );
+        let modifiers = self.get_mouse_modifiers(native_event);
+
+        let previous = self.ivars().last_mouse_position.replace(Some(position));
+        if matches!(event, MouseEvent::Motion(_))
+            && previous.is_some_and(|previous| {
+                if mouse_encoding == cterm_core::MouseEncoding::SgrPixels {
+                    (previous.pixel_x, previous.pixel_y) == (position.pixel_x, position.pixel_y)
+                } else {
+                    (previous.col, previous.row) == (position.col, position.row)
+                }
+            })
+        {
+            return true;
+        }
 
         if let Some(seq) =
-            mouse::encode_mouse_event(mouse_mode, sgr_mouse, button, col, row, modifiers, is_drag)
+            mouse::encode_mouse_event(mouse_mode, mouse_encoding, event, position, modifiers)
         {
             self.write_to_pty(&seq);
         }

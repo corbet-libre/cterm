@@ -72,6 +72,32 @@ impl SessionManager {
         env: Vec<(String, String)>,
         term: Option<String>,
     ) -> Result<Arc<SessionState>> {
+        self.create_session_with_size_and_palette(
+            size,
+            shell,
+            args,
+            cwd,
+            env,
+            term,
+            None,
+            cterm_core::FrontendState::default(),
+        )
+    }
+
+    /// Create a terminal session with complete geometry and an authoritative
+    /// frontend palette installed before the reader processes child output.
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_session_with_size_and_palette(
+        &self,
+        size: cterm_core::PtySize,
+        shell: Option<String>,
+        args: Vec<String>,
+        cwd: Option<PathBuf>,
+        env: Vec<(String, String)>,
+        term: Option<String>,
+        base_palette: Option<cterm_core::ColorPalette>,
+        frontend_state: cterm_core::FrontendState,
+    ) -> Result<Arc<SessionState>> {
         let size = size.normalized();
         let cols = size.cols as usize;
         let rows = size.rows as usize;
@@ -92,6 +118,11 @@ impl SessionManager {
             term,
             self.scrollback_lines,
         )?;
+
+        if let Some(palette) = base_palette {
+            state.set_base_palette(palette);
+        }
+        state.set_frontend_state(frontend_state);
 
         // Start the PTY reader task
         let state = state.start_reader()?;
@@ -132,6 +163,22 @@ impl SessionManager {
         size: cterm_core::PtySize,
         ssh_config: cterm_core::SshConfig,
     ) -> Result<Arc<SessionState>> {
+        self.create_ssh_session_with_size_and_palette(
+            size,
+            ssh_config,
+            None,
+            cterm_core::FrontendState::default(),
+        )
+    }
+
+    /// Create a native SSH session with complete geometry and frontend palette.
+    pub fn create_ssh_session_with_size_and_palette(
+        &self,
+        size: cterm_core::PtySize,
+        ssh_config: cterm_core::SshConfig,
+        base_palette: Option<cterm_core::ColorPalette>,
+        frontend_state: cterm_core::FrontendState,
+    ) -> Result<Arc<SessionState>> {
         let size = size.normalized();
         let cols = size.cols as usize;
         let rows = size.rows as usize;
@@ -143,6 +190,10 @@ impl SessionManager {
 
         let host = ssh_config.host.clone();
         let state = SessionState::new_ssh_connecting(id.clone(), size, self.scrollback_lines);
+        if let Some(palette) = base_palette {
+            state.set_base_palette(palette);
+        }
+        state.set_frontend_state(frontend_state);
 
         // Store the session before driving the connection so prompt/event
         // subscribers can attach immediately.

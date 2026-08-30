@@ -13,7 +13,7 @@ use tonic::transport::Channel;
 
 /// GitHub repository for downloading ctermd releases
 #[cfg(unix)]
-const GITHUB_REPO: &str = "KarpelesLab/cterm";
+const CTERM_GITHUB_REPOSITORY: &str = "corbet-labs/cterm";
 
 /// Max time to establish the HTTP/2 transport to the daemon. A wedged daemon can
 /// accept the socket connection (the listen backlog is kernel-side) yet never
@@ -96,7 +96,7 @@ if [ -z "$CTERMD" ]; then
 fi
 "$CTERMD" >/dev/null 2>&1 || true
 "$CTERMD" --print-socket-path"#,
-        repo = GITHUB_REPO
+        repo = CTERM_GITHUB_REPOSITORY
     )
 }
 
@@ -245,6 +245,10 @@ pub struct CreateSessionOpts {
     pub term: Option<String>,
     /// When set, the daemon opens a native SSH session instead of a local shell.
     pub ssh: Option<SshParams>,
+    /// Active frontend palette for authoritative OSC color-query replies.
+    pub base_palette: Option<cterm_core::ColorPalette>,
+    /// Native theme and window state for foot-compatible protocol reports.
+    pub frontend_state: cterm_core::FrontendState,
 }
 
 /// Connection to a ctermd instance
@@ -434,11 +438,18 @@ impl DaemonConnection {
         Ok((conn, tunnel_handle))
     }
 
-    /// Stable per-host key identifying an SSH tunnel in the registry. It reuses
+    /// Process-unique key identifying an SSH tunnel in the registry. It reuses
     /// the daemon socket directory for a recognizable value but is never created
     /// as a file — it only flows through the app as a connection's `socket_path`.
+    ///
+    /// Distinct `RemoteManager`s may intentionally open the same host (for
+    /// example one manager per native window). A per-host key would make the
+    /// newer connection replace the older registry entry and let either
+    /// manager tear down the other's tunnel.
     #[cfg(unix)]
     fn ssh_tunnel_key(host: &str) -> PathBuf {
+        static NEXT_TUNNEL_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
         let safe_host: String = host
             .chars()
             .map(|c| {
@@ -449,9 +460,15 @@ impl DaemonConnection {
                 }
             })
             .collect();
+        let tunnel_id = NEXT_TUNNEL_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
         let mut path = socket::default_socket_path();
-        path.set_file_name(format!("ctermd-ssh-{}", safe_host));
+        path.set_file_name(format!(
+            "ctermd-ssh-{}-{}-{}",
+            safe_host,
+            std::process::id(),
+            tunnel_id
+        ));
         path
     }
 
@@ -482,7 +499,16 @@ impl DaemonConnection {
                     CONNECT_TIMEOUT.as_secs()
                 ))
             })??;
-        Self::handshake(channel, Some(key.to_owned()), None).await
+        let mut connection = Self::handshake(channel, Some(key.to_owned()), None).await?;
+        // `HandshakeResponse::is_local` is from the daemon's own perspective;
+        // a daemon reached through our SSH transport still reports itself as
+        // local. The client transport is authoritative for pane inheritance.
+        Arc::make_mut(&mut connection.info).is_local = false;
+        log::info!(
+            "Connected to remote ctermd on {} through SSH",
+            connection.info.hostname
+        );
+        Ok(connection)
     }
 
     /// Try to connect to the daemon at the given path (platform-dispatched).
@@ -760,6 +786,8 @@ impl DaemonConnection {
 
     /// Create a new terminal session
     pub async fn create_session(&self, opts: CreateSessionOpts) -> Result<SessionHandle> {
+        let (theme_appearance, window_visibility) =
+            cterm_proto::convert::frontend_state_to_proto(opts.frontend_state);
         let response = self
             .client
             .lock()
@@ -775,6 +803,12 @@ impl DaemonConnection {
                 ssh: opts.ssh,
                 pixel_width: opts.pixel_width,
                 pixel_height: opts.pixel_height,
+                base_palette: opts
+                    .base_palette
+                    .as_ref()
+                    .map(cterm_proto::convert::palette_to_proto),
+                theme_appearance,
+                window_visibility,
             })
             .await?;
 
@@ -1240,5 +1274,29 @@ mod tests {
             config.auth_file,
         )
         .is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn remote_setup_downloads_from_product_repository() {
+        let script = remote_setup_script();
+
+        assert!(script.contains(
+            "https://github.com/corbet-labs/cterm/releases/latest/download/$ASSET.tar.gz"
+        ));
+        assert!(!script.contains("KarpelesLab/cterm"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ssh_tunnel_registry_keys_are_unique_for_the_same_host() {
+        let first = DaemonConnection::ssh_tunnel_key("dev@example.test:2222");
+        let second = DaemonConnection::ssh_tunnel_key("dev@example.test:2222");
+
+        assert_ne!(first, second);
+        assert!(first
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with("ctermd-ssh-dev_example.test_2222-")));
     }
 }

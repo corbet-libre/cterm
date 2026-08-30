@@ -87,6 +87,22 @@ pub struct SessionState {
 }
 
 impl SessionState {
+    /// Replace the palette used for daemon-authoritative OSC color replies.
+    pub fn set_base_palette(&self, palette: cterm_core::ColorPalette) {
+        self.terminal.write().set_base_palette(palette);
+    }
+
+    /// Update native frontend state and forward any enabled change reports.
+    pub fn set_frontend_state(&self, state: cterm_core::FrontendState) {
+        let responses = self.terminal.write().set_frontend_state_collecting(state);
+        self.send_terminal_responses(responses);
+    }
+
+    /// Current state last reported by the native frontend.
+    pub fn frontend_state(&self) -> cterm_core::FrontendState {
+        self.terminal.read().screen().frontend_state()
+    }
+
     /// Create a new session with the given configuration
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -431,7 +447,13 @@ impl SessionState {
 
     /// Decrement the attached client count
     pub fn detach(&self) {
-        self.attached_clients.fetch_sub(1, Ordering::Relaxed);
+        // Stale UI cleanup can race after a failed reconnect. Keep detach
+        // idempotent instead of wrapping the public count to `u32::MAX`.
+        let _ = self
+            .attached_clients
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |count| {
+                Some(count.saturating_sub(1))
+            });
     }
 
     /// Get the number of currently attached clients
@@ -598,23 +620,26 @@ impl SessionState {
             (events, responses)
         }; // terminal lock released here
 
-        if !responses.is_empty() {
-            let response = responses.concat();
-            match self.pty_writer.get() {
-                Some(writer) => {
-                    writer.send(&response);
-                }
-                None => {
-                    // No PTY writer yet: write responses directly (no-op without a PTY).
-                    let mut term = self.terminal.write();
-                    if let Err(e) = term.write(&response) {
-                        log::error!("Failed to send response to PTY: {e}");
-                    }
+        self.send_terminal_responses(responses);
+
+        events
+    }
+
+    fn send_terminal_responses(&self, responses: Vec<Vec<u8>>) {
+        if responses.is_empty() {
+            return;
+        }
+        let response = responses.concat();
+        match self.pty_writer.get() {
+            Some(writer) => writer.send(&response),
+            None => {
+                // No PTY writer yet: write responses directly (no-op without a PTY).
+                let mut term = self.terminal.write();
+                if let Err(error) = term.write(&response) {
+                    log::error!("Failed to send response to PTY: {error}");
                 }
             }
         }
-
-        events
     }
 
     /// Broadcast output data to subscribers
@@ -662,5 +687,24 @@ impl SessionState {
     {
         let mut term = self.terminal.write();
         f(&mut term)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn detach_count_saturates_at_zero() {
+        let session =
+            SessionState::new_ssh_connecting("attachment-count".to_string(), PtySize::default(), 0);
+
+        session.detach();
+        assert_eq!(session.attached_clients(), 0);
+
+        session.attach();
+        session.detach();
+        session.detach();
+        assert_eq!(session.attached_clients(), 0);
     }
 }
