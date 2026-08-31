@@ -37,7 +37,7 @@ pub fn create_menu_model_with_options(
         file_menu.append_item(&menu_item(
             "Quick Open Template...",
             "win.quick-open",
-            Some("<Ctrl><Shift>o"),
+            Some("<Ctrl><Shift>g"),
         ));
 
         // Docker submenu
@@ -74,6 +74,15 @@ pub fn create_menu_model_with_options(
         Some("<Ctrl><Shift>a"),
     ));
     menu.append_submenu(Some("Edit"), &edit_menu);
+
+    // View menu
+    let view_menu = gio::Menu::new();
+    view_menu.append_item(&menu_item(
+        "Fullscreen",
+        "win.toggle-fullscreen",
+        Some("F11"),
+    ));
+    menu.append_submenu(Some("View"), &view_menu);
 
     // Terminal menu
     let terminal_menu = gio::Menu::new();
@@ -196,6 +205,24 @@ fn create_tools_submenu() -> gio::Menu {
             let action = format!("win.run-tool-shortcut::{}", i);
             menu.append(Some(&shortcut.name), Some(&action));
         }
+    }
+
+    match cterm_app::PluginRuntime::for_current_user() {
+        Ok(runtime) if !runtime.catalog().commands().is_empty() => {
+            let plugins = gio::Menu::new();
+            for command in runtime.catalog().commands() {
+                let label = format!("{} — {}", command.plugin_name(), command.command_title());
+                let item = gio::MenuItem::new(Some(&label), None);
+                item.set_action_and_target_value(
+                    Some("win.run-plugin-command"),
+                    Some(&glib::Variant::from(command.action_id())),
+                );
+                plugins.append_item(&item);
+            }
+            menu.append_section(Some("Plugins"), &plugins);
+        }
+        Ok(_) => {}
+        Err(error) => log::error!("Failed to load plugin commands: {error}"),
     }
     menu
 }

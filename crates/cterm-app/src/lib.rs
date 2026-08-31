@@ -13,10 +13,14 @@ pub mod file_drop;
 pub mod file_transfer;
 pub mod git_sync;
 pub mod log_capture;
+pub mod plugin_broker;
+pub mod plugin_runtime;
+pub mod plugins;
 pub mod quick_open;
 pub mod session;
 pub mod shortcuts;
 pub mod ssh_history;
+pub mod template_launch;
 pub mod upgrade;
 
 pub use config::{
@@ -33,8 +37,22 @@ pub use git_sync::{
     is_git_repo, prepare_working_directory, pull_with_conflict_resolution, GitError, InitResult,
     PullResult, SyncStatus,
 };
+pub use plugin_broker::{PluginBroker, PluginBrokerError, PluginBrokerOutput, PluginBrokerTimeout};
+pub use plugin_runtime::{
+    PluginApprovalPrompt, PluginAuthorization, PluginExecution, PluginInvocation, PluginRuntime,
+    PluginRuntimeError,
+};
+pub use plugins::{
+    PluginCatalog, PluginCatalogError, PluginCommandDescriptor, PluginDataPaths,
+    PluginDiscoveryError, PluginDiscoveryFailure, PluginGrantFile, PluginStorageError,
+};
 pub use session::{Session, TabState, WindowState};
 pub use shortcuts::ShortcutManager;
+pub use template_launch::{
+    TemplateAppearance, TemplateDaemonTarget, TemplateInstancePolicy, TemplateLaunchPlan,
+    TemplateLaunchPlanError, TemplateLaunchTarget, TemplateNamedRemote, TemplateWorkspace,
+    TemplateWorkspaceLocation, TemplateWorkspaceSource,
+};
 pub use upgrade::{execute_upgrade, receive_upgrade, UpgradeError};
 pub use upgrade::{UpdateError, UpdateInfo, Updater, UpgradeState};
 

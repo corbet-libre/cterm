@@ -4,7 +4,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use gtk4::prelude::*;
 use gtk4::{
@@ -20,15 +20,59 @@ use cterm_core::mouse::{
 };
 use cterm_core::screen::{ClipboardOperation, CursorStyle, MouseEncoding, MouseMode, ScreenConfig};
 use cterm_core::term::{Key, Modifiers, Terminal, TerminalEvent};
-use cterm_core::{KeyEventKind, KeyboardEnhancementFlags};
+use cterm_core::KeyEventKind;
+use cterm_ui::blink::{
+    cell_foreground_visible, cursor_visible, BlinkClock, BlinkNeeds, BlinkPhase,
+    BLINK_POLL_INTERVAL,
+};
+use cterm_ui::cursor::{cursor_footprint, extra_cursors_visible, resolve_extra_cursor_colors};
 use cterm_ui::sprite::{Sprite, SpriteCache};
+use cterm_ui::text_sizing::{
+    is_multicell_render_anchor, multicell_is_selected, multicell_render_metrics,
+};
 use cterm_ui::theme::Theme;
+
+use crate::keyboard::{
+    associated_text_for_gdk_key, gtk_state_to_modifiers, keyval_to_key, reported_key_from_gdk,
+    should_route_enhanced_key, ReportedKey,
+};
 
 /// Cell dimensions calculated from font metrics
 #[derive(Debug, Clone, Copy)]
 pub struct CellDimensions {
     pub width: f64,
     pub height: f64,
+}
+
+impl CellDimensions {
+    /// Reject Pango's missing-font sentinel metrics before they become GTK
+    /// size requests. Some headless fontconfig setups return large positive
+    /// values rather than an error when no usable face is installed.
+    pub(crate) fn checked(width: f64, height: f64) -> Option<Self> {
+        const MAX_CELL_DIMENSION: f64 = 256.0;
+
+        if width.is_finite()
+            && height.is_finite()
+            && (1.0..=MAX_CELL_DIMENSION).contains(&width)
+            && (1.0..=MAX_CELL_DIMENSION).contains(&height)
+        {
+            Some(Self { width, height })
+        } else {
+            None
+        }
+    }
+
+    pub(crate) fn conservative_fallback(font_size: f64) -> Self {
+        let font_size = if font_size.is_finite() {
+            font_size.clamp(6.0, 72.0)
+        } else {
+            12.0
+        };
+        Self {
+            width: font_size * 0.75,
+            height: font_size * 1.5,
+        }
+    }
 }
 
 /// Callback type for terminal events
@@ -56,6 +100,8 @@ pub struct TerminalWidget {
     default_font_size: f64,
     cell_dims: Rc<RefCell<CellDimensions>>,
     sprite_cache: Rc<RefCell<SpriteCache>>,
+    blink_clock: Rc<RefCell<BlinkClock>>,
+    blink_started: Instant,
     /// Optional background color override (from template)
     background_override: Rc<RefCell<Option<cterm_core::color::Rgb>>>,
     /// Input method preedit (composition) state
@@ -248,19 +294,7 @@ impl TerminalWidget {
     /// Reset the terminal (soft reset - keeps scrollback)
     pub fn reset(&self) {
         let mut term = self.terminal.lock();
-        let screen = term.screen_mut();
-        // Soft reset: reset modes and cursor but keep scrollback
-        screen.cursor = cterm_core::screen::Cursor::default();
-        screen.style = cterm_core::cell::CellStyle::default();
-        screen.modes = cterm_core::screen::TerminalModes {
-            auto_wrap: true,
-            reverse_wrap: true,
-            modify_other_keys: 1,
-            show_cursor: true,
-            ..Default::default()
-        };
-        screen.reset_scroll_region();
-        screen.dirty = true;
+        soft_reset_screen(term.screen_mut());
         drop(term);
         self.drawing_area.queue_draw();
     }
@@ -565,6 +599,7 @@ impl TerminalWidget {
         let background_override = Rc::clone(&self.background_override);
         let preedit = Rc::clone(&self.preedit);
         let sprite_cache = Rc::clone(&self.sprite_cache);
+        let blink_clock = Rc::clone(&self.blink_clock);
 
         self.drawing_area
             .set_draw_func(move |_area, cr, _width, _height| {
@@ -579,6 +614,7 @@ impl TerminalWidget {
                     background_override: bg_override,
                 };
                 let mut sprites = sprite_cache.borrow_mut();
+                let blink_phase = blink_clock.borrow().phase();
                 draw_terminal(
                     cr,
                     &terminal,
@@ -586,8 +622,32 @@ impl TerminalWidget {
                     &render_config,
                     &preedit_state,
                     &mut sprites,
+                    blink_phase,
                 );
             });
+    }
+
+    /// Drive blink phases independently of PTY output and invalidate only on
+    /// phase edges that are relevant to the currently visible screen.
+    fn setup_blink_clock(&self) {
+        let drawing_area = self.drawing_area.downgrade();
+        let terminal = Arc::clone(&self.terminal);
+        let blink_clock = Rc::clone(&self.blink_clock);
+        let started = self.blink_started;
+
+        glib::timeout_add_local(BLINK_POLL_INTERVAL, move || {
+            let Some(drawing_area) = drawing_area.upgrade() else {
+                return glib::ControlFlow::Break;
+            };
+            let now = started.elapsed();
+            let mut terminal = terminal.lock();
+            let needs = BlinkNeeds::for_screen(terminal.screen());
+            let animation_changed = terminal.advance_graphics_animations(now).changed;
+            if blink_clock.borrow_mut().update(now, needs) || animation_changed {
+                drawing_area.queue_draw();
+            }
+            glib::ControlFlow::Continue
+        });
     }
 
     /// Set up input handling
@@ -612,8 +672,11 @@ impl TerminalWidget {
         im_context.connect_commit(move |_, text| {
             let mut term = terminal_commit.lock();
             term.scroll_viewport_to_bottom();
-            if let Err(e) = term.write(text.as_bytes()) {
-                log::error!("Failed to write IM text to PTY: {}", e);
+            let encoded = term.handle_text_input(text);
+            if !encoded.is_empty() {
+                if let Err(e) = term.write(&encoded) {
+                    log::error!("Failed to write IM text to PTY: {}", e);
+                }
             }
             drawing_area_commit.queue_draw();
         });
@@ -640,7 +703,8 @@ impl TerminalWidget {
             drawing_area_preedit_end.queue_draw();
         });
 
-        let enhanced_keys: Rc<RefCell<HashMap<u32, Key>>> = Rc::new(RefCell::new(HashMap::new()));
+        let enhanced_keys: Rc<RefCell<HashMap<u32, ReportedKey>>> =
+            Rc::new(RefCell::new(HashMap::new()));
 
         // Manage IM focus when the DrawingArea gains/loses keyboard focus
         let im_focus = im_context.clone();
@@ -685,22 +749,26 @@ impl TerminalWidget {
             }
 
             let modifiers = gtk_state_to_modifiers(state);
-            let protocol_key = keyval_to_key(keyval).or_else(|| {
-                keyval
-                    .to_lower()
-                    .to_unicode()
-                    .map(cterm_core::term::Key::Char)
-            });
-            if let Some(key) = protocol_key {
+            let reported_key = reported_key_from_gdk(controller, keyval, keycode);
+            if let Some(reported) = reported_key {
                 let mut term = terminal_key.lock();
-                if should_route_enhanced_key(&term, key, modifiers) {
-                    let kind = if enhanced_keys_down.borrow().contains_key(&keycode) {
-                        KeyEventKind::Repeat
-                    } else {
-                        enhanced_keys_down.borrow_mut().insert(keycode, key);
-                        KeyEventKind::Press
+                if should_route_enhanced_key(&term, reported.key, modifiers) {
+                    let already_pressed = enhanced_keys_down.borrow().get(&keycode).copied();
+                    let (kind, reported) = match already_pressed {
+                        Some(pressed) => (KeyEventKind::Repeat, pressed),
+                        None => {
+                            enhanced_keys_down.borrow_mut().insert(keycode, reported);
+                            (KeyEventKind::Press, reported)
+                        }
                     };
-                    if let Some(bytes) = term.handle_key_event(key, modifiers, kind) {
+                    let associated_text =
+                        associated_text_for_gdk_key(reported.key, keyval, modifiers);
+                    let metadata = reported
+                        .metadata()
+                        .with_associated_text(associated_text.as_deref());
+                    if let Some(bytes) =
+                        term.handle_key_event_with_metadata(reported.key, modifiers, kind, metadata)
+                    {
                         if let Err(e) = term.write(&bytes) {
                             log::error!("Failed to write enhanced key event to PTY: {e}");
                         }
@@ -718,8 +786,8 @@ impl TerminalWidget {
                     if let Err(e) = term.write(&bytes) {
                         log::error!("Failed to write to PTY: {}", e);
                     }
+                    return glib::Propagation::Stop;
                 }
-                return glib::Propagation::Stop;
             }
 
             // Get the character for this key
@@ -766,8 +834,11 @@ impl TerminalWidget {
                     let mut term = terminal_key.lock();
                     let mut buf = [0u8; 4];
                     let s = c.encode_utf8(&mut buf);
-                    if let Err(e) = term.write(s.as_bytes()) {
-                        log::error!("Failed to write to PTY: {}", e);
+                    let encoded = term.handle_text_input(s);
+                    if !encoded.is_empty() {
+                        if let Err(e) = term.write(&encoded) {
+                            log::error!("Failed to write to PTY: {}", e);
+                        }
                     }
                     return glib::Propagation::Stop;
                 }
@@ -782,10 +853,14 @@ impl TerminalWidget {
         let terminal_release = Arc::clone(&terminal);
         let enhanced_keys_up = Rc::clone(&enhanced_keys);
         key_controller.connect_key_released(move |controller, _keyval, keycode, state| {
-            if let Some(key) = enhanced_keys_up.borrow_mut().remove(&keycode) {
+            if let Some(reported) = enhanced_keys_up.borrow_mut().remove(&keycode) {
                 let modifiers = gtk_state_to_modifiers(state);
                 let mut term = terminal_release.lock();
-                if let Some(bytes) = term.handle_reported_key_release(key, modifiers) {
+                if let Some(bytes) = term.handle_reported_key_release_with_metadata(
+                    reported.key,
+                    modifiers,
+                    reported.metadata(),
+                ) {
                     if let Err(e) = term.write(&bytes) {
                         log::error!("Failed to write enhanced key release to PTY: {e}");
                     }
@@ -1226,6 +1301,22 @@ impl TerminalWidget {
             }
         });
 
+        let terminal_leave = Arc::clone(&terminal);
+        let last_position_leave = Rc::clone(&last_position);
+        motion_controller.connect_leave(move |controller| {
+            let state = controller
+                .current_event()
+                .map(|event| event.modifier_state())
+                .unwrap_or_else(gdk::ModifierType::empty);
+            let mut term = terminal_leave.lock();
+            report_mouse(
+                &mut term,
+                MouseEvent::Leave,
+                *last_position_leave.borrow(),
+                gtk_state_to_mouse_mods(state),
+            );
+        });
+
         self.drawing_area.add_controller(motion_controller);
 
         // Scroll handling
@@ -1437,6 +1528,7 @@ impl TerminalWidget {
 
         // Create a Terminal with no PTY — write callback forwards via channel
         let mut terminal = Terminal::new(80, 24, ScreenConfig::default());
+        configure_terminal_cursor(&mut terminal, config);
         terminal.set_base_palette(frontend_palette(theme, None));
         terminal.set_frontend_state(cterm_core::FrontendState {
             appearance: theme.appearance(),
@@ -1462,6 +1554,8 @@ impl TerminalWidget {
             default_font_size: font_size,
             cell_dims,
             sprite_cache: Rc::new(RefCell::new(SpriteCache::default())),
+            blink_clock: Rc::new(RefCell::new(BlinkClock::default())),
+            blink_started: Instant::now(),
             background_override: Rc::new(RefCell::new(None)),
             on_exit: Rc::new(RefCell::new(None)),
             on_bell: Rc::new(RefCell::new(None)),
@@ -1473,6 +1567,7 @@ impl TerminalWidget {
 
         let daemon_socket = session.socket_path().map(|p| p.to_owned());
         widget.setup_drawing();
+        widget.setup_blink_clock();
         widget.setup_visibility_reporting();
         widget.setup_input();
         widget.setup_drop();
@@ -1518,6 +1613,7 @@ impl TerminalWidget {
 
         // Create a Terminal with no PTY
         let mut terminal = Terminal::new(80, 24, ScreenConfig::default());
+        configure_terminal_cursor(&mut terminal, config);
         terminal.set_base_palette(frontend_palette(theme, None));
         terminal.set_frontend_state(cterm_core::FrontendState {
             appearance: theme.appearance(),
@@ -1554,6 +1650,8 @@ impl TerminalWidget {
             default_font_size: font_size,
             cell_dims,
             sprite_cache: Rc::new(RefCell::new(SpriteCache::default())),
+            blink_clock: Rc::new(RefCell::new(BlinkClock::default())),
+            blink_started: Instant::now(),
             background_override: Rc::new(RefCell::new(None)),
             on_exit: Rc::new(RefCell::new(None)),
             on_bell: Rc::new(RefCell::new(None)),
@@ -1565,6 +1663,7 @@ impl TerminalWidget {
 
         let daemon_socket = recon.handle.socket_path().map(|p| p.to_owned());
         widget.setup_drawing();
+        widget.setup_blink_clock();
         widget.setup_visibility_reporting();
         widget.setup_input();
         widget.setup_drop();
@@ -1885,6 +1984,8 @@ impl TerminalWidget {
         let on_bell = Rc::clone(&self.on_bell);
         let on_title_change = Rc::clone(&self.on_title_change);
         let on_file_transfer = Rc::clone(&self.on_file_transfer);
+        let blink_clock = Rc::clone(&self.blink_clock);
+        let blink_started = self.blink_started;
         glib::timeout_add_local(Duration::from_millis(10), move || {
             while let Ok(msg) = rx.try_recv() {
                 match msg {
@@ -1961,6 +2062,9 @@ impl TerminalWidget {
                         }
 
                         if content_changed {
+                            blink_clock
+                                .borrow_mut()
+                                .rearm_cursor(blink_started.elapsed());
                             terminal_main.lock().screen_mut().dirty = false;
                             drawing_area.queue_draw();
                         }
@@ -1988,6 +2092,22 @@ impl TerminalWidget {
     }
 }
 
+/// Reset application-controlled state without discarding scrollback or the
+/// native cursor defaults supplied by this frontend.
+fn soft_reset_screen(screen: &mut cterm_core::Screen) {
+    screen.cursor.reset_protocol_state();
+    screen.style = cterm_core::cell::CellStyle::default();
+    screen.modes = cterm_core::screen::TerminalModes {
+        auto_wrap: true,
+        reverse_wrap: true,
+        modify_other_keys: 1,
+        show_cursor: true,
+        ..Default::default()
+    };
+    screen.reset_scroll_region();
+    screen.dirty = true;
+}
+
 /// Calculate cell dimensions using Pango font metrics
 fn calculate_cell_dimensions(font_family: &str, font_size: f64) -> CellDimensions {
     // Get the default font map and create a context
@@ -2010,20 +2130,25 @@ fn calculate_cell_dimensions(font_family: &str, font_size: f64) -> CellDimension
             let descent = metrics.descent() as f64 / pango::SCALE as f64;
             let height = ascent + descent;
 
-            // Validate that we got sensible metrics
-            if char_width > 0.0 && height > 0.0 {
+            // Validate that we got sensible metrics. In particular, reject
+            // Pango's missing-font sentinels before multiplying them into a
+            // multi-gigabyte Wayland shared-memory surface.
+            if let Some(dimensions) = CellDimensions::checked(char_width, height * 1.1) {
                 log::debug!(
                     "Using font '{}' at {}pt: cell={}x{}",
                     font_name,
                     font_size,
-                    char_width,
-                    height * 1.1
+                    dimensions.width,
+                    dimensions.height
                 );
-                return CellDimensions {
-                    width: char_width,
-                    height: height * 1.1, // Small line spacing factor
-                };
+                return dimensions;
             }
+            log::warn!(
+                "Ignoring invalid metrics for font '{}': width={}, height={}",
+                font_name,
+                char_width,
+                height
+            );
         }
     }
 
@@ -2034,23 +2159,22 @@ fn calculate_cell_dimensions(font_family: &str, font_size: f64) -> CellDimension
     layout.set_text("M");
 
     let (width, height) = layout.pixel_size();
-    if width > 0 && height > 0 {
+    if let Some(dimensions) = CellDimensions::checked(width as f64, height as f64 * 1.1) {
         log::warn!(
             "Font metrics unavailable, using layout measurement: {}x{}",
             width,
             height
         );
-        return CellDimensions {
-            width: width as f64,
-            height: height as f64 * 1.1,
-        };
+        return dimensions;
     }
 
-    // This should never happen on a functioning system with fonts installed
-    panic!(
-        "Failed to load any font or measure text. \
-         Please ensure fonts are installed (e.g., fonts-dejavu or similar)."
+    let fallback = CellDimensions::conservative_fallback(font_size);
+    log::error!(
+        "No usable font metrics; using conservative cell size {}x{}",
+        fallback.width,
+        fallback.height
     );
+    fallback
 }
 
 /// Messages from PTY reader thread
@@ -2113,6 +2237,13 @@ struct RenderConfig<'a> {
     background_override: Option<cterm_core::color::Rgb>,
 }
 
+fn configure_terminal_cursor(terminal: &mut Terminal, config: &Config) {
+    terminal.screen_mut().configure_cursor(
+        config.appearance.cursor_style.core_style(),
+        config.appearance.cursor_blink,
+    );
+}
+
 /// Draw the terminal contents
 fn draw_terminal(
     cr: &cairo::Context,
@@ -2121,6 +2252,7 @@ fn draw_terminal(
     config: &RenderConfig<'_>,
     preedit: &PreeditState,
     sprite_cache: &mut SpriteCache,
+    blink_phase: BlinkPhase,
 ) {
     let term = terminal.lock();
     let screen = term.screen();
@@ -2159,171 +2291,260 @@ fn draw_terminal(
     let scroll_offset = screen.scroll_offset;
     let rows = grid.height();
     let cols = grid.width();
+    let visible_top = screen.visible_row_to_absolute_line(0);
 
-    for row_idx in 0..rows {
-        let y = row_idx as f64 * cell_height;
-        let absolute_line = screen.visible_row_to_absolute_line(row_idx);
+    draw_terminal_images(
+        cr,
+        screen,
+        cell_width,
+        cell_height,
+        cterm_core::ImageLayer::BehindCellBackground,
+    );
 
-        for col_idx in 0..cols {
-            let cell = if let Some(c) = screen.get_cell_with_scrollback(absolute_line, col_idx) {
-                c
-            } else {
-                continue;
-            };
-            let x = col_idx as f64 * cell_width;
+    for render_foreground in [false, true] {
+        if render_foreground {
+            draw_terminal_images(
+                cr,
+                screen,
+                cell_width,
+                cell_height,
+                cterm_core::ImageLayer::BehindText,
+            );
+        }
 
-            // Skip wide char spacers
-            if cell.attrs.contains(CellAttrs::WIDE_SPACER) {
-                continue;
-            }
+        for row_idx in 0..rows {
+            let cell_y = row_idx as f64 * cell_height;
+            let absolute_line = screen.visible_row_to_absolute_line(row_idx);
 
-            // Check if this cell is selected
-            let is_selected = screen.is_selected(absolute_line, col_idx);
-
-            // Determine if cell has INVERSE attribute (XOR with selection)
-            let is_inverted =
-                cell.attrs.contains(CellAttrs::INVERSE) ^ is_selected ^ screen.modes.reverse_video;
-            let char_width = if cell.attrs.contains(CellAttrs::WIDE) {
-                cell_width * 2.0
-            } else {
-                cell_width
-            };
-
-            let fg_color = if is_inverted {
-                if cell.bg == Color::Default {
-                    *normal_background
+            for col_idx in 0..cols {
+                let cell = if let Some(c) = screen.get_cell_with_scrollback(absolute_line, col_idx)
+                {
+                    c
                 } else {
-                    screen.resolve_color(cell.bg, palette)
+                    continue;
+                };
+                let cell_x = col_idx as f64 * cell_width;
+                let foreground_visible = cell_foreground_visible(cell.attrs, blink_phase);
+
+                if cell.attrs.contains(CellAttrs::WIDE_SPACER) {
+                    continue;
                 }
-            } else if cell.hyperlink.is_some() && cell.fg == Color::Default {
-                Rgb::new(100, 149, 237)
-            } else if cell.fg == Color::Default {
-                palette.foreground
-            } else {
-                screen.resolve_color(cell.fg, palette)
-            };
-            let fg_color = if cell.attrs.contains(CellAttrs::DIM) {
-                Rgb::new(fg_color.r / 2, fg_color.g / 2, fg_color.b / 2)
-            } else {
-                fg_color
-            };
+                let multicell = cell.multicell.as_ref();
+                if multicell.is_some_and(|multicell| {
+                    !is_multicell_render_anchor(multicell, absolute_line, visible_top)
+                }) {
+                    continue;
+                }
+                let metrics = multicell.map(multicell_render_metrics);
+                let x = cell_x;
+                let y = metrics.map_or(cell_y, |_| {
+                    cell_y
+                        - cell_height
+                            * f64::from(multicell.expect("metrics require metadata").row_offset)
+                });
+                let text_x =
+                    x + metrics.map_or(0.0, |metrics| metrics.horizontal_offset * cell_width);
+                let text_y =
+                    y + metrics.map_or(0.0, |metrics| metrics.vertical_offset * cell_height);
+                let text = multicell.map_or_else(|| cell.text(), |multicell| multicell.text());
 
-            // Draw background (always draw for selected cells to show highlight)
-            let needs_bg = cell.bg != Color::Default
-                || is_inverted
-                || is_selected
-                || screen.modes.reverse_video;
+                // Check if this cell is selected
+                let is_selected = multicell.map_or_else(
+                    || screen.is_selected(absolute_line, col_idx),
+                    |multicell| multicell_is_selected(screen, absolute_line, col_idx, multicell),
+                );
 
-            if needs_bg {
-                let bg_color = if is_inverted {
-                    // Inverted: use foreground color as background
-                    if cell.fg == Color::Default {
-                        palette.foreground
-                    } else {
-                        screen.resolve_color(cell.fg, palette)
-                    }
-                } else if cell.bg == Color::Default {
-                    *normal_background
+                // Determine if cell has INVERSE attribute (XOR with selection)
+                let is_inverted = cell.attrs.contains(CellAttrs::INVERSE)
+                    ^ is_selected
+                    ^ screen.modes.reverse_video;
+                let char_width = if let Some(multicell) = multicell {
+                    cell_width * f64::from(multicell.columns)
+                } else if cell.attrs.contains(CellAttrs::WIDE) {
+                    cell_width * 2.0
                 } else {
-                    screen.resolve_color(cell.bg, palette)
+                    cell_width
+                };
+                let char_height =
+                    metrics.map_or(cell_height, |metrics| cell_height * metrics.rows as f64);
+
+                let fg_color = if is_inverted {
+                    if cell.bg == Color::Default {
+                        *normal_background
+                    } else {
+                        screen.resolve_color(cell.bg, palette)
+                    }
+                } else if cell.hyperlink.is_some() && cell.fg == Color::Default {
+                    Rgb::new(100, 149, 237)
+                } else if cell.fg == Color::Default {
+                    palette.foreground
+                } else {
+                    screen.resolve_color(cell.fg, palette)
+                };
+                let fg_color = if cell.attrs.contains(CellAttrs::DIM) {
+                    Rgb::new(fg_color.r / 2, fg_color.g / 2, fg_color.b / 2)
+                } else {
+                    fg_color
                 };
 
-                let (r, g, b) = bg_color.to_f64();
-                cr.set_source_rgb(r, g, b);
+                // Draw background (always draw for selected cells to show highlight)
+                let needs_bg = cell.bg != Color::Default
+                    || is_inverted
+                    || is_selected
+                    || screen.modes.reverse_video;
 
-                cr.rectangle(x, y, char_width, cell_height);
-                cr.fill().ok();
-            }
+                if !render_foreground && needs_bg {
+                    let bg_color = if is_inverted {
+                        // Inverted: use foreground color as background
+                        if cell.fg == Color::Default {
+                            palette.foreground
+                        } else {
+                            screen.resolve_color(cell.fg, palette)
+                        }
+                    } else if cell.bg == Color::Default {
+                        *normal_background
+                    } else {
+                        screen.resolve_color(cell.bg, palette)
+                    };
 
-            // Draw character
-            if cell.text() != " " && !cell.attrs.contains(CellAttrs::HIDDEN) {
-                let sprite_width = cell_width.round().max(1.0) as u32;
-                let sprite_height = cell_height.round().max(1.0) as u32;
-                if let Some(sprite) = cell
-                    .single_char()
-                    .and_then(|c| sprite_cache.get(c as u32, sprite_width, sprite_height))
-                {
-                    draw_sprite(cr, sprite, x, y, cell_width, cell_height, &fg_color);
-                } else {
-                    let (r, g, b) = fg_color.to_f64();
+                    let (r, g, b) = bg_color.to_f64();
                     cr.set_source_rgb(r, g, b);
 
-                    // Apply text attributes to font
-                    let attrs = pango::AttrList::new();
-
-                    if cell.attrs.contains(CellAttrs::BOLD) {
-                        let attr = pango::AttrInt::new_weight(pango::Weight::Bold);
-                        attrs.insert(attr);
-                    }
-
-                    if cell.attrs.contains(CellAttrs::ITALIC) {
-                        let attr = pango::AttrInt::new_style(pango::Style::Italic);
-                        attrs.insert(attr);
-                    }
-
-                    layout.set_attributes(Some(&attrs));
-                    layout.set_text(cell.text());
-
-                    cr.move_to(x, y);
-                    pangocairo::functions::show_layout(cr, &layout);
-
-                    // Reset attributes
-                    layout.set_attributes(None::<&pango::AttrList>);
+                    cr.rectangle(x, y, char_width, char_height);
+                    cr.fill().ok();
                 }
-            }
 
-            if !cell.attrs.contains(CellAttrs::HIDDEN) {
-                draw_cell_decorations(
-                    cr,
-                    cell,
-                    (x, y),
-                    (char_width, cell_height),
-                    &fg_color,
-                    palette,
-                    screen,
-                );
+                // Draw character
+                if render_foreground
+                    && foreground_visible
+                    && text != " "
+                    && !cell.is_kitty_image_placeholder()
+                    && !cell.attrs.contains(CellAttrs::HIDDEN)
+                {
+                    let sprite_width = cell_width.round().max(1.0) as u32;
+                    let sprite_height = cell_height.round().max(1.0) as u32;
+                    if let Some(sprite) = multicell
+                        .is_none()
+                        .then(|| cell.single_char())
+                        .flatten()
+                        .and_then(|c| sprite_cache.get(c as u32, sprite_width, sprite_height))
+                    {
+                        draw_sprite(cr, sprite, x, y, cell_width, cell_height, &fg_color);
+                    } else {
+                        let (r, g, b) = fg_color.to_f64();
+                        cr.set_source_rgb(r, g, b);
+
+                        // Apply text attributes to font
+                        let attrs = pango::AttrList::new();
+
+                        if cell.attrs.contains(CellAttrs::BOLD) {
+                            let attr = pango::AttrInt::new_weight(pango::Weight::Bold);
+                            attrs.insert(attr);
+                        }
+
+                        if cell.attrs.contains(CellAttrs::ITALIC) {
+                            let attr = pango::AttrInt::new_style(pango::Style::Italic);
+                            attrs.insert(attr);
+                        }
+
+                        layout.set_attributes(Some(&attrs));
+                        layout.set_text(text);
+                        layout.set_width(
+                            ((char_width - (text_x - x)).max(cell_width) * f64::from(pango::SCALE))
+                                as i32,
+                        );
+                        if let Some(metrics) = metrics {
+                            let scaled_font = pango::FontDescription::from_string(&format!(
+                                "{} {}",
+                                config.font_family,
+                                config.font_size * metrics.font_scale
+                            ));
+                            layout.set_font_description(Some(&scaled_font));
+                        }
+
+                        cr.move_to(text_x, text_y);
+                        pangocairo::functions::show_layout(cr, &layout);
+
+                        // Reset attributes
+                        layout.set_attributes(None::<&pango::AttrList>);
+                        layout.set_width(-1);
+                        if metrics.is_some() {
+                            layout.set_font_description(Some(&font_desc));
+                        }
+                    }
+                }
+
+                if render_foreground
+                    && foreground_visible
+                    && !cell.attrs.contains(CellAttrs::HIDDEN)
+                {
+                    draw_cell_decorations(
+                        cr,
+                        cell,
+                        (x, y),
+                        (char_width, char_height),
+                        &fg_color,
+                        palette,
+                        screen,
+                    );
+                }
             }
         }
     }
 
-    // Images replace the cells beneath them and must therefore be composited
-    // after the text grid but before the cursor and overlays.
-    draw_terminal_images(cr, screen, cell_width, cell_height);
+    draw_terminal_images(
+        cr,
+        screen,
+        cell_width,
+        cell_height,
+        cterm_core::ImageLayer::AboveText,
+    );
 
-    // Draw cursor
-    if screen.modes.show_cursor && scroll_offset == 0 {
-        let cursor = &screen.cursor;
-        let x = cursor.col as f64 * cell_width;
-        let y = cursor.row as f64 * cell_height;
-
-        let (r, g, b) = palette.cursor.to_f64();
-        cr.set_source_rgb(r, g, b);
-
-        match cursor.style {
-            CursorStyle::Block => {
-                cr.rectangle(x, y, cell_width, cell_height);
-                cr.fill().ok();
-
-                // Draw character under cursor with inverted color
-                if let Some(cell) = screen.get_cell(cursor.row, cursor.col) {
-                    if cell.text() != " " && !cell.attrs.contains(CellAttrs::HIDDEN) {
-                        let (r, g, b) = theme.cursor.text_color.to_f64();
-                        cr.set_source_rgb(r, g, b);
-                        layout.set_text(cell.text());
-                        cr.move_to(x, y);
-                        pangocairo::functions::show_layout(cr, &layout);
-                    }
-                }
-            }
-            CursorStyle::Underline => {
-                cr.rectangle(x, y + cell_height - 2.0, cell_width, 2.0);
-                cr.fill().ok();
-            }
-            CursorStyle::Bar => {
-                cr.rectangle(x, y, 2.0, cell_height);
-                cr.fill().ok();
-            }
+    // Extra cursors ignore DECTCEM and draw beneath the main cursor when both
+    // target the same cell.
+    if extra_cursors_visible(screen, blink_phase) {
+        for cursor in screen.extra_cursors() {
+            let colors = resolve_extra_cursor_colors(
+                screen,
+                palette,
+                theme.cursor.text_color,
+                cursor.row,
+                cursor.col,
+            );
+            draw_cursor_cell(
+                cr,
+                screen,
+                &layout,
+                cursor.row,
+                cursor.col,
+                cursor.shape.resolve(screen.cursor.style),
+                colors.cursor,
+                colors.text,
+                cell_width,
+                cell_height,
+                config.font_family,
+                config.font_size,
+            );
         }
+    }
+
+    // Draw main cursor.
+    if cursor_visible(screen, blink_phase) {
+        let cursor = &screen.cursor;
+        draw_cursor_cell(
+            cr,
+            screen,
+            &layout,
+            cursor.row,
+            cursor.col,
+            cursor.style,
+            palette.cursor,
+            theme.cursor.text_color,
+            cell_width,
+            cell_height,
+            config.font_family,
+            config.font_size,
+        );
     }
 
     // Draw IM preedit (composition) text at the cursor position
@@ -2408,6 +2629,83 @@ fn draw_terminal(
         cr.close_path();
         cr.set_source_rgba(0.5, 0.5, 0.5, opacity);
         cr.fill().ok();
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn draw_cursor_cell(
+    cr: &cairo::Context,
+    screen: &cterm_core::Screen,
+    layout: &pango::Layout,
+    row: usize,
+    col: usize,
+    style: CursorStyle,
+    cursor_color: Rgb,
+    text_color: Rgb,
+    cell_width: f64,
+    cell_height: f64,
+    font_family: &str,
+    font_size: f64,
+) {
+    let footprint = cursor_footprint(screen, row, col);
+    let x = footprint.col as f64 * cell_width;
+    let y = footprint.row as f64 * cell_height;
+    let width = footprint.columns as f64 * cell_width;
+    let height = footprint.rows as f64 * cell_height;
+    let (red, green, blue) = cursor_color.to_f64();
+    cr.set_source_rgb(red, green, blue);
+
+    match style {
+        CursorStyle::Block => {
+            cr.rectangle(x, y, width, height);
+            cr.fill().ok();
+            if let Some(cell) = screen.get_cell(footprint.row, footprint.col) {
+                let multicell = cell.multicell.as_ref();
+                let text = multicell.map_or_else(|| cell.text(), |multicell| multicell.text());
+                if text != " "
+                    && !cell.is_kitty_image_placeholder()
+                    && !cell.attrs.contains(CellAttrs::HIDDEN)
+                {
+                    let metrics = multicell.map(multicell_render_metrics);
+                    let text_x =
+                        x + metrics.map_or(0.0, |metrics| metrics.horizontal_offset * cell_width);
+                    let text_y =
+                        y + metrics.map_or(0.0, |metrics| metrics.vertical_offset * cell_height);
+                    let (red, green, blue) = text_color.to_f64();
+                    cr.set_source_rgb(red, green, blue);
+                    layout.set_text(text);
+                    layout.set_width(
+                        ((width - (text_x - x)).max(cell_width) * f64::from(pango::SCALE)) as i32,
+                    );
+                    if let Some(metrics) = metrics {
+                        let scaled_font = pango::FontDescription::from_string(&format!(
+                            "{} {}",
+                            font_family,
+                            font_size * metrics.font_scale
+                        ));
+                        layout.set_font_description(Some(&scaled_font));
+                    }
+                    cr.move_to(text_x, text_y);
+                    pangocairo::functions::show_layout(cr, layout);
+                    layout.set_width(-1);
+                    if metrics.is_some() {
+                        let font = pango::FontDescription::from_string(&format!(
+                            "{} {}",
+                            font_family, font_size
+                        ));
+                        layout.set_font_description(Some(&font));
+                    }
+                }
+            }
+        }
+        CursorStyle::Underline => {
+            cr.rectangle(x, y + height - 2.0, width, 2.0);
+            cr.fill().ok();
+        }
+        CursorStyle::Bar => {
+            cr.rectangle(x, y, 2.0, height);
+            cr.fill().ok();
+        }
     }
 }
 
@@ -2550,8 +2848,9 @@ fn draw_terminal_images(
     screen: &cterm_core::Screen,
     cell_width: f64,
     cell_height: f64,
+    layer: cterm_core::ImageLayer,
 ) {
-    for image in screen.visible_images() {
+    for image in screen.visible_images_in_layer(layer) {
         let Some(visible_row) = screen.image_visible_row(image) else {
             continue;
         };
@@ -2653,89 +2952,56 @@ fn mouse_position_changed(
     }
 }
 
-/// Convert GTK modifier state to our Modifiers
-fn gtk_state_to_modifiers(state: gdk::ModifierType) -> Modifiers {
-    let mut modifiers = Modifiers::empty();
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-    if state.contains(gdk::ModifierType::CONTROL_MASK) {
-        modifiers.insert(Modifiers::CTRL);
+    #[test]
+    fn cell_dimensions_reject_missing_font_sentinels() {
+        assert!(CellDimensions::checked(8.0, 18.0).is_some());
+        assert!(CellDimensions::checked(f64::NAN, 18.0).is_none());
+        assert!(CellDimensions::checked(8.0, f64::INFINITY).is_none());
+        assert!(CellDimensions::checked(8.0, 192_185.0).is_none());
+        assert!(CellDimensions::checked(0.0, 18.0).is_none());
+
+        let fallback = CellDimensions::conservative_fallback(f64::NAN);
+        assert_eq!(fallback.width, 9.0);
+        assert_eq!(fallback.height, 18.0);
     }
-    if state.contains(gdk::ModifierType::SHIFT_MASK) {
-        modifiers.insert(Modifiers::SHIFT);
+
+    #[test]
+    fn native_cursor_config_initializes_protocol_defaults() {
+        let mut config = Config::default();
+        config.appearance.cursor_style = cterm_app::config::CursorStyleConfig::Bar;
+        config.appearance.cursor_blink = false;
+        let mut terminal = Terminal::new(8, 2, ScreenConfig::default());
+
+        configure_terminal_cursor(&mut terminal, &config);
+
+        assert_eq!(terminal.screen().cursor.style, CursorStyle::Bar);
+        assert!(!terminal.screen().cursor.blink.enabled());
+        terminal.process(b"\x1b[?12h");
+        assert!(terminal.screen().cursor.blink.enabled());
+        terminal.process(b"\x1b[?12l\x1b[0 q");
+        assert_eq!(terminal.screen().cursor.style, CursorStyle::Bar);
+        assert!(!terminal.screen().cursor.blink.enabled());
     }
-    if state.contains(gdk::ModifierType::ALT_MASK) {
-        modifiers.insert(Modifiers::ALT);
+
+    #[test]
+    fn soft_reset_preserves_native_cursor_defaults() {
+        let mut screen = cterm_core::Screen::new(8, 2, ScreenConfig::default());
+        screen.configure_cursor(CursorStyle::Bar, false);
+        screen.cursor.restore_protocol_snapshot(
+            Some(CursorStyle::Underline),
+            Some(true),
+            Some(true),
+        );
+
+        soft_reset_screen(&mut screen);
+
+        assert_eq!(screen.cursor.style, CursorStyle::Bar);
+        assert_eq!(screen.cursor.configured_style(), CursorStyle::Bar);
+        assert!(!screen.cursor.blink.configured());
+        assert!(!screen.cursor.blink.enabled());
     }
-    if state.contains(gdk::ModifierType::SUPER_MASK) {
-        modifiers.insert(Modifiers::SUPER);
-    }
-
-    modifiers
-}
-
-fn should_route_enhanced_key(term: &Terminal, key: Key, modifiers: Modifiers) -> bool {
-    let flags = term.screen().keyboard_enhancement_flags();
-    let events = flags.contains(KeyboardEnhancementFlags::REPORT_EVENT_TYPES);
-    let disambiguate = flags.contains(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES);
-
-    match key {
-        Key::Char(_) => {
-            disambiguate
-                && modifiers.intersects(Modifiers::CTRL | Modifiers::ALT | Modifiers::SUPER)
-        }
-        Key::Escape => disambiguate || events,
-        Key::Enter | Key::Tab | Key::Backspace => false,
-        _ => events,
-    }
-}
-
-/// Convert GDK keyval to terminal Key
-fn keyval_to_key(keyval: gdk::Key) -> Option<Key> {
-    use gdk::Key as GK;
-
-    Some(match keyval {
-        GK::Up => Key::Up,
-        GK::Down => Key::Down,
-        GK::Left => Key::Left,
-        GK::Right => Key::Right,
-        GK::Home => Key::Home,
-        GK::End => Key::End,
-        GK::Page_Up => Key::PageUp,
-        GK::Page_Down => Key::PageDown,
-        GK::Insert => Key::Insert,
-        GK::Delete => Key::Delete,
-        GK::BackSpace => Key::Backspace,
-        GK::Return => Key::Enter,
-        GK::KP_0 => Key::NumpadDigit(0),
-        GK::KP_1 => Key::NumpadDigit(1),
-        GK::KP_2 => Key::NumpadDigit(2),
-        GK::KP_3 => Key::NumpadDigit(3),
-        GK::KP_4 => Key::NumpadDigit(4),
-        GK::KP_5 => Key::NumpadDigit(5),
-        GK::KP_6 => Key::NumpadDigit(6),
-        GK::KP_7 => Key::NumpadDigit(7),
-        GK::KP_8 => Key::NumpadDigit(8),
-        GK::KP_9 => Key::NumpadDigit(9),
-        GK::KP_Decimal => Key::NumpadDecimal,
-        GK::KP_Divide => Key::NumpadDivide,
-        GK::KP_Multiply => Key::NumpadMultiply,
-        GK::KP_Subtract => Key::NumpadSubtract,
-        GK::KP_Add => Key::NumpadAdd,
-        GK::KP_Enter => Key::NumpadEnter,
-        GK::Tab | GK::ISO_Left_Tab => Key::Tab,
-        GK::Escape => Key::Escape,
-        GK::F1 => Key::F(1),
-        GK::F2 => Key::F(2),
-        GK::F3 => Key::F(3),
-        GK::F4 => Key::F(4),
-        GK::F5 => Key::F(5),
-        GK::F6 => Key::F(6),
-        GK::F7 => Key::F(7),
-        GK::F8 => Key::F(8),
-        GK::F9 => Key::F(9),
-        GK::F10 => Key::F(10),
-        GK::F11 => Key::F(11),
-        GK::F12 => Key::F(12),
-        _ => return None,
-    })
 }

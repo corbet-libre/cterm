@@ -479,7 +479,14 @@ mod unix {
                 ws_xpixel: pty_size.pixel_width,
                 ws_ypixel: pty_size.pixel_height,
             };
-            libc::ioctl(slave_fd, libc::TIOCSWINSZ, &size);
+            if libc::ioctl(slave_fd, libc::TIOCSWINSZ, &size) < 0
+                || libc::ioctl(master_fd, libc::TIOCSWINSZ, &size) < 0
+            {
+                let error = io::Error::last_os_error();
+                libc::close(master_fd);
+                libc::close(slave_fd);
+                return Err(PtyError::Create(Box::new(error)));
+            }
 
             // Fork the process
             let pid = libc::fork();
@@ -1735,10 +1742,6 @@ mod tests {
         };
 
         let pty = Pty::new(&config).expect("Failed to create PTY");
-
-        // Give it time to produce output
-        std::thread::sleep(std::time::Duration::from_millis(100));
-
         let mut reader = pty.try_clone_reader().expect("Failed to clone reader");
         let mut buf = [0u8; 1024];
         let n = reader.read(&mut buf).expect("Failed to read");

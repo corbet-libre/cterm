@@ -165,6 +165,11 @@ message CreateSessionRequest {
   // Native frontend state used for foot-compatible theme/visibility reports.
   FrontendTheme theme_appearance = 12;
   FrontendVisibility window_visibility = 13;
+
+  // Native cursor defaults must be installed before child output is consumed,
+  // so an immediate DECRQSS query observes the same defaults as the renderer.
+  optional CursorStyle cursor_style = 14;
+  optional bool cursor_blink = 15;
 }
 
 message CreateSessionResponse {
@@ -353,7 +358,8 @@ message Key {
   oneof key_type {
     string char = 1;        // Single character
     SpecialKey special = 2;  // Special key
-    uint32 function = 3;     // F1-F12 (1-12)
+    uint32 function = 3;     // F1-F35 (1-35)
+    uint32 kitty_named = 4;  // Kitty private-use functional-key code
   }
 }
 
@@ -396,6 +402,10 @@ message Modifiers {
   bool ctrl = 2;
   bool alt = 3;
   bool super = 4;
+  bool hyper = 5;
+  bool meta = 6;
+  bool caps_lock = 7;
+  bool num_lock = 8;
 }
 
 // ============================================================================
@@ -447,10 +457,17 @@ message DirtyRowsUpdate {
   optional TerminalModes modes = 3;
   // Include the complete image set only when it changed.
   TerminalImages images = 4;
+  // Include the complete multiple-cursor overlay only when it changed.
+  ExtraCursorsUpdate extra_cursors = 5;
 }
 
 message TerminalImages {
   repeated TerminalImage images = 1;
+}
+
+message ExtraCursorsUpdate {
+  repeated ExtraCursor cursors = 1;
+  ExtraCursorColors colors = 2;
 }
 
 message DirtyRow {
@@ -497,6 +514,43 @@ message GetScreenResponse {
   // Inline terminal images. Image lines are absolute indexes into the
   // scrollback-plus-visible buffer represented by this snapshot.
   repeated TerminalImage images = 9;
+  // Kitty multiple-cursor viewport overlays.
+  repeated ExtraCursor extra_cursors = 10;
+  ExtraCursorColors extra_cursor_colors = 11;
+}
+
+message ExtraCursor {
+  uint32 row = 1;
+  uint32 col = 2;
+  ExtraCursorShape shape = 3;
+}
+
+enum ExtraCursorShape {
+  EXTRA_CURSOR_SHAPE_UNSPECIFIED = 0;
+  EXTRA_CURSOR_SHAPE_BLOCK = 1;
+  EXTRA_CURSOR_SHAPE_BAR = 2;
+  EXTRA_CURSOR_SHAPE_UNDERLINE = 3;
+  EXTRA_CURSOR_SHAPE_FOLLOW_MAIN = 4;
+}
+
+message ExtraCursorColors {
+  ExtraCursorColor text = 1;
+  ExtraCursorColor cursor = 2;
+}
+
+message ExtraCursorColor {
+  ExtraCursorColorKind kind = 1;
+  uint32 index = 2;
+  uint32 red = 3;
+  uint32 green = 4;
+  uint32 blue = 5;
+}
+
+enum ExtraCursorColorKind {
+  EXTRA_CURSOR_COLOR_KIND_MAIN = 0;
+  EXTRA_CURSOR_COLOR_KIND_REVERSE = 1;
+  EXTRA_CURSOR_COLOR_KIND_INDEXED = 2;
+  EXTRA_CURSOR_COLOR_KIND_RGB = 3;
 }
 
 message TerminalImage {
@@ -508,6 +562,8 @@ message TerminalImage {
   bytes rgba = 6;
   uint32 pixel_width = 7;
   uint32 pixel_height = 8;
+  sint32 z_index = 9;
+  uint32 protocol_image_id = 10;
 }
 
 // DRCS (Dynamically Redefinable Character Sets) soft font
@@ -557,6 +613,27 @@ message Cell {
   CellAttributes attrs = 4;
   optional Color underline_color = 5;
   optional Hyperlink hyperlink = 6;
+  optional Multicell multicell = 7;
+}
+
+message Multicell {
+  string text = 1;
+  uint32 columns = 2;
+  uint32 rows = 3;
+  uint32 column_offset = 4;
+  uint32 row_offset = 5;
+  uint32 scale = 6;
+  optional uint32 fractional_numerator = 7;
+  optional uint32 fractional_denominator = 8;
+  TextSizeAlignment vertical_alignment = 9;
+  TextSizeAlignment horizontal_alignment = 10;
+  bool natural_width = 11;
+}
+
+enum TextSizeAlignment {
+  TEXT_SIZE_ALIGNMENT_START = 0;
+  TEXT_SIZE_ALIGNMENT_END = 1;
+  TEXT_SIZE_ALIGNMENT_CENTER = 2;
 }
 
 message Color {
@@ -590,6 +667,7 @@ message CellAttributes {
   bool overline = 13;
   bool wide = 14;
   bool wide_spacer = 15;
+  bool rapid_blink = 16;
 }
 
 message Hyperlink {
@@ -602,6 +680,11 @@ message CursorPosition {
   uint32 col = 2;
   bool visible = 3;
   CursorStyle style = 4;
+  // Present only after an application selects a DECSCUSR style. Absence
+  // preserves the frontend's configured cursor shape/blink defaults.
+  optional bool style_blink_override = 5;
+  // DEC private mode 12 is independent from the DECSCUSR blink source.
+  optional bool dec_mode_12 = 6;
 }
 
 enum CursorStyle {

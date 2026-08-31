@@ -9,6 +9,41 @@ is omitted for readability.
 
 ## [Unreleased]
 
+### Added
+- A fail-closed command-plugin foundation with fixed WebAssembly packages,
+  strict manifests, content-addressed trust, exact per-action grants, and a
+  bounded versioned protobuf ABI, plus a separate one-shot Wasmi/WASIp1 runner
+  with digest revalidation, fuel, memory, stack, table, input, and output
+  limits. The application-side broker adds canonical package-relative host and
+  plugin resolution, deterministic command discovery, atomic machine-local
+  grant persistence, stale-descriptor rejection, exact pre/post-execution
+  grant enforcement, typed native-action conversion, bounded framed process
+  I/O, a strict wall timeout, and Unix process-group / Windows Job Object
+  termination. GTK/Wayland, Cocoa, and Win32 expose discovered commands in a
+  native Tools → Plugins menu, show exact native grant prompts, execute on
+  worker threads, and dispatch validated results through their existing native
+  action policy. Managed mode disables the complete plugin surface. Release
+  packages include the runner.
+- Native FreeBSD builds now compile the GTK4/Wayland client and daemon and run
+  their portable library and daemon-integration tests in a FreeBSD 14.4 VM.
+- Foot-compatible independent cursor blink sources and native cursor/text
+  blink rendering across GTK/Wayland, Cocoa, and Win32, including distinct
+  slow and rapid SGR phases and daemon snapshot persistence.
+
+### Fixed
+- Streamed OSC 1337 interception now replays incomplete, cancelled, and
+  oversized sequences atomically instead of leaving the VTE parser inside a
+  partial control string. Large replay and decoded-transfer spill files are
+  unique and private, and failed receptions remove their temporary storage.
+
+### Security
+- Plugin package files are size-checked before allocation, read through a
+  strict `limit + 1` bound, and rejected if their length changes during the
+  read.
+- Added a hard RustSec advisory gate, upgraded `anyhow`, `bytes`, `h2`, and
+  `tar` to patched compatible releases, and removed the unused, unmaintained
+  `bincode` dependency.
+
 ## [0.0.20] - 2026-08-31
 
 ### Added

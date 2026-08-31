@@ -6,7 +6,12 @@ use std::collections::HashMap;
 
 use cterm_core::color::{Color, Rgb};
 use cterm_core::{Cell, CellAttrs, CursorStyle, Screen};
+use cterm_ui::blink::{cell_foreground_visible, cursor_visible, BlinkPhase};
+use cterm_ui::cursor::{cursor_footprint, extra_cursors_visible, resolve_extra_cursor_colors};
 use cterm_ui::pane::PaneRect;
+use cterm_ui::text_sizing::{
+    is_multicell_render_anchor, multicell_is_selected, multicell_render_metrics,
+};
 use cterm_ui::theme::Theme;
 use windows::core::{Interface, PCWSTR};
 use windows::Win32::Foundation::{HWND, RECT};
@@ -27,7 +32,7 @@ use windows::Win32::Graphics::DirectWrite::{
     DWriteCreateFactory, IDWriteFactory, IDWriteTextFormat, IDWriteTextLayout,
     DWRITE_FACTORY_TYPE_SHARED, DWRITE_FONT_STRETCH_NORMAL, DWRITE_FONT_STYLE_ITALIC,
     DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_WEIGHT_BOLD, DWRITE_FONT_WEIGHT_NORMAL,
-    DWRITE_TEXT_METRICS,
+    DWRITE_TEXT_METRICS, DWRITE_TEXT_RANGE,
 };
 use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM;
 use windows::Win32::UI::WindowsAndMessaging::GetClientRect;
@@ -40,6 +45,19 @@ pub struct CellDimensions {
     pub width: f32,
     pub height: f32,
     pub baseline: f32,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum GridPass {
+    Background,
+    Foreground,
+}
+
+#[derive(Clone, Copy)]
+struct CellPosition {
+    row: usize,
+    col: usize,
+    absolute_line: usize,
 }
 
 impl Default for CellDimensions {
@@ -348,6 +366,7 @@ impl TerminalRenderer {
         rect: PaneRect,
         active: bool,
         alerted: bool,
+        blink_phase: BlinkPhase,
     ) -> windows::core::Result<()> {
         let Some(rt) = self.render_target.clone() else {
             return Ok(());
@@ -378,10 +397,14 @@ impl TerminalRenderer {
             base.PushAxisAlignedClip(&clip, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
         }
         let draw_result = (|| {
-            self.draw_grid(screen)?;
-            self.draw_images(screen)?;
+            self.draw_images(screen, cterm_core::ImageLayer::BehindCellBackground)?;
+            self.draw_grid(screen, blink_phase, GridPass::Background)?;
+            self.draw_images(screen, cterm_core::ImageLayer::BehindText)?;
+            self.draw_grid(screen, blink_phase, GridPass::Foreground)?;
+            self.draw_images(screen, cterm_core::ImageLayer::AboveText)?;
+            self.draw_extra_cursors(screen, blink_phase)?;
             if active {
-                self.draw_cursor(screen)?;
+                self.draw_cursor(screen, blink_phase)?;
             }
             Ok::<(), windows::core::Error>(())
         })();
@@ -415,7 +438,11 @@ impl TerminalRenderer {
     }
 
     /// Render the terminal screen as a single full-window pane.
-    pub fn render(&mut self, screen: &Screen) -> windows::core::Result<()> {
+    pub fn render(
+        &mut self,
+        screen: &Screen,
+        blink_phase: BlinkPhase,
+    ) -> windows::core::Result<()> {
         if self.render_target.is_none() {
             return Ok(());
         }
@@ -432,12 +459,17 @@ impl TerminalRenderer {
             ),
             true,
             false,
+            blink_phase,
         )?;
         self.end_frame()
     }
 
     /// Draw decoded SIXEL and other inline images through Direct2D.
-    fn draw_images(&self, screen: &Screen) -> windows::core::Result<()> {
+    fn draw_images(
+        &self,
+        screen: &Screen,
+        layer: cterm_core::ImageLayer,
+    ) -> windows::core::Result<()> {
         let rt = self.render_target.clone().unwrap();
         let base: ID2D1RenderTarget = rt.cast()?;
         let bitmap_properties = D2D1_BITMAP_PROPERTIES {
@@ -449,7 +481,7 @@ impl TerminalRenderer {
             dpiY: 96.0,
         };
 
-        for image in screen.visible_images() {
+        for image in screen.visible_images_in_layer(layer) {
             let Some(visible_row) = screen.image_visible_row(image) else {
                 continue;
             };
@@ -506,20 +538,40 @@ impl TerminalRenderer {
     }
 
     /// Draw the terminal grid
-    fn draw_grid(&mut self, screen: &Screen) -> windows::core::Result<()> {
+    fn draw_grid(
+        &mut self,
+        screen: &Screen,
+        blink_phase: BlinkPhase,
+        pass: GridPass,
+    ) -> windows::core::Result<()> {
         let grid = screen.grid();
         let rows = grid.height();
         let cols = grid.width();
+        let visible_top = screen.visible_row_to_absolute_line(0);
 
         for row in 0..rows {
             let absolute_line = screen.visible_row_to_absolute_line(row);
 
             for col in 0..cols {
                 if let Some(cell) = screen.get_cell_with_scrollback(absolute_line, col) {
-                    if cell.is_wide_spacer() {
+                    if cell.is_wide_spacer()
+                        || cell.multicell.as_ref().is_some_and(|multicell| {
+                            !is_multicell_render_anchor(multicell, absolute_line, visible_top)
+                        })
+                    {
                         continue;
                     }
-                    self.draw_cell(row, col, absolute_line, cell, screen)?;
+                    self.draw_cell(
+                        CellPosition {
+                            row,
+                            col,
+                            absolute_line,
+                        },
+                        cell,
+                        screen,
+                        blink_phase,
+                        pass,
+                    )?;
                 }
             }
         }
@@ -530,24 +582,48 @@ impl TerminalRenderer {
     /// Draw a single cell
     fn draw_cell(
         &mut self,
-        row: usize,
-        col: usize,
-        absolute_line: usize,
+        position: CellPosition,
         cell: &Cell,
         screen: &Screen,
+        blink_phase: BlinkPhase,
+        pass: GridPass,
     ) -> windows::core::Result<()> {
-        let x = self.origin_x + col as f32 * self.cell_dims.width;
-        let y = self.origin_y + row as f32 * self.cell_dims.height;
+        let multicell = cell.multicell.as_ref();
+        let metrics = multicell.map(multicell_render_metrics);
+        let x = self.origin_x + position.col as f32 * self.cell_dims.width;
+        let cell_y = self.origin_y + position.row as f32 * self.cell_dims.height;
+        let y = metrics.map_or(cell_y, |_| {
+            cell_y
+                - self.cell_dims.height
+                    * f32::from(multicell.expect("metrics require metadata").row_offset)
+        });
+        let text_x = x + metrics.map_or(0.0, |metrics| {
+            metrics.horizontal_offset as f32 * self.cell_dims.width
+        });
+        let text_y = y + metrics.map_or(0.0, |metrics| {
+            metrics.vertical_offset as f32 * self.cell_dims.height
+        });
 
         let attrs = cell.attrs;
-        let is_selected = screen.is_selected(absolute_line, col);
+        let foreground_visible = cell_foreground_visible(attrs, blink_phase);
+        let is_selected = multicell.map_or_else(
+            || screen.is_selected(position.absolute_line, position.col),
+            |multicell| {
+                multicell_is_selected(screen, position.absolute_line, position.col, multicell)
+            },
+        );
         let (fg, bg) = self.resolve_colors(cell, screen, screen.modes.reverse_video, is_selected);
         let palette = self.resolved_palette(screen);
-        let cell_width = if cell.is_wide() {
+        let cell_width = if let Some(multicell) = multicell {
+            self.cell_dims.width * f32::from(multicell.columns)
+        } else if cell.is_wide() {
             self.cell_dims.width * 2.0
         } else {
             self.cell_dims.width
         };
+        let cell_height = metrics.map_or(self.cell_dims.height, |metrics| {
+            self.cell_dims.height * metrics.rows as f32
+        });
 
         // Get brushes first (this mutably borrows self temporarily)
         let canvas_background = if screen.modes.reverse_video {
@@ -555,25 +631,30 @@ impl TerminalRenderer {
         } else {
             palette.background
         };
-        let bg_brush = if bg != canvas_background || is_selected {
+        let bg_brush = if pass == GridPass::Background && (bg != canvas_background || is_selected) {
             Some(self.get_brush(bg)?)
         } else {
             None
         };
 
-        let text = cell.text();
+        let text = multicell.map_or_else(|| cell.text(), |multicell| multicell.text());
         let has_hyperlink = cell.hyperlink.is_some();
-        let needs_fg = text != " " && text != "\0"
-            || attrs.has_underline()
-            || has_hyperlink
-            || attrs.intersects(CellAttrs::STRIKETHROUGH | CellAttrs::OVERLINE);
+        let needs_fg = pass == GridPass::Foreground
+            && foreground_visible
+            && (text != " " && text != "\0"
+                || attrs.has_underline()
+                || has_hyperlink
+                || attrs.intersects(CellAttrs::STRIKETHROUGH | CellAttrs::OVERLINE));
         let fg_brush = if needs_fg {
             Some(self.get_brush(fg)?)
         } else {
             None
         };
 
-        let underline_brush = if attrs.has_underline() || has_hyperlink {
+        let underline_brush = if pass == GridPass::Foreground
+            && foreground_visible
+            && (attrs.has_underline() || has_hyperlink)
+        {
             let color = if has_hyperlink {
                 Rgb::new(100, 149, 237)
             } else if let Some(color) = cell.underline_color {
@@ -596,13 +677,19 @@ impl TerminalRenderer {
                 left: x,
                 top: y,
                 right: x + cell_width,
-                bottom: y + self.cell_dims.height,
+                bottom: y + cell_height,
             };
             unsafe { base.FillRectangle(&rect, brush) };
         }
 
         // Draw character
-        if text != " " && text != "\0" && !attrs.contains(CellAttrs::HIDDEN) {
+        if pass == GridPass::Foreground
+            && foreground_visible
+            && text != " "
+            && text != "\0"
+            && !cell.is_kitty_image_placeholder()
+            && !attrs.contains(CellAttrs::HIDDEN)
+        {
             let text_format = match (
                 attrs.contains(CellAttrs::BOLD),
                 attrs.contains(CellAttrs::ITALIC),
@@ -619,12 +706,27 @@ impl TerminalRenderer {
                 self.dwrite_factory.CreateTextLayout(
                     &utf16,
                     text_format,
-                    cell_width,
-                    self.cell_dims.height,
+                    (cell_width - (text_x - x)).max(self.cell_dims.width),
+                    (cell_height - (text_y - y)).max(self.cell_dims.height),
                 )?
             };
 
-            let origin = D2D_POINT_2F { x, y };
+            if let Some(metrics) = metrics {
+                unsafe {
+                    layout.SetFontSize(
+                        self.dpi.scale_f32(self.font_size) * metrics.font_scale as f32,
+                        DWRITE_TEXT_RANGE {
+                            startPosition: 0,
+                            length: utf16.len() as u32,
+                        },
+                    )?;
+                }
+            }
+
+            let origin = D2D_POINT_2F {
+                x: text_x,
+                y: text_y,
+            };
             unsafe {
                 base.DrawTextLayout(
                     origin,
@@ -636,9 +738,10 @@ impl TerminalRenderer {
         }
 
         // Draw underline (also for hyperlinks)
-        let visible = !attrs.contains(CellAttrs::HIDDEN);
-        if visible && (attrs.has_underline() || has_hyperlink) {
-            let underline_y = y + self.cell_dims.baseline + 2.0;
+        let visible = foreground_visible && !attrs.contains(CellAttrs::HIDDEN);
+        if pass == GridPass::Foreground && visible && (attrs.has_underline() || has_hyperlink) {
+            let underline_y =
+                y + cell_height - (self.cell_dims.height - self.cell_dims.baseline) + 2.0;
             self.draw_underline_pattern(
                 &base,
                 underline_brush.as_ref().unwrap(),
@@ -650,8 +753,8 @@ impl TerminalRenderer {
         }
 
         // Draw strikethrough
-        if visible && attrs.contains(CellAttrs::STRIKETHROUGH) {
-            let strike_y = y + self.cell_dims.height / 2.0;
+        if pass == GridPass::Foreground && visible && attrs.contains(CellAttrs::STRIKETHROUGH) {
+            let strike_y = y + cell_height / 2.0;
             unsafe {
                 base.DrawLine(
                     D2D_POINT_2F { x, y: strike_y },
@@ -666,7 +769,7 @@ impl TerminalRenderer {
             };
         }
 
-        if visible && attrs.contains(CellAttrs::OVERLINE) {
+        if pass == GridPass::Foreground && visible && attrs.contains(CellAttrs::OVERLINE) {
             unsafe {
                 base.DrawLine(
                     D2D_POINT_2F { x, y: y + 1.0 },
@@ -774,38 +877,91 @@ impl TerminalRenderer {
     }
 
     /// Draw the cursor
-    fn draw_cursor(&mut self, screen: &Screen) -> windows::core::Result<()> {
+    fn draw_cursor(
+        &mut self,
+        screen: &Screen,
+        blink_phase: BlinkPhase,
+    ) -> windows::core::Result<()> {
         // Check DECTCEM mode for cursor visibility
-        if !screen.modes.show_cursor || screen.scroll_offset > 0 {
+        if !cursor_visible(screen, blink_phase) {
             return Ok(());
         }
 
-        let cursor = &screen.cursor;
-
-        let x = self.origin_x + cursor.col as f32 * self.cell_dims.width;
-        let y = self.origin_y + cursor.row as f32 * self.cell_dims.height;
-
         let cursor_color = self.resolved_palette(screen).cursor;
+        self.draw_cursor_cell(
+            screen,
+            screen.cursor.row,
+            screen.cursor.col,
+            screen.cursor.style,
+            cursor_color,
+            self.theme.cursor.text_color,
+        )
+    }
+
+    fn draw_extra_cursors(
+        &mut self,
+        screen: &Screen,
+        blink_phase: BlinkPhase,
+    ) -> windows::core::Result<()> {
+        if !extra_cursors_visible(screen, blink_phase) {
+            return Ok(());
+        }
+        let palette = self.resolved_palette(screen);
+        for cursor in screen.extra_cursors() {
+            let colors = resolve_extra_cursor_colors(
+                screen,
+                &palette,
+                self.theme.cursor.text_color,
+                cursor.row,
+                cursor.col,
+            );
+            self.draw_cursor_cell(
+                screen,
+                cursor.row,
+                cursor.col,
+                cursor.shape.resolve(screen.cursor.style),
+                colors.cursor,
+                colors.text,
+            )?;
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn draw_cursor_cell(
+        &mut self,
+        screen: &Screen,
+        row: usize,
+        col: usize,
+        style: CursorStyle,
+        cursor_color: Rgb,
+        text_color: Rgb,
+    ) -> windows::core::Result<()> {
+        let footprint = cursor_footprint(screen, row, col);
+        let x = self.origin_x + footprint.col as f32 * self.cell_dims.width;
+        let y = self.origin_y + footprint.row as f32 * self.cell_dims.height;
+        let width = footprint.columns as f32 * self.cell_dims.width;
+        let height = footprint.rows as f32 * self.cell_dims.height;
         let brush = self.get_brush(cursor_color)?;
 
-        let rect = match cursor.style {
+        let rect = match style {
             CursorStyle::Block => D2D_RECT_F {
                 left: x,
                 top: y,
-                right: x + self.cell_dims.width,
-                bottom: y + self.cell_dims.height,
+                right: x + width,
+                bottom: y + height,
             },
             CursorStyle::Underline => D2D_RECT_F {
                 left: x,
-                top: y + self.cell_dims.height - 2.0,
-                right: x + self.cell_dims.width,
-                bottom: y + self.cell_dims.height,
+                top: y + height - 2.0,
+                right: x + width,
+                bottom: y + height,
             },
             CursorStyle::Bar => D2D_RECT_F {
                 left: x,
                 top: y,
                 right: x + 2.0,
-                bottom: y + self.cell_dims.height,
+                bottom: y + height,
             },
         };
 
@@ -818,18 +974,28 @@ impl TerminalRenderer {
             base.FillRectangle(&rect, &brush);
         }
 
-        if cursor.style != CursorStyle::Block {
+        if style != CursorStyle::Block {
             return Ok(());
         }
 
         // Draw the character under a block cursor with inverted color.
-        let grid = screen.grid();
-        if let Some(cell) = grid.get(cursor.row, cursor.col) {
-            let text = cell.text();
+        if let Some(cell) = screen.get_cell(footprint.row, footprint.col) {
+            let multicell = cell.multicell.as_ref();
+            let metrics = multicell.map(multicell_render_metrics);
+            let text = multicell.map_or_else(|| cell.text(), |multicell| multicell.text());
 
-            if text != " " && text != "\0" && !cell.attrs.contains(CellAttrs::HIDDEN) {
-                let text_color = self.theme.cursor.text_color;
+            if text != " "
+                && text != "\0"
+                && !cell.is_kitty_image_placeholder()
+                && !cell.attrs.contains(CellAttrs::HIDDEN)
+            {
                 let text_brush = self.get_brush(text_color)?;
+                let text_x = x + metrics.map_or(0.0, |metrics| {
+                    metrics.horizontal_offset as f32 * self.cell_dims.width
+                });
+                let text_y = y + metrics.map_or(0.0, |metrics| {
+                    metrics.vertical_offset as f32 * self.cell_dims.height
+                });
 
                 let text_format = self.text_format.as_ref().unwrap();
                 let utf16: Vec<u16> = text.encode_utf16().collect();
@@ -838,12 +1004,27 @@ impl TerminalRenderer {
                     self.dwrite_factory.CreateTextLayout(
                         &utf16,
                         text_format,
-                        self.cell_dims.width * 2.0,
-                        self.cell_dims.height,
+                        (width - (text_x - x)).max(self.cell_dims.width),
+                        (height - (text_y - y)).max(self.cell_dims.height),
                     )?
                 };
 
-                let origin = D2D_POINT_2F { x, y };
+                if let Some(metrics) = metrics {
+                    unsafe {
+                        layout.SetFontSize(
+                            self.dpi.scale_f32(self.font_size) * metrics.font_scale as f32,
+                            DWRITE_TEXT_RANGE {
+                                startPosition: 0,
+                                length: utf16.len() as u32,
+                            },
+                        )?;
+                    }
+                }
+
+                let origin = D2D_POINT_2F {
+                    x: text_x,
+                    y: text_y,
+                };
                 unsafe {
                     base.DrawTextLayout(origin, &layout, &text_brush, Default::default());
                 }

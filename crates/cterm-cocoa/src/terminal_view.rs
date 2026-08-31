@@ -4,8 +4,9 @@
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::Arc;
+use std::time::Instant;
 
 use objc2::rc::Retained;
 use objc2::runtime::AnyObject;
@@ -20,114 +21,58 @@ use objc2_foundation::{
 };
 use parking_lot::Mutex;
 
-use cterm_app::config::Config;
+use cterm_app::config::{Config, ShortcutsConfig};
 use cterm_app::upgrade::PaneLaunchContext;
 use cterm_app::ShortcutManager;
 use cterm_core::screen::{ScreenConfig, SelectionMode};
 use cterm_core::term::{Key, Modifiers as CoreModifiers, TerminalEvent};
-use cterm_core::{KeyEventKind, KeyboardEnhancementFlags, Terminal};
-use cterm_ui::events::Action;
+use cterm_core::{KeyEventKind, KeyEventMetadata, KeyboardEnhancementFlags, Terminal};
 use cterm_ui::theme::Theme;
+use cterm_ui::{Action, BlinkClock, BlinkNeeds, BlinkPhase, KeyCode, Modifiers};
 
 use crate::cg_renderer::CGRenderer;
 use crate::file_transfer::PendingFileManager;
+use crate::keycode::{
+    direct_modified_key_char, exactly_one_char, key_event_kind, modifier_key_for_keycode,
+    terminal_key_for_keycode, unmodified_key_char, ReportedKey,
+};
 use crate::mouse::{self, MouseButton, MouseEvent, MouseModifiers, MousePosition};
 use crate::notification_bar::{NotificationBar, NOTIFICATION_BAR_HEIGHT};
+use crate::window::CtermWindow;
 use crate::{clipboard, keycode};
 
-fn key_event_kind(is_repeat: bool) -> KeyEventKind {
-    if is_repeat {
-        KeyEventKind::Repeat
-    } else {
-        KeyEventKind::Press
-    }
+const MIN_FONT_SIZE: f64 = 6.0;
+const MAX_FONT_SIZE: f64 = 72.0;
+
+fn adjusted_font_size(current: f64, delta: f64) -> f64 {
+    (current + delta).clamp(MIN_FONT_SIZE, MAX_FONT_SIZE)
 }
 
-fn terminal_key_for_keycode(keycode: u16) -> Option<Key> {
-    Some(match keycode {
-        // Arrow keys
-        0x7E => Key::Up,
-        0x7D => Key::Down,
-        0x7B => Key::Left,
-        0x7C => Key::Right,
-        // Navigation
-        0x73 => Key::Home,
-        0x77 => Key::End,
-        0x74 => Key::PageUp,
-        0x79 => Key::PageDown,
-        // Editing
-        0x72 => Key::Insert,
-        0x75 => Key::Delete,
-        0x33 => Key::Backspace,
-        0x24 => Key::Enter,
-        0x30 => Key::Tab,
-        0x35 => Key::Escape,
-        // Numeric keypad (preserve physical identity for DECKPAM and Kitty).
-        0x52 => Key::NumpadDigit(0),
-        0x53 => Key::NumpadDigit(1),
-        0x54 => Key::NumpadDigit(2),
-        0x55 => Key::NumpadDigit(3),
-        0x56 => Key::NumpadDigit(4),
-        0x57 => Key::NumpadDigit(5),
-        0x58 => Key::NumpadDigit(6),
-        0x59 => Key::NumpadDigit(7),
-        0x5B => Key::NumpadDigit(8),
-        0x5C => Key::NumpadDigit(9),
-        0x41 => Key::NumpadDecimal,
-        0x4B => Key::NumpadDivide,
-        0x43 => Key::NumpadMultiply,
-        0x4E => Key::NumpadSubtract,
-        0x45 => Key::NumpadAdd,
-        0x4C => Key::NumpadEnter,
-        // Function keys
-        0x7A => Key::F(1),
-        0x78 => Key::F(2),
-        0x63 => Key::F(3),
-        0x76 => Key::F(4),
-        0x60 => Key::F(5),
-        0x61 => Key::F(6),
-        0x62 => Key::F(7),
-        0x64 => Key::F(8),
-        0x65 => Key::F(9),
-        0x6D => Key::F(10),
-        0x67 => Key::F(11),
-        0x6F => Key::F(12),
-        _ => return None,
-    })
+fn configure_terminal_cursor(terminal: &mut Terminal, config: &Config) {
+    terminal.screen_mut().configure_cursor(
+        config.appearance.cursor_style.core_style(),
+        config.appearance.cursor_blink,
+    );
 }
 
-fn exactly_one_char(text: &str) -> Option<char> {
-    let mut chars = text.chars();
-    let character = chars.next()?;
-    chars.next().is_none().then_some(character)
+fn replace_shortcut_bindings(shortcuts: &RefCell<ShortcutManager>, config: &ShortcutsConfig) {
+    *shortcuts.borrow_mut() = ShortcutManager::from_config(config);
 }
 
-fn unmodified_key_char(text: &str) -> Option<char> {
-    let character = exactly_one_char(text)?;
-    let mut lowercase = character.to_lowercase();
-    let character = lowercase.next()?;
-    lowercase.next().is_none().then_some(character)
-}
-
-fn direct_modified_key_char(
-    event_text: &str,
-    base_text: &str,
-    alt_may_produce_text: bool,
-) -> Option<char> {
-    let event = exactly_one_char(event_text)?;
-    let base = unmodified_key_char(base_text)?;
-    if alt_may_produce_text && !event.is_control() {
-        let mut lowercase = event.to_lowercase();
-        if lowercase.next() != Some(base) || lowercase.next().is_some() {
-            return None;
-        }
-    }
-    Some(base)
+fn match_configured_action(
+    shortcuts: &RefCell<ShortcutManager>,
+    key: KeyCode,
+    modifiers: Modifiers,
+) -> Option<Action> {
+    // Own the action before dispatch: opening Preferences may replace this manager.
+    shortcuts.borrow().match_event(key, modifiers).cloned()
 }
 
 /// Shared state between the view and PTY thread
 struct ViewState {
     needs_redraw: AtomicBool,
+    blink_phase: AtomicU8,
+    cursor_rearm: AtomicBool,
     pty_closed: AtomicBool,
     /// Set when the view is being deallocated - threads should stop
     view_invalid: AtomicBool,
@@ -147,6 +92,8 @@ impl Default for ViewState {
     fn default() -> Self {
         Self {
             needs_redraw: AtomicBool::new(false),
+            blink_phase: AtomicU8::new(BlinkPhase::default().bits()),
+            cursor_rearm: AtomicBool::new(false),
             pty_closed: AtomicBool::new(false),
             view_invalid: AtomicBool::new(false),
             title: std::sync::RwLock::new(String::new()),
@@ -189,10 +136,11 @@ struct PaneSessionContext {
 /// Terminal view state
 pub struct TerminalViewIvars {
     terminal: Arc<Mutex<Terminal>>,
-    shortcuts: ShortcutManager,
+    shortcuts: RefCell<ShortcutManager>,
     renderer: RefCell<Option<CGRenderer>>,
-    cell_width: f64,
-    cell_height: f64,
+    cell_width: Cell<f64>,
+    cell_height: Cell<f64>,
+    default_font_size: f64,
     /// Shared state with PTY thread
     state: Arc<ViewState>,
     /// Whether we're currently in a selection drag
@@ -220,7 +168,7 @@ pub struct TerminalViewIvars {
     /// Marked text for IME input (Japanese, Chinese, etc.)
     marked_text: RefCell<String>,
     /// Keys whose presses were sent directly to the terminal instead of Cocoa text input
-    reported_keys: RefCell<HashMap<u16, Key>>,
+    reported_keys: RefCell<HashMap<u16, ReportedKey>>,
     /// Notification bar for file transfers
     notification_bar: RefCell<Option<Retained<NotificationBar>>>,
     /// Pending file manager for file transfers
@@ -315,7 +263,10 @@ define_class!(
                 // Always use full view bounds for rendering to avoid artifacts
                 // from partial dirty_rect updates after resize/fullscreen
                 let bounds: NSRect = unsafe { msg_send![self, bounds] };
-                renderer.render(&terminal, bounds);
+                let blink_phase = BlinkPhase::from_bits(
+                    self.ivars().state.blink_phase.load(Ordering::Relaxed),
+                );
+                renderer.render(&terminal, bounds, blink_phase);
 
                 // Render IME marked text if present
                 let marked_text = self.ivars().marked_text.borrow();
@@ -329,18 +280,13 @@ define_class!(
         #[unsafe(method(performKeyEquivalent:))]
         fn perform_key_equivalent(&self, event: &NSEvent) -> objc2::runtime::Bool {
             let modifiers = keycode::modifiers_from_event(event);
-            let raw_keycode = event.keyCode();
 
-            // Handle Ctrl+Tab / Ctrl+Shift+Tab for tab switching
-            // Tab key is virtual keycode 0x30 on macOS
-            if raw_keycode == 0x30 && modifiers.contains(cterm_ui::events::Modifiers::CTRL) {
-                if let Some(window) = self.window() {
-                    if modifiers.contains(cterm_ui::events::Modifiers::SHIFT) {
-                        let _: () = unsafe { msg_send![&*window, selectPreviousTab: std::ptr::null::<objc2::runtime::AnyObject>()] };
-                    } else {
-                        let _: () = unsafe { msg_send![&*window, selectNextTab: std::ptr::null::<objc2::runtime::AnyObject>()] };
-                    }
-                }
+            // Preserve AppKit's native Command-key menu handling. Other configured
+            // shortcuts are intercepted before a conflicting menu equivalent can
+            // claim them (notably pane focus on Control-Option-arrow).
+            if !modifiers.contains(cterm_ui::events::Modifiers::SUPER)
+                && self.dispatch_configured_shortcut(event)
+            {
                 return objc2::runtime::Bool::YES;
             }
 
@@ -360,55 +306,16 @@ define_class!(
             let modifiers = keycode::modifiers_from_event(event);
             let core_mods = CoreModifiers::from_bits_truncate(modifiers.bits());
 
-            if let Some(action) = keycode::keycode_from_event(event)
-                .and_then(|key| self.ivars().shortcuts.match_event(key, modifiers))
-            {
-                if self.dispatch_pane_action(action) {
-                    return;
-                }
-                let mut terminal = self.ivars().terminal.lock();
-                let page = terminal.rows().max(1);
-                let handled = match action {
-                    Action::ScrollUp => {
-                        terminal.scroll_viewport_up(1);
-                        true
-                    }
-                    Action::ScrollDown => {
-                        terminal.scroll_viewport_down(1);
-                        true
-                    }
-                    Action::ScrollPageUp => {
-                        terminal.scroll_viewport_up(page);
-                        true
-                    }
-                    Action::ScrollPageDown => {
-                        terminal.scroll_viewport_down(page);
-                        true
-                    }
-                    Action::ScrollToTop => {
-                        terminal.scroll_viewport_up(usize::MAX);
-                        true
-                    }
-                    Action::ScrollToBottom => {
-                        terminal.scroll_viewport_to_bottom();
-                        true
-                    }
-                    Action::PromptPrevious => {
-                        terminal.scroll_to_previous_prompt();
-                        true
-                    }
-                    Action::PromptNext => {
-                        terminal.scroll_to_next_prompt();
-                        true
-                    }
-                    _ => false,
-                };
-                drop(terminal);
-                if handled {
-                    self.set_needs_display();
-                    return;
-                }
+            if self.dispatch_configured_shortcut(event) {
+                return;
             }
+
+            let keyboard_flags = self
+                .ivars()
+                .terminal
+                .lock()
+                .screen()
+                .keyboard_enhancement_flags();
 
             // Clear any stale press for a newly pressed physical key. Repeats retain the
             // original identity so keyUp can report the same key even if the layout changes.
@@ -416,10 +323,14 @@ define_class!(
                 self.ivars().reported_keys.borrow_mut().remove(&raw_keycode);
             }
 
-            // Let Command+key combinations pass through to the menu system
-            // Command is never part of terminal sequences
-            if modifiers.contains(cterm_ui::events::Modifiers::SUPER) {
-                // Don't handle - let the responder chain process it for menu shortcuts
+            // AppKit menu equivalents and configured shortcuts have first refusal. An
+            // otherwise unclaimed Command combination is a Kitty Super combination.
+            if modifiers.contains(cterm_ui::events::Modifiers::SUPER)
+                && !keyboard_flags.intersects(
+                    KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+                        | KeyboardEnhancementFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES,
+                )
+            {
                 return;
             }
 
@@ -439,18 +350,11 @@ define_class!(
             {
                 let mut terminal = self.ivars().terminal.lock();
                 if terminal.screen().scroll_offset != 0 {
-                    terminal.screen_mut().scroll_offset = 0;
+                    terminal.scroll_viewport_to_bottom();
                     drop(terminal);
                     self.set_needs_display();
                 }
             }
-
-            let keyboard_flags = self
-                .ivars()
-                .terminal
-                .lock()
-                .screen()
-                .keyboard_enhancement_flags();
 
             // Handle Option+Arrow keys specially to match macOS Terminal.app behavior
             // when no application has requested enhanced keyboard events.
@@ -478,7 +382,14 @@ define_class!(
                     self.ivars()
                         .reported_keys
                         .borrow_mut()
-                        .insert(raw_keycode, key);
+                        .insert(
+                            raw_keycode,
+                            ReportedKey {
+                                key,
+                                shifted_key: None,
+                                base_layout_key: None,
+                            },
+                        );
                     log::debug!("Special key: {:?} -> {:?}", key, data);
                     self.write_to_pty(&data);
                     return;
@@ -488,31 +399,60 @@ define_class!(
             // Kitty disambiguation needs the base key plus modifiers. Only bypass Cocoa text
             // input when both strings identify exactly one scalar; dead keys and composed text
             // stay on interpretKeyEvents so IME behavior is unchanged.
-            if keyboard_flags.contains(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
-                && modifiers.intersects(
-                    cterm_ui::events::Modifiers::CTRL | cterm_ui::events::Modifiers::ALT,
-                )
+            let report_all = keyboard_flags
+                .contains(KeyboardEnhancementFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES);
+            if report_all
+                || (keyboard_flags
+                    .contains(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
+                    && modifiers.intersects(
+                        cterm_ui::events::Modifiers::CTRL
+                            | cterm_ui::events::Modifiers::ALT
+                            | cterm_ui::events::Modifiers::SUPER,
+                    ))
             {
                 let event_text = keycode::characters_from_event(event);
                 let base_text = keycode::characters_ignoring_modifiers(event);
-                let key = event_text
-                    .as_deref()
-                    .zip(base_text.as_deref())
-                    .and_then(|(event_text, base_text)| {
-                        direct_modified_key_char(
-                            event_text,
-                            base_text,
-                            modifiers.contains(cterm_ui::events::Modifiers::ALT),
-                        )
-                    })
-                    .map(Key::Char);
+                let character = if report_all {
+                    base_text.as_deref().and_then(unmodified_key_char)
+                } else {
+                    event_text.as_deref().zip(base_text.as_deref()).and_then(
+                        |(event_text, base_text)| {
+                            direct_modified_key_char(
+                                event_text,
+                                base_text,
+                                modifiers.contains(cterm_ui::events::Modifiers::ALT),
+                            )
+                        },
+                    )
+                };
+                let key = character.map(Key::Char);
 
                 if let Some(key) = key {
-                    if let Some(data) = self.terminal_key_event(key, core_mods, kind) {
+                    let shifted_key = modifiers
+                        .contains(cterm_ui::events::Modifiers::SHIFT)
+                        .then(|| event_text.as_deref().and_then(exactly_one_char))
+                        .flatten();
+                    let base_layout_key = keycode::keycode_from_event(event)
+                        .and_then(|keycode| keycode.to_char());
+                    let associated_text = event_text.as_deref();
+                    let metadata = KeyEventMetadata::new()
+                        .with_shifted_key(shifted_key)
+                        .with_base_layout_key(base_layout_key)
+                        .with_associated_text(associated_text);
+                    if let Some(data) =
+                        self.terminal_key_event_with_metadata(key, core_mods, kind, metadata)
+                    {
                         self.ivars()
                             .reported_keys
                             .borrow_mut()
-                            .insert(raw_keycode, key);
+                            .insert(
+                                raw_keycode,
+                                ReportedKey {
+                                    key,
+                                    shifted_key,
+                                    base_layout_key,
+                                },
+                            );
                         log::debug!("Enhanced character key: {:?} -> {:?}", key, data);
                         self.write_to_pty(&data);
                         return;
@@ -552,18 +492,22 @@ define_class!(
         #[unsafe(method(keyUp:))]
         fn key_up(&self, event: &NSEvent) {
             let raw_keycode = event.keyCode();
-            let key = self.ivars().reported_keys.borrow_mut().remove(&raw_keycode);
+            let reported = self.ivars().reported_keys.borrow_mut().remove(&raw_keycode);
 
-            if let Some(key) = key {
+            if let Some(reported) = reported {
                 let modifiers = keycode::modifiers_from_event(event);
                 let core_mods = CoreModifiers::from_bits_truncate(modifiers.bits());
                 let data = self
                     .ivars()
                     .terminal
                     .lock()
-                    .handle_reported_key_release(key, core_mods);
+                    .handle_reported_key_release_with_metadata(
+                        reported.key,
+                        core_mods,
+                        reported.metadata(),
+                    );
                 if let Some(data) = data {
-                    log::debug!("Key release: {:?} -> {:?}", key, data);
+                    log::debug!("Key release: {:?} -> {:?}", reported.key, data);
                     self.write_to_pty(&data);
                 }
                 return;
@@ -594,8 +538,12 @@ define_class!(
             let location = self.convert_point_from_view(location_in_window, None);
 
             // Calculate cell position
-            let col = (location.x / self.ivars().cell_width).floor().max(0.0) as usize;
-            let row = (location.y / self.ivars().cell_height).floor().max(0.0) as usize;
+            let col = (location.x / self.ivars().cell_width.get())
+                .floor()
+                .max(0.0) as usize;
+            let row = (location.y / self.ivars().cell_height.get())
+                .floor()
+                .max(0.0) as usize;
 
             // Check for Cmd+click on hyperlinks
             let flags = event.modifierFlags();
@@ -713,8 +661,12 @@ define_class!(
             let location = self.convert_point_from_view(location_in_window, None);
 
             // Calculate cell position (clamp to valid range)
-            let col = (location.x / self.ivars().cell_width).floor().max(0.0) as usize;
-            let row = (location.y / self.ivars().cell_height).floor().max(0.0) as usize;
+            let col = (location.x / self.ivars().cell_width.get())
+                .floor()
+                .max(0.0) as usize;
+            let row = (location.y / self.ivars().cell_height.get())
+                .floor()
+                .max(0.0) as usize;
 
             // Forward drag motion to a tracking application (ButtonEvent /
             // AnyEvent modes); Shift bypasses so a Shift-drag extends a local
@@ -808,8 +760,12 @@ define_class!(
                 if mouse::should_capture_mouse(mouse_mode) {
                     let location_in_window = event.locationInWindow();
                     let location = self.convert_point_from_view(location_in_window, None);
-                    let col = (location.x / self.ivars().cell_width).floor().max(0.0) as usize;
-                    let row = (location.y / self.ivars().cell_height).floor().max(0.0) as usize;
+                    let col = (location.x / self.ivars().cell_width.get())
+                        .floor()
+                        .max(0.0) as usize;
+                    let row = (location.y / self.ivars().cell_height.get())
+                        .floor()
+                        .max(0.0) as usize;
                     let modifiers = self.get_mouse_modifiers(event);
                     let button = if up {
                         MouseButton::WheelUp
@@ -886,7 +842,8 @@ define_class!(
 
             // Create new tracking area covering the entire view
             let mtm = MainThreadMarker::from(self);
-            let options = NSTrackingAreaOptions::MouseMoved
+            let options = NSTrackingAreaOptions::MouseEnteredAndExited
+                | NSTrackingAreaOptions::MouseMoved
                 | NSTrackingAreaOptions::ActiveInKeyWindow
                 | NSTrackingAreaOptions::InVisibleRect;
 
@@ -910,8 +867,12 @@ define_class!(
             let location_in_window = event.locationInWindow();
             let location = self.convert_point_from_view(location_in_window, None);
 
-            let col = (location.x / self.ivars().cell_width).floor().max(0.0) as usize;
-            let row = (location.y / self.ivars().cell_height).floor().max(0.0) as usize;
+            let col = (location.x / self.ivars().cell_width.get())
+                .floor()
+                .max(0.0) as usize;
+            let row = (location.y / self.ivars().cell_height.get())
+                .floor()
+                .max(0.0) as usize;
 
             let mouse_mode = self.ivars().terminal.lock().screen().modes.mouse_mode;
             if mouse_mode == cterm_core::MouseMode::AnyEvent
@@ -949,15 +910,17 @@ define_class!(
             }
         }
 
+        /// Report Kitty's SGR-pixel leave event to mouse-tracking applications.
+        #[unsafe(method(mouseExited:))]
+        fn mouse_exited(&self, event: &NSEvent) {
+            self.report_mouse_event(event, MouseEvent::Leave);
+            self.ivars().last_mouse_position.set(None);
+        }
+
         /// Copy selection to clipboard (Command+C)
         #[unsafe(method(copy:))]
         fn action_copy(&self, _sender: Option<&objc2::runtime::AnyObject>) {
-            let terminal = self.ivars().terminal.lock();
-            if let Some(text) = terminal.screen().get_selected_text() {
-                drop(terminal);
-                clipboard::set_text(&text);
-                log::debug!("Copied {} chars to clipboard", text.len());
-            }
+            self.copy_selection();
         }
 
         /// Copy selection to clipboard as HTML (Command+Shift+C)
@@ -976,39 +939,13 @@ define_class!(
         /// Paste from clipboard (Command+V)
         #[unsafe(method(paste:))]
         fn action_paste(&self, _sender: Option<&objc2::runtime::AnyObject>) {
-            if let Some(text) = clipboard::get_text() {
-                // Check if bracketed paste mode is enabled
-                let terminal = self.ivars().terminal.lock();
-                let bracketed = terminal.screen().modes.bracketed_paste;
-                drop(terminal);
-
-                let paste_text = if bracketed {
-                    format!("\x1b[200~{}\x1b[201~", text)
-                } else {
-                    text
-                };
-
-                self.write_to_pty(paste_text.as_bytes());
-            }
+            self.paste_clipboard();
         }
 
         /// Select all text (Command+A)
         #[unsafe(method(selectAll:))]
         fn action_select_all(&self, _sender: Option<&objc2::runtime::AnyObject>) {
-            let mut terminal = self.ivars().terminal.lock();
-            let total_lines = terminal.screen().total_lines();
-            let width = terminal.screen().width();
-
-            // Select from the first line to the last line
-            terminal
-                .screen_mut()
-                .start_selection(0, 0, SelectionMode::Char);
-            terminal
-                .screen_mut()
-                .extend_selection(total_lines.saturating_sub(1), width.saturating_sub(1));
-            drop(terminal);
-
-            self.set_needs_display();
+            self.select_all();
         }
 
         /// Handle modifier key changes (for secret debug menu)
@@ -1021,6 +958,58 @@ define_class!(
 
             // Show/hide debug menu based on Shift key state
             crate::menu::set_debug_menu_visible(shift_pressed);
+
+            let keyboard_flags = self
+                .ivars()
+                .terminal
+                .lock()
+                .screen()
+                .keyboard_enhancement_flags();
+            if !keyboard_flags
+                .contains(KeyboardEnhancementFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES)
+            {
+                return;
+            }
+
+            let raw_keycode = event.keyCode();
+            let Some((named, modifier)) = modifier_key_for_keycode(raw_keycode) else {
+                return;
+            };
+            let was_pressed = self
+                .ivars()
+                .reported_keys
+                .borrow()
+                .contains_key(&raw_keycode);
+            let kind = if was_pressed {
+                KeyEventKind::Release
+            } else {
+                KeyEventKind::Press
+            };
+            let mut modifiers = keycode::modifiers_from_event(event);
+            if kind == KeyEventKind::Press {
+                modifiers.insert(modifier);
+            }
+            let core_modifiers = CoreModifiers::from_bits_truncate(modifiers.bits());
+            let key = Key::Named(named);
+
+            if let Some(data) = self.terminal_key_event(key, core_modifiers, kind) {
+                if kind == KeyEventKind::Press {
+                    self.ivars().reported_keys.borrow_mut().insert(
+                        raw_keycode,
+                        ReportedKey {
+                            key,
+                            shifted_key: None,
+                            base_layout_key: None,
+                        },
+                    );
+                } else {
+                    self.ivars()
+                        .reported_keys
+                        .borrow_mut()
+                        .remove(&raw_keycode);
+                }
+                self.write_to_pty(&data);
+            }
         }
 
         /// Debug: Dump terminal state
@@ -1048,23 +1037,13 @@ define_class!(
         /// Reset terminal to initial state
         #[unsafe(method(resetTerminal:))]
         fn action_reset_terminal(&self, _sender: Option<&objc2::runtime::AnyObject>) {
-            let mut terminal = self.ivars().terminal.lock();
-            terminal.screen_mut().reset();
-            drop(terminal);
-            self.set_needs_display();
-            log::debug!("Terminal reset");
+            self.reset();
         }
 
         /// Clear screen and reset terminal
         #[unsafe(method(clearAndResetTerminal:))]
         fn action_clear_and_reset_terminal(&self, _sender: Option<&objc2::runtime::AnyObject>) {
-            use cterm_core::screen::ClearMode;
-            let mut terminal = self.ivars().terminal.lock();
-            terminal.screen_mut().clear(ClearMode::All);
-            terminal.screen_mut().reset();
-            drop(terminal);
-            self.set_needs_display();
-            log::debug!("Terminal cleared and reset");
+            self.clear_and_reset();
         }
 
         /// Set terminal title via dialog
@@ -1202,8 +1181,12 @@ define_class!(
             let location = self.convert_point_from_view(location_in_window, None);
 
             // Calculate cell position
-            let col = (location.x / self.ivars().cell_width).floor().max(0.0) as usize;
-            let row = (location.y / self.ivars().cell_height).floor().max(0.0) as usize;
+            let col = (location.x / self.ivars().cell_width.get())
+                .floor()
+                .max(0.0) as usize;
+            let row = (location.y / self.ivars().cell_height.get())
+                .floor()
+                .max(0.0) as usize;
 
             let terminal = self.ivars().terminal.lock();
             let absolute_line = terminal.screen().visible_row_to_absolute_line(row);
@@ -1391,7 +1374,7 @@ define_class!(
 
             if !text.is_empty() {
                 log::debug!("IME insert text (old method): {:?}", text);
-                self.write_to_pty(text.as_bytes());
+                self.write_text_input(&text);
             }
         }
 
@@ -1433,7 +1416,7 @@ define_class!(
 
             if !text.is_empty() {
                 log::debug!("IME insert text: {:?}", text);
-                self.write_to_pty(text.as_bytes());
+                self.write_text_input(&text);
             }
         }
 
@@ -1529,8 +1512,8 @@ define_class!(
             // Use cursor position
             let terminal = self.ivars().terminal.lock();
             let cursor = &terminal.screen().cursor;
-            let cell_width = self.ivars().cell_width;
-            let cell_height = self.ivars().cell_height;
+            let cell_width = self.ivars().cell_width.get();
+            let cell_height = self.ivars().cell_height.get();
 
             let x = cursor.col as f64 * cell_width;
             let y = cursor.row as f64 * cell_height;
@@ -1564,52 +1547,32 @@ struct ViewInitOptions {
 }
 
 impl TerminalView {
-    fn dispatch_pane_action(&self, action: &Action) -> bool {
-        let Some(window) = self.window() else {
+    fn dispatch_configured_shortcut(&self, event: &NSEvent) -> bool {
+        let Some(action) = keycode::keycode_from_event(event).and_then(|key| {
+            match_configured_action(
+                &self.ivars().shortcuts,
+                key,
+                keycode::modifiers_from_event(event),
+            )
+        }) else {
             return false;
         };
-        let sender = std::ptr::null::<AnyObject>();
-        unsafe {
-            match action {
-                Action::SplitPane(cterm_ui::SplitDirection::Horizontal) => {
-                    let _: () = msg_send![&*window, splitPaneHorizontal: sender];
-                }
-                Action::SplitPane(cterm_ui::SplitDirection::Vertical) => {
-                    let _: () = msg_send![&*window, splitPaneVertical: sender];
-                }
-                Action::ClosePane => {
-                    let _: () = msg_send![&*window, closePane: sender];
-                }
-                Action::FocusPane(cterm_ui::PaneDirection::Left) => {
-                    let _: () = msg_send![&*window, focusPaneLeft: sender];
-                }
-                Action::FocusPane(cterm_ui::PaneDirection::Right) => {
-                    let _: () = msg_send![&*window, focusPaneRight: sender];
-                }
-                Action::FocusPane(cterm_ui::PaneDirection::Up) => {
-                    let _: () = msg_send![&*window, focusPaneUp: sender];
-                }
-                Action::FocusPane(cterm_ui::PaneDirection::Down) => {
-                    let _: () = msg_send![&*window, focusPaneDown: sender];
-                }
-                Action::ResizePane(cterm_ui::PaneDirection::Left) => {
-                    let _: () = msg_send![&*window, resizePaneLeft: sender];
-                }
-                Action::ResizePane(cterm_ui::PaneDirection::Right) => {
-                    let _: () = msg_send![&*window, resizePaneRight: sender];
-                }
-                Action::ResizePane(cterm_ui::PaneDirection::Up) => {
-                    let _: () = msg_send![&*window, resizePaneUp: sender];
-                }
-                Action::ResizePane(cterm_ui::PaneDirection::Down) => {
-                    let _: () = msg_send![&*window, resizePaneDown: sender];
-                }
-                Action::TogglePaneZoom => {
-                    let _: () = msg_send![&*window, togglePaneZoom: sender];
-                }
-                _ => return false,
-            }
+
+        let Some(window) = self.window() else {
+            log::warn!("Ignoring configured action {action:?} without an owning window");
+            return true;
+        };
+
+        let is_cterm: bool =
+            unsafe { msg_send![&*window, isKindOfClass: objc2::class!(CtermWindow)] };
+        if !is_cterm {
+            log::error!("Ignoring configured action {action:?} for a non-cterm window");
+            return true;
         }
+
+        let cterm_window =
+            unsafe { &*(&*window as *const objc2_app_kit::NSWindow as *const CtermWindow) };
+        cterm_window.dispatch_action(&action);
         true
     }
 
@@ -1623,6 +1586,19 @@ impl TerminalView {
             .terminal
             .lock()
             .handle_key_event(key, modifiers, kind)
+    }
+
+    fn terminal_key_event_with_metadata(
+        &self,
+        key: Key,
+        modifiers: CoreModifiers,
+        kind: KeyEventKind,
+        metadata: KeyEventMetadata<'_>,
+    ) -> Option<Vec<u8>> {
+        self.ivars()
+            .terminal
+            .lock()
+            .handle_key_event_with_metadata(key, modifiers, kind, metadata)
     }
 
     /// Common initialization: allocate NSView, set ivars, init frame, setup notification bar
@@ -1641,10 +1617,11 @@ impl TerminalView {
         let this = mtm.alloc::<Self>();
         let this = this.set_ivars(TerminalViewIvars {
             terminal: terminal.clone(),
-            shortcuts: ShortcutManager::from_config(&config.shortcuts),
+            shortcuts: RefCell::new(ShortcutManager::from_config(&config.shortcuts)),
             renderer: RefCell::new(Some(renderer)),
-            cell_width,
-            cell_height,
+            cell_width: Cell::new(cell_width),
+            cell_height: Cell::new(cell_height),
+            default_font_size: config.appearance.font.size,
             state: state.clone(),
             is_selecting: Cell::new(false),
             auto_scroll_direction: Cell::new(0),
@@ -1706,6 +1683,7 @@ impl TerminalView {
         let mut base_palette = theme.colors.clone();
         base_palette.cursor = theme.cursor.color;
         let mut terminal = Terminal::new(80, 24, ScreenConfig::default());
+        configure_terminal_cursor(&mut terminal, config);
         terminal.set_base_palette(base_palette.clone());
         terminal.set_frontend_state(cterm_core::FrontendState {
             appearance: theme.appearance(),
@@ -1793,6 +1771,7 @@ impl TerminalView {
         let mut base_palette = theme.colors.clone();
         base_palette.cursor = theme.cursor.color;
         let mut terminal = Terminal::new(80, 24, ScreenConfig::default());
+        configure_terminal_cursor(&mut terminal, config);
         terminal.set_base_palette(base_palette.clone());
         terminal.set_frontend_state(cterm_core::FrontendState {
             appearance: theme.appearance(),
@@ -2172,6 +2151,7 @@ impl TerminalView {
 
                                         drop(term);
                                         if content_changed {
+                                            state.cursor_rearm.store(true, Ordering::Relaxed);
                                             state.needs_redraw.store(true, Ordering::Relaxed);
                                         }
                                     }
@@ -2198,6 +2178,8 @@ impl TerminalView {
         let terminal = Arc::clone(&self.ivars().terminal);
         // Start a background thread that periodically triggers redraws on main thread
         std::thread::spawn(move || {
+            let started = Instant::now();
+            let mut blink_clock = BlinkClock::default();
             // Wait briefly for app to initialize
             std::thread::sleep(std::time::Duration::from_millis(100));
             loop {
@@ -2210,6 +2192,26 @@ impl TerminalView {
                 }
 
                 if terminal.lock().expire_synchronized_update() {
+                    state.needs_redraw.store(true, Ordering::Relaxed);
+                }
+
+                let now = started.elapsed();
+                let mut terminal = terminal.lock();
+                let blink_needs = BlinkNeeds::for_screen(terminal.screen());
+                let animation_changed = terminal.advance_graphics_animations(now).changed;
+                drop(terminal);
+                if blink_clock.update(now, blink_needs) || animation_changed {
+                    state
+                        .blink_phase
+                        .store(blink_clock.phase().bits(), Ordering::Relaxed);
+                    state.needs_redraw.store(true, Ordering::Relaxed);
+                }
+                if state.cursor_rearm.swap(false, Ordering::Relaxed)
+                    && blink_clock.rearm_cursor(started.elapsed())
+                {
+                    state
+                        .blink_phase
+                        .store(blink_clock.phase().bits(), Ordering::Relaxed);
                     state.needs_redraw.store(true, Ordering::Relaxed);
                 }
 
@@ -2477,8 +2479,8 @@ impl TerminalView {
     /// Handle window resize
     pub fn handle_resize(&self) {
         let frame = self.frame();
-        let cell_width = self.ivars().cell_width;
-        let cell_height = self.ivars().cell_height;
+        let cell_width = self.ivars().cell_width.get();
+        let cell_height = self.ivars().cell_height.get();
 
         log::debug!(
             "handle_resize: frame={}x{}, cell={}x{}",
@@ -2529,6 +2531,16 @@ impl TerminalView {
         let mut terminal = self.ivars().terminal.lock();
         if let Err(e) = terminal.write(data) {
             log::error!("Failed to write to PTY: {}", e);
+        }
+    }
+
+    fn write_text_input(&self, text: &str) {
+        let mut terminal = self.ivars().terminal.lock();
+        let encoded = terminal.handle_text_input(text);
+        if !encoded.is_empty() {
+            if let Err(error) = terminal.write(&encoded) {
+                log::error!("Failed to write text input to PTY: {error}");
+            }
         }
     }
 
@@ -2621,7 +2633,169 @@ impl TerminalView {
 
     /// Get the cell size (width, height) for grid snapping
     pub fn cell_size(&self) -> (f64, f64) {
-        (self.ivars().cell_width, self.ivars().cell_height)
+        (
+            self.ivars().cell_width.get(),
+            self.ivars().cell_height.get(),
+        )
+    }
+
+    pub(crate) fn reload_shortcuts(&self, config: &ShortcutsConfig) {
+        replace_shortcut_bindings(&self.ivars().shortcuts, config);
+    }
+
+    pub(crate) fn paste_clipboard(&self) {
+        let Some(text) = clipboard::get_text() else {
+            return;
+        };
+        let bracketed = self.ivars().terminal.lock().screen().modes.bracketed_paste;
+        let paste_text = if bracketed {
+            format!("\x1b[200~{}\x1b[201~", text)
+        } else {
+            text
+        };
+        self.write_to_pty(paste_text.as_bytes());
+    }
+
+    pub(crate) fn select_all(&self) {
+        let mut terminal = self.ivars().terminal.lock();
+        let total_lines = terminal.screen().total_lines();
+        let width = terminal.screen().width();
+        terminal
+            .screen_mut()
+            .start_selection(0, 0, SelectionMode::Char);
+        terminal
+            .screen_mut()
+            .extend_selection(total_lines.saturating_sub(1), width.saturating_sub(1));
+        drop(terminal);
+        self.set_needs_display();
+    }
+
+    pub(crate) fn reset(&self) {
+        self.ivars().terminal.lock().screen_mut().reset();
+        self.set_needs_display();
+        log::debug!("Terminal reset");
+    }
+
+    fn clear_and_reset(&self) {
+        use cterm_core::screen::ClearMode;
+
+        let mut terminal = self.ivars().terminal.lock();
+        terminal.screen_mut().clear(ClearMode::All);
+        terminal.screen_mut().reset();
+        drop(terminal);
+        self.set_needs_display();
+        log::debug!("Terminal cleared and reset");
+    }
+
+    pub(crate) fn scroll_viewport_up(&self, lines: usize) {
+        self.ivars().terminal.lock().scroll_viewport_up(lines);
+        self.set_needs_display();
+    }
+
+    pub(crate) fn scroll_viewport_down(&self, lines: usize) {
+        self.ivars().terminal.lock().scroll_viewport_down(lines);
+        self.set_needs_display();
+    }
+
+    pub(crate) fn scroll_page_up(&self) {
+        let mut terminal = self.ivars().terminal.lock();
+        let page = terminal.rows().max(1);
+        terminal.scroll_viewport_up(page);
+        drop(terminal);
+        self.set_needs_display();
+    }
+
+    pub(crate) fn scroll_page_down(&self) {
+        let mut terminal = self.ivars().terminal.lock();
+        let page = terminal.rows().max(1);
+        terminal.scroll_viewport_down(page);
+        drop(terminal);
+        self.set_needs_display();
+    }
+
+    pub(crate) fn scroll_to_top(&self) {
+        self.ivars().terminal.lock().scroll_viewport_up(usize::MAX);
+        self.set_needs_display();
+    }
+
+    pub(crate) fn scroll_to_bottom(&self) {
+        self.ivars().terminal.lock().scroll_viewport_to_bottom();
+        self.set_needs_display();
+    }
+
+    pub(crate) fn scroll_to_previous_prompt(&self) {
+        self.ivars().terminal.lock().scroll_to_previous_prompt();
+        self.set_needs_display();
+    }
+
+    pub(crate) fn scroll_to_next_prompt(&self) {
+        self.ivars().terminal.lock().scroll_to_next_prompt();
+        self.set_needs_display();
+    }
+
+    pub(crate) fn find_text(&self, pattern: &str, case_sensitive: bool, regex: bool) -> usize {
+        let mut terminal = self.ivars().terminal.lock();
+        let results = terminal.find(pattern, case_sensitive, regex);
+        let count = results.len();
+        if let Some(first) = results.first() {
+            terminal.scroll_to_line(first.line);
+        }
+        drop(terminal);
+        self.set_needs_display();
+        count
+    }
+
+    pub(crate) fn zoom_in(&self) {
+        let current = self
+            .ivars()
+            .renderer
+            .borrow()
+            .as_ref()
+            .map(CGRenderer::font_size);
+        if let Some(current) = current {
+            self.apply_font_size(adjusted_font_size(current, 1.0));
+        }
+    }
+
+    pub(crate) fn zoom_out(&self) {
+        let current = self
+            .ivars()
+            .renderer
+            .borrow()
+            .as_ref()
+            .map(CGRenderer::font_size);
+        if let Some(current) = current {
+            self.apply_font_size(adjusted_font_size(current, -1.0));
+        }
+    }
+
+    pub(crate) fn zoom_reset(&self) {
+        self.apply_font_size(self.ivars().default_font_size);
+    }
+
+    fn apply_font_size(&self, font_size: f64) {
+        let cell_size = {
+            let mut renderer = self.ivars().renderer.borrow_mut();
+            let Some(renderer) = renderer.as_mut() else {
+                return;
+            };
+            renderer.set_font_size(MainThreadMarker::from(self), font_size);
+            renderer.cell_size()
+        };
+
+        self.ivars().cell_width.set(cell_size.0);
+        self.ivars().cell_height.set(cell_size.1);
+        {
+            let mut terminal = self.ivars().terminal.lock();
+            terminal.screen_mut().set_cell_width_hint(cell_size.0);
+            terminal.screen_mut().set_cell_height_hint(cell_size.1);
+        }
+        if let Some(window) = self.window() {
+            window.setContentResizeIncrements(NSSize::new(cell_size.0, cell_size.1));
+        }
+        self.handle_resize();
+        self.set_needs_display();
+        log::info!("Terminal font size set to {font_size}");
     }
 
     /// Send focus event to terminal if focus events mode is enabled (DECSET 1004)
@@ -2783,8 +2957,12 @@ impl TerminalView {
         }
 
         let location = self.convert_point_from_view(native_event.locationInWindow(), None);
-        let col = (location.x / self.ivars().cell_width).floor().max(0.0) as usize;
-        let row = (location.y / self.ivars().cell_height).floor().max(0.0) as usize;
+        let col = (location.x / self.ivars().cell_width.get())
+            .floor()
+            .max(0.0) as usize;
+        let row = (location.y / self.ivars().cell_height.get())
+            .floor()
+            .max(0.0) as usize;
         let position = MousePosition::new(
             col,
             row,
@@ -3225,35 +3403,57 @@ mod keyboard_event_tests {
     use super::*;
 
     #[test]
-    fn maps_press_and_repeat_event_kinds() {
-        assert_eq!(key_event_kind(false), KeyEventKind::Press);
-        assert_eq!(key_event_kind(true), KeyEventKind::Repeat);
+    fn font_zoom_stays_within_supported_bounds() {
+        assert_eq!(adjusted_font_size(12.0, 1.0), 13.0);
+        assert_eq!(adjusted_font_size(MIN_FONT_SIZE, -1.0), MIN_FONT_SIZE);
+        assert_eq!(adjusted_font_size(MAX_FONT_SIZE, 1.0), MAX_FONT_SIZE);
     }
 
     #[test]
-    fn maps_functional_keycodes() {
-        assert_eq!(terminal_key_for_keycode(0x7E), Some(Key::Up));
-        assert_eq!(terminal_key_for_keycode(0x75), Some(Key::Delete));
-        assert_eq!(terminal_key_for_keycode(0x7A), Some(Key::F(1)));
-        assert_eq!(terminal_key_for_keycode(0x6F), Some(Key::F(12)));
-        assert_eq!(terminal_key_for_keycode(0x57), Some(Key::NumpadDigit(5)));
-        assert_eq!(terminal_key_for_keycode(0x4C), Some(Key::NumpadEnter));
-        assert_eq!(terminal_key_for_keycode(0x00), None);
+    fn shortcut_bindings_can_be_replaced_without_stale_matches() {
+        let mut config = ShortcutsConfig::default();
+        let shortcuts = RefCell::new(ShortcutManager::from_config(&config));
+        let old_modifiers = Modifiers::CTRL | Modifiers::ALT;
+
+        assert_eq!(
+            match_configured_action(&shortcuts, KeyCode::Left, old_modifiers),
+            Some(Action::FocusPane(cterm_ui::PaneDirection::Left))
+        );
+
+        config.focus_pane_left = "Ctrl+H".to_string();
+        replace_shortcut_bindings(&shortcuts, &config);
+
+        assert_eq!(
+            match_configured_action(&shortcuts, KeyCode::Left, old_modifiers),
+            None
+        );
+        assert_eq!(
+            match_configured_action(&shortcuts, KeyCode::H, Modifiers::CTRL),
+            Some(Action::FocusPane(cterm_ui::PaneDirection::Left))
+        );
     }
 
     #[test]
-    fn accepts_only_one_unicode_scalar_for_direct_reporting() {
-        assert_eq!(exactly_one_char("a"), Some('a'));
-        assert_eq!(exactly_one_char("é"), Some('é'));
-        assert_eq!(exactly_one_char(""), None);
-        assert_eq!(exactly_one_char("ab"), None);
-        assert_eq!(exactly_one_char("e\u{301}"), None);
-        assert_eq!(unmodified_key_char("A"), Some('a'));
-        assert_eq!(unmodified_key_char("İ"), None);
-        assert_eq!(direct_modified_key_char("a", "a", true), Some('a'));
-        assert_eq!(direct_modified_key_char("A", "A", true), Some('a'));
-        assert_eq!(direct_modified_key_char("å", "a", true), None);
-        assert_eq!(direct_modified_key_char("\u{1}", "A", false), Some('a'));
-        assert_eq!(direct_modified_key_char("\u{1}", "A", true), Some('a'));
+    fn native_cursor_config_initializes_protocol_defaults() {
+        let mut config = Config::default();
+        config.appearance.cursor_style = cterm_app::config::CursorStyleConfig::Underline;
+        config.appearance.cursor_blink = false;
+        let mut terminal = Terminal::new(8, 2, ScreenConfig::default());
+
+        configure_terminal_cursor(&mut terminal, &config);
+
+        assert_eq!(
+            terminal.screen().cursor.style,
+            cterm_core::CursorStyle::Underline
+        );
+        assert!(!terminal.screen().cursor.blink.enabled());
+        terminal.process(b"\x1b[?12h");
+        assert!(terminal.screen().cursor.blink.enabled());
+        terminal.process(b"\x1b[?12l\x1b[0 q");
+        assert_eq!(
+            terminal.screen().cursor.style,
+            cterm_core::CursorStyle::Underline
+        );
+        assert!(!terminal.screen().cursor.blink.enabled());
     }
 }

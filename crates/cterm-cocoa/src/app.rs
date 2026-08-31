@@ -16,6 +16,10 @@ use objc2_foundation::{
 };
 
 use cterm_app::config::{load_config, Config};
+use cterm_app::{
+    PluginAuthorization, PluginInvocation, PluginRuntime, TemplateInstancePolicy,
+    TemplateLaunchPlan,
+};
 use cterm_ui::theme::Theme;
 
 use crate::menu;
@@ -70,6 +74,53 @@ fn reject_managed_secondary_action(action: &str) -> bool {
     }
 }
 
+fn key_cterm_window(mtm: MainThreadMarker) -> Option<Retained<CtermWindow>> {
+    let app = NSApplication::sharedApplication(mtm);
+    let window = app.keyWindow()?;
+    let is_cterm: bool = unsafe { msg_send![&window, isKindOfClass: objc2::class!(CtermWindow)] };
+    if !is_cterm {
+        return None;
+    }
+    unsafe { Retained::retain(Retained::as_ptr(&window) as *mut CtermWindow) }
+}
+
+fn run_plugin_invocation(
+    mtm: MainThreadMarker,
+    window: Retained<CtermWindow>,
+    invocation: PluginInvocation,
+) {
+    let window = dispatch2::MainThreadBound::new(window, mtm);
+    std::thread::spawn(move || {
+        let result = invocation.execute_blocking();
+        dispatch2::Queue::main().exec_async(move || {
+            let mtm = unsafe { MainThreadMarker::new_unchecked() };
+            let window = window.into_inner(mtm);
+            match result {
+                Ok(execution) => {
+                    for diagnostic in execution.diagnostics() {
+                        log::info!("Plugin diagnostic: {diagnostic}");
+                    }
+                    if !execution.host_stderr().is_empty() {
+                        log::warn!(
+                            "Plugin host stderr: {}",
+                            String::from_utf8_lossy(execution.host_stderr())
+                        );
+                    }
+                    for action in execution.actions() {
+                        window.dispatch_action(action);
+                    }
+                }
+                Err(error) => crate::dialogs::show_error(
+                    mtm,
+                    Some(&window),
+                    "Plugin command failed",
+                    &error.to_string(),
+                ),
+            }
+        });
+    });
+}
+
 async fn detach_snapshot_handles(sessions: &[cterm_app::daemon_reconnect::ReconnectedSession]) {
     let detaches = sessions.iter().map(|session| async move {
         let session_id = session.handle.session_id().to_string();
@@ -84,7 +135,7 @@ async fn detach_snapshot_handles(sessions: &[cterm_app::daemon_reconnect::Reconn
 
 /// Application state stored in the delegate
 pub struct AppDelegateIvars {
-    config: Config,
+    config: std::cell::RefCell<Config>,
     theme: Theme,
     windows: std::cell::RefCell<Vec<Retained<CtermWindow>>>,
     /// Manages cached SSH connections to remote ctermd instances
@@ -118,7 +169,7 @@ define_class!(
                     "Restoring {} window(s) from upgrade state",
                     upgrade_state.windows.len()
                 );
-                let config = self.ivars().config.clone();
+                let config = self.ivars().config.borrow().clone();
                 let theme = self.ivars().theme.clone();
 
                 let rt = tokio::runtime::Builder::new_current_thread()
@@ -198,7 +249,7 @@ define_class!(
             // Try to reconnect to existing daemon sessions. Explicit child
             // launches must never be replaced by an old session.
             if !get_args().requests_fresh_session() {
-                let config = self.ivars().config.clone();
+                let config = self.ivars().config.borrow().clone();
                 let theme = self.ivars().theme.clone();
 
                 // Check if daemon has existing sessions (non-blocking, don't auto-start)
@@ -263,13 +314,14 @@ define_class!(
             // Normal startup - create the main window
             log::debug!("Creating main window...");
             let args = get_args();
-            let opts = args.initial_session_options(&self.ivars().config, 80, 24);
+            let config = self.ivars().config.borrow().clone();
+            let opts = args.initial_session_options(&config, 80, 24);
             let window = CtermWindow::new_cli_daemon(
                 mtm,
-                &self.ivars().config,
+                &config,
                 &self.ivars().theme,
                 opts,
-                args.initial_title(&self.ivars().config),
+                args.initial_title(&config),
                 args.title.is_some(),
             );
             log::debug!("Main window created");
@@ -312,7 +364,13 @@ define_class!(
             }
 
             // Check if config says to confirm close with running processes
-            if !self.ivars().config.general.confirm_close_with_running {
+            if !self
+                .ivars()
+                .config
+                .borrow()
+                .general
+                .confirm_close_with_running
+            {
                 return NSApplicationTerminateReply::TerminateNow;
             }
 
@@ -381,10 +439,13 @@ define_class!(
                 return;
             }
             let mtm = MainThreadMarker::from(self);
-            let config = self.ivars().config.clone();
-            crate::preferences::show_preferences(mtm, &config, |_new_config| {
-                // Config saved - could reload theme or apply changes here
-                log::info!("Preferences saved");
+            let config = self.ivars().config.borrow().clone();
+            let delegate = unsafe {
+                Retained::retain(self as *const _ as *mut AppDelegate)
+                    .expect("the live application delegate can be retained")
+            };
+            crate::preferences::show_preferences(mtm, &config, move |new_config| {
+                delegate.apply_preferences_shortcuts(new_config);
             });
         }
 
@@ -398,6 +459,7 @@ define_class!(
             let remote_names: Vec<String> = self
                 .ivars()
                 .config
+                .borrow()
                 .remotes
                 .iter()
                 .map(|r| r.name.clone())
@@ -522,6 +584,76 @@ define_class!(
             }
         }
 
+        #[unsafe(method(runPluginCommand:))]
+        fn action_run_plugin_command(&self, sender: Option<&objc2::runtime::AnyObject>) {
+            if reject_managed_secondary_action("plugin command") {
+                return;
+            }
+            use objc2_app_kit::NSMenuItem;
+
+            let Some(sender) = sender else {
+                return;
+            };
+            let item: &NSMenuItem = unsafe { &*(sender as *const _ as *const NSMenuItem) };
+            let Some(object) = item.representedObject() else {
+                log::error!("Plugin menu item omitted its stable command ID");
+                return;
+            };
+            let action_id: &NSString = unsafe { &*(&*object as *const _ as *const NSString) };
+            let mtm = MainThreadMarker::from(self);
+            let Some(window) = key_cterm_window(mtm) else {
+                crate::dialogs::show_error(
+                    mtm,
+                    None,
+                    "Plugin command failed",
+                    "No cterm window is available for this command.",
+                );
+                return;
+            };
+            let mut runtime = match PluginRuntime::for_current_user() {
+                Ok(runtime) => runtime,
+                Err(error) => {
+                    crate::dialogs::show_error(
+                        mtm,
+                        Some(&window),
+                        "Plugin command failed",
+                        &error.to_string(),
+                    );
+                    return;
+                }
+            };
+            match runtime.authorize_action(&action_id.to_string()) {
+                Ok(PluginAuthorization::Granted(invocation)) => {
+                    run_plugin_invocation(mtm, window, invocation);
+                }
+                Ok(PluginAuthorization::ApprovalRequired(prompt)) => {
+                    if !crate::dialogs::show_confirm(
+                        mtm,
+                        Some(&window),
+                        "Allow plugin command?",
+                        &prompt.message(),
+                    ) {
+                        return;
+                    }
+                    match runtime.approve(prompt) {
+                        Ok(invocation) => run_plugin_invocation(mtm, window, invocation),
+                        Err(error) => crate::dialogs::show_error(
+                            mtm,
+                            Some(&window),
+                            "Plugin command failed",
+                            &error.to_string(),
+                        ),
+                    }
+                }
+                Err(error) => crate::dialogs::show_error(
+                    mtm,
+                    Some(&window),
+                    "Plugin command failed",
+                    &error.to_string(),
+                ),
+            }
+        }
+
         #[unsafe(method(newWindow:))]
         fn action_new_window(&self, _sender: Option<&objc2::runtime::AnyObject>) {
             if reject_managed_secondary_action("new window") {
@@ -530,7 +662,8 @@ define_class!(
             use objc2_app_kit::NSWindowTabbingMode;
 
             let mtm = MainThreadMarker::from(self);
-            let window = CtermWindow::new(mtm, &self.ivars().config, &self.ivars().theme);
+            let config = self.ivars().config.borrow().clone();
+            let window = CtermWindow::new(mtm, &config, &self.ivars().theme);
 
             // Temporarily disable tabbing to force a new window instead of a tab
             window.setTabbingMode(NSWindowTabbingMode::Disallowed);
@@ -684,7 +817,7 @@ define_class!(
                 return;
             }
             let mtm = MainThreadMarker::from(self);
-            let config = self.ivars().config.clone();
+            let config = self.ivars().config.borrow().clone();
             let theme = self.ivars().theme.clone();
 
             // Run session listing in background
@@ -763,7 +896,7 @@ define_class!(
             }
             let mtm = MainThreadMarker::from(self);
             let remote_manager = self.ivars().remote_manager.clone();
-            let config = self.ivars().config.clone();
+            let config = self.ivars().config.borrow().clone();
             let theme = self.ivars().theme.clone();
 
             // Show a simple input dialog for the SSH host
@@ -845,6 +978,10 @@ define_class!(
                                 .create_session(cterm_client::CreateSessionOpts {
                                     cols: 80,
                                     rows: 24,
+                                    cursor: cterm_client::CursorDefaults {
+                                        style: config.appearance.cursor_style.core_style(),
+                                        blink: config.appearance.cursor_blink,
+                                    },
                                     ..Default::default()
                                 })
                                 .await?;
@@ -935,7 +1072,7 @@ define_class!(
                 return;
             }
             let mtm = MainThreadMarker::from(self);
-            let config = self.ivars().config.clone();
+            let config = self.ivars().config.borrow().clone();
             crate::remotes_dialog::show_remotes_dialog(mtm, config);
         }
 
@@ -1119,7 +1256,7 @@ impl AppDelegate {
     pub fn new(mtm: MainThreadMarker, config: Config, theme: Theme) -> Retained<Self> {
         let this = mtm.alloc::<Self>();
         let this = this.set_ivars(AppDelegateIvars {
-            config,
+            config: std::cell::RefCell::new(config),
             theme,
             windows: std::cell::RefCell::new(Vec::new()),
             remote_manager: cterm_client::RemoteManager::new(),
@@ -1127,6 +1264,22 @@ impl AppDelegate {
             bell_count: std::cell::Cell::new(0),
         });
         unsafe { msg_send![super(this), init] }
+    }
+
+    fn apply_preferences_shortcuts(&self, config: Config) {
+        let shortcuts = config.shortcuts;
+        self.ivars().config.borrow_mut().shortcuts = shortcuts.clone();
+
+        let windows = self.ivars().windows.borrow().clone();
+        let terminal_count = windows
+            .iter()
+            .map(|window| window.reload_shortcuts(&shortcuts))
+            .sum::<usize>();
+        log::info!(
+            "Preferences saved; refreshed shortcuts for {} window(s) and {} terminal view(s)",
+            windows.len(),
+            terminal_count
+        );
     }
 
     fn reconnect_upgrade_pane(
@@ -1322,125 +1475,89 @@ impl AppDelegate {
 
     /// Open a tab from a template
     fn open_template(&self, template: &cterm_app::config::StickyTabConfig) {
+        self.open_template_with_preferred_window(template, None);
+    }
+
+    /// Open a Quick Open selection in the native tab group that requested it.
+    pub(crate) fn open_template_in_window(
+        &self,
+        template: &cterm_app::config::StickyTabConfig,
+        window: &CtermWindow,
+    ) {
+        self.open_template_with_preferred_window(template, Some(window));
+    }
+
+    fn open_template_with_preferred_window(
+        &self,
+        template: &cterm_app::config::StickyTabConfig,
+        preferred_window: Option<&CtermWindow>,
+    ) {
         if reject_managed_secondary_action("tab template") {
             return;
         }
-        let mtm = MainThreadMarker::from(self);
-
-        // If the template is unique, check if we already have a tab with this template
-        if template.unique {
-            // Look through all windows to find a matching tab
-            let windows = self.ivars().windows.borrow();
-            for window in windows.iter() {
-                // Check if this window has a tab with the template name
-                if let Some(terminal_view) = window.active_terminal() {
-                    if terminal_view.template_name().as_deref() == Some(template.name.as_str()) {
-                        // Focus this window
-                        window.makeKeyAndOrderFront(None);
-                        log::info!("Focused existing unique tab: {}", template.name);
-                        return;
-                    }
-                }
-            }
-        }
-
-        // Prepare working directory (clone from git if needed)
-        if let Some(ref working_dir) = template.working_directory {
-            if let Err(e) =
-                cterm_app::prepare_working_directory(working_dir, template.git_remote.as_deref())
-            {
-                log::error!("Failed to prepare working directory: {}", e);
-            }
-        }
-
-        let config = self.ivars().config.clone();
-        let theme = self.ivars().theme.clone();
-
-        let opts = cterm_client::CreateSessionOpts {
-            cols: 80,
-            rows: 24,
-            shell: template
-                .command
-                .clone()
-                .or_else(|| config.general.default_shell.clone()),
-            args: if template.args.is_empty() && template.command.is_none() {
-                config.general.shell_args.clone()
-            } else {
-                template.args.clone()
-            },
-            cwd: template
-                .working_directory
-                .as_ref()
-                .map(|p| p.to_string_lossy().to_string()),
-            env: template
-                .env
-                .iter()
-                .map(|(k, v)| (k.clone(), v.clone()))
-                .collect(),
-            ..Default::default()
-        };
-
-        let template_name = template.name.clone();
-        let template_color = template.color.clone();
-        let template_bg_color = template.background_color.clone();
-
-        // Resolve remote connection info if template targets a remote host
-        let remote_cfg = template
-            .remote
-            .as_ref()
-            .and_then(|name| config.find_remote(name).cloned());
-
-        if let Some(ref remote_name) = template.remote {
-            if remote_cfg.is_none() {
-                log::error!(
-                    "Template '{}' references unknown remote '{}'",
-                    template.name,
-                    remote_name
-                );
+        let config = self.ivars().config.borrow().clone();
+        let plan = match TemplateLaunchPlan::build(template, &config) {
+            Ok(plan) => plan,
+            Err(error) => {
+                log::error!("Cannot launch template '{}': {error}", template.name);
                 return;
             }
+        };
+        if plan.instance_policy == TemplateInstancePolicy::ReuseExisting
+            && self.focus_existing_template(&plan.template_name)
+        {
+            log::info!("Focused existing unique tab: {}", plan.template_name);
+            return;
         }
 
-        let app = NSApplication::sharedApplication(mtm);
+        let launched = if let Some(window) = self.template_target_window(preferred_window) {
+            window.spawn_template_plan(plan, self.ivars().remote_manager.clone())
+        } else {
+            CtermWindow::spawn_template_plan_in_new_window(
+                MainThreadMarker::from(self),
+                &config,
+                &self.ivars().theme,
+                plan,
+                self.ivars().remote_manager.clone(),
+            )
+        };
+        if launched {
+            log::info!("Template launch requested from Cocoa");
+        }
+    }
 
-        {
-            let remote = remote_cfg.and_then(|rc| {
-                template.remote.as_ref().map(|name| {
-                    (
-                        self.ivars().remote_manager.clone(),
-                        name.clone(),
-                        rc.host.clone(),
-                        rc.ssh_compression,
-                    )
-                })
-            });
+    fn focus_existing_template(&self, template_name: &str) -> bool {
+        let windows = self.ivars().windows.borrow().clone();
+        windows
+            .iter()
+            .any(|window| window.focus_template(template_name))
+    }
 
-            if let Some(key_window) = app.keyWindow() {
-                let window_ptr = Retained::as_ptr(&key_window) as *const CtermWindow;
-                let cterm_window: &CtermWindow = unsafe { &*window_ptr };
-                cterm_window.spawn_daemon_tab(
-                    opts,
-                    Some(template_name),
-                    template_color,
-                    template_bg_color,
-                    remote,
-                    None,
-                );
-            } else {
-                // No key window — create a new standalone daemon-backed window
-                let window = CtermWindow::new_daemon(
-                    mtm,
-                    &config,
-                    &theme,
-                    opts,
-                    template_name,
-                    template_color,
-                    template_bg_color,
-                );
-                self.ivars().windows.borrow_mut().push(window.clone());
-                window.makeKeyAndOrderFront(None);
+    fn template_target_window(
+        &self,
+        preferred_window: Option<&CtermWindow>,
+    ) -> Option<Retained<CtermWindow>> {
+        let windows = self.ivars().windows.borrow();
+        if let Some(preferred_window) = preferred_window {
+            if let Some(window) = windows
+                .iter()
+                .find(|window| std::ptr::eq(&***window, preferred_window))
+            {
+                return Some(window.clone());
             }
         }
+
+        let app = NSApplication::sharedApplication(MainThreadMarker::from(self));
+        if let Some(key_window) = app.keyWindow() {
+            let key_ptr = Retained::as_ptr(&key_window);
+            if let Some(window) = windows
+                .iter()
+                .find(|window| Retained::as_ptr(window) as *const NSWindow == key_ptr)
+            {
+                return Some(window.clone());
+            }
+        }
+        windows.first().cloned()
     }
 
     /// Perform a seamless relaunch, preserving all windows and tabs

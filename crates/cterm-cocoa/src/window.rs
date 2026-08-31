@@ -5,23 +5,25 @@
 use std::cell::{Cell, RefCell};
 
 use objc2::rc::Retained;
-use objc2::runtime::ProtocolObject;
+use objc2::runtime::{AnyObject, ProtocolObject};
 use objc2::{define_class, msg_send, DefinedClass, MainThreadOnly};
 use objc2_app_kit::{
-    NSAlertFirstButtonReturn, NSAlertStyle, NSApplication, NSAutoresizingMaskOptions, NSMenu,
-    NSMenuItem, NSView, NSWindow, NSWindowDelegate, NSWindowOcclusionState, NSWindowOrderingMode,
-    NSWindowStyleMask, NSWindowTabbingMode,
+    NSAlertFirstButtonReturn, NSAlertStyle, NSApplication, NSAutoresizingMaskOptions, NSColor,
+    NSLayoutAttribute, NSLayoutConstraint, NSLayoutRelation, NSMenu, NSMenuItem, NSView, NSWindow,
+    NSWindowDelegate, NSWindowOcclusionState, NSWindowOrderingMode, NSWindowStyleMask, NSWindowTab,
+    NSWindowTabbingMode,
 };
 use objc2_foundation::{
     MainThreadMarker, NSArray, NSNotification, NSObjectProtocol, NSPoint, NSRect, NSSize, NSString,
 };
 
-use cterm_app::config::Config;
+use cterm_app::config::{Config, ShortcutsConfig};
 use cterm_app::shortcuts::ShortcutManager;
 use cterm_app::upgrade::{PaneLaunchContext, PaneUpgradeState, TabUpgradeState};
+use cterm_app::{TemplateDaemonTarget, TemplateLaunchPlan};
 use cterm_ui::{
-    PaneDirection, PaneId, PaneLayout, PaneLayoutError, PaneRect, SplitDirection, SplitPlacement,
-    SplitRatio, SplitRequest, Theme,
+    Action, PaneDirection, PaneId, PaneLayout, PaneLayoutError, PaneRect, SplitDirection,
+    SplitPlacement, SplitRatio, SplitRequest, Theme,
 };
 
 use crate::cg_renderer::CGRenderer;
@@ -40,6 +42,128 @@ enum CloseTarget {
     Pane(PaneId),
 }
 
+#[derive(Clone, Copy)]
+enum AppAction {
+    NewWindow,
+    NextAlertedTab,
+    OpenPreferences,
+}
+
+fn is_managed_restricted_action(action: &Action) -> bool {
+    matches!(
+        action,
+        Action::NewTab
+            | Action::SplitPane(_)
+            | Action::ClosePane
+            | Action::FocusPane(_)
+            | Action::ResizePane(_)
+            | Action::TogglePaneZoom
+            | Action::NewWindow
+            | Action::OpenPreferences
+            | Action::QuickOpenTemplate
+    )
+}
+
+fn config_with_shortcuts(config: &Config, shortcuts: &ShortcutsConfig) -> Config {
+    let mut config = config.clone();
+    config.shortcuts = shortcuts.clone();
+    config
+}
+
+fn template_theme_name_matches(requested: &str, resolved: &str) -> bool {
+    requested.eq_ignore_ascii_case(resolved)
+        || matches!(
+            (requested.to_ascii_lowercase().as_str(), resolved),
+            ("dark", "Default Dark")
+                | ("light", "Default Light")
+                | ("tokyo_night" | "tokyo-night", "Tokyo Night")
+                | ("dracula", "Dracula")
+                | ("nord", "Nord")
+        )
+}
+
+fn template_theme(config: &Config, fallback: &Theme, override_name: Option<&str>) -> Theme {
+    let Some(override_name) = override_name.map(str::trim).filter(|name| !name.is_empty()) else {
+        return fallback.clone();
+    };
+
+    if let Some(custom) = config.appearance.custom_theme.as_ref() {
+        if override_name.eq_ignore_ascii_case("custom")
+            || override_name.eq_ignore_ascii_case(&custom.name)
+        {
+            return custom.clone();
+        }
+    }
+
+    let mut themed_config = config.clone();
+    themed_config.appearance.theme = override_name.to_string();
+    themed_config.appearance.custom_theme = None;
+    let resolved = cterm_app::config::resolve_theme(&themed_config);
+    if template_theme_name_matches(override_name, &resolved.name) {
+        resolved
+    } else {
+        log::warn!("Unknown template theme '{override_name}', using the window theme");
+        fallback.clone()
+    }
+}
+
+fn template_remote_details(plan: &TemplateLaunchPlan) -> Option<(&str, &str, bool)> {
+    match &plan.daemon {
+        TemplateDaemonTarget::Local => None,
+        TemplateDaemonTarget::Named(remote) => Some((
+            remote.name.as_str(),
+            remote.host.as_str(),
+            remote.ssh_compression,
+        )),
+    }
+}
+
+struct TemplateSpawnRequest {
+    options: cterm_client::CreateSessionOpts,
+    template_name: String,
+    tab_color: Option<String>,
+    background_color: Option<String>,
+    keep_open: bool,
+    theme: Theme,
+    remote: Option<(cterm_client::RemoteManager, String, String, bool)>,
+}
+
+fn prepare_template_spawn(
+    plan: TemplateLaunchPlan,
+    config: &Config,
+    fallback_theme: &Theme,
+    remote_manager: cterm_client::RemoteManager,
+) -> Result<TemplateSpawnRequest, String> {
+    if let Some((directory, git_remote)) = plan.local_workspace_preparation() {
+        cterm_app::prepare_working_directory(directory, git_remote).map_err(|error| {
+            format!(
+                "failed to prepare workspace for template '{}': {error}",
+                plan.template_name
+            )
+        })?;
+    }
+
+    let theme = template_theme(config, fallback_theme, plan.appearance.theme.as_deref());
+    let options = plan.session_options(80, 24);
+    let remote = template_remote_details(&plan).map(|(name, host, ssh_compression)| {
+        (
+            remote_manager,
+            name.to_string(),
+            host.to_string(),
+            ssh_compression,
+        )
+    });
+    Ok(TemplateSpawnRequest {
+        options,
+        template_name: plan.template_name,
+        tab_color: plan.appearance.tab_color,
+        background_color: plan.appearance.background_color,
+        keep_open: plan.keep_open,
+        theme,
+        remote,
+    })
+}
+
 struct DaemonProcessQuery {
     session_id: String,
     daemon_socket: Option<std::path::PathBuf>,
@@ -50,7 +174,8 @@ struct DaemonProcessQuery {
 pub struct CtermWindowIvars {
     config: Config,
     theme: Theme,
-    shortcuts: ShortcutManager,
+    shortcut_config: RefCell<ShortcutsConfig>,
+    shortcuts: RefCell<ShortcutManager>,
     active_terminal: RefCell<Option<Retained<TerminalView>>>,
     panes: RefCell<PaneRegistry<NativePane>>,
     pane_host: RefCell<Option<Retained<PaneHostView>>>,
@@ -167,76 +292,92 @@ define_class!(
     impl CtermWindow {
         #[unsafe(method(newTab:))]
         fn action_new_tab(&self, _sender: Option<&objc2::runtime::AnyObject>) {
-            if crate::app::get_args().managed {
-                log::warn!("Ignoring new-tab request in managed mode");
-                return;
-            }
-            self.create_new_tab();
+            self.dispatch_action(&Action::NewTab);
         }
 
         #[unsafe(method(closeTab:))]
         fn action_close_tab(&self, _sender: Option<&objc2::runtime::AnyObject>) {
-            self.close_current_tab();
+            self.dispatch_action(&Action::CloseTab);
         }
 
         #[unsafe(method(splitPaneHorizontal:))]
         fn action_split_pane_horizontal(&self, _sender: Option<&objc2::runtime::AnyObject>) {
-            self.create_pane(SplitDirection::Horizontal);
+            self.dispatch_action(&Action::SplitPane(SplitDirection::Horizontal));
         }
 
         #[unsafe(method(splitPaneVertical:))]
         fn action_split_pane_vertical(&self, _sender: Option<&objc2::runtime::AnyObject>) {
-            self.create_pane(SplitDirection::Vertical);
+            self.dispatch_action(&Action::SplitPane(SplitDirection::Vertical));
         }
 
         #[unsafe(method(closePane:))]
         fn action_close_pane(&self, _sender: Option<&objc2::runtime::AnyObject>) {
-            self.close_active_pane();
+            self.dispatch_action(&Action::ClosePane);
         }
 
         #[unsafe(method(focusPaneLeft:))]
         fn action_focus_pane_left(&self, _sender: Option<&objc2::runtime::AnyObject>) {
-            self.focus_pane_direction(PaneDirection::Left);
+            self.dispatch_action(&Action::FocusPane(PaneDirection::Left));
         }
 
         #[unsafe(method(focusPaneRight:))]
         fn action_focus_pane_right(&self, _sender: Option<&objc2::runtime::AnyObject>) {
-            self.focus_pane_direction(PaneDirection::Right);
+            self.dispatch_action(&Action::FocusPane(PaneDirection::Right));
         }
 
         #[unsafe(method(focusPaneUp:))]
         fn action_focus_pane_up(&self, _sender: Option<&objc2::runtime::AnyObject>) {
-            self.focus_pane_direction(PaneDirection::Up);
+            self.dispatch_action(&Action::FocusPane(PaneDirection::Up));
         }
 
         #[unsafe(method(focusPaneDown:))]
         fn action_focus_pane_down(&self, _sender: Option<&objc2::runtime::AnyObject>) {
-            self.focus_pane_direction(PaneDirection::Down);
+            self.dispatch_action(&Action::FocusPane(PaneDirection::Down));
         }
 
         #[unsafe(method(resizePaneLeft:))]
         fn action_resize_pane_left(&self, _sender: Option<&objc2::runtime::AnyObject>) {
-            self.resize_active_pane(PaneDirection::Left);
+            self.dispatch_action(&Action::ResizePane(PaneDirection::Left));
         }
 
         #[unsafe(method(resizePaneRight:))]
         fn action_resize_pane_right(&self, _sender: Option<&objc2::runtime::AnyObject>) {
-            self.resize_active_pane(PaneDirection::Right);
+            self.dispatch_action(&Action::ResizePane(PaneDirection::Right));
         }
 
         #[unsafe(method(resizePaneUp:))]
         fn action_resize_pane_up(&self, _sender: Option<&objc2::runtime::AnyObject>) {
-            self.resize_active_pane(PaneDirection::Up);
+            self.dispatch_action(&Action::ResizePane(PaneDirection::Up));
         }
 
         #[unsafe(method(resizePaneDown:))]
         fn action_resize_pane_down(&self, _sender: Option<&objc2::runtime::AnyObject>) {
-            self.resize_active_pane(PaneDirection::Down);
+            self.dispatch_action(&Action::ResizePane(PaneDirection::Down));
         }
 
         #[unsafe(method(togglePaneZoom:))]
         fn action_toggle_pane_zoom(&self, _sender: Option<&objc2::runtime::AnyObject>) {
-            self.toggle_active_pane_zoom();
+            self.dispatch_action(&Action::TogglePaneZoom);
+        }
+
+        #[unsafe(method(zoomIn:))]
+        fn action_zoom_in(&self, _sender: Option<&objc2::runtime::AnyObject>) {
+            self.dispatch_action(&Action::ZoomIn);
+        }
+
+        #[unsafe(method(zoomOut:))]
+        fn action_zoom_out(&self, _sender: Option<&objc2::runtime::AnyObject>) {
+            self.dispatch_action(&Action::ZoomOut);
+        }
+
+        #[unsafe(method(zoomReset:))]
+        fn action_zoom_reset(&self, _sender: Option<&objc2::runtime::AnyObject>) {
+            self.dispatch_action(&Action::ZoomReset);
+        }
+
+        #[unsafe(method(performFindPanelAction:))]
+        fn action_find_text(&self, _sender: Option<&objc2::runtime::AnyObject>) {
+            self.dispatch_action(&Action::FindText);
         }
 
         #[unsafe(method(focusPaneForView:))]
@@ -309,9 +450,10 @@ define_class!(
             let daemon_socket = active.as_ref().and_then(|t| t.daemon_socket());
             drop(active);
 
+            let config = self.config_with_live_shortcuts();
             let new_window = CtermWindow::new_with_cwd_and_socket(
                 mtm,
-                &self.ivars().config,
+                &config,
                 &self.ivars().theme,
                 cwd,
                 daemon_socket,
@@ -433,30 +575,8 @@ fn configured_template_launch_context(config: &Config, name: &str) -> Option<Pan
         .sticky_tabs
         .iter()
         .find(|template| template.name == name)?;
-    let (configured_shell, configured_args) = template.get_command_args();
-    let options = cterm_client::CreateSessionOpts {
-        shell: configured_shell.or_else(|| config.general.default_shell.clone()),
-        args: if template.docker.is_none() && template.command.is_none() {
-            config.general.shell_args.clone()
-        } else {
-            configured_args
-        },
-        env: template
-            .env
-            .iter()
-            .map(|(name, value)| (name.clone(), value.clone()))
-            .chain(
-                config
-                    .general
-                    .env
-                    .iter()
-                    .map(|(name, value)| (name.clone(), value.clone())),
-            )
-            .collect(),
-        term: config.general.term.clone(),
-        ssh: template.ssh.as_ref().map(|ssh| ssh.to_ssh_params()),
-        ..Default::default()
-    };
+    let plan = TemplateLaunchPlan::build(template, config).ok()?;
+    let options = plan.session_options(0, 0);
     Some(PaneLaunchContext::capture(&options))
 }
 
@@ -474,6 +594,186 @@ fn destroy_unattached_session(session: cterm_client::SessionHandle) {
 }
 
 impl CtermWindow {
+    /// Execute a shared semantic action against this window's active context.
+    ///
+    /// Keep this match exhaustive so newly added actions cannot silently fall
+    /// through into terminal input on macOS.
+    pub(crate) fn dispatch_action(&self, action: &Action) {
+        if crate::app::get_args().managed && is_managed_restricted_action(action) {
+            log::warn!("Ignoring {action:?} request in managed mode");
+            return;
+        }
+
+        match action {
+            Action::NewTab => self.create_new_tab(),
+            Action::CloseTab => self.close_current_tab(),
+            Action::NextTab => {
+                let _: () =
+                    unsafe { msg_send![self, selectNextTab: std::ptr::null::<AnyObject>()] };
+            }
+            Action::PrevTab => {
+                let _: () =
+                    unsafe { msg_send![self, selectPreviousTab: std::ptr::null::<AnyObject>()] };
+            }
+            Action::NextAlertedTab => self.dispatch_app_action(AppAction::NextAlertedTab),
+            Action::Tab(number) => self.select_tab_number(*number),
+            Action::SplitPane(direction) => self.create_pane(*direction),
+            Action::ClosePane => self.close_active_pane(),
+            Action::FocusPane(direction) => self.focus_pane_direction(*direction),
+            Action::ResizePane(direction) => self.resize_active_pane(*direction),
+            Action::TogglePaneZoom => self.toggle_active_pane_zoom(),
+            Action::NewWindow => self.dispatch_app_action(AppAction::NewWindow),
+            Action::CloseWindow => self.performClose(None),
+            Action::Copy => {
+                if let Some(terminal) = self.active_terminal() {
+                    terminal.copy_selection();
+                }
+            }
+            Action::Paste => {
+                if let Some(terminal) = self.active_terminal() {
+                    terminal.paste_clipboard();
+                }
+            }
+            Action::SelectAll => {
+                if let Some(terminal) = self.active_terminal() {
+                    terminal.select_all();
+                }
+            }
+            Action::ZoomIn => {
+                if let Some(terminal) = self.active_terminal() {
+                    terminal.zoom_in();
+                }
+            }
+            Action::ZoomOut => {
+                if let Some(terminal) = self.active_terminal() {
+                    terminal.zoom_out();
+                }
+            }
+            Action::ZoomReset => {
+                if let Some(terminal) = self.active_terminal() {
+                    terminal.zoom_reset();
+                }
+            }
+            Action::ToggleFullscreen => self.toggleFullScreen(None),
+            Action::ScrollUp => {
+                if let Some(terminal) = self.active_terminal() {
+                    terminal.scroll_viewport_up(1);
+                }
+            }
+            Action::ScrollDown => {
+                if let Some(terminal) = self.active_terminal() {
+                    terminal.scroll_viewport_down(1);
+                }
+            }
+            Action::ScrollPageUp => {
+                if let Some(terminal) = self.active_terminal() {
+                    terminal.scroll_page_up();
+                }
+            }
+            Action::ScrollPageDown => {
+                if let Some(terminal) = self.active_terminal() {
+                    terminal.scroll_page_down();
+                }
+            }
+            Action::ScrollToTop => {
+                if let Some(terminal) = self.active_terminal() {
+                    terminal.scroll_to_top();
+                }
+            }
+            Action::ScrollToBottom => {
+                if let Some(terminal) = self.active_terminal() {
+                    terminal.scroll_to_bottom();
+                }
+            }
+            Action::PromptPrevious => {
+                if let Some(terminal) = self.active_terminal() {
+                    terminal.scroll_to_previous_prompt();
+                }
+            }
+            Action::PromptNext => {
+                if let Some(terminal) = self.active_terminal() {
+                    terminal.scroll_to_next_prompt();
+                }
+            }
+            Action::OpenPreferences => self.dispatch_app_action(AppAction::OpenPreferences),
+            Action::FindText => self.show_find_dialog(),
+            Action::ResetTerminal => {
+                if let Some(terminal) = self.active_terminal() {
+                    terminal.reset();
+                }
+            }
+            Action::QuickOpenTemplate => self.show_quick_open(),
+        }
+    }
+
+    fn dispatch_app_action(&self, action: AppAction) {
+        let app = NSApplication::sharedApplication(MainThreadMarker::from(self));
+        let Some(delegate) = app.delegate() else {
+            log::error!("Cannot dispatch Cocoa application action without a delegate");
+            return;
+        };
+        let sender = std::ptr::null::<AnyObject>();
+        unsafe {
+            match action {
+                AppAction::NewWindow => {
+                    let _: () = msg_send![&*delegate, newWindow: sender];
+                }
+                AppAction::NextAlertedTab => {
+                    let _: () = msg_send![&*delegate, selectNextAlertedTab: sender];
+                }
+                AppAction::OpenPreferences => {
+                    let _: () = msg_send![&*delegate, showPreferences: sender];
+                }
+            }
+        }
+    }
+
+    fn select_tab_number(&self, number: u8) {
+        let windows: Option<Retained<NSArray<NSWindow>>> =
+            unsafe { msg_send![self, tabbedWindows] };
+        let Some(windows) = windows else {
+            return;
+        };
+        let index = usize::from(number).saturating_sub(1);
+        if let Some(window) = windows.iter().nth(index) {
+            window.makeKeyAndOrderFront(None);
+            log::debug!("Selected tab {}", index + 1);
+        }
+    }
+
+    fn show_find_dialog(&self) {
+        let mtm = MainThreadMarker::from(self);
+        let Some(pattern) = crate::dialogs::show_input(
+            mtm,
+            None,
+            "Find in Terminal",
+            "Search the active terminal's scrollback and visible buffer:",
+            "",
+        ) else {
+            return;
+        };
+        if pattern.is_empty() {
+            return;
+        }
+
+        let count = self
+            .active_terminal()
+            .map(|terminal| terminal.find_text(&pattern, false, false))
+            .unwrap_or(0);
+        log::info!("Found {count} matches for: {pattern}");
+
+        if count == 0 {
+            let alert = objc2_app_kit::NSAlert::new(mtm);
+            alert.setAlertStyle(NSAlertStyle::Informational);
+            alert.setMessageText(&NSString::from_str("Find in Terminal"));
+            alert.setInformativeText(&NSString::from_str(&format!(
+                "No matches found for \"{pattern}\"."
+            )));
+            alert.addButtonWithTitle(&NSString::from_str("OK"));
+            alert.runModal();
+        }
+    }
+
     /// Common window initialization: calculate size, allocate, init NSWindow,
     /// set min size, tabbing mode, and delegate.
     fn init_window(
@@ -500,7 +800,8 @@ impl CtermWindow {
         let this = this.set_ivars(CtermWindowIvars {
             config: config.clone(),
             theme: theme.clone(),
-            shortcuts: ShortcutManager::from_config(&config.shortcuts),
+            shortcut_config: RefCell::new(config.shortcuts.clone()),
+            shortcuts: RefCell::new(ShortcutManager::from_config(&config.shortcuts)),
             active_terminal: RefCell::new(None),
             panes: RefCell::new(PaneRegistry::default()),
             pane_host: RefCell::new(None),
@@ -877,7 +1178,7 @@ impl CtermWindow {
         }
         let terminal_frame: NSRect = unsafe { msg_send![&*terminal, frame] };
         let (cell_width, cell_height) = terminal.cell_size();
-        let config = self.ivars().config.clone();
+        let config = self.config_with_live_shortcuts();
         let theme = self.ivars().theme.clone();
         let mut opts = cterm_client::CreateSessionOpts {
             cols: (terminal_frame.size.width / cell_width).floor().max(1.0) as u32,
@@ -890,6 +1191,10 @@ impl CtermWindow {
         launch_context.apply_to(&mut opts);
         opts.base_palette = Some(terminal_palette(&theme, None));
         opts.frontend_state.appearance = theme.appearance();
+        opts.set_cursor_defaults(
+            config.appearance.cursor_style.core_style(),
+            config.appearance.cursor_blink,
+        );
         let window = unsafe {
             Retained::retain(self as *const _ as *mut CtermWindow)
                 .expect("a live pane window can be retained")
@@ -1064,7 +1369,7 @@ impl CtermWindow {
         daemon_socket: Option<std::path::PathBuf>,
     ) -> Retained<Self> {
         let this = Self::init_window(mtm, config, theme, "Terminal", None);
-        let config = this.ivars().config.clone();
+        let config = this.config_with_live_shortcuts();
         let opts = cterm_client::CreateSessionOpts {
             cols: 80,
             rows: 24,
@@ -1080,7 +1385,7 @@ impl CtermWindow {
     /// Spawn a daemon session in the background and attach the terminal when ready.
     /// Used for initial window creation where the window must exist immediately.
     fn spawn_initial_daemon_session(&self, cwd: Option<String>) {
-        let config = self.ivars().config.clone();
+        let config = self.config_with_live_shortcuts();
         let opts = cterm_client::CreateSessionOpts {
             cols: 80,
             rows: 24,
@@ -1104,11 +1409,15 @@ impl CtermWindow {
         daemon_socket: Option<std::path::PathBuf>,
         title_locked: bool,
     ) {
-        let config = self.ivars().config.clone();
+        let config = self.config_with_live_shortcuts();
         ensure_session_pixel_size(&config, &mut opts);
         let theme = self.ivars().theme.clone();
         opts.base_palette = Some(terminal_palette(&theme, background_color.as_deref()));
         opts.frontend_state.appearance = theme.appearance();
+        opts.set_cursor_defaults(
+            config.appearance.cursor_style.core_style(),
+            config.appearance.cursor_blink,
+        );
         let launch_context = PaneLaunchContext::capture(&opts);
         let window = unsafe {
             Retained::retain(self as *const _ as *mut CtermWindow)
@@ -1337,8 +1646,8 @@ impl CtermWindow {
     pub fn create_daemon_tab(&self, session: cterm_client::SessionHandle) {
         let mtm = MainThreadMarker::from(self);
 
-        let new_window =
-            CtermWindow::from_daemon(mtm, &self.ivars().config, &self.ivars().theme, session);
+        let config = self.config_with_live_shortcuts();
+        let new_window = CtermWindow::from_daemon(mtm, &config, &self.ivars().theme, session);
 
         // Register with AppDelegate
         let app = NSApplication::sharedApplication(mtm);
@@ -1371,7 +1680,7 @@ impl CtermWindow {
         let daemon_socket = active.as_ref().and_then(|t| t.daemon_socket());
         drop(active);
 
-        let config = self.ivars().config.clone();
+        let config = self.config_with_live_shortcuts();
         let opts = cterm_client::CreateSessionOpts {
             cols: 80,
             rows: 24,
@@ -1392,25 +1701,129 @@ impl CtermWindow {
     /// daemon.
     pub fn spawn_daemon_tab(
         &self,
-        mut opts: cterm_client::CreateSessionOpts,
+        opts: cterm_client::CreateSessionOpts,
         template_name: Option<String>,
         color: Option<String>,
         background_color: Option<String>,
         remote: Option<(cterm_client::RemoteManager, String, String, bool)>,
         daemon_socket: Option<std::path::PathBuf>,
     ) {
-        let config = self.ivars().config.clone();
+        Self::spawn_daemon_window_with_theme(
+            MainThreadMarker::from(self),
+            Some(self),
+            self.config_with_live_shortcuts(),
+            opts,
+            template_name,
+            color,
+            background_color,
+            false,
+            self.ivars().theme.clone(),
+            remote,
+            daemon_socket,
+        );
+    }
+
+    /// Launch one normalized template plan into this window's native tab group.
+    pub(crate) fn spawn_template_plan(
+        &self,
+        plan: TemplateLaunchPlan,
+        remote_manager: cterm_client::RemoteManager,
+    ) -> bool {
+        if crate::app::get_args().managed {
+            log::warn!("Ignoring template launch plan in managed mode");
+            return false;
+        }
+        let config = self.config_with_live_shortcuts();
+        let request =
+            match prepare_template_spawn(plan, &config, &self.ivars().theme, remote_manager) {
+                Ok(request) => request,
+                Err(error) => {
+                    log::error!("{error}");
+                    return false;
+                }
+            };
+        Self::spawn_daemon_window_with_theme(
+            MainThreadMarker::from(self),
+            Some(self),
+            config,
+            request.options,
+            Some(request.template_name),
+            request.tab_color,
+            request.background_color,
+            request.keep_open,
+            request.theme,
+            request.remote,
+            None,
+        );
+        true
+    }
+
+    /// Launch a normalized template plan as a new standalone native window.
+    pub(crate) fn spawn_template_plan_in_new_window(
+        mtm: MainThreadMarker,
+        config: &Config,
+        fallback_theme: &Theme,
+        plan: TemplateLaunchPlan,
+        remote_manager: cterm_client::RemoteManager,
+    ) -> bool {
+        if crate::app::get_args().managed {
+            log::warn!("Ignoring standalone template launch plan in managed mode");
+            return false;
+        }
+        let request = match prepare_template_spawn(plan, config, fallback_theme, remote_manager) {
+            Ok(request) => request,
+            Err(error) => {
+                log::error!("{error}");
+                return false;
+            }
+        };
+        Self::spawn_daemon_window_with_theme(
+            mtm,
+            None,
+            config.clone(),
+            request.options,
+            Some(request.template_name),
+            request.tab_color,
+            request.background_color,
+            request.keep_open,
+            request.theme,
+            request.remote,
+            None,
+        );
+        true
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn spawn_daemon_window_with_theme(
+        mtm: MainThreadMarker,
+        tab_owner: Option<&Self>,
+        config: Config,
+        mut opts: cterm_client::CreateSessionOpts,
+        template_name: Option<String>,
+        color: Option<String>,
+        background_color: Option<String>,
+        keep_open: bool,
+        theme: Theme,
+        remote: Option<(cterm_client::RemoteManager, String, String, bool)>,
+        daemon_socket: Option<std::path::PathBuf>,
+    ) {
         ensure_session_pixel_size(&config, &mut opts);
-        let theme = self.ivars().theme.clone();
         opts.base_palette = Some(terminal_palette(&theme, background_color.as_deref()));
         opts.frontend_state.appearance = theme.appearance();
+        opts.set_cursor_defaults(
+            config.appearance.cursor_style.core_style(),
+            config.appearance.cursor_blink,
+        );
         let launch_context = PaneLaunchContext::capture(&opts);
         let remote_name = remote.as_ref().map(|(_, name, _, _)| name.clone());
-        let window = unsafe {
-            Retained::retain(self as *const _ as *mut CtermWindow)
-                .expect("a live tab owner can be retained")
-        };
-        let window = dispatch2::MainThreadBound::new(window, MainThreadMarker::from(self));
+        let tab_owner = tab_owner.map(|tab_owner| {
+            let tab_owner = unsafe {
+                Retained::retain(tab_owner as *const _ as *mut CtermWindow)
+                    .expect("a live tab owner can be retained")
+            };
+            dispatch2::MainThreadBound::new(tab_owner, mtm)
+        });
+        let joins_tab_group = tab_owner.is_some();
 
         std::thread::spawn(move || {
             let rt = tokio::runtime::Builder::new_current_thread()
@@ -1436,8 +1849,11 @@ impl CtermWindow {
                 Ok(session) => {
                     dispatch2::Queue::main().exec_async(move || {
                         let mtm = unsafe { MainThreadMarker::new_unchecked() };
-                        let window = window.into_inner(mtm);
-                        if window.ivars().closed.get() {
+                        let tab_owner = tab_owner.map(|owner| owner.into_inner(mtm));
+                        if tab_owner
+                            .as_ref()
+                            .is_some_and(|owner| owner.ivars().closed.get())
+                        {
                             destroy_unattached_session(session);
                             return;
                         }
@@ -1453,6 +1869,7 @@ impl CtermWindow {
                         if let Some(tv) = new_window.active_terminal() {
                             tv.set_pane_launch_context(launch_context);
                             tv.set_remote_name(remote_name);
+                            tv.set_keep_open(keep_open);
                             if let Some(ref name) = template_name {
                                 tv.set_current_title(title.clone());
                                 tv.set_title_locked(true);
@@ -1470,17 +1887,23 @@ impl CtermWindow {
                                 unsafe { msg_send![&*delegate, registerWindow: &*new_window] };
                         }
 
-                        window.addTabbedWindow_ordered(
-                            &new_window,
-                            objc2_app_kit::NSWindowOrderingMode::Above,
-                        );
+                        if let Some(owner) = tab_owner.as_ref() {
+                            owner.addTabbedWindow_ordered(
+                                &new_window,
+                                objc2_app_kit::NSWindowOrderingMode::Above,
+                            );
+                        }
                         new_window.makeKeyAndOrderFront(None);
 
                         if let Some(ref c) = color {
                             new_window.set_tab_color(Some(c));
                         }
 
-                        log::info!("Created daemon tab: {}", title);
+                        if joins_tab_group {
+                            log::info!("Created daemon tab: {title}");
+                        } else {
+                            log::info!("Created standalone daemon window: {title}");
+                        }
                     });
                 }
                 Err(e) => {
@@ -1522,6 +1945,38 @@ impl CtermWindow {
             .into_iter()
             .filter_map(|id| panes.get(id).map(|entry| entry.terminal.clone()))
             .collect()
+    }
+
+    /// Focus the pane carrying a reusable template, if this tab owns one.
+    pub(crate) fn focus_template(&self, template_name: &str) -> bool {
+        let Some(terminal) = self
+            .terminal_views()
+            .into_iter()
+            .find(|terminal| terminal.template_name().as_deref() == Some(template_name))
+        else {
+            return false;
+        };
+        if let Some(pane_id) = self.pane_id_for_terminal(&terminal) {
+            self.focus_pane(pane_id);
+        }
+        self.makeKeyAndOrderFront(None);
+        true
+    }
+
+    /// Replace configured bindings for this window and every pane it owns.
+    pub(crate) fn reload_shortcuts(&self, shortcuts: &ShortcutsConfig) -> usize {
+        *self.ivars().shortcut_config.borrow_mut() = shortcuts.clone();
+        *self.ivars().shortcuts.borrow_mut() = ShortcutManager::from_config(shortcuts);
+
+        let terminals = self.terminal_views();
+        for terminal in &terminals {
+            terminal.reload_shortcuts(shortcuts);
+        }
+        terminals.len()
+    }
+
+    fn config_with_live_shortcuts(&self) -> Config {
+        config_with_shortcuts(&self.ivars().config, &self.ivars().shortcut_config.borrow())
     }
 
     /// Keep daemon sessions alive when this frontend hands them to a new process.
@@ -1820,50 +2275,13 @@ impl CtermWindow {
             log::warn!("Ignoring tab-template request in managed mode");
             return;
         }
-        // Prepare working directory (clone from git if needed)
-        if let Some(ref working_dir) = template.working_directory {
-            if let Err(e) =
-                cterm_app::prepare_working_directory(working_dir, template.git_remote.as_deref())
-            {
-                log::error!("Failed to prepare working directory: {}", e);
-            }
-        }
-
-        let config = &self.ivars().config;
-        let opts = cterm_client::CreateSessionOpts {
-            cols: 80,
-            rows: 24,
-            shell: template
-                .command
-                .clone()
-                .or_else(|| config.general.default_shell.clone()),
-            args: if template.args.is_empty() && template.command.is_none() {
-                config.general.shell_args.clone()
-            } else {
-                template.args.clone()
-            },
-            cwd: template
-                .working_directory
-                .as_ref()
-                .map(|p| p.to_string_lossy().to_string()),
-            env: template
-                .env
-                .iter()
-                .map(|(k, v)| (k.clone(), v.clone()))
-                .collect(),
-            // SSH tabs open a native puressh connection on the daemon.
-            ssh: template.ssh.as_ref().map(|s| s.to_ssh_params()),
-            ..Default::default()
+        let app = NSApplication::sharedApplication(MainThreadMarker::from(self));
+        let Some(delegate) = app.delegate() else {
+            log::error!("Cannot launch template without the Cocoa application delegate");
+            return;
         };
-
-        self.spawn_daemon_tab(
-            opts,
-            Some(template.name.clone()),
-            template.color.clone(),
-            template.background_color.clone(),
-            None,
-            None,
-        );
+        let delegate = unsafe { &*(Retained::as_ptr(&delegate) as *const crate::app::AppDelegate) };
+        delegate.open_template_in_window(template, self);
     }
 
     /// Get the current tab color
@@ -1884,16 +2302,8 @@ impl CtermWindow {
             tv.set_tab_color_on_daemon(color.unwrap_or(""));
         }
 
-        unsafe {
-            // Get the window's tab object
-            let tab: *mut objc2::runtime::AnyObject = msg_send![self, tab];
-            if tab.is_null() {
-                log::debug!("No tab object available, stored for later");
-                return;
-            }
-
-            self.apply_tab_color_to_tab(tab, color);
-        }
+        let tab = self.tab();
+        self.apply_tab_color_to_tab(&tab, color);
     }
 
     /// Apply pending tab color if the tab is now available
@@ -1904,19 +2314,12 @@ impl CtermWindow {
             return true; // Nothing to apply
         }
 
-        unsafe {
-            let tab: *mut objc2::runtime::AnyObject = msg_send![self, tab];
-            if tab.is_null() {
-                log::debug!("Tab not available yet for pending color");
-                return false;
-            }
-
-            self.apply_tab_color_to_tab(tab, pending.as_deref());
-            // Clear pending after successful application
-            *self.ivars().pending_tab_color.borrow_mut() = None;
-            log::debug!("Applied pending tab color: {:?}", pending);
-            true
-        }
+        let tab = self.tab();
+        self.apply_tab_color_to_tab(&tab, pending.as_deref());
+        // Clear pending after successful application
+        *self.ivars().pending_tab_color.borrow_mut() = None;
+        log::debug!("Applied pending tab color: {:?}", pending);
+        true
     }
 
     /// Schedule a retry for applying tab color after a short delay
@@ -1932,11 +2335,7 @@ impl CtermWindow {
     }
 
     /// Internal: Apply color to a tab object
-    unsafe fn apply_tab_color_to_tab(
-        &self,
-        tab: *mut objc2::runtime::AnyObject,
-        color: Option<&str>,
-    ) {
+    fn apply_tab_color_to_tab(&self, tab: &NSWindowTab, color: Option<&str>) {
         if let Some(hex) = color {
             // Parse hex color
             let hex = hex.trim_start_matches('#');
@@ -1947,63 +2346,62 @@ impl CtermWindow {
                     u8::from_str_radix(&hex[4..6], 16),
                 ) {
                     // Create a small colored circle view
+                    let mtm = MainThreadMarker::from(self);
                     let frame = NSRect::new(NSPoint::ZERO, NSSize::new(12.0, 12.0));
-                    let view: *mut objc2::runtime::AnyObject =
-                        msg_send![objc2::class!(NSView), alloc];
-                    let view: *mut objc2::runtime::AnyObject =
-                        msg_send![view, initWithFrame: frame];
+                    let view = unsafe { NSView::initWithFrame(mtm.alloc(), frame) };
 
                     // Enable layer-backing and set the background color
-                    let _: () = msg_send![view, setWantsLayer: true];
-                    let layer: *mut objc2::runtime::AnyObject = msg_send![view, layer];
-                    if !layer.is_null() {
+                    view.setWantsLayer(true);
+                    if let Some(layer) = view.layer() {
                         // Create NSColor from RGB
-                        let ns_color: *mut objc2::runtime::AnyObject = msg_send![
-                            objc2::class!(NSColor),
-                            colorWithRed: (r as f64 / 255.0),
-                            green: (g as f64 / 255.0),
-                            blue: (b as f64 / 255.0),
-                            alpha: 1.0f64
-                        ];
-                        let cg_color: *mut objc2::runtime::AnyObject = msg_send![ns_color, CGColor];
-                        let _: () = msg_send![layer, setBackgroundColor: cg_color];
-                        // Make it a circle
-                        let _: () = msg_send![layer, setCornerRadius: 6.0f64];
+                        unsafe {
+                            let color = NSColor::colorWithSRGBRed_green_blue_alpha(
+                                r as f64 / 255.0,
+                                g as f64 / 255.0,
+                                b as f64 / 255.0,
+                                1.0,
+                            );
+                            let cg_color = color.CGColor();
+                            layer.setBackgroundColor(Some(&cg_color));
+                            // Make it a circle
+                            layer.setCornerRadius(6.0);
+                        }
                     }
 
                     // Add width and height constraints (required since translatesAutoresizingMaskIntoConstraints is false)
-                    let width_constraint: *mut objc2::runtime::AnyObject = msg_send![
-                        objc2::class!(NSLayoutConstraint),
-                        constraintWithItem: view,
-                        attribute: 7i64,  // NSLayoutAttributeWidth
-                        relatedBy: 0i64,  // NSLayoutRelationEqual
-                        toItem: std::ptr::null::<objc2::runtime::AnyObject>(),
-                        attribute: 0i64,  // NSLayoutAttributeNotAnAttribute
-                        multiplier: 1.0f64,
-                        constant: 12.0f64
-                    ];
-                    let height_constraint: *mut objc2::runtime::AnyObject = msg_send![
-                        objc2::class!(NSLayoutConstraint),
-                        constraintWithItem: view,
-                        attribute: 8i64,  // NSLayoutAttributeHeight
-                        relatedBy: 0i64,  // NSLayoutRelationEqual
-                        toItem: std::ptr::null::<objc2::runtime::AnyObject>(),
-                        attribute: 0i64,  // NSLayoutAttributeNotAnAttribute
-                        multiplier: 1.0f64,
-                        constant: 12.0f64
-                    ];
-                    let _: () = msg_send![width_constraint, setActive: true];
-                    let _: () = msg_send![height_constraint, setActive: true];
+                    let width_constraint = unsafe {
+                        NSLayoutConstraint::constraintWithItem_attribute_relatedBy_toItem_attribute_multiplier_constant(
+                            &view,
+                            NSLayoutAttribute::Width,
+                            NSLayoutRelation::Equal,
+                            None,
+                            NSLayoutAttribute::NotAnAttribute,
+                            1.0,
+                            12.0,
+                        )
+                    };
+                    let height_constraint = unsafe {
+                        NSLayoutConstraint::constraintWithItem_attribute_relatedBy_toItem_attribute_multiplier_constant(
+                            &view,
+                            NSLayoutAttribute::Height,
+                            NSLayoutRelation::Equal,
+                            None,
+                            NSLayoutAttribute::NotAnAttribute,
+                            1.0,
+                            12.0,
+                        )
+                    };
+                    width_constraint.setActive(true);
+                    height_constraint.setActive(true);
 
                     // Set as tab's accessory view
-                    let _: () = msg_send![tab, setAccessoryView: view];
+                    tab.setAccessoryView(Some(&view));
                     log::debug!("Set tab color to #{}", hex);
                 }
             }
         } else {
             // Clear the accessory view
-            let null_view: *mut objc2::runtime::AnyObject = std::ptr::null_mut();
-            let _: () = msg_send![tab, setAccessoryView: null_view];
+            tab.setAccessoryView(None);
         }
     }
 
@@ -2157,4 +2555,214 @@ fn terminal_palette(theme: &Theme, background: Option<&str>) -> cterm_core::Colo
         palette.background = background;
     }
     palette
+}
+
+#[cfg(test)]
+mod action_dispatch_tests {
+    use super::*;
+
+    #[test]
+    fn template_theme_override_ignores_the_global_custom_theme() {
+        let config = Config {
+            appearance: cterm_app::config::AppearanceConfig {
+                custom_theme: Some(Theme::dark()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let resolved = template_theme(&config, &Theme::tokyo_night(), Some("Default Light"));
+        let custom = template_theme(&config, &Theme::tokyo_night(), Some("custom"));
+        let unknown = template_theme(&config, &Theme::tokyo_night(), Some("not-a-theme"));
+        let fallback = template_theme(&config, &Theme::light(), None);
+
+        assert_eq!(resolved.name, "Default Light");
+        assert_eq!(custom.name, "Default Dark");
+        assert_eq!(unknown.name, "Tokyo Night");
+        assert_eq!(fallback.name, "Default Light");
+    }
+
+    #[test]
+    fn configured_template_context_uses_native_ssh_from_shared_plan() {
+        let mut config = Config::default();
+        config.sticky_tabs.push(cterm_app::config::StickyTabConfig {
+            name: "Production".into(),
+            command: Some("ignored-for-native-ssh".into()),
+            args: vec!["ignored".into()],
+            ssh: Some(cterm_app::config::SshTabConfig {
+                host: "shell.example.com".into(),
+                port: Some(2222),
+                username: Some("deploy".into()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+
+        let context = configured_template_launch_context(&config, "Production").unwrap();
+
+        assert!(context.shell.is_none());
+        assert!(context.args.is_empty());
+        let ssh = context.ssh.unwrap();
+        assert_eq!(ssh.host, "shell.example.com");
+        assert_eq!(ssh.port, 2222);
+        assert_eq!(ssh.username.as_deref(), Some("deploy"));
+    }
+
+    #[test]
+    fn configured_template_context_keeps_shared_docker_argv() {
+        let mut config = Config::default();
+        config.sticky_tabs.push(cterm_app::config::StickyTabConfig {
+            name: "Container".into(),
+            docker: Some(cterm_app::config::DockerTabConfig {
+                mode: cterm_app::config::DockerMode::Run,
+                image: Some("alpine:latest".into()),
+                shell: Some("/bin/sh".into()),
+                docker_args: vec!["--pull=never".into()],
+                auto_remove: true,
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+
+        let context = configured_template_launch_context(&config, "Container").unwrap();
+
+        assert_eq!(context.shell.as_deref(), Some("docker"));
+        assert_eq!(
+            context.args,
+            [
+                "run",
+                "-it",
+                "--rm",
+                "--pull=never",
+                "alpine:latest",
+                "/bin/sh"
+            ]
+        );
+        assert!(context.ssh.is_none());
+    }
+
+    #[test]
+    fn named_remote_template_keeps_daemon_intent_and_skips_local_preparation() {
+        let mut config = Config::default();
+        config.remotes.push(cterm_app::config::RemoteConfig {
+            name: "builder".into(),
+            host: "dev@build.example.com".into(),
+            ssh_compression: false,
+        });
+        let template = cterm_app::config::StickyTabConfig {
+            name: "Remote build".into(),
+            command: Some("just".into()),
+            args: vec!["test".into()],
+            working_directory: Some("/srv/project".into()),
+            color: Some("#123456".into()),
+            theme: Some("light".into()),
+            background_color: Some("#abcdef".into()),
+            keep_open: true,
+            remote: Some("builder".into()),
+            ..Default::default()
+        };
+
+        let plan = TemplateLaunchPlan::build(&template, &config).unwrap();
+        assert!(plan.local_workspace_preparation().is_none());
+        let request = prepare_template_spawn(
+            plan,
+            &config,
+            &Theme::tokyo_night(),
+            cterm_client::RemoteManager::new(),
+        )
+        .unwrap();
+
+        assert_eq!(request.template_name, "Remote build");
+        assert_eq!(request.options.shell.as_deref(), Some("just"));
+        assert_eq!(request.options.args, ["test"]);
+        assert_eq!(request.options.cwd.as_deref(), Some("/srv/project"));
+        assert_eq!(request.tab_color.as_deref(), Some("#123456"));
+        assert_eq!(request.background_color.as_deref(), Some("#abcdef"));
+        assert!(request.keep_open);
+        assert_eq!(request.theme.name, "Default Light");
+        let (_, remote_name, remote_host, ssh_compression) = request.remote.unwrap();
+        assert_eq!(remote_name, "builder");
+        assert_eq!(remote_host, "dev@build.example.com");
+        assert!(!ssh_compression);
+    }
+
+    #[test]
+    fn live_shortcuts_are_inherited_by_future_terminal_configs() {
+        let config = Config::default();
+        let original = config.shortcuts.new_tab.clone();
+        let shortcuts = ShortcutsConfig {
+            new_tab: "Ctrl+Alt+T".to_string(),
+            ..ShortcutsConfig::default()
+        };
+
+        let merged = config_with_shortcuts(&config, &shortcuts);
+
+        assert_eq!(merged.shortcuts.new_tab, "Ctrl+Alt+T");
+        assert_eq!(config.shortcuts.new_tab, original);
+    }
+
+    #[test]
+    fn managed_mode_restricts_secondary_topology_and_configuration_actions() {
+        let restricted = [
+            Action::NewTab,
+            Action::SplitPane(SplitDirection::Horizontal),
+            Action::SplitPane(SplitDirection::Vertical),
+            Action::ClosePane,
+            Action::FocusPane(PaneDirection::Left),
+            Action::FocusPane(PaneDirection::Right),
+            Action::FocusPane(PaneDirection::Up),
+            Action::FocusPane(PaneDirection::Down),
+            Action::ResizePane(PaneDirection::Left),
+            Action::ResizePane(PaneDirection::Right),
+            Action::ResizePane(PaneDirection::Up),
+            Action::ResizePane(PaneDirection::Down),
+            Action::TogglePaneZoom,
+            Action::NewWindow,
+            Action::OpenPreferences,
+            Action::QuickOpenTemplate,
+        ];
+
+        for action in restricted {
+            assert!(
+                is_managed_restricted_action(&action),
+                "expected {action:?} to be restricted"
+            );
+        }
+    }
+
+    #[test]
+    fn managed_mode_keeps_session_safe_actions_available() {
+        let allowed = [
+            Action::CloseTab,
+            Action::NextTab,
+            Action::PrevTab,
+            Action::NextAlertedTab,
+            Action::Tab(1),
+            Action::CloseWindow,
+            Action::Copy,
+            Action::Paste,
+            Action::SelectAll,
+            Action::ZoomIn,
+            Action::ZoomOut,
+            Action::ZoomReset,
+            Action::ToggleFullscreen,
+            Action::ScrollUp,
+            Action::ScrollDown,
+            Action::ScrollPageUp,
+            Action::ScrollPageDown,
+            Action::ScrollToTop,
+            Action::ScrollToBottom,
+            Action::PromptPrevious,
+            Action::PromptNext,
+            Action::FindText,
+            Action::ResetTerminal,
+        ];
+
+        for action in allowed {
+            assert!(
+                !is_managed_restricted_action(&action),
+                "expected {action:?} to remain available"
+            );
+        }
+    }
 }

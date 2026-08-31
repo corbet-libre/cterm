@@ -43,6 +43,18 @@ jobs:
       - name: Check formatting
         run: cargo fmt --all -- --check
 
+  security-advisories:
+    name: Security advisories
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Reject vulnerable or unsound Rust dependencies
+        uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
+        with:
+          command: check advisories
+          arguments: --locked
+
   lint-linux:
     name: Clippy (Linux)
     runs-on: ubuntu-22.04
@@ -98,7 +110,10 @@ jobs:
       - uses: actions/checkout@v7
 
       - name: Install protobuf
-        run: choco install protoc -y
+        uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3.0.0
+        with:
+          version: "35.1"
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
@@ -146,7 +161,7 @@ jobs:
         run: cargo test -p cterm-headless --test grpc_integration -- --test-threads=1
 
       - name: Build cterm for UI tests
-        run: cargo build -p cterm
+        run: cargo build -p cterm -p cterm-plugin-host
 
       - name: Run Wayland pane UI/action test
         run: |
@@ -179,23 +194,158 @@ jobs:
           if-no-files-found: ignore
 
   test-freebsd:
-    name: Test core (FreeBSD 14.4)
+    name: Build and test (FreeBSD 14.4)
     runs-on: ubuntu-24.04
-    timeout-minutes: 10
+    timeout-minutes: 35
     needs: format
     steps:
       - uses: actions/checkout@v7
 
-      # FreeBSD is a headless/core portability target for now; cterm's Linux
-      # desktop backend intentionally targets Wayland rather than X11.
-      - name: Run tests in FreeBSD VM
+      # This gate qualifies the native GTK build and local daemon stack. The
+      # compositor-backed Wayland smoke test is intentionally a separate slice.
+      - name: Build and test in FreeBSD VM
         uses: vmactions/freebsd-vm@f0552d3b69211736abd97f02ff3d4674c56b73b1 # v1.5.5
         with:
           release: 14.4
           usesh: true
-          prepare: pkg install -y rust
+          prepare: |
+            pkg install -y \
+              git \
+              gtk4 \
+              libadwaita \
+              pkgconf \
+              protobuf \
+              rust
           run: |
-            cargo test -p cterm-core -p cterm-ui --lib
+            cargo build --locked -p cterm -p cterm-headless -p cterm-plugin-host
+            cargo test --locked --workspace --exclude cterm-cocoa --exclude cterm-win32 --lib
+            cargo test --locked -p cterm-headless --test grpc_integration -- --test-threads=1
+
+            mkdir -p freebsd-ui-binaries
+            install -m 0755 \
+              target/debug/cterm \
+              target/debug/ctermd \
+              target/debug/cterm-plugin-host \
+              freebsd-ui-binaries/
+
+      - name: Upload FreeBSD UI binaries
+        uses: actions/upload-artifact@v7
+        with:
+          name: freebsd-ui-binaries
+          path: freebsd-ui-binaries/
+          if-no-files-found: error
+          retention-days: 1
+
+  test-freebsd-ui:
+    name: UI smoke (FreeBSD 14.4, Wayland)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    needs: test-freebsd
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Download qualified FreeBSD binaries
+        uses: actions/download-artifact@v8
+        with:
+          name: freebsd-ui-binaries
+          path: freebsd-ui-binaries
+
+      - name: Run compositor-backed UI contract in FreeBSD VM
+        uses: vmactions/freebsd-vm@f0552d3b69211736abd97f02ff3d4674c56b73b1 # v1.5.5
+        with:
+          release: 14.4
+          usesh: true
+          prepare: |
+            pkg install -y \
+              bash \
+              cage \
+              coreutils \
+              dbus \
+              dejavu \
+              gtk4 \
+              libadwaita
+          run: |
+            OUTPUT_DIR="freebsd-ui-test-results"
+            mkdir -p "$OUTPUT_DIR"
+            chmod +x \
+              freebsd-ui-binaries/cterm \
+              freebsd-ui-binaries/ctermd \
+              freebsd-ui-binaries/cterm-plugin-host \
+              scripts/linux_ui_test.sh
+
+            {
+              uname -a
+              freebsd-version -ku
+              pkg info bash cage dbus dejavu gtk4 libadwaita
+              command -v cage
+              command -v dbus-run-session
+              fc-match monospace
+            } >"$OUTPUT_DIR/environment.log" 2>&1
+
+            unset DISPLAY
+            export XDG_RUNTIME_DIR="$(mktemp -d)"
+            chmod 0700 "$XDG_RUNTIME_DIR"
+            export GDK_BACKEND=wayland
+            export GSK_RENDERER=cairo
+            export WLR_BACKENDS=headless
+            export WLR_RENDERER=pixman
+            export WLR_HEADLESS_OUTPUTS=1
+            export WLR_LIBINPUT_NO_DEVICES=1
+
+            ui_status=0
+            # Keep the VM action alive long enough to copy its workspace back
+            # to the runner even when Cage, cterm, or a descendant wedges.
+            # Run Cage directly so GNU timeout owns the whole compositor/client
+            # process group and can escalate to SIGKILL. wlheadless-run creates
+            # a new process group internally, which lets wedged descendants
+            # escape timeout's cleanup.
+            gtimeout --signal=TERM --kill-after=10s 3m \
+              dbus-run-session -- \
+                cage -- \
+                  env -u DISPLAY \
+                  ./scripts/linux_ui_test.sh \
+                  ./freebsd-ui-binaries/cterm \
+                  "$OUTPUT_DIR" \
+                  >"$OUTPUT_DIR/wlheadless.log" 2>&1 || ui_status=$?
+            printf '%s\n' "$ui_status" >"$OUTPUT_DIR/exit-code"
+            rm -rf -- "$XDG_RUNTIME_DIR"
+
+      - name: Upload FreeBSD UI test diagnostics
+        uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: freebsd-wayland-ui-test-results
+          path: freebsd-ui-test-results/
+          if-no-files-found: warn
+          retention-days: 7
+
+      - name: Enforce FreeBSD Wayland UI result
+        if: always()
+        shell: bash
+        run: |
+          STATUS_FILE="freebsd-ui-test-results/exit-code"
+          if [[ ! -s "$STATUS_FILE" ]]; then
+            echo "FreeBSD UI smoke did not produce an exit status" >&2
+            find freebsd-ui-test-results -maxdepth 2 -type f -print 2>/dev/null || true
+            exit 1
+          fi
+
+          read -r UI_STATUS <"$STATUS_FILE"
+          if [[ "$UI_STATUS" != "0" ]]; then
+            echo "FreeBSD Wayland UI smoke failed with exit code $UI_STATUS" >&2
+            for LOG_FILE in \
+              freebsd-ui-test-results/environment.log \
+              freebsd-ui-test-results/wlheadless.log \
+              freebsd-ui-test-results/test.log \
+              freebsd-ui-test-results/cterm.stderr.log \
+              freebsd-ui-test-results/cterm.log; do
+              if [[ -f "$LOG_FILE" ]]; then
+                echo "===== $LOG_FILE =====" >&2
+                sed -n '1,240p' "$LOG_FILE" >&2
+              fi
+            done
+            exit 1
+          fi
 
   compatibility-linux:
     name: Compatibility (foot + real TUIs)
@@ -239,7 +389,7 @@ jobs:
 
       - name: Compare cterm behavior with foot
         run: |
-          OUTPUT_DIR="${{ runner.temp }}/cterm_compat_test"
+          OUTPUT_DIR="test-results/compatibility"
           mkdir -p "$OUTPUT_DIR"
           chmod +x scripts/foot_compat_test.sh
           export XDG_RUNTIME_DIR="${{ runner.temp }}/cterm-compat-xdg-runtime"
@@ -285,7 +435,7 @@ jobs:
         if: always()
         with:
           name: linux-compatibility-results
-          path: ${{ runner.temp }}/cterm_compat_test/
+          path: test-results/compatibility/
           if-no-files-found: ignore
 
   test-macos:
@@ -314,7 +464,7 @@ jobs:
         run: cargo test -p cterm-headless --test grpc_integration -- --test-threads=1
 
       - name: Build cterm for UI tests
-        run: cargo build -p cterm
+        run: cargo build -p cterm -p cterm-plugin-host
 
       - name: Run UI automation test
         run: |
@@ -355,8 +505,8 @@ jobs:
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
 
-      - name: Build cterm and ctermd
-        run: cargo build --release -p cterm -p cterm-headless
+      - name: Build cterm, ctermd, and plugin host
+        run: cargo build --release -p cterm -p cterm-headless -p cterm-plugin-host
 
       - name: List built binaries
         run: ls -la target/release/cterm* || true
@@ -389,6 +539,7 @@ jobs:
           mkdir -p release/cterm-linux-x86_64/icons
           cp target/release/cterm release/cterm-linux-x86_64/
           cp target/release/ctermd release/cterm-linux-x86_64/
+          cp target/release/cterm-plugin-host release/cterm-linux-x86_64/
           cp README.md LICENSE release/cterm-linux-x86_64/
           cp THIRD_PARTY_LICENSES.md release/cterm-linux-x86_64/
           cp -R LICENSES release/cterm-linux-x86_64/
@@ -456,8 +607,8 @@ jobs:
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
 
-      - name: Build cterm and ctermd
-        run: cargo build --release -p cterm -p cterm-headless
+      - name: Build cterm, ctermd, and plugin host
+        run: cargo build --release -p cterm -p cterm-headless -p cterm-plugin-host
 
       - name: List built binaries
         run: ls -la target/release/cterm* || true
@@ -490,6 +641,7 @@ jobs:
           mkdir -p release/cterm-linux-arm64/icons
           cp target/release/cterm release/cterm-linux-arm64/
           cp target/release/ctermd release/cterm-linux-arm64/
+          cp target/release/cterm-plugin-host release/cterm-linux-arm64/
           cp README.md LICENSE release/cterm-linux-arm64/
           cp THIRD_PARTY_LICENSES.md release/cterm-linux-arm64/
           cp -R LICENSES release/cterm-linux-arm64/
@@ -541,7 +693,10 @@ jobs:
       - uses: actions/checkout@v7
 
       - name: Install protobuf
-        run: choco install protoc -y
+        uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3.0.0
+        with:
+          version: "35.1"
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
@@ -559,7 +714,7 @@ jobs:
         run: cargo test -p cterm-headless --test grpc_integration -- --test-threads=1
 
       - name: Build cterm for UI tests
-        run: cargo build -p cterm
+        run: cargo build -p cterm -p cterm-plugin-host
 
       - name: Run UI automation test
         shell: pwsh
@@ -584,7 +739,10 @@ jobs:
       - uses: actions/checkout@v7
 
       - name: Install protobuf
-        run: choco install protoc -y
+        uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3.0.0
+        with:
+          version: "35.1"
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
@@ -592,8 +750,8 @@ jobs:
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
 
-      - name: Build cterm and ctermd
-        run: cargo build --release -p cterm -p cterm-headless
+      - name: Build cterm, ctermd, and plugin host
+        run: cargo build --release -p cterm -p cterm-headless -p cterm-plugin-host
 
       - name: List built binaries
         shell: pwsh
@@ -605,6 +763,7 @@ jobs:
           New-Item -ItemType Directory -Force -Path release/cterm-windows-x86_64
           Copy-Item target/release/cterm.exe release/cterm-windows-x86_64/
           Copy-Item target/release/ctermd.exe release/cterm-windows-x86_64/
+          Copy-Item target/release/cterm-plugin-host.exe release/cterm-windows-x86_64/
           Copy-Item README.md release/cterm-windows-x86_64/
           Copy-Item LICENSE release/cterm-windows-x86_64/
           Copy-Item THIRD_PARTY_LICENSES.md release/cterm-windows-x86_64/
@@ -751,8 +910,8 @@ jobs:
       - name: Build
         run: cargo build --release
 
-      - name: Build ctermd explicitly
-        run: cargo build --release -p cterm-headless
+      - name: Build ctermd and plugin host explicitly
+        run: cargo build --release -p cterm-headless -p cterm-plugin-host
 
       - name: List built binaries
         run: ls -la target/release/cterm* || true
@@ -768,6 +927,12 @@ jobs:
         with:
           name: ctermd-macos-x86_64-binary
           path: target/release/ctermd
+
+      - name: Upload plugin host binary artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: cterm-plugin-host-macos-x86_64-binary
+          path: target/release/cterm-plugin-host
 
   build-macos-arm:
     name: Build macOS (Apple Silicon)
@@ -789,8 +954,8 @@ jobs:
       - name: Build
         run: cargo build --release
 
-      - name: Build ctermd explicitly
-        run: cargo build --release -p cterm-headless
+      - name: Build ctermd and plugin host explicitly
+        run: cargo build --release -p cterm-headless -p cterm-plugin-host
 
       - name: List built binaries
         run: ls -la target/release/cterm* || true
@@ -807,6 +972,12 @@ jobs:
           name: ctermd-macos-x86_64-binary
           path: intel-binary-ctermd
 
+      - name: Download Intel plugin host binary
+        uses: actions/download-artifact@v8
+        with:
+          name: cterm-plugin-host-macos-x86_64-binary
+          path: intel-binary-plugin-host
+
       - name: Create universal binaries
         run: |
           mkdir -p universal-binary
@@ -820,10 +991,16 @@ jobs:
             intel-binary-ctermd/ctermd \
             target/release/ctermd
           chmod +x universal-binary/ctermd
+          # Create universal plugin host binary
+          lipo -create -output universal-binary/cterm-plugin-host \
+            intel-binary-plugin-host/cterm-plugin-host \
+            target/release/cterm-plugin-host
+          chmod +x universal-binary/cterm-plugin-host
           # Verify they're universal
-          file universal-binary/cterm universal-binary/ctermd
+          file universal-binary/cterm universal-binary/ctermd universal-binary/cterm-plugin-host
           lipo -info universal-binary/cterm
           lipo -info universal-binary/ctermd
+          lipo -info universal-binary/cterm-plugin-host
 
       - name: Generate app icon
         run: |
@@ -864,6 +1041,7 @@ jobs:
           # Copy binaries
           cp universal-binary/cterm "$APP_DIR/Contents/MacOS/"
           cp universal-binary/ctermd "$APP_DIR/Contents/MacOS/"
+          cp universal-binary/cterm-plugin-host "$APP_DIR/Contents/MacOS/"
 
           # Copy generated icon
           cp packaging/macos/cterm.icns "$APP_DIR/Contents/Resources/"
@@ -956,6 +1134,13 @@ jobs:
             --timestamp \
             "release/cterm.app/Contents/MacOS/ctermd"
 
+          # Sign the isolated plugin host before sealing the app bundle.
+          codesign --force --options runtime \
+            --entitlements packaging/macos/cterm.entitlements \
+            --sign "$IDENTITY" \
+            --timestamp \
+            "release/cterm.app/Contents/MacOS/cterm-plugin-host"
+
           # Sign the main binary inside the bundle with hardened runtime
           codesign --force --options runtime \
             --entitlements packaging/macos/cterm.entitlements \
@@ -980,6 +1165,10 @@ jobs:
             --entitlements packaging/macos/cterm.entitlements \
             --sign - \
             "release/cterm.app/Contents/MacOS/ctermd"
+          codesign --force --options runtime \
+            --entitlements packaging/macos/cterm.entitlements \
+            --sign - \
+            "release/cterm.app/Contents/MacOS/cterm-plugin-host"
           codesign --force --options runtime \
             --entitlements packaging/macos/cterm.entitlements \
             --sign - \
@@ -1149,7 +1338,7 @@ jobs:
 
   release:
     name: Create Release
-    needs: [release-metadata, test-freebsd, build-linux, build-linux-arm64, build-windows, build-macos-arm]
+    needs: [release-metadata, security-advisories, test-freebsd, test-freebsd-ui, build-linux, build-linux-arm64, build-windows, build-macos-arm]
     runs-on: ubuntu-latest
     if: startsWith(github.ref, 'refs/tags/v')
     permissions:

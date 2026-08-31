@@ -8,6 +8,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::time::Duration;
 use vte::Params;
 
 use crate::cell::{CellAttrs, Hyperlink};
@@ -16,6 +17,11 @@ use crate::drcs::DecdldDecoder;
 use crate::image_decode::decode_image;
 use crate::iterm2::{Iterm2Dimension, Iterm2FileParams};
 use crate::keyboard::KeyboardEnhancementFlags;
+use crate::kitty_graphics::{
+    GraphicsAnimationTick, InterceptorResult as KittyInterceptorResult, KittyGraphics,
+};
+use crate::multiple_cursors::{ExtraCursorColor, ExtraCursorColorTarget, ExtraCursorShape};
+use crate::osc1337::{InterceptorResult, Osc1337Interceptor};
 #[cfg(test)]
 use crate::screen::DesktopNotificationAction;
 use crate::screen::{
@@ -26,7 +32,7 @@ use crate::sixel::{
     SixelDecoder, SixelDecoderConfig, SixelImage, DEFAULT_SIXEL_MAX_BYTES, MAX_SIXEL_COLORS,
     MAX_SIXEL_DIMENSION,
 };
-use crate::streaming_file::StreamingFileReceiver;
+use crate::text_sizing::parse_text_size_request;
 
 /// DCS (Device Control String) state for handling multi-byte sequences
 enum DcsState {
@@ -128,24 +134,6 @@ enum KittyPayloadType {
     Capabilities,
 }
 
-/// State for intercepting OSC 1337 File transfers before VTE buffers them
-#[derive(Debug, Default)]
-enum Osc1337State {
-    /// Not in an OSC 1337 sequence
-    #[default]
-    None,
-    /// Saw ESC, waiting for ]
-    Escape,
-    /// Inside OSC, collecting command number
-    OscCommand(Vec<u8>),
-    /// Inside OSC 1337, collecting content after the semicolon
-    Osc1337Content(Vec<u8>),
-    /// Inside OSC 1337 File=, collecting parameters before ':'
-    Osc1337Params(String),
-    /// Inside OSC 1337 File= base64 data, streaming to receiver
-    Osc1337Data(StreamingFileReceiver),
-}
-
 /// Parser wraps the vte parser and applies actions to a Screen
 pub struct Parser {
     state_machine: vte::Parser,
@@ -154,12 +142,12 @@ pub struct Parser {
     last_printed: Option<char>,
     /// Saved DEC private modes for xterm XTSAVE/XTRESTORE.
     saved_dec_modes: HashMap<usize, bool>,
-    /// State for intercepting OSC 1337 File sequences
-    osc_1337_state: Osc1337State,
-    /// Whether an OSC 1337 string terminator (BEL or ESC \) was seen
-    osc_1337_terminated: bool,
+    /// Bounded, all-or-none interceptor for streaming OSC 1337 File sequences.
+    osc_1337: Osc1337Interceptor,
     /// In-progress chunked Kitty OSC 99 notification.
     kitty_notification: KittyNotificationBuilder,
+    /// Bounded Kitty graphics APC parser and image store.
+    kitty_graphics: KittyGraphics,
     /// Optimistically active Kitty notification identifiers for p=alive.
     active_notification_ids: HashSet<String>,
     /// Palette and resource limits shared by Sixel protocol sequences.
@@ -179,9 +167,9 @@ impl Parser {
             dcs_state: DcsState::None,
             last_printed: None,
             saved_dec_modes: HashMap::new(),
-            osc_1337_state: Osc1337State::None,
-            osc_1337_terminated: false,
+            osc_1337: Osc1337Interceptor::new(),
             kitty_notification: KittyNotificationBuilder::default(),
+            kitty_graphics: KittyGraphics::default(),
             active_notification_ids: HashSet::new(),
             sixel: SixelSessionState::default(),
         }
@@ -193,216 +181,88 @@ impl Parser {
     /// enabling streaming of large files without exhausting memory.
     pub fn parse(&mut self, screen: &mut Screen, bytes: &[u8]) {
         for &byte in bytes {
-            // Check if we should intercept this byte for OSC 1337 streaming
-            // We need to handle this before creating the performer to avoid borrow conflicts
-            let consumed = self.handle_osc_1337_byte_pre(byte);
-
-            if consumed {
-                // Check if we need to finish the streaming transfer
-                self.check_osc_1337_finish(screen);
-                continue;
+            match self.osc_1337.advance(byte) {
+                InterceptorResult::Forward(bytes) => {
+                    self.advance_after_osc1337(screen, bytes.as_slice());
+                }
+                InterceptorResult::Replay(bytes) => {
+                    if let Err(error) =
+                        bytes.replay(|chunk| self.advance_after_osc1337(screen, chunk))
+                    {
+                        log::warn!("Failed to replay OSC 1337 through VTE: {error}");
+                    }
+                }
+                InterceptorResult::Swallow => {}
+                InterceptorResult::Finished(result) => {
+                    self.finish_streaming_file_direct(result, screen);
+                }
             }
+        }
+        self.kitty_graphics.refresh_unicode_placements(screen);
+        self.kitty_graphics.refresh_relative_placements(screen);
+    }
 
-            // Normal VTE processing
-            let mut performer = ScreenPerformer {
-                screen,
-                dcs_state: &mut self.dcs_state,
-                last_printed: &mut self.last_printed,
-                saved_dec_modes: &mut self.saved_dec_modes,
-                kitty_notification: &mut self.kitty_notification,
-                active_notification_ids: &mut self.active_notification_ids,
-                sixel: &mut self.sixel,
-            };
+    /// Re-project Kitty Unicode placeholders after viewport or geometry changes.
+    pub(crate) fn refresh_graphics_viewport(&mut self, screen: &mut Screen) {
+        self.kitty_graphics
+            .refresh_unicode_placement_geometry(screen);
+        self.kitty_graphics.refresh_relative_placements(screen);
+    }
+
+    /// Sample terminal-driven Kitty animations from a monotonic clock.
+    pub fn advance_graphics_animations(
+        &mut self,
+        screen: &mut Screen,
+        now: Duration,
+    ) -> GraphicsAnimationTick {
+        let now_ms = u64::try_from(now.as_millis()).unwrap_or(u64::MAX);
+        self.kitty_graphics.advance_animations(now_ms, screen)
+    }
+
+    fn advance_after_osc1337(&mut self, screen: &mut Screen, bytes: &[u8]) {
+        for byte in bytes {
+            match self.kitty_graphics.advance(*byte) {
+                KittyInterceptorResult::Forward(bytes) => {
+                    self.advance_vte(screen, bytes.as_slice());
+                }
+                KittyInterceptorResult::Swallow => {}
+                KittyInterceptorResult::Captured(raw) => {
+                    self.kitty_graphics.handle(&raw, screen);
+                }
+            }
+        }
+    }
+
+    fn advance_vte(&mut self, screen: &mut Screen, bytes: &[u8]) {
+        let mut performer = ScreenPerformer {
+            screen,
+            dcs_state: &mut self.dcs_state,
+            last_printed: &mut self.last_printed,
+            saved_dec_modes: &mut self.saved_dec_modes,
+            kitty_notification: &mut self.kitty_notification,
+            active_notification_ids: &mut self.active_notification_ids,
+            sixel: &mut self.sixel,
+        };
+        for &byte in bytes {
             self.state_machine.advance(&mut performer, byte);
         }
     }
 
-    /// Pre-check a byte for OSC 1337 interception (before performer is created)
-    ///
-    /// Returns true if the byte was consumed
-    fn handle_osc_1337_byte_pre(&mut self, byte: u8) -> bool {
-        match &mut self.osc_1337_state {
-            Osc1337State::None => {
-                // Look for ESC to start potential OSC sequence
-                if byte == 0x1b {
-                    self.osc_1337_state = Osc1337State::Escape;
-                }
-                false
-            }
+    fn finish_streaming_file_direct(
+        &mut self,
+        result: crate::streaming_file::StreamingFileResult,
+        screen: &mut Screen,
+    ) {
+        log::debug!(
+            "OSC 1337 File streaming complete: {} bytes, name={:?}",
+            result.total_bytes,
+            result.params.name
+        );
 
-            Osc1337State::Escape => {
-                if byte == b']' {
-                    // This is an OSC start - start collecting command number
-                    self.osc_1337_state = Osc1337State::OscCommand(Vec::new());
-                } else {
-                    // Not an OSC, reset
-                    self.osc_1337_state = Osc1337State::None;
-                }
-                false
-            }
-
-            Osc1337State::OscCommand(cmd) => {
-                if byte == b';' {
-                    // End of command number
-                    let cmd_str = String::from_utf8_lossy(cmd);
-                    if cmd_str == "1337" {
-                        // This is OSC 1337! Start collecting content
-                        self.osc_1337_state = Osc1337State::Osc1337Content(Vec::new());
-                        // We're now committed - need to intercept everything
-                        return true;
-                    } else {
-                        // Not 1337, let VTE handle normally
-                        self.osc_1337_state = Osc1337State::None;
-                    }
-                } else if byte.is_ascii_digit() {
-                    cmd.push(byte);
-                } else {
-                    // Invalid command number, reset
-                    self.osc_1337_state = Osc1337State::None;
-                }
-                false
-            }
-
-            Osc1337State::Osc1337Content(content) => {
-                // Check for string terminator (ST = ESC \, or BEL)
-                if byte == 0x07 || (content.last() == Some(&0x1b) && byte == b'\\') {
-                    // End of OSC - will be handled by check_osc_1337_finish
-                    if byte == b'\\' {
-                        // Remove the ESC we added
-                        content.pop();
-                    }
-                    self.osc_1337_terminated = true;
-                    return true;
-                }
-
-                // Cap buffer to prevent unbounded growth from malicious input
-                if content.len() > 1024 {
-                    self.osc_1337_state = Osc1337State::None;
-                    return false;
-                }
-
-                // Check if this starts "File="
-                const FILE_PREFIX: &[u8] = b"File=";
-                if content.len() < FILE_PREFIX.len()
-                    && FILE_PREFIX.get(content.len()) == Some(&byte)
-                {
-                    content.push(byte);
-
-                    // If we've matched the full "File=" prefix, switch to params mode
-                    if content.len() == FILE_PREFIX.len() {
-                        self.osc_1337_state = Osc1337State::Osc1337Params(String::new());
-                    }
-                    return true;
-                }
-
-                content.push(byte);
-                true
-            }
-
-            Osc1337State::Osc1337Params(params) => {
-                // Check for string terminator
-                if byte == 0x07 || (params.ends_with('\x1b') && byte == b'\\') {
-                    // Terminator without data - will be handled by check_osc_1337_finish
-                    self.osc_1337_terminated = true;
-                    return true;
-                }
-
-                // Cap params to prevent unbounded growth from malicious input
-                if params.len() > 65536 {
-                    self.osc_1337_state = Osc1337State::None;
-                    return false;
-                }
-
-                if byte == b':' {
-                    // End of params, start of base64 data
-                    let param_str = std::mem::take(params);
-                    let file_params = Iterm2FileParams::parse(&param_str);
-
-                    log::debug!(
-                        "OSC 1337 File streaming: name={:?}, size={:?}, inline={}",
-                        file_params.name,
-                        file_params.size,
-                        file_params.inline
-                    );
-
-                    let receiver = StreamingFileReceiver::new(file_params);
-                    self.osc_1337_state = Osc1337State::Osc1337Data(receiver);
-                    return true;
-                }
-
-                params.push(byte as char);
-                true
-            }
-
-            Osc1337State::Osc1337Data(receiver) => {
-                // Check for string terminator (BEL or ESC \)
-                if byte == 0x07 || byte == b'\\' {
-                    // Terminator - mark as terminated for check_osc_1337_finish
-                    self.osc_1337_terminated = true;
-                    return true;
-                }
-
-                if byte == 0x1b {
-                    // Might be start of ESC \ - don't feed to receiver yet
-                    return true;
-                }
-
-                // Feed to streaming receiver
-                if !receiver.put(byte) {
-                    // Error occurred
-                    log::warn!("OSC 1337 streaming error: {:?}", receiver.error());
-                    self.osc_1337_state = Osc1337State::None;
-                }
-                true
-            }
-        }
-    }
-
-    /// Check if OSC 1337 streaming needs to be finished
-    fn check_osc_1337_finish(&mut self, screen: &mut Screen) {
-        if !self.osc_1337_terminated {
-            return;
-        }
-        self.osc_1337_terminated = false;
-
-        match &self.osc_1337_state {
-            Osc1337State::Osc1337Content(_) | Osc1337State::Osc1337Params(_) => {
-                // Non-File content or terminated params without data - just reset
-                self.osc_1337_state = Osc1337State::None;
-            }
-            Osc1337State::Osc1337Data(_) => {
-                // Streaming data terminated - finish the transfer
-                self.finish_streaming_file_direct(screen);
-            }
-            _ => {}
-        }
-    }
-
-    /// Finish streaming a file directly (called from check_osc_1337_finish)
-    fn finish_streaming_file_direct(&mut self, screen: &mut Screen) {
-        let state = std::mem::replace(&mut self.osc_1337_state, Osc1337State::None);
-
-        if let Osc1337State::Osc1337Data(receiver) = state {
-            match receiver.finish() {
-                Ok(result) => {
-                    log::debug!(
-                        "OSC 1337 File streaming complete: {} bytes, name={:?}",
-                        result.total_bytes,
-                        result.params.name
-                    );
-
-                    if result.params.inline {
-                        // Inline image - decode and display
-                        self.handle_streaming_inline_image_direct(result, screen);
-                    } else {
-                        // File transfer - queue for UI
-                        screen.queue_streaming_file_transfer(result);
-                    }
-                }
-                Err(e) => {
-                    log::warn!("OSC 1337 File streaming failed: {}", e);
-                }
-            }
+        if result.params.inline {
+            self.handle_streaming_inline_image_direct(result, screen);
+        } else {
+            screen.queue_streaming_file_transfer(result);
         }
     }
 
@@ -802,6 +662,13 @@ impl vte::Perform for ScreenPerformer<'_> {
             // Kitty desktop notifications, including chunking and capability,
             // close, and liveness requests.
             99 => self.handle_osc99(params, bell_terminated),
+            // Kitty text sizing. The core advertises width support through
+            // cursor movement; integer scaling is enabled in a later stage.
+            66 => {
+                if let Some(request) = parse_text_size_request(params) {
+                    self.screen.put_text_size(request);
+                }
+            }
             // Set/query 256-color palette entries.
             4 => {
                 for pair in params[1..].as_chunks::<2>().0 {
@@ -980,6 +847,7 @@ impl vte::Perform for ScreenPerformer<'_> {
                     1 => self.screen.clear(ClearMode::Above),
                     2 => self.screen.clear(ClearMode::All),
                     3 => self.screen.clear(ClearMode::Scrollback),
+                    22 => self.screen.move_viewport_to_scrollback(),
                     _ => {}
                 }
             }
@@ -1024,15 +892,7 @@ impl vte::Perform for ScreenPerformer<'_> {
             // Erase Characters (ECH)
             ('X', []) => {
                 let n = first_param(&params_vec, 1);
-                let cursor_row = self.screen.cursor.row;
-                let cursor_col = self.screen.cursor.col;
-                let width = self.screen.width();
-                let count = n.min(width.saturating_sub(cursor_col));
-                if let Some(row) = self.screen.grid_mut().row_mut(cursor_row) {
-                    for i in 0..count {
-                        row[cursor_col + i].reset();
-                    }
-                }
+                self.screen.erase_chars(n);
             }
             // Repeat the preceding graphic character (REP). Bound the repeat
             // count to one screen, matching foot's denial-of-service guard.
@@ -1053,19 +913,7 @@ impl vte::Perform for ScreenPerformer<'_> {
             // Insert Characters (ICH)
             ('@', []) => {
                 let n = first_param(&params_vec, 1);
-                let cursor_row = self.screen.cursor.row;
-                let col = self.screen.cursor.col;
-                let width = self.screen.width();
-                if let Some(row) = self.screen.grid_mut().row_mut(cursor_row) {
-                    // Shift characters right
-                    for i in (col + n..width).rev() {
-                        row[i] = row[i - n].clone();
-                    }
-                    // Clear inserted positions
-                    for i in col..col + n.min(width.saturating_sub(col)) {
-                        row[i].reset();
-                    }
-                }
+                self.screen.insert_chars(n);
             }
             // Vertical Line Position Absolute (VPA)
             ('d', []) => {
@@ -1290,6 +1138,9 @@ impl vte::Perform for ScreenPerformer<'_> {
                     );
                 }
             }
+            // Kitty multiple-cursors protocol. The private marker and the
+            // trailing space are both presented as CSI intermediates by VTE.
+            ('q', [b'>', b' ']) => self.handle_multiple_cursors(params),
             // Query the active kitty keyboard progressive-enhancement flags.
             ('u', [b'?']) => {
                 let flags = self.screen.keyboard_enhancement_flags().bits();
@@ -1398,34 +1249,36 @@ impl vte::Perform for ScreenPerformer<'_> {
                 self.screen.modes.insert_mode = false;
                 self.screen.modes.origin_mode = false;
                 self.screen.reset_scroll_region();
+                self.screen.reset_extra_cursors();
             }
             // Set cursor style (DECSCUSR)
             ('q', [b' ']) => {
                 let style = first_param(&params_vec, 0);
                 match style {
-                    0 | 1 => {
+                    0 => self.screen.cursor.reset_style_to_config(),
+                    1 => {
                         self.screen.cursor.style = CursorStyle::Block;
-                        self.screen.cursor.blink = true;
+                        self.screen.cursor.blink.set_decscusr(Some(true));
                     }
                     2 => {
                         self.screen.cursor.style = CursorStyle::Block;
-                        self.screen.cursor.blink = false;
+                        self.screen.cursor.blink.set_decscusr(Some(false));
                     }
                     3 => {
                         self.screen.cursor.style = CursorStyle::Underline;
-                        self.screen.cursor.blink = true;
+                        self.screen.cursor.blink.set_decscusr(Some(true));
                     }
                     4 => {
                         self.screen.cursor.style = CursorStyle::Underline;
-                        self.screen.cursor.blink = false;
+                        self.screen.cursor.blink.set_decscusr(Some(false));
                     }
                     5 => {
                         self.screen.cursor.style = CursorStyle::Bar;
-                        self.screen.cursor.blink = true;
+                        self.screen.cursor.blink.set_decscusr(Some(true));
                     }
                     6 => {
                         self.screen.cursor.style = CursorStyle::Bar;
-                        self.screen.cursor.blink = false;
+                        self.screen.cursor.blink.set_decscusr(Some(false));
                     }
                     _ => {}
                 }
@@ -1560,7 +1413,7 @@ fn decrqss_response(query: &[u8], screen: &Screen) -> Vec<u8> {
         ),
         b"m" => sgr_status_string(screen),
         b" q" => {
-            let mode = match (screen.cursor.style, screen.cursor.blink) {
+            let mode = match (screen.cursor.style, screen.cursor.blink.style_enabled()) {
                 (CursorStyle::Block, true) => 1,
                 (CursorStyle::Block, false) => 2,
                 (CursorStyle::Underline, true) => 3,
@@ -1585,6 +1438,7 @@ fn sgr_status_string(screen: &Screen) -> String {
         (CellAttrs::DIM, "2"),
         (CellAttrs::ITALIC, "3"),
         (CellAttrs::BLINK, "5"),
+        (CellAttrs::RAPID_BLINK, "6"),
         (CellAttrs::INVERSE, "7"),
         (CellAttrs::HIDDEN, "8"),
         (CellAttrs::STRIKETHROUGH, "9"),
@@ -1735,6 +1589,100 @@ fn xtgettcap_capability(name: &[u8], cols: usize, lines: usize) -> Option<Xtgett
 }
 
 impl ScreenPerformer<'_> {
+    fn handle_multiple_cursors(&mut self, params: &Params) {
+        let groups = params.iter().collect::<Vec<_>>();
+        if groups.is_empty() {
+            self.screen.queue_extra_cursor_support_response();
+            return;
+        }
+
+        let Some(&command) = groups[0].first() else {
+            self.screen.queue_extra_cursor_support_response();
+            return;
+        };
+        if groups.len() == 1 {
+            match command {
+                0 => self.screen.queue_extra_cursor_support_response(),
+                100 => self.screen.queue_extra_cursor_state_response(),
+                101 => self.screen.queue_extra_cursor_color_response(),
+                _ => {}
+            }
+            return;
+        }
+
+        if matches!(command, 30 | 40) {
+            let Some(color) = groups
+                .get(1)
+                .and_then(|params| ExtraCursorColor::parse(params))
+            else {
+                return;
+            };
+            let target = if command == 30 {
+                ExtraCursorColorTarget::Text
+            } else {
+                ExtraCursorColorTarget::Cursor
+            };
+            self.screen.set_extra_cursor_color(target, color);
+            return;
+        }
+
+        let shape = if command == 0 {
+            None
+        } else {
+            let Some(shape) = ExtraCursorShape::from_protocol(command) else {
+                return;
+            };
+            Some(shape)
+        };
+
+        for coordinates in &groups[1..] {
+            let Some(&coordinate_type) = coordinates.first() else {
+                continue;
+            };
+            match coordinate_type {
+                0 => {
+                    let point = (self.screen.cursor.row, self.screen.cursor.col);
+                    self.screen.set_extra_cursor_points(shape, [point]);
+                }
+                2 => {
+                    let points = coordinates[1..]
+                        .as_chunks::<2>()
+                        .0
+                        .iter()
+                        .filter_map(|pair| {
+                            Some((
+                                pair[0].checked_sub(1)? as usize,
+                                pair[1].checked_sub(1)? as usize,
+                            ))
+                        })
+                        .collect::<Vec<_>>();
+                    self.screen.set_extra_cursor_points(shape, points);
+                }
+                4 => {
+                    let rectangles = coordinates[1..]
+                        .as_chunks::<4>()
+                        .0
+                        .iter()
+                        .filter_map(|rectangle| {
+                            Some((
+                                rectangle[0].checked_sub(1)? as usize,
+                                rectangle[1].checked_sub(1)? as usize,
+                                rectangle[2].checked_sub(1)? as usize,
+                                rectangle[3].checked_sub(1)? as usize,
+                            ))
+                        })
+                        .collect::<Vec<_>>();
+                    self.screen.set_extra_cursor_rectangles(
+                        shape,
+                        &rectangles,
+                        coordinates.len() == 1,
+                    );
+                }
+                _ => {}
+            }
+        }
+    }
+
     fn handle_osc99(&mut self, params: &[&[u8]], bell_terminated: bool) {
         use base64::Engine as _;
 
@@ -2156,8 +2104,15 @@ impl ScreenPerformer<'_> {
                         _ => self.screen.style.attrs.insert(CellAttrs::UNDERLINE),
                     }
                 }
-                // Blink
-                [5] | [6] => self.screen.style.attrs.insert(CellAttrs::BLINK),
+                // Slow and rapid blink are mutually exclusive.
+                [5] => {
+                    self.screen.style.attrs.clear_blink();
+                    self.screen.style.attrs.insert(CellAttrs::BLINK);
+                }
+                [6] => {
+                    self.screen.style.attrs.clear_blink();
+                    self.screen.style.attrs.insert(CellAttrs::RAPID_BLINK);
+                }
                 // Inverse
                 [7] => self.screen.style.attrs.insert(CellAttrs::INVERSE),
                 // Hidden
@@ -2169,12 +2124,15 @@ impl ScreenPerformer<'_> {
                     self.screen.style.attrs.remove(CellAttrs::BOLD);
                     self.screen.style.attrs.remove(CellAttrs::DIM);
                 }
+                // Kitty extensions: reset bold and faint independently.
+                [221] => self.screen.style.attrs.remove(CellAttrs::BOLD),
+                [222] => self.screen.style.attrs.remove(CellAttrs::DIM),
                 // Not italic
                 [23] => self.screen.style.attrs.remove(CellAttrs::ITALIC),
                 // Not underlined
                 [24] => self.screen.style.attrs.clear_underline(),
                 // Not blinking
-                [25] => self.screen.style.attrs.remove(CellAttrs::BLINK),
+                [25] => self.screen.style.attrs.clear_blink(),
                 // Not inverse
                 [27] => self.screen.style.attrs.remove(CellAttrs::INVERSE),
                 // Not hidden
@@ -2376,7 +2334,7 @@ impl ScreenPerformer<'_> {
             // DECTCEM - Show Cursor
             25 => self.screen.modes.show_cursor = set,
             // Cursor blinking mode
-            12 => self.screen.cursor.blink = set,
+            12 => self.screen.cursor.blink.set_dec_mode_12(set),
             // DECNKM - Numeric Keypad Mode.  This is equivalent to DECKPAM /
             // DECKPNM, but expressed as a DEC private mode.
             66 => self.screen.modes.application_keypad = set,
@@ -2467,7 +2425,7 @@ impl ScreenPerformer<'_> {
             6 => self.screen.modes.origin_mode,
             7 => self.screen.modes.auto_wrap,
             45 => self.screen.modes.reverse_wrap,
-            12 => self.screen.cursor.blink,
+            12 => self.screen.cursor.blink.dec_mode_12(),
             25 => self.screen.modes.show_cursor,
             47 | 1047 | 1049 => self.screen.modes.alternate_screen,
             66 => self.screen.modes.application_keypad,
@@ -2884,6 +2842,390 @@ mod tests {
     }
 
     #[test]
+    fn test_sgr_slow_and_rapid_blink_are_distinct() {
+        let mut screen = make_screen();
+        let mut parser = Parser::new();
+
+        parser.parse(&mut screen, b"\x1b[5mA\x1b[6mB\x1b[25mC");
+
+        let slow = screen.get_cell(0, 0).unwrap().attrs;
+        assert!(slow.contains(CellAttrs::BLINK));
+        assert!(!slow.contains(CellAttrs::RAPID_BLINK));
+        let rapid = screen.get_cell(0, 1).unwrap().attrs;
+        assert!(!rapid.contains(CellAttrs::BLINK));
+        assert!(rapid.contains(CellAttrs::RAPID_BLINK));
+        assert!(!screen.get_cell(0, 2).unwrap().attrs.has_blink());
+    }
+
+    #[test]
+    fn test_kitty_sgr_resets_bold_and_faint_independently() {
+        let mut screen = make_screen();
+        let mut parser = Parser::new();
+
+        parser.parse(&mut screen, b"\x1b[1;2mA\x1b[221mB\x1b[1;222mC");
+
+        let both = screen.get_cell(0, 0).unwrap().attrs;
+        assert!(both.contains(CellAttrs::BOLD));
+        assert!(both.contains(CellAttrs::DIM));
+        let faint_only = screen.get_cell(0, 1).unwrap().attrs;
+        assert!(!faint_only.contains(CellAttrs::BOLD));
+        assert!(faint_only.contains(CellAttrs::DIM));
+        let bold_only = screen.get_cell(0, 2).unwrap().attrs;
+        assert!(bold_only.contains(CellAttrs::BOLD));
+        assert!(!bold_only.contains(CellAttrs::DIM));
+    }
+
+    #[test]
+    fn test_kitty_multiple_cursors_protocol_queries_updates_and_clears() {
+        let mut screen = Screen::new(5, 4, ScreenConfig::default());
+        let mut parser = Parser::new();
+
+        parser.parse(&mut screen, b"\x1b[> q");
+        assert_eq!(
+            screen.take_pending_responses(),
+            vec![b"\x1b[>1;2;3;29;30;40;100;101 q"]
+        );
+
+        parser.parse(
+            &mut screen,
+            b"\x1b[>29;4:2:2:3:3 q\x1b[>2;2:1:5;3:2 q\x1b[>100 q",
+        );
+        assert_eq!(
+            screen.take_pending_responses(),
+            vec![b"\x1b[>100;2:2:1:5;29:2:2:2;29:2:2:3;29:2:3:2;29:2:3:3 q"]
+        );
+
+        // Incomplete point/rectangle coordinates and zero underflow are
+        // ignored. Coordinate type zero addresses the current main cursor.
+        screen.move_cursor(3, 1);
+        parser.parse(
+            &mut screen,
+            b"\x1b[>3;2:1;2:0:1;4:1:1:2 q\x1b[>3;0 q\x1b[>100 q",
+        );
+        assert_eq!(
+            screen.take_pending_responses(),
+            vec![b"\x1b[>100;2:2:1:5;29:2:2:2;29:2:2:3;29:2:3:2;29:2:3:3;3:2:4:2 q"]
+        );
+
+        parser.parse(&mut screen, b"\x1b[>30;2:1:2:3 q\x1b[>40;5:13 q\x1b[>101 q");
+        assert_eq!(
+            screen.take_pending_responses(),
+            vec![b"\x1b[>101;30:2:1:2:3;40:5:13 q"]
+        );
+
+        parser.parse(&mut screen, b"\x1b[!p\x1b[>100 q\x1b[>101 q");
+        assert_eq!(
+            screen.take_pending_responses(),
+            vec![b"\x1b[>100 q".to_vec(), b"\x1b[>101;30:0;40:0 q".to_vec()]
+        );
+
+        parser.parse(&mut screen, b"\x1b[>1;4 q\x1b[?1049h\x1b[>100 q");
+        assert_eq!(screen.take_pending_responses(), vec![b"\x1b[>100 q"]);
+        assert!(!screen.has_extra_cursors());
+    }
+
+    #[test]
+    fn test_kitty_text_sizing_width_protocol_and_overwrite() {
+        let mut screen = Screen::new(8, 3, ScreenConfig::default());
+        let mut parser = Parser::new();
+
+        parser.parse(&mut screen, b"\x1b]66;w=3;ab;c\x07");
+        assert_eq!((screen.cursor.row, screen.cursor.col), (0, 3));
+        assert_eq!(screen.get_cell(0, 0).unwrap().text(), "ab;c");
+        for col in 0..3 {
+            let multicell = screen
+                .get_cell(0, col)
+                .and_then(|cell| cell.multicell.as_ref())
+                .expect("OSC 66 metadata");
+            assert_eq!(multicell.columns, 3);
+            assert_eq!(usize::from(multicell.column_offset), col);
+            assert_eq!(multicell.text(), "ab;c");
+        }
+
+        screen.start_selection(0, 2, crate::screen::SelectionMode::Char);
+        assert_eq!(screen.get_selected_text().as_deref(), Some("ab;c"));
+        screen.clear_selection();
+
+        // Writing over any cell in a one-row span clears the entire span.
+        screen.move_cursor(0, 1);
+        parser.parse(&mut screen, b"X");
+        assert_eq!(screen.get_cell(0, 0).unwrap().text(), " ");
+        assert_eq!(screen.get_cell(0, 1).unwrap().text(), "X");
+        assert_eq!(screen.get_cell(0, 2).unwrap().text(), " ");
+        assert!(screen
+            .grid()
+            .row(0)
+            .unwrap()
+            .iter()
+            .all(|cell| cell.multicell.is_none()));
+    }
+
+    #[test]
+    fn test_kitty_text_sizing_width_editing_and_reflow_are_atomic() {
+        let mut screen = Screen::new(6, 3, ScreenConfig::default());
+        let mut parser = Parser::new();
+
+        parser.parse(&mut screen, b"a\x1b]66;w=3;B\x07c");
+        screen.move_cursor(0, 2);
+        parser.parse(&mut screen, b"\x1b[X");
+        assert_eq!(screen.grid().row(0).unwrap().text(), "a   c");
+
+        screen.move_cursor(0, 1);
+        parser.parse(&mut screen, b"\x1b]66;w=3;B\x07");
+        screen.resize(4, 3);
+        let row = screen.grid().row(0).unwrap();
+        assert_eq!(row[1].text(), "B");
+        assert_eq!(row[1].multicell.as_ref().unwrap().columns, 3);
+        assert!(row[2].is_multicell_spacer());
+        assert!(row[3].is_multicell_spacer());
+
+        screen.move_cursor(0, 2);
+        parser.parse(&mut screen, b"\x1b[@");
+        assert!(screen
+            .grid()
+            .row(0)
+            .unwrap()
+            .iter()
+            .all(|cell| cell.multicell.is_none()));
+
+        let mut screen = Screen::new(6, 2, ScreenConfig::default());
+        parser.parse(&mut screen, b"a\x1b]66;w=3;B\x07c\x1b[1;3H\x1b[P");
+        assert_eq!(screen.grid().row(0).unwrap().text(), "a  c");
+        assert!(screen
+            .grid()
+            .row(0)
+            .unwrap()
+            .iter()
+            .all(|cell| cell.multicell.is_none()));
+    }
+
+    #[test]
+    fn test_kitty_text_sizing_capability_reports_width_and_scale() {
+        let mut screen = Screen::new(8, 3, ScreenConfig::default());
+        let mut parser = Parser::new();
+
+        parser.parse(
+            &mut screen,
+            b"\r\x1b[6n\x1b]66;w=2; \x07\x1b[6n\x1b]66;s=2; \x07\x1b[6n",
+        );
+        assert_eq!(
+            screen.take_pending_responses(),
+            vec![
+                b"\x1b[1;1R".to_vec(),
+                b"\x1b[1;3R".to_vec(),
+                b"\x1b[1;5R".to_vec(),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_kitty_text_sizing_places_scaled_blocks_and_preserves_metadata() {
+        let mut screen = Screen::new(10, 5, ScreenConfig::default());
+        let mut parser = Parser::new();
+
+        parser.parse(&mut screen, b"\x1b]66;s=2:w=2:n=1:d=2:v=1:h=2;Title\x07");
+
+        assert_eq!((screen.cursor.row, screen.cursor.col), (0, 4));
+        for row in 0..2 {
+            for col in 0..4 {
+                let cell = screen.get_cell(row, col).expect("scaled cell");
+                let multicell = cell.multicell.as_ref().expect("scaled metadata");
+                assert_eq!((multicell.columns, multicell.rows), (4, 2));
+                assert_eq!(
+                    (multicell.column_offset, multicell.row_offset),
+                    (col as u8, row as u8)
+                );
+                assert_eq!(multicell.scale, 2);
+                assert_eq!(multicell.fractional_scale, Some((1, 2)));
+                assert_eq!(multicell.vertical_alignment, crate::TextSizeAlignment::End);
+                assert_eq!(
+                    multicell.horizontal_alignment,
+                    crate::TextSizeAlignment::Center
+                );
+                assert_eq!(multicell.text(), "Title");
+            }
+        }
+        assert_eq!(screen.get_cell(0, 0).unwrap().text(), "Title");
+        assert_eq!(screen.get_cell(1, 0).unwrap().text(), " ");
+    }
+
+    #[test]
+    fn test_kitty_text_sizing_skips_lower_rows_and_erases_intersections() {
+        let mut screen = Screen::new(8, 4, ScreenConfig::default());
+        let mut parser = Parser::new();
+
+        parser.parse(&mut screen, b"\x1b]66;s=2:w=2;A\x07");
+        screen.move_cursor(1, 1);
+        parser.parse(&mut screen, b"X");
+        assert_eq!((screen.cursor.row, screen.cursor.col), (1, 5));
+        assert_eq!(screen.get_cell(1, 4).unwrap().text(), "X");
+        assert_eq!(screen.get_cell(0, 0).unwrap().text(), "A");
+
+        screen.move_cursor(1, 2);
+        parser.parse(&mut screen, b"\x1b[X");
+        assert!(screen
+            .grid()
+            .iter()
+            .flat_map(|row| row.iter())
+            .all(|cell| cell.multicell.is_none()));
+    }
+
+    #[test]
+    fn test_kitty_text_sizing_selection_emits_a_scaled_block_once() {
+        let mut screen = Screen::new(6, 3, ScreenConfig::default());
+        let mut parser = Parser::new();
+        parser.parse(&mut screen, b"\x1b[1m\x1b]66;s=2:w=2;Heading\x07");
+
+        screen.start_selection(0, 0, crate::screen::SelectionMode::Char);
+        screen.extend_selection(1, 3);
+        assert_eq!(screen.get_selected_text().as_deref(), Some("Heading"));
+        let html = screen
+            .get_selected_html(&crate::ColorPalette::default())
+            .expect("selected HTML");
+        assert_eq!(html.matches("Heading").count(), 1);
+    }
+
+    #[test]
+    fn test_kitty_text_sizing_reflows_scaled_blocks_atomically() {
+        let mut screen = Screen::new(8, 4, ScreenConfig::default());
+        let mut parser = Parser::new();
+        parser.parse(&mut screen, b"a\x1b]66;s=2:w=2;B\x07");
+
+        screen.resize(5, 4);
+        for row in 0..2 {
+            for col in 1..5 {
+                let multicell = screen
+                    .get_cell(row, col)
+                    .and_then(|cell| cell.multicell.as_ref())
+                    .expect("reflowed scaled block");
+                assert_eq!(usize::from(multicell.row_offset), row);
+                assert_eq!(usize::from(multicell.column_offset), col - 1);
+            }
+        }
+
+        screen.resize(3, 4);
+        assert!(screen
+            .grid()
+            .iter()
+            .flat_map(|row| row.iter())
+            .all(|cell| cell.multicell.is_none()));
+    }
+
+    #[test]
+    fn test_kitty_text_sizing_history_rows_remain_one_clearable_block() {
+        let mut screen = Screen::new(5, 2, ScreenConfig::default());
+        let mut parser = Parser::new();
+        parser.parse(&mut screen, b"\x1b]66;s=2:w=1;A\x07\x1b[2;1H\n");
+
+        assert_eq!(screen.scrollback().len(), 1);
+        assert_eq!(
+            screen
+                .get_cell_with_scrollback(0, 0)
+                .unwrap()
+                .multicell
+                .as_ref()
+                .unwrap()
+                .row_offset,
+            0
+        );
+        assert_eq!(
+            screen
+                .get_cell(0, 0)
+                .unwrap()
+                .multicell
+                .as_ref()
+                .unwrap()
+                .row_offset,
+            1
+        );
+
+        screen.move_cursor(0, 0);
+        parser.parse(&mut screen, b"\x1b[X");
+        assert!(screen
+            .get_cell_with_scrollback(0, 0)
+            .unwrap()
+            .multicell
+            .is_none());
+        assert!(screen.get_cell(0, 0).unwrap().multicell.is_none());
+    }
+
+    #[test]
+    fn test_kitty_text_sizing_character_and_line_edits_do_not_split_blocks() {
+        let mut parser = Parser::new();
+
+        for edit in [b"\x1b[@".as_slice(), b"\x1b[P".as_slice()] {
+            let mut screen = Screen::new(8, 4, ScreenConfig::default());
+            parser.parse(&mut screen, b"\x1b]66;s=2:w=2;A\x07");
+            screen.move_cursor(1, 1);
+            parser.parse(&mut screen, edit);
+            assert!(screen
+                .grid()
+                .iter()
+                .flat_map(|row| row.iter())
+                .all(|cell| cell.multicell.is_none()));
+        }
+
+        for edit in [b"\x1b[L".as_slice(), b"\x1b[M".as_slice()] {
+            let mut screen = Screen::new(8, 5, ScreenConfig::default());
+            parser.parse(&mut screen, b"\x1b[2;1H\x1b]66;s=2:w=2;A\x07");
+            screen.move_cursor(2, 0);
+            parser.parse(&mut screen, edit);
+            assert!(screen
+                .grid()
+                .iter()
+                .flat_map(|row| row.iter())
+                .all(|cell| cell.multicell.is_none()));
+        }
+    }
+
+    #[test]
+    fn test_kitty_text_sizing_top_row_overwrite_erases_the_full_block() {
+        let mut screen = Screen::new(8, 4, ScreenConfig::default());
+        let mut parser = Parser::new();
+        parser.parse(&mut screen, b"\x1b]66;s=2:w=2;A\x07\x1b[1;3HX");
+
+        assert_eq!(screen.get_cell(0, 2).unwrap().text(), "X");
+        assert!(screen
+            .grid()
+            .iter()
+            .flat_map(|row| row.iter())
+            .all(|cell| cell.multicell.is_none()));
+    }
+
+    #[test]
+    fn test_cursor_blink_sources_match_foot() {
+        let mut screen = make_screen();
+        screen.configure_cursor(CursorStyle::Bar, false);
+        let mut parser = Parser::new();
+
+        assert!(!screen.cursor.blink.enabled());
+        parser.parse(&mut screen, b"\x1b[?12h\x1b[4 q");
+        assert!(screen.cursor.blink.enabled());
+        assert!(screen.cursor.blink.dec_mode_12());
+        assert!(!screen.cursor.blink.style_enabled());
+        assert_eq!(screen.cursor.style, CursorStyle::Underline);
+
+        parser.parse(&mut screen, b"\x1bP$q q\x1b\\\x1b[?12$p");
+        assert_eq!(
+            screen.take_pending_responses(),
+            vec![b"\x1bP1$r4 q\x1b\\".to_vec(), b"\x1b[?12;1$y".to_vec()]
+        );
+
+        parser.parse(&mut screen, b"\x1b[?12l");
+        assert!(!screen.cursor.blink.enabled());
+        parser.parse(&mut screen, b"\x1b[1 q");
+        assert!(screen.cursor.blink.enabled());
+        parser.parse(&mut screen, b"\x1b[0 q");
+        assert_eq!(screen.cursor.style, CursorStyle::Bar);
+        assert!(!screen.cursor.blink.enabled());
+
+        parser.parse(&mut screen, b"\x1b[?12h");
+        screen.reset();
+        assert_eq!(screen.cursor.style, CursorStyle::Bar);
+        assert!(!screen.cursor.blink.enabled());
+    }
+
+    #[test]
     fn test_sgr_256_color() {
         let mut screen = make_screen();
         let mut parser = Parser::new();
@@ -3242,6 +3584,48 @@ mod tests {
     }
 
     #[test]
+    fn test_kitty_ed_22_moves_content_into_scrollback() {
+        let mut screen = Screen::new(
+            5,
+            3,
+            ScreenConfig {
+                scrollback_lines: 10,
+            },
+        );
+        let mut parser = Parser::new();
+        parser.parse(&mut screen, b"one\r\ntwo");
+        screen.add_image(
+            4,
+            0,
+            SixelImage {
+                data: vec![1, 2, 3, 255],
+                width: 1,
+                height: 1,
+            },
+        );
+        screen.add_image(
+            4,
+            2,
+            SixelImage {
+                data: vec![1, 2, 3, 255],
+                width: 1,
+                height: 1,
+            },
+        );
+        let cursor = (screen.cursor.row, screen.cursor.col);
+
+        parser.parse(&mut screen, b"\x1b[22J");
+
+        assert_eq!(cursor, (screen.cursor.row, screen.cursor.col));
+        assert_eq!(screen.scrollback().len(), 2);
+        assert_eq!(screen.scrollback()[0].text(), "one");
+        assert_eq!(screen.scrollback()[1].text(), "two");
+        assert_eq!(screen.images().len(), 1);
+        assert_eq!(screen.images()[0].line, 0);
+        assert!((0..screen.height()).all(|row| screen.grid().row(row).unwrap().is_all_empty()));
+    }
+
+    #[test]
     fn test_dec_rectangular_fill_and_erase_match_foot() {
         let mut screen = make_screen();
         let mut parser = Parser::new();
@@ -3336,48 +3720,52 @@ mod tests {
         let mut screen = make_screen();
         let mut parser = Parser::new();
 
-        // Feed a complete OSC 1337 File= sequence with multi-byte base64 data
-        // This is: ESC ] 1337 ; File=inline=1;size=4: AQAAAA== BEL
-        // "AQAAAA==" is base64 for 4 bytes (0x01, 0x00, 0x00, 0x00)
-        // We use a tiny 1x1 image won't decode, but we can verify the streaming
-        // doesn't terminate prematurely by checking the state machine handles
-        // multi-byte data correctly.
-
-        // Build the sequence byte by byte to test streaming
         let prefix = b"\x1b]1337;File=inline=0;size=4:";
         let data = b"AQAAAA==";
-        let terminator = b"\x07";
-
-        // Feed prefix - should be consumed by the state machine
         parser.parse(&mut screen, prefix);
-        // At this point we should be in Osc1337Data state
-        assert!(
-            matches!(parser.osc_1337_state, Osc1337State::Osc1337Data(_)),
-            "Should be in Osc1337Data state after prefix, got {:?}",
-            std::mem::discriminant(&parser.osc_1337_state)
-        );
 
-        // Feed data bytes one at a time - should NOT terminate early
-        for &byte in data.iter() {
+        for &byte in data {
             parser.parse(&mut screen, &[byte]);
-            assert!(
-                matches!(parser.osc_1337_state, Osc1337State::Osc1337Data(_)),
-                "Should still be in Osc1337Data state during data"
-            );
         }
 
-        // Feed terminator - should finish
-        parser.parse(&mut screen, terminator);
-        assert!(
-            matches!(parser.osc_1337_state, Osc1337State::None),
-            "Should be in None state after terminator"
-        );
+        parser.parse(&mut screen, b"\x07ordinary text");
 
-        // Verify a file transfer was queued (inline=0 means file transfer, not inline image)
-        assert!(
-            screen.has_file_transfers(),
-            "Should have a pending file transfer"
+        assert_eq!(
+            screen.grid().row(0).unwrap().text().trim_end(),
+            "ordinary text"
         );
+        let transfers = screen.take_file_transfers();
+        let [crate::screen::FileTransferOperation::StreamingFileReceived { result, .. }] =
+            transfers.as_slice()
+        else {
+            panic!("expected one streaming file transfer, got {transfers:?}");
+        };
+        assert_eq!(result.data.to_bytes().unwrap(), [1, 0, 0, 0]);
+    }
+
+    #[test]
+    fn test_osc_1337_cancel_and_malformed_payload_recover() {
+        for abort in [0x18, 0x1a] {
+            let mut screen = make_screen();
+            let mut parser = Parser::new();
+            let mut input = b"\x1b]1337;File=inline=0;size=4:AQ".to_vec();
+            input.extend_from_slice(&[abort]);
+            input.extend_from_slice(b"OK");
+
+            parser.parse(&mut screen, &input);
+
+            assert_eq!(screen.grid().row(0).unwrap().text().trim_end(), "OK");
+            assert!(!screen.has_file_transfers());
+        }
+
+        let mut screen = make_screen();
+        let mut parser = Parser::new();
+        parser.parse(
+            &mut screen,
+            b"\x1b]1337;File=inline=0;size=4:!!!!\x07recovered",
+        );
+        assert_eq!(screen.grid().row(0).unwrap().text().trim_end(), "recovered");
+        assert!(!screen.has_file_transfers());
     }
 
     #[test]
@@ -3684,5 +4072,47 @@ mod tests {
                 b"\x1b[?2;0;320;200S".to_vec(),
             ]
         );
+    }
+
+    #[test]
+    fn kitty_graphics_apc_is_captured_alongside_plain_vte_input() {
+        let mut screen = make_screen();
+        let mut parser = Parser::new();
+
+        parser.parse(
+            &mut screen,
+            b"a\x1b_Ga=T,f=32,s=1,v=1,i=7,C=1;/wAA/w==\x1b\\b",
+        );
+
+        assert_eq!(screen.images().len(), 1);
+        assert_eq!(&screen.images()[0].data[..], &[255, 0, 0, 255]);
+        assert_eq!(screen.grid().row(0).unwrap().text(), "ab");
+        assert_eq!(
+            screen.take_pending_responses(),
+            vec![b"\x1b_Gi=7;OK\x1b\\".to_vec()]
+        );
+    }
+
+    #[test]
+    fn kitty_unicode_placeholder_is_combined_and_projected_after_parse() {
+        use crate::cell::KITTY_IMAGE_PLACEHOLDER;
+
+        let mut screen = make_screen();
+        screen.set_cell_width_hint(1.0);
+        screen.set_cell_height_hint(1.0);
+        let mut parser = Parser::new();
+        let input = format!(
+            "\x1b_Ga=T,f=32,s=1,v=1,i=1,U=1,c=1,r=1,C=1;/wAA/w==\x1b\\\x1b[38;5;1m{KITTY_IMAGE_PLACEHOLDER}\u{0305}\u{0305}"
+        );
+
+        parser.parse(&mut screen, input.as_bytes());
+
+        let cell = screen.get_cell(0, 0).unwrap();
+        assert!(cell.is_kitty_image_placeholder());
+        assert_eq!(cell.text().chars().count(), 3);
+        let images = screen.images();
+        assert_eq!(images.len(), 1);
+        assert_eq!(images[0].z_index, -1);
+        assert_eq!(images[0].data.as_slice(), &[255, 0, 0, 255]);
     }
 }

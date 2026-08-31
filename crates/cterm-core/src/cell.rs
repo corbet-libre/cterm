@@ -4,10 +4,14 @@
 //! extended grapheme cluster, colors, and attributes.
 
 use crate::color::Color;
+use crate::text_sizing::{Multicell, MAX_TEXT_SIZE_PAYLOAD_BYTES};
 use bitflags::bitflags;
 use serde::{Deserialize, Serialize};
 use smol_str::SmolStr;
 use std::sync::Arc;
+
+/// Kitty's private-use scalar for image placements that move with text.
+pub const KITTY_IMAGE_PLACEHOLDER: char = '\u{10EEEE}';
 
 /// Maximum UTF-8 payload retained in one terminal cell.
 ///
@@ -34,7 +38,7 @@ bitflags! {
         const DOTTED_UNDERLINE = 1 << 5;
         /// Dashed underline
         const DASHED_UNDERLINE = 1 << 6;
-        /// Blinking text
+        /// Slowly blinking text (SGR 5)
         const BLINK = 1 << 7;
         /// Reverse video (swap fg/bg)
         const INVERSE = 1 << 8;
@@ -50,10 +54,22 @@ bitflags! {
         const WIDE = 1 << 13;
         /// Placeholder for second cell of wide char
         const WIDE_SPACER = 1 << 14;
+        /// Rapidly blinking text (SGR 6)
+        const RAPID_BLINK = 1 << 15;
     }
 }
 
 impl CellAttrs {
+    /// Check if either slow or rapid blinking is selected.
+    pub fn has_blink(&self) -> bool {
+        self.intersects(Self::BLINK | Self::RAPID_BLINK)
+    }
+
+    /// Clear both mutually exclusive blink speeds.
+    pub fn clear_blink(&mut self) {
+        self.remove(Self::BLINK | Self::RAPID_BLINK);
+    }
+
     /// Check if any underline style is set
     pub fn has_underline(&self) -> bool {
         self.intersects(
@@ -111,6 +127,8 @@ pub struct Cell {
     pub attrs: CellAttrs,
     /// Hyperlink if present (shared via Arc for efficiency)
     pub hyperlink: Option<Arc<Hyperlink>>,
+    /// Kitty OSC 66 layout metadata for a fixed-width or scaled text block.
+    pub multicell: Option<Multicell>,
 }
 
 impl Default for Cell {
@@ -122,6 +140,7 @@ impl Default for Cell {
             underline_color: None,
             attrs: CellAttrs::empty(),
             hyperlink: None,
+            multicell: None,
         }
     }
 }
@@ -145,6 +164,11 @@ impl Cell {
         self.text.chars().next().unwrap_or(' ')
     }
 
+    /// Whether this cell carries Kitty's Unicode image-placeholder scalar.
+    pub fn is_kitty_image_placeholder(&self) -> bool {
+        self.first_char() == KITTY_IMAGE_PLACEHOLDER
+    }
+
     /// Return the cell content when it consists of exactly one scalar value.
     pub fn single_char(&self) -> Option<char> {
         let mut chars = self.text.chars();
@@ -165,6 +189,15 @@ impl Cell {
         }
 
         let mut end = text.len().min(MAX_GRAPHEME_BYTES);
+        while !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        self.text = SmolStr::new(&text[..end]);
+    }
+
+    /// Store a pre-bounded OSC 66 payload in the anchor cell.
+    pub fn set_text_size_payload(&mut self, text: &str) {
+        let mut end = text.len().min(MAX_TEXT_SIZE_PAYLOAD_BYTES);
         while !text.is_char_boundary(end) {
             end -= 1;
         }
@@ -196,6 +229,7 @@ impl Cell {
             && self.bg == Color::Default
             && self.attrs.is_empty()
             && self.hyperlink.is_none()
+            && self.multicell.is_none()
     }
 
     /// Check if this cell is a wide character
@@ -206,6 +240,13 @@ impl Cell {
     /// Check if this cell is a spacer for a wide character
     pub fn is_wide_spacer(&self) -> bool {
         self.attrs.contains(CellAttrs::WIDE_SPACER)
+    }
+
+    /// Whether this is a non-anchor cell occupied by Kitty OSC 66 text.
+    pub fn is_multicell_spacer(&self) -> bool {
+        self.multicell
+            .as_ref()
+            .is_some_and(|multicell| !multicell.is_anchor())
     }
 
     /// Reset cell to empty state
@@ -252,6 +293,7 @@ impl CellStyle {
             underline_color: self.underline_color,
             attrs: self.attrs,
             hyperlink: self.hyperlink.clone(),
+            multicell: None,
         }
     }
 

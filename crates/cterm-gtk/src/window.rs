@@ -12,7 +12,11 @@ use gtk4::{
 use cterm_app::config::Config;
 use cterm_app::file_transfer::PendingFileManager;
 use cterm_app::shortcuts::ShortcutManager;
-use cterm_ui::events::{Action, KeyCode, Modifiers};
+use cterm_app::{
+    PluginAuthorization, PluginInvocation, PluginRuntime, TemplateDaemonTarget,
+    TemplateInstancePolicy, TemplateLaunchPlan,
+};
+use cterm_ui::events::{Action, KeyCode, Modifiers, Shortcut};
 use cterm_ui::theme::Theme;
 use cterm_ui::{
     PaneDirection, PaneId, PaneLayout, PaneTree, SplitDirection, SplitPlacement, SplitRatio,
@@ -132,7 +136,7 @@ pub struct CtermWindow {
     pub tab_bar: TabBar,
     pub config: Rc<RefCell<Config>>,
     pub theme: Theme,
-    pub shortcuts: ShortcutManager,
+    pub shortcuts: Rc<RefCell<ShortcutManager>>,
     tabs: Rc<RefCell<Vec<TabEntry>>>,
     next_tab_id: Rc<RefCell<u64>>,
     menu_bar: PopoverMenuBar,
@@ -156,6 +160,118 @@ struct PaneActionContext {
     notification_bar: NotificationBar,
 }
 
+#[derive(Clone)]
+struct TerminalViewActionContext {
+    notebook: Notebook,
+    tabs: Rc<RefCell<Vec<TabEntry>>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GtkActionActivation {
+    name: &'static str,
+    parameter: Option<String>,
+}
+
+impl GtkActionActivation {
+    fn simple(name: &'static str) -> Self {
+        Self {
+            name,
+            parameter: None,
+        }
+    }
+
+    fn with_string(name: &'static str, parameter: impl Into<String>) -> Self {
+        Self {
+            name,
+            parameter: Some(parameter.into()),
+        }
+    }
+}
+
+/// Map a shared semantic action onto the canonical GTK window action.
+///
+/// Keep this match exhaustive: adding an `Action` must require an explicit GTK
+/// dispatch decision instead of silently falling through to the terminal.
+fn gtk_action_activation(action: &Action) -> GtkActionActivation {
+    match action {
+        Action::NewTab => GtkActionActivation::simple("new-tab"),
+        Action::CloseTab => GtkActionActivation::simple("close-tab"),
+        Action::NextTab => GtkActionActivation::simple("next-tab"),
+        Action::PrevTab => GtkActionActivation::simple("prev-tab"),
+        Action::NextAlertedTab => GtkActionActivation::simple("next-alerted-tab"),
+        Action::Tab(tab) => GtkActionActivation::with_string("select-tab-index", tab.to_string()),
+        Action::SplitPane(SplitDirection::Horizontal) => {
+            GtkActionActivation::simple("split-pane-horizontal")
+        }
+        Action::SplitPane(SplitDirection::Vertical) => {
+            GtkActionActivation::simple("split-pane-vertical")
+        }
+        Action::ClosePane => GtkActionActivation::simple("close-pane"),
+        Action::FocusPane(PaneDirection::Left) => GtkActionActivation::simple("focus-pane-left"),
+        Action::FocusPane(PaneDirection::Right) => GtkActionActivation::simple("focus-pane-right"),
+        Action::FocusPane(PaneDirection::Up) => GtkActionActivation::simple("focus-pane-up"),
+        Action::FocusPane(PaneDirection::Down) => GtkActionActivation::simple("focus-pane-down"),
+        Action::ResizePane(PaneDirection::Left) => GtkActionActivation::simple("resize-pane-left"),
+        Action::ResizePane(PaneDirection::Right) => {
+            GtkActionActivation::simple("resize-pane-right")
+        }
+        Action::ResizePane(PaneDirection::Up) => GtkActionActivation::simple("resize-pane-up"),
+        Action::ResizePane(PaneDirection::Down) => GtkActionActivation::simple("resize-pane-down"),
+        Action::TogglePaneZoom => GtkActionActivation::simple("toggle-pane-zoom"),
+        Action::NewWindow => GtkActionActivation::simple("new-window"),
+        Action::CloseWindow => GtkActionActivation::simple("close-window"),
+        Action::Copy => GtkActionActivation::simple("copy"),
+        Action::Paste => GtkActionActivation::simple("paste"),
+        Action::SelectAll => GtkActionActivation::simple("select-all"),
+        Action::ZoomIn => GtkActionActivation::simple("zoom-in"),
+        Action::ZoomOut => GtkActionActivation::simple("zoom-out"),
+        Action::ZoomReset => GtkActionActivation::simple("zoom-reset"),
+        Action::ToggleFullscreen => GtkActionActivation::simple("toggle-fullscreen"),
+        Action::ScrollUp => GtkActionActivation::simple("scroll-up"),
+        Action::ScrollDown => GtkActionActivation::simple("scroll-down"),
+        Action::ScrollPageUp => GtkActionActivation::simple("scroll-page-up"),
+        Action::ScrollPageDown => GtkActionActivation::simple("scroll-page-down"),
+        Action::ScrollToTop => GtkActionActivation::simple("scroll-to-top"),
+        Action::ScrollToBottom => GtkActionActivation::simple("scroll-to-bottom"),
+        Action::PromptPrevious => GtkActionActivation::simple("prompt-previous"),
+        Action::PromptNext => GtkActionActivation::simple("prompt-next"),
+        Action::OpenPreferences => GtkActionActivation::simple("preferences"),
+        Action::FindText => GtkActionActivation::simple("find"),
+        Action::ResetTerminal => GtkActionActivation::simple("reset"),
+        Action::QuickOpenTemplate => GtkActionActivation::simple("quick-open"),
+    }
+}
+
+fn activate_shared_action(window: &ApplicationWindow, action: &Action) {
+    let activation = gtk_action_activation(action);
+    let parameter = activation
+        .parameter
+        .as_ref()
+        .map(|value| glib::Variant::from(value.as_str()));
+
+    if window.lookup_action(activation.name).is_none() {
+        log::error!(
+            "GTK action '{}' is not registered for shared action {:?}",
+            activation.name,
+            action
+        );
+        return;
+    }
+
+    gtk4::prelude::ActionGroupExt::activate_action(window, activation.name, parameter.as_ref());
+}
+
+fn shortcut_manager(config: &Config) -> ShortcutManager {
+    let mut shortcuts = ShortcutManager::from_config(&config.shortcuts);
+    // Fullscreen is not yet configurable in the shared config. Keep the
+    // conventional desktop binding local to GTK until it becomes one.
+    shortcuts.bind(
+        Shortcut::new(KeyCode::F11, Modifiers::empty()),
+        Action::ToggleFullscreen,
+    );
+    shortcuts
+}
+
 /// Show an error dialog when a seamless upgrade fails.
 fn show_upgrade_error_dialog(window: &ApplicationWindow, error: &dyn std::fmt::Display) {
     let dialog = gtk4::MessageDialog::new(
@@ -169,6 +285,58 @@ fn show_upgrade_error_dialog(window: &ApplicationWindow, error: &dyn std::fmt::D
     dialog.present();
 }
 
+fn show_plugin_error_dialog(window: &ApplicationWindow, error: &dyn std::fmt::Display) {
+    log::error!("Plugin command failed: {error}");
+    let dialog = gtk4::MessageDialog::new(
+        Some(window),
+        gtk4::DialogFlags::MODAL,
+        gtk4::MessageType::Error,
+        gtk4::ButtonsType::Ok,
+        format!("Plugin command failed:\n\n{error}"),
+    );
+    dialog.connect_response(|dialog, _| dialog.close());
+    dialog.present();
+}
+
+fn run_plugin_invocation(window: &ApplicationWindow, invocation: PluginInvocation) {
+    log::debug!("Starting isolated plugin invocation");
+    let (sender, receiver) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = sender.send(invocation.execute_blocking());
+    });
+
+    let window = window.clone();
+    glib::timeout_add_local(std::time::Duration::from_millis(25), move || {
+        let result = match receiver.try_recv() {
+            Ok(result) => result,
+            Err(std::sync::mpsc::TryRecvError::Empty) => return glib::ControlFlow::Continue,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                log::error!("Plugin worker disconnected without a result");
+                return glib::ControlFlow::Break;
+            }
+        };
+
+        match result {
+            Ok(execution) => {
+                for diagnostic in execution.diagnostics() {
+                    log::info!("Plugin diagnostic: {diagnostic}");
+                }
+                if !execution.host_stderr().is_empty() {
+                    log::warn!(
+                        "Plugin host stderr: {}",
+                        String::from_utf8_lossy(execution.host_stderr())
+                    );
+                }
+                for action in execution.actions() {
+                    activate_shared_action(&window, action);
+                }
+            }
+            Err(error) => show_plugin_error_dialog(&window, &error),
+        }
+        glib::ControlFlow::Break
+    });
+}
+
 fn reject_managed_secondary_action(action: &str) -> bool {
     if crate::get_args().managed {
         log::warn!("Ignoring {action} request in managed mode");
@@ -176,6 +344,137 @@ fn reject_managed_secondary_action(action: &str) -> bool {
     } else {
         false
     }
+}
+
+fn is_managed_restricted_action(action: &Action) -> bool {
+    matches!(
+        action,
+        Action::NewTab
+            | Action::SplitPane(_)
+            | Action::ClosePane
+            | Action::FocusPane(_)
+            | Action::ResizePane(_)
+            | Action::TogglePaneZoom
+            | Action::NewWindow
+            | Action::OpenPreferences
+            | Action::QuickOpenTemplate
+    )
+}
+
+fn reject_managed_action(action: &Action) -> bool {
+    if crate::get_args().managed && is_managed_restricted_action(action) {
+        log::warn!("Ignoring {action:?} request in managed mode");
+        true
+    } else {
+        false
+    }
+}
+
+fn template_remote_details(plan: &TemplateLaunchPlan) -> Option<(&str, &str, bool)> {
+    match &plan.daemon {
+        TemplateDaemonTarget::Local => None,
+        TemplateDaemonTarget::Named(remote) => Some((
+            remote.name.as_str(),
+            remote.host.as_str(),
+            remote.ssh_compression,
+        )),
+    }
+}
+
+fn theme_name_matches(requested: &str, resolved: &str) -> bool {
+    requested.eq_ignore_ascii_case(resolved)
+        || matches!(
+            (requested.to_ascii_lowercase().as_str(), resolved),
+            ("dark", "Default Dark")
+                | ("light", "Default Light")
+                | ("tokyo_night" | "tokyo-night", "Tokyo Night")
+                | ("dracula", "Dracula")
+                | ("nord", "Nord")
+        )
+}
+
+/// Resolve a template theme without changing the window-wide UI theme.
+///
+/// `resolve_theme` intentionally prefers a configured custom theme globally,
+/// so a named per-template built-in must temporarily ignore that global custom
+/// value. Unknown names stay on the window theme instead of silently becoming
+/// Default Dark.
+fn resolve_template_theme(config: &Config, window_theme: &Theme, requested: Option<&str>) -> Theme {
+    let Some(requested) = requested.map(str::trim).filter(|name| !name.is_empty()) else {
+        return window_theme.clone();
+    };
+
+    if let Some(custom) = config.appearance.custom_theme.as_ref() {
+        if requested.eq_ignore_ascii_case("custom") || requested.eq_ignore_ascii_case(&custom.name)
+        {
+            return custom.clone();
+        }
+    }
+
+    let mut themed_config = config.clone();
+    themed_config.appearance.custom_theme = None;
+    themed_config.appearance.theme = requested.to_string();
+    let resolved = cterm_app::resolve_theme(&themed_config);
+    if theme_name_matches(requested, &resolved.name) {
+        resolved
+    } else {
+        log::warn!("Unknown template theme '{requested}', using the window theme");
+        window_theme.clone()
+    }
+}
+
+fn reusable_template_location<'a, P: Copy>(
+    policy: TemplateInstancePolicy,
+    template_name: &str,
+    candidates: impl IntoIterator<Item = (usize, P, Option<&'a str>)>,
+) -> Option<(usize, P)> {
+    if policy != TemplateInstancePolicy::ReuseExisting {
+        return None;
+    }
+
+    candidates
+        .into_iter()
+        .find(|(_, _, candidate)| candidate.is_some_and(|name| name == template_name))
+        .map(|(tab_index, pane_id, _)| (tab_index, pane_id))
+}
+
+fn focus_reusable_template(
+    notebook: &Notebook,
+    tabs: &Rc<RefCell<Vec<TabEntry>>>,
+    tab_bar: &TabBar,
+    plan: &TemplateLaunchPlan,
+) -> bool {
+    let location = {
+        let tabs = tabs.borrow();
+        reusable_template_location(
+            plan.instance_policy,
+            &plan.template_name,
+            tabs.iter().enumerate().flat_map(|(tab_index, tab)| {
+                tab.panes
+                    .iter()
+                    .map(move |(pane_id, pane)| (tab_index, pane_id, pane.template_name.as_deref()))
+            }),
+        )
+    };
+    let Some((tab_index, pane_id)) = location else {
+        return false;
+    };
+
+    let tab_id = {
+        let mut tabs = tabs.borrow_mut();
+        let Some(tab) = tabs.get_mut(tab_index) else {
+            return false;
+        };
+        if !tab.activate_pane(pane_id) {
+            return false;
+        }
+        tab.id
+    };
+
+    notebook.set_current_page(Some(tab_index as u32));
+    tab_bar.set_active(tab_id);
+    focus_current_terminal(notebook, tabs);
+    true
 }
 
 fn perform_pane_action(context: &PaneActionContext, action: Action) {
@@ -294,7 +593,58 @@ fn register_pane_actions(window: &ApplicationWindow, context: &PaneActionContext
     ] {
         let context = context.clone();
         let gtk_action = gio::SimpleAction::new(name, None);
-        gtk_action.connect_activate(move |_, _| perform_pane_action(&context, action.clone()));
+        gtk_action.connect_activate(move |_, _| {
+            if reject_managed_action(&action) {
+                return;
+            }
+            perform_pane_action(&context, action.clone());
+        });
+        window.add_action(&gtk_action);
+    }
+}
+
+fn perform_terminal_view_action(context: &TerminalViewActionContext, action: &Action) {
+    let Some(page_idx) = context.notebook.current_page() else {
+        return;
+    };
+    let tabs = context.tabs.borrow();
+    let Some(tab) = tabs.get(page_idx as usize) else {
+        return;
+    };
+
+    match action {
+        Action::ZoomIn => tab.terminal.zoom_in(),
+        Action::ZoomOut => tab.terminal.zoom_out(),
+        Action::ZoomReset => tab.terminal.zoom_reset(),
+        Action::ScrollUp => tab.terminal.scroll_viewport_up(1),
+        Action::ScrollDown => tab.terminal.scroll_viewport_down(1),
+        Action::ScrollPageUp => tab.terminal.scroll_viewport_page(true),
+        Action::ScrollPageDown => tab.terminal.scroll_viewport_page(false),
+        Action::ScrollToTop => tab.terminal.scroll_viewport_edge(true),
+        Action::ScrollToBottom => tab.terminal.scroll_viewport_edge(false),
+        Action::PromptPrevious => tab.terminal.scroll_to_shell_prompt(true),
+        Action::PromptNext => tab.terminal.scroll_to_shell_prompt(false),
+        _ => unreachable!("non-view action registered as a terminal view action"),
+    }
+}
+
+fn register_terminal_view_actions(window: &ApplicationWindow, context: &TerminalViewActionContext) {
+    for (name, action) in [
+        ("zoom-in", Action::ZoomIn),
+        ("zoom-out", Action::ZoomOut),
+        ("zoom-reset", Action::ZoomReset),
+        ("scroll-up", Action::ScrollUp),
+        ("scroll-down", Action::ScrollDown),
+        ("scroll-page-up", Action::ScrollPageUp),
+        ("scroll-page-down", Action::ScrollPageDown),
+        ("scroll-to-top", Action::ScrollToTop),
+        ("scroll-to-bottom", Action::ScrollToBottom),
+        ("prompt-previous", Action::PromptPrevious),
+        ("prompt-next", Action::PromptNext),
+    ] {
+        let context = context.clone();
+        let gtk_action = gio::SimpleAction::new(name, None);
+        gtk_action.connect_activate(move |_, _| perform_terminal_view_action(&context, &action));
         window.add_action(&gtk_action);
     }
 }
@@ -309,6 +659,10 @@ enum PaneCiStep {
     Zoom,
     Unzoom,
     WaitClose,
+    WaitTemplate,
+    WaitUniqueReuse,
+    WaitPluginPrompt,
+    WaitPluginExecution,
 }
 
 #[derive(Clone)]
@@ -332,6 +686,36 @@ fn pane_ci_snapshot(
     })
 }
 
+struct TemplateCiSnapshot {
+    tab_count: usize,
+    tab_id: u64,
+    session_id: Option<String>,
+    template_name: Option<String>,
+    keep_open: bool,
+    color: Option<String>,
+    screen_text: String,
+}
+
+fn template_ci_snapshot(
+    notebook: &Notebook,
+    tabs: &Rc<RefCell<Vec<TabEntry>>>,
+) -> Option<TemplateCiSnapshot> {
+    let page = notebook.current_page()?;
+    let tabs = tabs.borrow();
+    let tab = tabs.get(page as usize)?;
+    let pane = tab.panes.active();
+    let screen_text = pane.terminal.terminal().lock().screen().grid().text();
+    Some(TemplateCiSnapshot {
+        tab_count: tabs.len(),
+        tab_id: tab.id,
+        session_id: pane.session_id.clone(),
+        template_name: pane.template_name.clone(),
+        keep_open: pane.keep_open,
+        color: tab.color.clone(),
+        screen_text,
+    })
+}
+
 fn pane_ci_activate(window: &ApplicationWindow, name: &str) -> Result<(), String> {
     let action = window
         .lookup_action(name)
@@ -340,6 +724,21 @@ fn pane_ci_activate(window: &ApplicationWindow, name: &str) -> Result<(), String
         return Err(format!("window action '{name}' is disabled"));
     }
     action.activate(None);
+    Ok(())
+}
+
+fn pane_ci_activate_with_string(
+    window: &ApplicationWindow,
+    name: &str,
+    value: &str,
+) -> Result<(), String> {
+    let action = window
+        .lookup_action(name)
+        .ok_or_else(|| format!("window action '{name}' is not registered"))?;
+    if !action.is_enabled() {
+        return Err(format!("window action '{name}' is disabled"));
+    }
+    action.activate(Some(&glib::Variant::from(value)));
     Ok(())
 }
 
@@ -412,7 +811,7 @@ impl CtermWindow {
         window.set_child(Some(&main_box));
 
         // Create shortcut manager
-        let shortcuts = ShortcutManager::from_config(&config.shortcuts);
+        let shortcuts = Rc::new(RefCell::new(shortcut_manager(config)));
 
         let has_bell = Rc::new(RefCell::new(false));
         let file_manager = Rc::new(RefCell::new(PendingFileManager::new()));
@@ -530,7 +929,7 @@ impl CtermWindow {
         main_box.append(&notebook);
         window.set_child(Some(&main_box));
 
-        let shortcuts = ShortcutManager::from_config(&config.shortcuts);
+        let shortcuts = Rc::new(RefCell::new(shortcut_manager(config)));
         let has_bell = Rc::new(RefCell::new(false));
         let file_manager = Rc::new(RefCell::new(PendingFileManager::new()));
 
@@ -656,6 +1055,11 @@ impl CtermWindow {
             notification_bar: self.notification_bar.clone(),
         };
         register_pane_actions(window, &pane_context);
+        let terminal_view_context = TerminalViewActionContext {
+            notebook: notebook.clone(),
+            tabs: Rc::clone(&tabs),
+        };
+        register_terminal_view_actions(window, &terminal_view_context);
 
         // File menu actions
         {
@@ -671,7 +1075,7 @@ impl CtermWindow {
             let notification_bar = self.notification_bar.clone();
             let action = gio::SimpleAction::new("new-tab", None);
             action.connect_activate(move |_, _| {
-                if reject_managed_secondary_action("new tab") {
+                if reject_managed_action(&Action::NewTab) {
                     return;
                 }
                 // Get info from the active terminal
@@ -714,7 +1118,7 @@ impl CtermWindow {
             let theme = theme.clone();
             let action = gio::SimpleAction::new("new-window", None);
             action.connect_activate(move |_, _| {
-                if reject_managed_secondary_action("new window") {
+                if reject_managed_action(&Action::NewWindow) {
                     return;
                 }
                 let cfg = config.borrow();
@@ -761,12 +1165,24 @@ impl CtermWindow {
             window.add_action(&action);
         }
 
+        {
+            // `CloseWindow` is a window-scoped semantic action. Keep it
+            // separate from the menu's historical "quit" action so it cannot
+            // accidentally acquire application-wide semantics later.
+            let window_clone = window.clone();
+            let action = gio::SimpleAction::new("close-window", None);
+            action.connect_activate(move |_, _| {
+                window_clone.close();
+            });
+            window.add_action(&action);
+        }
+
         // Quick Open Template action
         {
             let quick_open = self.quick_open.clone();
             let action = gio::SimpleAction::new("quick-open", None);
             action.connect_activate(move |_, _| {
-                if reject_managed_secondary_action("quick open") {
+                if reject_managed_action(&Action::QuickOpenTemplate) {
                     return;
                 }
                 // Load templates and show overlay
@@ -917,7 +1333,14 @@ impl CtermWindow {
                 let file_manager = Rc::clone(&file_manager);
                 let notification_bar = notification_bar.clone();
 
-                crate::session_dialog::show_ssh_dialog(&window_clone, move |sessions| {
+                let cursor = {
+                    let config = config.borrow();
+                    cterm_client::CursorDefaults {
+                        style: config.appearance.cursor_style.core_style(),
+                        blink: config.appearance.cursor_blink,
+                    }
+                };
+                crate::session_dialog::show_ssh_dialog(&window_clone, cursor, move |sessions| {
                     for recon in sessions {
                         let sid = recon.handle.session_id().to_string();
                         let daemon_socket = recon.handle.socket_path().map(|p| p.to_owned());
@@ -1101,6 +1524,19 @@ impl CtermWindow {
             window.add_action(&action);
         }
 
+        {
+            let window_clone = window.clone();
+            let action = gio::SimpleAction::new("toggle-fullscreen", None);
+            action.connect_activate(move |_, _| {
+                if window_clone.is_fullscreen() {
+                    window_clone.unfullscreen();
+                } else {
+                    window_clone.fullscreen();
+                }
+            });
+            window.add_action(&action);
+        }
+
         // Terminal menu actions
         {
             let window_clone = window.clone();
@@ -1250,6 +1686,32 @@ impl CtermWindow {
                     let prev = if current == 0 { n - 1 } else { current - 1 };
                     notebook.set_current_page(Some(prev));
                     sync_tab_bar_active(&tab_bar, &tabs, &notebook);
+                    focus_current_terminal(&notebook, &tabs);
+                }
+            });
+            window.add_action(&action);
+        }
+
+        {
+            let notebook = notebook.clone();
+            let tabs = Rc::clone(&tabs);
+            let tab_bar = tab_bar.clone();
+            let action = gio::SimpleAction::new(
+                "select-tab-index",
+                Some(&glib::VariantType::new("s").unwrap()),
+            );
+            action.connect_activate(move |_, param| {
+                let Some(tab_number) = param
+                    .and_then(|value| value.get::<String>())
+                    .and_then(|value| value.parse::<u32>().ok())
+                else {
+                    return;
+                };
+                let page = tab_number.saturating_sub(1);
+                if page < notebook.n_pages() {
+                    notebook.set_current_page(Some(page));
+                    sync_tab_bar_active(&tab_bar, &tabs, &notebook);
+                    focus_current_terminal(&notebook, &tabs);
                 }
             });
             window.add_action(&action);
@@ -1266,6 +1728,7 @@ impl CtermWindow {
                     let current = notebook.current_page().unwrap_or(0);
                     notebook.set_current_page(Some((current + 1) % n));
                     sync_tab_bar_active(&tab_bar, &tabs, &notebook);
+                    focus_current_terminal(&notebook, &tabs);
                 }
             });
             window.add_action(&action);
@@ -1288,6 +1751,7 @@ impl CtermWindow {
                                 drop(tabs_ref);
                                 notebook.set_current_page(Some(idx as u32));
                                 sync_tab_bar_active(&tab_bar, &tabs, &notebook);
+                                focus_current_terminal(&notebook, &tabs);
                                 return;
                             }
                         }
@@ -1376,18 +1840,88 @@ impl CtermWindow {
             window.add_action(&action);
         }
 
+        {
+            let window_clone = window.clone();
+            let action = gio::SimpleAction::new(
+                "run-plugin-command",
+                Some(&glib::VariantType::new("s").unwrap()),
+            );
+            action.connect_activate(move |_, parameter| {
+                if reject_managed_secondary_action("plugin command") {
+                    return;
+                }
+                let Some(action_id) = parameter.and_then(|value| value.get::<String>()) else {
+                    log::error!("Plugin menu action omitted its stable command ID");
+                    return;
+                };
+                let runtime = match PluginRuntime::for_current_user() {
+                    Ok(runtime) => runtime,
+                    Err(error) => {
+                        show_plugin_error_dialog(&window_clone, &error);
+                        return;
+                    }
+                };
+                match runtime.authorize_action(&action_id) {
+                    Ok(PluginAuthorization::Granted(invocation)) => {
+                        run_plugin_invocation(&window_clone, invocation);
+                    }
+                    Ok(PluginAuthorization::ApprovalRequired(prompt)) => {
+                        let dialog = gtk4::MessageDialog::new(
+                            Some(&window_clone),
+                            gtk4::DialogFlags::MODAL,
+                            gtk4::MessageType::Question,
+                            gtk4::ButtonsType::YesNo,
+                            prompt.message(),
+                        );
+                        let pending = Rc::new(RefCell::new(Some((runtime, prompt))));
+                        let pending_for_response = Rc::clone(&pending);
+                        let window_for_response = window_clone.clone();
+                        dialog.connect_response(move |dialog, response| {
+                            log::debug!("Native plugin approval response: {response:?}");
+                            let Some((mut runtime, prompt)) =
+                                pending_for_response.borrow_mut().take()
+                            else {
+                                return;
+                            };
+                            // Closing emits a nested DeleteEvent response on GTK.
+                            // Consume the pending approval first so that nested
+                            // response cannot discard the user's Yes decision.
+                            dialog.close();
+                            if response != gtk4::ResponseType::Yes {
+                                return;
+                            }
+                            match runtime.approve(prompt) {
+                                Ok(invocation) => {
+                                    log::debug!("Persisted plugin grant after native approval");
+                                    run_plugin_invocation(&window_for_response, invocation);
+                                }
+                                Err(error) => {
+                                    show_plugin_error_dialog(&window_for_response, &error);
+                                }
+                            }
+                        });
+                        dialog.present();
+                    }
+                    Err(error) => show_plugin_error_dialog(&window_clone, &error),
+                }
+            });
+            window.add_action(&action);
+        }
+
         // Help menu actions
         {
             let window_clone = window.clone();
             let config = Rc::clone(&config);
+            let shortcuts = Rc::clone(&self.shortcuts);
             let menu_bar_clone = menu_bar.clone();
             let action = gio::SimpleAction::new("preferences", None);
             action.connect_activate(move |_, _| {
-                if reject_managed_secondary_action("preferences") {
+                if reject_managed_action(&Action::OpenPreferences) {
                     return;
                 }
                 let cfg = config.borrow().clone();
                 let config_for_save = Rc::clone(&config);
+                let shortcuts_for_save = Rc::clone(&shortcuts);
                 let menu_bar = menu_bar_clone.clone();
                 dialogs::show_preferences_dialog(&window_clone, &cfg, move |new_config| {
                     log::info!("Preferences saved");
@@ -1404,6 +1938,9 @@ impl CtermWindow {
                         crate::get_args().updater_enabled(),
                         crate::get_args().managed,
                     );
+                    // The key controller borrows this shared manager for every
+                    // event, so shortcut edits take effect immediately.
+                    *shortcuts_for_save.borrow_mut() = shortcut_manager(&new_config);
                     // Update internal config state
                     *config_for_save.borrow_mut() = new_config;
                 });
@@ -1792,14 +2329,51 @@ impl CtermWindow {
         let window = self.window.clone();
         let notebook = self.notebook.clone();
         let tabs = Rc::clone(&self.tabs);
+        let quick_open = self.quick_open.clone();
         let step = Rc::new(RefCell::new(PaneCiStep::WaitInitial));
         let started = std::time::Instant::now();
+        let template_name = std::env::var("CTERM_WAYLAND_TEMPLATE_CI_NAME")
+            .unwrap_or_else(|_| pane_ci_fail(PaneCiStep::WaitTemplate, "template name is unset"));
+        let template_marker = std::env::var("CTERM_WAYLAND_TEMPLATE_CI_MARKER")
+            .unwrap_or_else(|_| pane_ci_fail(PaneCiStep::WaitTemplate, "template marker is unset"));
+        let template_ready = std::env::var_os("CTERM_WAYLAND_TEMPLATE_CI_READY")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| {
+                pane_ci_fail(PaneCiStep::WaitTemplate, "template ready path is unset")
+            });
+        let template_visible = std::env::var_os("CTERM_WAYLAND_TEMPLATE_CI_VISIBLE")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| {
+                pane_ci_fail(PaneCiStep::WaitTemplate, "template visible path is unset")
+            });
+        let template_done = std::env::var_os("CTERM_WAYLAND_TEMPLATE_CI_DONE")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| {
+                pane_ci_fail(
+                    PaneCiStep::WaitTemplate,
+                    "template completion path is unset",
+                )
+            });
+        let template_workspace = std::env::var_os("CTERM_WAYLAND_TEMPLATE_CI_WORKSPACE")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| {
+                pane_ci_fail(PaneCiStep::WaitTemplate, "template workspace is unset")
+            });
+        let plugin_action_id =
+            std::env::var("CTERM_WAYLAND_PLUGIN_CI_ACTION_ID").unwrap_or_else(|_| {
+                pane_ci_fail(PaneCiStep::WaitPluginPrompt, "plugin action ID is unset")
+            });
+        let mut template_completed_at = None;
+        let mut template_tab_id = None;
+        let mut template_session_id = None;
+        let mut unique_requested_at = None;
+        let mut plugin_tab_count = None;
 
         pane_ci_marker("CTERM_PANE_CI START backend=wayland");
         glib::timeout_add_local(std::time::Duration::from_millis(50), move || {
             let current_step = *step.borrow();
-            if started.elapsed() > std::time::Duration::from_secs(20) {
-                pane_ci_fail(current_step, "timed out after 20 seconds");
+            if started.elapsed() > std::time::Duration::from_secs(40) {
+                pane_ci_fail(current_step, "timed out after 40 seconds");
             }
 
             let Some(snapshot) = pane_ci_snapshot(&notebook, &tabs) else {
@@ -1916,6 +2490,185 @@ impl CtermWindow {
                         );
                     }
                     pane_ci_marker("CTERM_PANE_CI CLOSE_OK panes=2");
+
+                    pane_ci_activate(&window, "quick-open")
+                        .unwrap_or_else(|error| pane_ci_fail(current_step, error));
+                    if !quick_open.is_visible() {
+                        pane_ci_fail(current_step, "Quick Open overlay did not become visible");
+                    }
+                    if !quick_open.confirm_selection_for_ci() {
+                        pane_ci_fail(current_step, "Quick Open had no template selection");
+                    }
+                    pane_ci_marker("CTERM_TEMPLATE_CI INGRESS_OK source=quick-open");
+                    *step.borrow_mut() = PaneCiStep::WaitTemplate;
+                }
+                PaneCiStep::WaitTemplate => {
+                    let Some(template) = template_ci_snapshot(&notebook, &tabs) else {
+                        return glib::ControlFlow::Continue;
+                    };
+                    if template.tab_count == 1 {
+                        return glib::ControlFlow::Continue;
+                    }
+                    if template.tab_count != 2 {
+                        pane_ci_fail(
+                            current_step,
+                            format!(
+                                "template launch produced {} tabs instead of 2",
+                                template.tab_count
+                            ),
+                        );
+                    }
+                    if template.template_name.as_deref() != Some(template_name.as_str()) {
+                        pane_ci_fail(current_step, "new tab lost its template identity");
+                    }
+                    let Some(session_id) = template.session_id.clone() else {
+                        return glib::ControlFlow::Continue;
+                    };
+                    if !template_ready.exists() {
+                        std::fs::write(&template_ready, b"attached\n").unwrap_or_else(|error| {
+                            pane_ci_fail(
+                                current_step,
+                                format!("cannot signal attached template session: {error}"),
+                            )
+                        });
+                    }
+                    if !template.screen_text.contains(&template_marker) {
+                        return glib::ControlFlow::Continue;
+                    }
+                    if !template_visible.exists() {
+                        std::fs::write(&template_visible, b"visible\n").unwrap_or_else(|error| {
+                            pane_ci_fail(
+                                current_step,
+                                format!("cannot acknowledge visible template output: {error}"),
+                            )
+                        });
+                    }
+                    let completed_cwd = match std::fs::read_to_string(&template_done) {
+                        Ok(cwd) => cwd,
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                            return glib::ControlFlow::Continue;
+                        }
+                        Err(error) => pane_ci_fail(
+                            current_step,
+                            format!("cannot read template completion evidence: {error}"),
+                        ),
+                    };
+                    if std::path::Path::new(completed_cwd.trim()) != template_workspace {
+                        pane_ci_fail(
+                            current_step,
+                            format!(
+                                "template cwd was {:?}, expected {:?}",
+                                completed_cwd.trim(),
+                                template_workspace
+                            ),
+                        );
+                    }
+
+                    let completed_at =
+                        template_completed_at.get_or_insert_with(std::time::Instant::now);
+                    if completed_at.elapsed() < std::time::Duration::from_millis(750) {
+                        return glib::ControlFlow::Continue;
+                    }
+                    if !template.keep_open {
+                        pane_ci_fail(current_step, "exited template tab was not marked keep_open");
+                    }
+                    if template.color.as_deref() != Some("#2a7fff") {
+                        pane_ci_fail(current_step, "template tab color was not applied");
+                    }
+                    template_tab_id = Some(template.tab_id);
+                    template_session_id = Some(session_id);
+                    pane_ci_marker(
+                        "CTERM_TEMPLATE_CI LAUNCH_OK argv=visible cwd=prepared keep_open=true color=#2a7fff",
+                    );
+
+                    pane_ci_activate(&window, "prev-tab")
+                        .unwrap_or_else(|error| pane_ci_fail(current_step, error));
+                    let left_template = template_ci_snapshot(&notebook, &tabs)
+                        .is_some_and(|current| current.tab_id != template.tab_id);
+                    if !left_template {
+                        pane_ci_fail(current_step, "could not leave the unique template tab");
+                    }
+                    pane_ci_activate(&window, "quick-open")
+                        .unwrap_or_else(|error| pane_ci_fail(current_step, error));
+                    if !quick_open.is_visible() || !quick_open.confirm_selection_for_ci() {
+                        pane_ci_fail(current_step, "second Quick Open selection failed");
+                    }
+                    unique_requested_at = Some(std::time::Instant::now());
+                    *step.borrow_mut() = PaneCiStep::WaitUniqueReuse;
+                }
+                PaneCiStep::WaitUniqueReuse => {
+                    if unique_requested_at.is_none_or(|requested| {
+                        requested.elapsed() < std::time::Duration::from_secs(1)
+                    }) {
+                        return glib::ControlFlow::Continue;
+                    }
+                    let template = template_ci_snapshot(&notebook, &tabs)
+                        .unwrap_or_else(|| pane_ci_fail(current_step, "active tab disappeared"));
+                    if template.tab_count != 2 {
+                        pane_ci_fail(
+                            current_step,
+                            format!(
+                                "unique template created a duplicate; tab count is {}",
+                                template.tab_count
+                            ),
+                        );
+                    }
+                    if Some(template.tab_id) != template_tab_id
+                        || template.session_id != template_session_id
+                        || template.template_name.as_deref() != Some(template_name.as_str())
+                    {
+                        pane_ci_fail(
+                            current_step,
+                            "unique template did not focus the existing tab/session",
+                        );
+                    }
+                    pane_ci_marker("CTERM_TEMPLATE_CI UNIQUE_OK tabs=2 session=reused");
+                    plugin_tab_count = Some(template.tab_count);
+                    pane_ci_activate_with_string(&window, "run-plugin-command", &plugin_action_id)
+                        .unwrap_or_else(|error| pane_ci_fail(current_step, error));
+                    *step.borrow_mut() = PaneCiStep::WaitPluginPrompt;
+                }
+                PaneCiStep::WaitPluginPrompt => {
+                    // Transient dialogs are GTK toplevels, but unlike the main
+                    // ApplicationWindow they are not necessarily registered in
+                    // Application::windows(). Inspect all GTK toplevels so this
+                    // exercises the real native approval dialog.
+                    let Some(dialog) = gtk4::Window::list_toplevels()
+                        .into_iter()
+                        .find_map(|candidate| candidate.downcast::<gtk4::MessageDialog>().ok())
+                    else {
+                        return glib::ControlFlow::Continue;
+                    };
+                    let text = dialog
+                        .text()
+                        .map_or_else(String::new, |text| text.to_string());
+                    if !text.contains("UI Test Plugin (org.example.ui)")
+                        || !text.contains("cterm:new-tab (new)")
+                    {
+                        pane_ci_fail(
+                            current_step,
+                            format!("native plugin approval text was incomplete: {text}"),
+                        );
+                    }
+                    pane_ci_marker("CTERM_PLUGIN_CI PROMPT_OK backend=wayland");
+                    dialog.response(gtk4::ResponseType::Yes);
+                    *step.borrow_mut() = PaneCiStep::WaitPluginExecution;
+                }
+                PaneCiStep::WaitPluginExecution => {
+                    let expected = plugin_tab_count
+                        .unwrap_or_else(|| pane_ci_fail(current_step, "tab baseline is absent"))
+                        + 1;
+                    let actual = tabs.borrow().len();
+                    if actual < expected {
+                        return glib::ControlFlow::Continue;
+                    }
+                    if actual != expected {
+                        pane_ci_fail(
+                            current_step,
+                            format!("plugin action produced {actual} tabs instead of {expected}"),
+                        );
+                    }
+                    pane_ci_marker("CTERM_PLUGIN_CI EXECUTION_OK action=cterm:new-tab");
                     pane_ci_marker("CTERM_PANE_CI COMPLETE");
                     destroy_all_pane_sessions(&tabs);
                     window.destroy();
@@ -1936,28 +2689,8 @@ impl CtermWindow {
         // swallow Ctrl+Shift+letter events before key-pressed fires.
         key_controller.set_im_context(None::<&gtk4::IMContext>);
 
-        let shortcuts = self.shortcuts.clone();
-        let notebook = self.notebook.clone();
-        let tabs = Rc::clone(&self.tabs);
-        let next_tab_id = Rc::clone(&self.next_tab_id);
+        let shortcuts = Rc::clone(&self.shortcuts);
         let window = self.window.clone();
-        let config = self.config.clone();
-        let theme = self.theme.clone();
-        let tab_bar = self.tab_bar.clone();
-        let has_bell = Rc::clone(&self.has_bell);
-        let file_manager = Rc::clone(&self.file_manager);
-        let notification_bar = self.notification_bar.clone();
-        let pane_context = PaneActionContext {
-            notebook: notebook.clone(),
-            tabs: Rc::clone(&tabs),
-            config: Rc::clone(&config),
-            theme: theme.clone(),
-            tab_bar: tab_bar.clone(),
-            window: window.clone(),
-            has_bell: Rc::clone(&has_bell),
-            file_manager: Rc::clone(&file_manager),
-            notification_bar: notification_bar.clone(),
-        };
 
         key_controller.connect_key_pressed(move |_, keyval, _keycode, state| {
             // Convert GTK modifiers to our modifiers
@@ -1973,234 +2706,16 @@ impl CtermWindow {
                 }
             }
 
-            // Convert keyval to our key code
-            if let Some(key) = keyval_to_keycode(keyval) {
-                // Check for shortcut match
-                if let Some(action) = shortcuts.match_event(key, modifiers) {
-                    match action {
-                        Action::SplitPane(_)
-                        | Action::ClosePane
-                        | Action::FocusPane(_)
-                        | Action::ResizePane(_)
-                        | Action::TogglePaneZoom => {
-                            perform_pane_action(&pane_context, action.clone());
-                            return glib::Propagation::Stop;
-                        }
-                        Action::NewTab => {
-                            if reject_managed_secondary_action("new-tab shortcut") {
-                                return glib::Propagation::Stop;
-                            }
-                            let (cwd, daemon_socket) = {
-                                let tabs_borrow = tabs.borrow();
-                                if let Some(page_idx) = notebook.current_page() {
-                                    let entry = tabs_borrow.get(page_idx as usize);
-                                    #[cfg(unix)]
-                                    let cwd = entry.and_then(|e| e.terminal.foreground_cwd());
-                                    #[cfg(not(unix))]
-                                    let cwd: Option<String> = None;
-                                    let socket = entry.and_then(|e| e.daemon_socket.clone());
-                                    (cwd, socket)
-                                } else {
-                                    (None, None)
-                                }
-                            };
+            let Some(key) = keyval_to_keycode(keyval) else {
+                return glib::Propagation::Proceed;
+            };
+            let action = shortcuts.borrow().match_event(key, modifiers).cloned();
+            let Some(action) = action else {
+                return glib::Propagation::Proceed;
+            };
 
-                            create_new_tab(
-                                &notebook,
-                                &tabs,
-                                &next_tab_id,
-                                &config,
-                                &theme,
-                                &tab_bar,
-                                &window,
-                                &has_bell,
-                                &file_manager,
-                                &notification_bar,
-                                cwd,
-                                daemon_socket,
-                            );
-                            return glib::Propagation::Stop;
-                        }
-                        Action::CloseTab => {
-                            close_current_tab(&notebook, &tabs, &tab_bar, &window, &config);
-                            return glib::Propagation::Stop;
-                        }
-                        Action::NextTab => {
-                            let n = notebook.n_pages();
-                            if n > 0 {
-                                let current = notebook.current_page().unwrap_or(0);
-                                notebook.set_current_page(Some((current + 1) % n));
-                                sync_tab_bar_active(&tab_bar, &tabs, &notebook);
-                                focus_current_terminal(&notebook, &tabs);
-                            }
-                            return glib::Propagation::Stop;
-                        }
-                        Action::PrevTab => {
-                            let n = notebook.n_pages();
-                            if n > 0 {
-                                let current = notebook.current_page().unwrap_or(0);
-                                let prev = if current == 0 { n - 1 } else { current - 1 };
-                                notebook.set_current_page(Some(prev));
-                                sync_tab_bar_active(&tab_bar, &tabs, &notebook);
-                                focus_current_terminal(&notebook, &tabs);
-                            }
-                            return glib::Propagation::Stop;
-                        }
-                        Action::NextAlertedTab => {
-                            let n = notebook.n_pages();
-                            if n > 0 {
-                                let current = notebook.current_page().unwrap_or(0) as usize;
-                                let tabs_ref = tabs.borrow();
-                                for offset in 1..tabs_ref.len() {
-                                    let idx = (current + offset) % tabs_ref.len();
-                                    if let Some(entry) = tabs_ref.get(idx) {
-                                        if tab_bar.has_bell(entry.id) {
-                                            drop(tabs_ref);
-                                            notebook.set_current_page(Some(idx as u32));
-                                            sync_tab_bar_active(&tab_bar, &tabs, &notebook);
-                                            focus_current_terminal(&notebook, &tabs);
-                                            break;
-                                        }
-                                    }
-                                }
-                            }
-                            return glib::Propagation::Stop;
-                        }
-                        Action::Tab(n) => {
-                            let idx = (*n as u32).saturating_sub(1);
-                            if idx < notebook.n_pages() {
-                                notebook.set_current_page(Some(idx));
-                                sync_tab_bar_active(&tab_bar, &tabs, &notebook);
-                                focus_current_terminal(&notebook, &tabs);
-                            }
-                            return glib::Propagation::Stop;
-                        }
-                        Action::Copy => {
-                            // Copy selection to clipboard
-                            if let Some(page_idx) = notebook.current_page() {
-                                let tabs_ref = tabs.borrow();
-                                if let Some(tab) = tabs_ref.get(page_idx as usize) {
-                                    tab.terminal.copy_selection();
-                                }
-                            }
-                            return glib::Propagation::Stop;
-                        }
-                        Action::Paste => {
-                            // Get clipboard and paste to current terminal
-                            if let Some(display) = gdk::Display::default() {
-                                let clipboard = display.clipboard();
-                                let tabs_paste = Rc::clone(&tabs);
-                                let notebook_paste = notebook.clone();
-                                clipboard.read_text_async(
-                                    None::<&gio::Cancellable>,
-                                    move |result| {
-                                        if let Ok(Some(text)) = result {
-                                            // Find current terminal and write
-                                            if let Some(page_idx) = notebook_paste.current_page() {
-                                                let tabs = tabs_paste.borrow();
-                                                if let Some(tab) = tabs.get(page_idx as usize) {
-                                                    tab.terminal.write_str(&text);
-                                                }
-                                            }
-                                        }
-                                    },
-                                );
-                            }
-                            return glib::Propagation::Stop;
-                        }
-                        Action::ZoomIn => {
-                            if let Some(page_idx) = notebook.current_page() {
-                                let tabs_ref = tabs.borrow();
-                                if let Some(tab) = tabs_ref.get(page_idx as usize) {
-                                    tab.terminal.zoom_in();
-                                }
-                            }
-                            return glib::Propagation::Stop;
-                        }
-                        Action::ZoomOut => {
-                            if let Some(page_idx) = notebook.current_page() {
-                                let tabs_ref = tabs.borrow();
-                                if let Some(tab) = tabs_ref.get(page_idx as usize) {
-                                    tab.terminal.zoom_out();
-                                }
-                            }
-                            return glib::Propagation::Stop;
-                        }
-                        Action::ZoomReset => {
-                            if let Some(page_idx) = notebook.current_page() {
-                                let tabs_ref = tabs.borrow();
-                                if let Some(tab) = tabs_ref.get(page_idx as usize) {
-                                    tab.terminal.zoom_reset();
-                                }
-                            }
-                            return glib::Propagation::Stop;
-                        }
-                        Action::ScrollUp
-                        | Action::ScrollDown
-                        | Action::ScrollPageUp
-                        | Action::ScrollPageDown
-                        | Action::ScrollToTop
-                        | Action::ScrollToBottom
-                        | Action::PromptPrevious
-                        | Action::PromptNext => {
-                            if let Some(page_idx) = notebook.current_page() {
-                                let tabs_ref = tabs.borrow();
-                                if let Some(tab) = tabs_ref.get(page_idx as usize) {
-                                    match action {
-                                        Action::ScrollUp => tab.terminal.scroll_viewport_up(1),
-                                        Action::ScrollDown => tab.terminal.scroll_viewport_down(1),
-                                        Action::ScrollPageUp => {
-                                            tab.terminal.scroll_viewport_page(true)
-                                        }
-                                        Action::ScrollPageDown => {
-                                            tab.terminal.scroll_viewport_page(false)
-                                        }
-                                        Action::ScrollToTop => {
-                                            tab.terminal.scroll_viewport_edge(true)
-                                        }
-                                        Action::ScrollToBottom => {
-                                            tab.terminal.scroll_viewport_edge(false)
-                                        }
-                                        Action::PromptPrevious => {
-                                            tab.terminal.scroll_to_shell_prompt(true)
-                                        }
-                                        Action::PromptNext => {
-                                            tab.terminal.scroll_to_shell_prompt(false)
-                                        }
-                                        _ => unreachable!(),
-                                    }
-                                }
-                            }
-                            return glib::Propagation::Stop;
-                        }
-                        Action::NewWindow => {
-                            gtk4::prelude::ActionGroupExt::activate_action(
-                                &window,
-                                "new-window",
-                                None,
-                            );
-                            return glib::Propagation::Stop;
-                        }
-                        Action::CloseWindow => {
-                            window.close();
-                            return glib::Propagation::Stop;
-                        }
-                        Action::QuickOpenTemplate => {
-                            // Activate the quick-open action
-                            gtk4::prelude::ActionGroupExt::activate_action(
-                                &window,
-                                "quick-open",
-                                None,
-                            );
-                            return glib::Propagation::Stop;
-                        }
-                        _ => {}
-                    }
-                }
-            }
-
-            // Pass to terminal
-            glib::Propagation::Proceed
+            activate_shared_action(&window, &action);
+            glib::Propagation::Stop
         });
 
         self.window.add_controller(key_controller);
@@ -3484,6 +3999,10 @@ fn spawn_daemon_pane(context: &PaneActionContext, direction: SplitDirection) {
     );
     opts.base_palette = Some(frontend_palette(&context.theme, None));
     opts.frontend_state.appearance = context.theme.appearance();
+    opts.set_cursor_defaults(
+        config.appearance.cursor_style.core_style(),
+        config.appearance.cursor_blink,
+    );
     opts.pixel_width = (cell_dims.width * 80.0).round().max(1.0) as u32;
     opts.pixel_height = (cell_dims.height * 24.0).round().max(1.0) as u32;
     let split_native_ssh = opts.ssh.clone();
@@ -3632,6 +4151,13 @@ fn spawn_daemon_tab(
         background_color.as_deref().and_then(parse_rgb),
     ));
     opts.frontend_state.appearance = theme.appearance();
+    {
+        let config = config.borrow();
+        opts.set_cursor_defaults(
+            config.appearance.cursor_style.core_style(),
+            config.appearance.cursor_blink,
+        );
+    }
     if opts.pixel_width == 0 || opts.pixel_height == 0 {
         let cell_dims = calculate_initial_cell_dimensions(&config.borrow());
         opts.pixel_width = (cell_dims.width * opts.cols.max(1) as f64)
@@ -3900,98 +4426,74 @@ fn create_tab_from_template(
     template: &cterm_app::config::StickyTabConfig,
     remote_manager: &cterm_client::RemoteManager,
 ) {
-    // Prepare working directory (clone from git if needed)
-    if let Some(ref working_dir) = template.working_directory {
-        if let Err(e) =
-            cterm_app::prepare_working_directory(working_dir, template.git_remote.as_deref())
-        {
-            log::error!("Failed to prepare working directory: {}", e);
+    // This is the canonical GTK template-launch ingress. Keep the policy here
+    // as well as at menu/shortcut actions so dialog and overlay callbacks can
+    // never bypass managed mode.
+    if reject_managed_secondary_action("template launch") {
+        return;
+    }
+
+    let (plan, launch_theme) = {
+        let cfg = config.borrow();
+        let plan = match TemplateLaunchPlan::build(template, &cfg) {
+            Ok(plan) => plan,
+            Err(error) => {
+                log::error!("Cannot launch template '{}': {error}", template.name);
+                return;
+            }
+        };
+        let launch_theme = resolve_template_theme(&cfg, theme, plan.appearance.theme.as_deref());
+        (plan, launch_theme)
+    };
+
+    if focus_reusable_template(notebook, tabs, tab_bar, &plan) {
+        log::info!("Focused existing template tab: {}", plan.template_name);
+        return;
+    }
+
+    // Only an explicit template workspace owned by the local daemon is ever
+    // prepared here. Named-remote paths belong to that daemon host.
+    if let Some((working_directory, git_remote)) = plan.local_workspace_preparation() {
+        if let Err(error) = cterm_app::prepare_working_directory(working_directory, git_remote) {
+            log::error!(
+                "Failed to prepare workspace for template '{}': {error}",
+                plan.template_name
+            );
+            return;
         }
     }
 
-    let cfg = config.borrow();
+    let opts = plan.session_options(80, 24);
+    let remote = template_remote_details(&plan).map(|(name, host, compression)| {
+        (
+            remote_manager.clone(),
+            name.to_string(),
+            host.to_string(),
+            compression,
+        )
+    });
 
-    // Build daemon session options from template
-    let remote_daemon = template.remote.is_some();
-    let opts = cterm_client::CreateSessionOpts {
-        cols: 80,
-        rows: 24,
-        shell: if remote_daemon {
-            template.command.clone()
-        } else {
-            template
-                .command
-                .clone()
-                .or_else(|| cfg.general.default_shell.clone())
-        },
-        args: if !remote_daemon && template.args.is_empty() && template.command.is_none() {
-            cfg.general.shell_args.clone()
-        } else {
-            template.args.clone()
-        },
-        cwd: template
-            .working_directory
-            .as_ref()
-            .map(|p| p.to_string_lossy().to_string()),
-        env: template
-            .env
-            .iter()
-            .map(|(k, v)| (k.clone(), v.clone()))
-            .collect(),
-        // SSH tabs open a native puressh connection on the daemon.
-        ssh: template.ssh.as_ref().map(|s| s.to_ssh_params()),
-        ..Default::default()
-    };
-
-    // Resolve remote from template
-    let remote_cfg = match template.remote.as_ref() {
-        Some(name) => match cfg.remotes.iter().find(|remote| remote.name == *name) {
-            Some(remote) => Some(remote.clone()),
-            None => {
-                log::error!(
-                    "Template '{}' references unknown remote '{}'",
-                    template.name,
-                    name
-                );
-                return;
-            }
-        },
-        None => None,
-    };
-
-    {
-        let remote = remote_cfg.map(|r| {
-            (
-                remote_manager.clone(),
-                r.name.clone(),
-                r.host.clone(),
-                r.ssh_compression,
-            )
-        });
-        drop(cfg);
-
-        spawn_daemon_tab(
-            notebook,
-            tabs,
-            next_tab_id,
-            config,
-            theme,
-            tab_bar,
-            window,
-            has_bell,
-            file_manager,
-            notification_bar,
-            opts,
-            template.name.clone(),
-            Some(template.name.clone()),
-            template.color.clone(),
-            template.background_color.clone(),
-            template.keep_open,
-            false,
-            remote,
-            None,
-        );
-    }
+    spawn_daemon_tab(
+        notebook,
+        tabs,
+        next_tab_id,
+        config,
+        &launch_theme,
+        tab_bar,
+        window,
+        has_bell,
+        file_manager,
+        notification_bar,
+        opts,
+        plan.template_name.clone(),
+        Some(plan.template_name.clone()),
+        plan.appearance.tab_color.clone(),
+        plan.appearance.background_color.clone(),
+        plan.keep_open,
+        false,
+        remote,
+        None,
+    );
 }
 
 /// Close current tab (with confirmation if process is running)
@@ -4511,10 +5013,16 @@ fn close_other_tabs_now(
 /// Sync tab bar active state with notebook
 /// Focus the active terminal in the currently visible notebook page.
 fn focus_current_terminal(notebook: &Notebook, tabs: &Rc<RefCell<Vec<TabEntry>>>) {
-    if let Some(page) = notebook.current_page() {
-        if let Some(tab) = tabs.borrow().get(page as usize) {
-            tab.terminal.widget().grab_focus();
-        }
+    let widget = notebook.current_page().and_then(|page| {
+        tabs.borrow()
+            .get(page as usize)
+            .map(|tab| tab.terminal.widget().clone())
+    });
+    if let Some(widget) = widget {
+        // `grab_focus` synchronously emits `notify::has-focus`. Drop the tab
+        // registry borrow first because that callback activates the pane and
+        // therefore needs a mutable borrow of the same registry.
+        widget.grab_focus();
     }
 }
 
@@ -4659,12 +5167,15 @@ fn calculate_initial_cell_dimensions(config: &Config) -> CellDimensions {
             let descent = metrics.descent() as f64 / pango::SCALE as f64;
             let height = ascent + descent;
 
-            if char_width > 0.0 && height > 0.0 {
-                return CellDimensions {
-                    width: char_width,
-                    height: height * 1.1,
-                };
+            if let Some(dimensions) = CellDimensions::checked(char_width, height * 1.1) {
+                return dimensions;
             }
+            log::warn!(
+                "Ignoring invalid initial metrics for font '{}': width={}, height={}",
+                font_name,
+                char_width,
+                height
+            );
         }
     }
 
@@ -4675,17 +5186,17 @@ fn calculate_initial_cell_dimensions(config: &Config) -> CellDimensions {
     layout.set_text("M");
 
     let (width, height) = layout.pixel_size();
-    if width > 0 && height > 0 {
-        return CellDimensions {
-            width: width as f64,
-            height: height as f64 * 1.1,
-        };
+    if let Some(dimensions) = CellDimensions::checked(width as f64, height as f64 * 1.1) {
+        return dimensions;
     }
 
-    panic!(
-        "Failed to load any font or measure text. \
-         Please ensure fonts are installed (e.g., fonts-dejavu or similar)."
+    let fallback = CellDimensions::conservative_fallback(font_size);
+    log::error!(
+        "No usable initial font metrics; using conservative cell size {}x{}",
+        fallback.width,
+        fallback.height
     );
+    fallback
 }
 
 #[cfg(test)]
@@ -4775,6 +5286,185 @@ mod tests {
         assert_eq!(
             keyval_to_keycode(gdk::Key::underscore),
             Some(KeyCode::Minus)
+        );
+    }
+
+    #[test]
+    fn formerly_missing_shortcut_actions_map_to_native_gtk_actions() {
+        for (action, name) in [
+            (Action::SelectAll, "select-all"),
+            (Action::ToggleFullscreen, "toggle-fullscreen"),
+            (Action::OpenPreferences, "preferences"),
+            (Action::FindText, "find"),
+            (Action::ResetTerminal, "reset"),
+        ] {
+            assert_eq!(
+                gtk_action_activation(&action),
+                GtkActionActivation::simple(name)
+            );
+        }
+    }
+
+    #[test]
+    fn parameterized_actions_preserve_their_native_parameters() {
+        assert_eq!(
+            gtk_action_activation(&Action::Tab(7)),
+            GtkActionActivation::with_string("select-tab-index", "7")
+        );
+        assert_eq!(
+            gtk_action_activation(&Action::SplitPane(SplitDirection::Horizontal)),
+            GtkActionActivation::simple("split-pane-horizontal")
+        );
+        assert_eq!(
+            gtk_action_activation(&Action::FocusPane(PaneDirection::Down)),
+            GtkActionActivation::simple("focus-pane-down")
+        );
+    }
+
+    #[test]
+    fn managed_policy_blocks_secondary_session_and_configuration_actions() {
+        for action in [
+            Action::NewTab,
+            Action::SplitPane(SplitDirection::Vertical),
+            Action::ClosePane,
+            Action::FocusPane(PaneDirection::Left),
+            Action::ResizePane(PaneDirection::Right),
+            Action::TogglePaneZoom,
+            Action::NewWindow,
+            Action::OpenPreferences,
+            Action::QuickOpenTemplate,
+        ] {
+            assert!(is_managed_restricted_action(&action), "{action:?}");
+        }
+
+        for action in [
+            Action::CloseTab,
+            Action::CloseWindow,
+            Action::Copy,
+            Action::SelectAll,
+            Action::ToggleFullscreen,
+            Action::FindText,
+            Action::ResetTerminal,
+        ] {
+            assert!(!is_managed_restricted_action(&action), "{action:?}");
+        }
+    }
+
+    #[test]
+    fn template_adapter_preserves_local_ssh_and_named_daemon_intent() {
+        use cterm_app::config::{RemoteConfig, SshTabConfig, StickyTabConfig};
+
+        let ssh_template = StickyTabConfig {
+            name: "Production shell".into(),
+            ssh: Some(SshTabConfig {
+                host: "shell.example".into(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let local_plan = TemplateLaunchPlan::build(&ssh_template, &Config::default()).unwrap();
+        let local_options = local_plan.session_options(80, 24);
+        assert!(template_remote_details(&local_plan).is_none());
+        assert_eq!(
+            local_options.ssh.as_ref().map(|ssh| ssh.host.as_str()),
+            Some("shell.example")
+        );
+
+        let mut config = Config::default();
+        config.remotes.push(RemoteConfig {
+            name: "build".into(),
+            host: "dev@build.example".into(),
+            ssh_compression: false,
+        });
+        let remote_template = StickyTabConfig {
+            name: "Remote build".into(),
+            command: Some("just".into()),
+            args: vec!["test".into()],
+            working_directory: Some("/srv/project".into()),
+            remote: Some("build".into()),
+            ..Default::default()
+        };
+        let remote_plan = TemplateLaunchPlan::build(&remote_template, &config).unwrap();
+        assert_eq!(
+            template_remote_details(&remote_plan),
+            Some(("build", "dev@build.example", false))
+        );
+        assert!(remote_plan.local_workspace_preparation().is_none());
+        let remote_options = remote_plan.session_options(80, 24);
+        assert_eq!(remote_options.shell.as_deref(), Some("just"));
+        assert_eq!(remote_options.args, ["test"]);
+        assert_eq!(remote_options.cwd.as_deref(), Some("/srv/project"));
+    }
+
+    #[test]
+    fn template_adapter_uses_docker_argv_and_plan_metadata() {
+        use cterm_app::config::{DockerMode, DockerTabConfig, StickyTabConfig};
+
+        let template = StickyTabConfig {
+            name: "Alpine".into(),
+            color: Some("#0db7ed".into()),
+            keep_open: true,
+            docker: Some(DockerTabConfig {
+                mode: DockerMode::Run,
+                image: Some("alpine:latest".into()),
+                shell: Some("/bin/ash".into()),
+                auto_remove: true,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let plan = TemplateLaunchPlan::build(&template, &Config::default()).unwrap();
+        let options = plan.session_options(80, 24);
+        assert_eq!(options.shell.as_deref(), Some("docker"));
+        assert_eq!(
+            options.args,
+            ["run", "-it", "--rm", "alpine:latest", "/bin/ash"]
+        );
+        assert_eq!(plan.appearance.tab_color.as_deref(), Some("#0db7ed"));
+        assert!(plan.keep_open);
+    }
+
+    #[test]
+    fn unique_template_policy_reuses_only_matching_template_identity() {
+        let candidates = [
+            (0, 11, Some("Editor")),
+            (1, 22, Some("Logs")),
+            (2, 33, None),
+        ];
+        assert_eq!(
+            reusable_template_location(TemplateInstancePolicy::ReuseExisting, "Logs", candidates),
+            Some((1, 22))
+        );
+        assert_eq!(
+            reusable_template_location(TemplateInstancePolicy::AlwaysCreate, "Logs", candidates),
+            None
+        );
+    }
+
+    #[test]
+    fn template_theme_override_is_scoped_and_unknown_names_fall_back() {
+        let mut config = Config::default();
+        config.appearance.custom_theme = Some(Theme::light());
+        let window_theme = Theme::tokyo_night();
+
+        let nord = resolve_template_theme(&config, &window_theme, Some("nord"));
+        assert_eq!(nord.name, "Nord");
+        let custom = resolve_template_theme(&config, &window_theme, Some("custom"));
+        assert_eq!(custom.name, "Default Light");
+        let unknown = resolve_template_theme(&config, &window_theme, Some("does-not-exist"));
+        assert_eq!(unknown.name, "Tokyo Night");
+        assert_eq!(window_theme.name, "Tokyo Night");
+    }
+
+    #[test]
+    fn gtk_provides_the_conventional_fullscreen_shortcut() {
+        let shortcuts = shortcut_manager(&Config::default());
+        assert_eq!(
+            shortcuts
+                .match_event(KeyCode::F11, Modifiers::empty())
+                .cloned(),
+            Some(Action::ToggleFullscreen)
         );
     }
 }

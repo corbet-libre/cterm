@@ -13,7 +13,11 @@ pub mod grid;
 pub mod image_decode;
 pub mod iterm2;
 pub mod keyboard;
+mod kitty_graphics;
+mod kitty_placeholder;
 pub mod mouse;
+mod multiple_cursors;
+mod osc1337;
 pub mod parser;
 pub mod pty;
 pub mod screen;
@@ -21,6 +25,7 @@ pub mod sixel;
 pub mod ssh;
 pub mod streaming_file;
 pub mod term;
+mod text_sizing;
 
 pub use cell::{Cell, CellAttrs};
 pub use color::{AnsiColor, Color, ColorPalette, Rgb};
@@ -28,15 +33,17 @@ pub use drcs::{DecdldDecoder, DrcsFont, DrcsGlyph};
 pub use grid::Grid;
 pub use image_decode::{decode_image, DecodedImage, ImageDecodeError};
 pub use iterm2::{Iterm2Dimension, Iterm2FileParams};
-pub use keyboard::{KeyEventKind, KeyboardEnhancementFlags};
+pub use keyboard::{KeyEventKind, KeyEventMetadata, KeyboardEnhancementFlags};
+pub use kitty_graphics::GraphicsAnimationTick;
+pub use multiple_cursors::{ExtraCursor, ExtraCursorColor, ExtraCursorColors, ExtraCursorShape};
 pub use parser::Parser;
 #[cfg(unix)]
 pub use pty::save_original_nofile_limit;
 pub use pty::{Pty, PtyConfig, PtyError, PtySize};
 pub use screen::{
     ClipboardOperation, ClipboardSelection, ColorQuery, CursorStyle, DesktopNotification,
-    DesktopNotificationAction, FileTransferOperation, FrontendState, MouseEncoding, MouseMode,
-    NotificationUrgency, Screen, SearchResult, Selection, SelectionMode, SelectionPoint,
+    DesktopNotificationAction, FileTransferOperation, FrontendState, ImageLayer, MouseEncoding,
+    MouseMode, NotificationUrgency, Screen, SearchResult, Selection, SelectionMode, SelectionPoint,
     TerminalImage, ThemeAppearance, WindowVisibility,
 };
 pub use sixel::{SixelDecoder, SixelImage};
@@ -48,3 +55,4 @@ pub use ssh::{
 pub use ssh::{SshChannelOpener, SshChannelReader, SshChannelWriter, SshTunnel};
 pub use streaming_file::{StreamingFileData, StreamingFileReceiver, StreamingFileResult};
 pub use term::{Terminal, WriteFn};
+pub use text_sizing::{Multicell, TextSizeAlignment};

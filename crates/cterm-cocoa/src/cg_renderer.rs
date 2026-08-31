@@ -14,10 +14,16 @@ use cterm_core::color::{Color, ColorPalette, Rgb};
 use cterm_core::drcs::DrcsGlyph;
 use cterm_core::TerminalImage;
 use cterm_core::{CursorStyle, Terminal};
+use cterm_ui::blink::{cell_foreground_visible, cursor_visible, BlinkPhase};
+use cterm_ui::cursor::{cursor_footprint, extra_cursors_visible, resolve_extra_cursor_colors};
+use cterm_ui::text_sizing::{
+    is_multicell_render_anchor, multicell_is_selected, multicell_render_metrics,
+};
 use cterm_ui::theme::Theme;
 
 /// CoreGraphics renderer for terminal display
 pub struct CGRenderer {
+    font_name: String,
     font: Retained<NSFont>,
     bold_font: Retained<NSFont>,
     italic_font: Retained<NSFont>,
@@ -73,6 +79,7 @@ impl CGRenderer {
         );
 
         Self {
+            font_name: font_name.to_string(),
             font,
             bold_font,
             italic_font,
@@ -83,6 +90,35 @@ impl CGRenderer {
             bold_is_bright,
             background_override: None,
         }
+    }
+
+    /// Return the current font size in points.
+    pub fn font_size(&self) -> f64 {
+        self.font.pointSize()
+    }
+
+    /// Rebuild the renderer fonts and cell metrics for a new point size.
+    pub fn set_font_size(&mut self, mtm: MainThreadMarker, font_size: f64) {
+        let font = Self::load_font(&self.font_name, font_size);
+        let fm = NSFontManager::sharedFontManager(mtm);
+        let bold_font = fm.convertFont_toHaveTrait(&font, NSFontTraitMask::BoldFontMask);
+        let italic_font = fm.convertFont_toHaveTrait(&font, NSFontTraitMask::ItalicFontMask);
+        let bold_italic_font =
+            fm.convertFont_toHaveTrait(&bold_font, NSFontTraitMask::ItalicFontMask);
+
+        self.cell_width = Self::get_advance_for_glyph(&font);
+        self.cell_height = font_size * 1.2;
+        self.font = font;
+        self.bold_font = bold_font;
+        self.italic_font = italic_font;
+        self.bold_italic_font = bold_italic_font;
+
+        log::debug!(
+            "CGRenderer: font_size={}, cell_width={}, cell_height={}",
+            font_size,
+            self.cell_width,
+            self.cell_height
+        );
     }
 
     /// Set an optional background color override (hex string like "#1a1b26")
@@ -121,7 +157,7 @@ impl CGRenderer {
     }
 
     /// Render the terminal content
-    pub fn render(&self, terminal: &Terminal, bounds: NSRect) {
+    pub fn render(&self, terminal: &Terminal, bounds: NSRect, blink_phase: BlinkPhase) {
         let Some(_context) = NSGraphicsContext::currentContext() else {
             log::warn!("No graphics context");
             return;
@@ -136,182 +172,260 @@ impl CGRenderer {
         }
         let palette = screen.resolved_palette(&base_palette);
         let normal_background = &palette.background;
+        let visible_top = screen.visible_row_to_absolute_line(0);
 
         // Draw background
         self.draw_background(bounds, screen.modes.reverse_video, &palette);
 
-        // Draw cells
-        for row in 0..rows {
-            // Get absolute line for scrollback access and selection checking
-            let absolute_line = screen.visible_row_to_absolute_line(row);
+        self.render_images(screen, cterm_core::ImageLayer::BehindCellBackground);
 
-            for col in 0..cols {
-                if let Some(cell) = screen.get_cell_with_scrollback(absolute_line, col) {
-                    // Skip wide char spacers - background handled by the wide cell
-                    if cell.is_wide_spacer() {
-                        continue;
-                    }
+        for render_foreground in [false, true] {
+            if render_foreground {
+                self.render_images(screen, cterm_core::ImageLayer::BehindText);
+            }
 
-                    let x = col as f64 * self.cell_width;
-                    let y = row as f64 * self.cell_height;
+            // Draw cells in separate background and foreground passes so
+            // negative-z Kitty images can sit precisely between them.
+            for row in 0..rows {
+                // Get absolute line for scrollback access and selection checking
+                let absolute_line = screen.visible_row_to_absolute_line(row);
 
-                    // Check if cell is selected
-                    let is_selected = screen.is_selected(absolute_line, col);
-
-                    // XOR selection with INVERSE attribute to determine if colors should be inverted
-                    let is_inverted = cell.attrs.contains(CellAttrs::INVERSE)
-                        ^ is_selected
-                        ^ screen.modes.reverse_video;
-
-                    // Apply bold_is_bright: map base ANSI fg colors to bright variants
-                    let fg = if self.bold_is_bright && cell.attrs.contains(CellAttrs::BOLD) {
-                        match cell.fg {
-                            Color::Ansi(ansi) => Color::Ansi(ansi.bright()),
-                            Color::Indexed(idx @ 0..=7) => Color::Indexed(idx + 8),
-                            other => other,
+                for col in 0..cols {
+                    if let Some(cell) = screen.get_cell_with_scrollback(absolute_line, col) {
+                        if cell.is_wide_spacer() {
+                            continue;
                         }
-                    } else {
-                        cell.fg
-                    };
-
-                    // Determine actual foreground and background colors
-                    let (fg_color, bg_color) = if is_inverted {
-                        // Inverted: swap foreground and background
-                        let fg_rgb = if cell.bg.is_default() {
-                            *normal_background
-                        } else {
-                            Self::color_to_rgb(screen, &cell.bg, &palette)
-                        };
-                        let bg_rgb = if fg.is_default() {
-                            palette.foreground
-                        } else {
-                            Self::color_to_rgb(screen, &fg, &palette)
-                        };
-                        (fg_rgb, bg_rgb)
-                    } else {
-                        let bg = if cell.bg.is_default() {
-                            *normal_background
-                        } else {
-                            Self::color_to_rgb(screen, &cell.bg, &palette)
-                        };
-                        (Self::color_to_rgb(screen, &fg, &palette), bg)
-                    };
-
-                    // Apply dim (SGR 2) — halve foreground brightness
-                    let fg_color = if cell.attrs.contains(CellAttrs::DIM) {
-                        Rgb::new(
-                            (fg_color.r as f64 * 0.5) as u8,
-                            (fg_color.g as f64 * 0.5) as u8,
-                            (fg_color.b as f64 * 0.5) as u8,
-                        )
-                    } else {
-                        fg_color
-                    };
-
-                    // Cornflower blue for hyperlinks with default foreground
-                    let fg_color = if cell.hyperlink.is_some() && fg.is_default() && !is_inverted {
-                        Rgb::new(100, 149, 237)
-                    } else {
-                        fg_color
-                    };
-
-                    // Use double width for wide characters
-                    let char_width = if cell.is_wide() {
-                        self.cell_width * 2.0
-                    } else {
-                        self.cell_width
-                    };
-
-                    // Draw cell background if not default or if selected/inverted
-                    if !cell.bg.is_default()
-                        || is_inverted
-                        || is_selected
-                        || screen.modes.reverse_video
-                    {
-                        self.draw_cell_background_sized(x, y, char_width, &bg_color);
-                    }
-
-                    // Draw character
-                    if cell.text() != " "
-                        && cell.text() != "\0"
-                        && !cell.attrs.contains(CellAttrs::HIDDEN)
-                    {
-                        // DRCS is defined for individual character positions,
-                        // while normal text may be a full grapheme cluster.
-                        let drcs = cell.single_char().and_then(|c| screen.get_drcs_for_char(c));
-                        if let Some(glyph) = drcs {
-                            self.draw_drcs_glyph(glyph, x, y, &fg_color);
-                        } else {
-                            self.draw_text_rgb(cell.text(), x, y, &fg_color, cell.attrs);
+                        let multicell = cell.multicell.as_ref();
+                        if multicell.is_some_and(|multicell| {
+                            !is_multicell_render_anchor(multicell, absolute_line, visible_top)
+                        }) {
+                            continue;
                         }
-                    }
+                        let metrics = multicell.map(multicell_render_metrics);
 
-                    // Draw underlines (regular underline attributes or hyperlinks)
-                    let has_hyperlink = cell.hyperlink.is_some();
-                    let visible = !cell.attrs.contains(CellAttrs::HIDDEN);
-                    if visible && (cell.attrs.has_underline() || has_hyperlink) {
-                        // Use hyperlink color (blue) for hyperlinks, otherwise use underline color or fg
-                        let underline_color = if has_hyperlink {
-                            Rgb {
-                                r: 100,
-                                g: 149,
-                                b: 237,
-                            } // Cornflower blue for hyperlinks
-                        } else if let Some(ref uc) = cell.underline_color {
-                            Self::color_to_rgb(screen, uc, &palette)
+                        let x = col as f64 * self.cell_width;
+                        let cell_y = row as f64 * self.cell_height;
+                        let y = metrics.map_or(cell_y, |_| {
+                            cell_y
+                                - self.cell_height
+                                    * f64::from(
+                                        multicell.expect("metrics require metadata").row_offset,
+                                    )
+                        });
+                        let text_x = x + metrics
+                            .map_or(0.0, |metrics| metrics.horizontal_offset * self.cell_width);
+                        let text_y = y + metrics
+                            .map_or(0.0, |metrics| metrics.vertical_offset * self.cell_height);
+                        let text =
+                            multicell.map_or_else(|| cell.text(), |multicell| multicell.text());
+                        let foreground_visible = cell_foreground_visible(cell.attrs, blink_phase);
+
+                        // Check if cell is selected
+                        let is_selected = multicell.map_or_else(
+                            || screen.is_selected(absolute_line, col),
+                            |multicell| {
+                                multicell_is_selected(screen, absolute_line, col, multicell)
+                            },
+                        );
+
+                        // XOR selection with INVERSE attribute to determine if colors should be inverted
+                        let is_inverted = cell.attrs.contains(CellAttrs::INVERSE)
+                            ^ is_selected
+                            ^ screen.modes.reverse_video;
+
+                        // Apply bold_is_bright: map base ANSI fg colors to bright variants
+                        let fg = if self.bold_is_bright && cell.attrs.contains(CellAttrs::BOLD) {
+                            match cell.fg {
+                                Color::Ansi(ansi) => Color::Ansi(ansi.bright()),
+                                Color::Indexed(idx @ 0..=7) => Color::Indexed(idx + 8),
+                                other => other,
+                            }
+                        } else {
+                            cell.fg
+                        };
+
+                        // Determine actual foreground and background colors
+                        let (fg_color, bg_color) = if is_inverted {
+                            // Inverted: swap foreground and background
+                            let fg_rgb = if cell.bg.is_default() {
+                                *normal_background
+                            } else {
+                                Self::color_to_rgb(screen, &cell.bg, &palette)
+                            };
+                            let bg_rgb = if fg.is_default() {
+                                palette.foreground
+                            } else {
+                                Self::color_to_rgb(screen, &fg, &palette)
+                            };
+                            (fg_rgb, bg_rgb)
+                        } else {
+                            let bg = if cell.bg.is_default() {
+                                *normal_background
+                            } else {
+                                Self::color_to_rgb(screen, &cell.bg, &palette)
+                            };
+                            (Self::color_to_rgb(screen, &fg, &palette), bg)
+                        };
+
+                        // Apply dim (SGR 2) — halve foreground brightness
+                        let fg_color = if cell.attrs.contains(CellAttrs::DIM) {
+                            Rgb::new(
+                                (fg_color.r as f64 * 0.5) as u8,
+                                (fg_color.g as f64 * 0.5) as u8,
+                                (fg_color.b as f64 * 0.5) as u8,
+                            )
                         } else {
                             fg_color
                         };
 
-                        self.draw_underline(
-                            x,
-                            y,
-                            char_width,
-                            &underline_color,
-                            &cell.attrs,
-                            has_hyperlink,
-                        );
-                    }
+                        // Cornflower blue for hyperlinks with default foreground
+                        let fg_color =
+                            if cell.hyperlink.is_some() && fg.is_default() && !is_inverted {
+                                Rgb::new(100, 149, 237)
+                            } else {
+                                fg_color
+                            };
 
-                    // Draw strikethrough
-                    if visible && cell.attrs.contains(CellAttrs::STRIKETHROUGH) {
-                        self.draw_strikethrough(x, y, char_width, &fg_color);
-                    }
+                        // Use double width for wide characters
+                        let char_width = if let Some(multicell) = multicell {
+                            self.cell_width * f64::from(multicell.columns)
+                        } else if cell.is_wide() {
+                            self.cell_width * 2.0
+                        } else {
+                            self.cell_width
+                        };
+                        let char_height = metrics.map_or(self.cell_height, |metrics| {
+                            self.cell_height * metrics.rows as f64
+                        });
 
-                    // Draw overline
-                    if visible && cell.attrs.contains(CellAttrs::OVERLINE) {
-                        self.draw_overline(x, y, char_width, &fg_color);
+                        // Draw cell background if not default or if selected/inverted
+                        if !render_foreground
+                            && (!cell.bg.is_default()
+                                || is_inverted
+                                || is_selected
+                                || screen.modes.reverse_video)
+                        {
+                            self.draw_cell_background_sized(
+                                x,
+                                y,
+                                char_width,
+                                char_height,
+                                &bg_color,
+                            );
+                        }
+
+                        // Draw character
+                        if render_foreground
+                            && foreground_visible
+                            && text != " "
+                            && text != "\0"
+                            && !cell.is_kitty_image_placeholder()
+                            && !cell.attrs.contains(CellAttrs::HIDDEN)
+                        {
+                            // DRCS is defined for individual character positions,
+                            // while normal text may be a full grapheme cluster.
+                            let drcs = multicell
+                                .is_none()
+                                .then(|| cell.single_char())
+                                .flatten()
+                                .and_then(|c| screen.get_drcs_for_char(c));
+                            if let Some(glyph) = drcs {
+                                self.draw_drcs_glyph(glyph, x, y, &fg_color);
+                            } else {
+                                self.draw_text_rgb(
+                                    text,
+                                    text_x,
+                                    text_y,
+                                    (char_width - (text_x - x)).max(self.cell_width),
+                                    (char_height - (text_y - y)).max(self.cell_height),
+                                    &fg_color,
+                                    cell.attrs,
+                                    metrics.map_or(1.0, |metrics| metrics.font_scale),
+                                );
+                            }
+                        }
+
+                        // Draw underlines (regular underline attributes or hyperlinks)
+                        let has_hyperlink = cell.hyperlink.is_some();
+                        let visible = foreground_visible && !cell.attrs.contains(CellAttrs::HIDDEN);
+                        if render_foreground
+                            && visible
+                            && (cell.attrs.has_underline() || has_hyperlink)
+                        {
+                            // Use hyperlink color (blue) for hyperlinks, otherwise use underline color or fg
+                            let underline_color = if has_hyperlink {
+                                Rgb {
+                                    r: 100,
+                                    g: 149,
+                                    b: 237,
+                                } // Cornflower blue for hyperlinks
+                            } else if let Some(ref uc) = cell.underline_color {
+                                Self::color_to_rgb(screen, uc, &palette)
+                            } else {
+                                fg_color
+                            };
+
+                            self.draw_underline(
+                                x,
+                                y,
+                                char_width,
+                                char_height,
+                                &underline_color,
+                                &cell.attrs,
+                                has_hyperlink,
+                            );
+                        }
+
+                        // Draw strikethrough
+                        if render_foreground
+                            && visible
+                            && cell.attrs.contains(CellAttrs::STRIKETHROUGH)
+                        {
+                            self.draw_strikethrough(x, y, char_width, char_height, &fg_color);
+                        }
+
+                        // Draw overline
+                        if render_foreground && visible && cell.attrs.contains(CellAttrs::OVERLINE)
+                        {
+                            self.draw_overline(x, y, char_width, char_height, &fg_color);
+                        }
                     }
                 }
             }
         }
 
-        // Draw images (Sixel, etc.)
-        self.render_images(screen);
+        self.render_images(screen, cterm_core::ImageLayer::AboveText);
 
-        // Draw cursor (only when visible and not scrolled back)
+        if extra_cursors_visible(screen, blink_phase) {
+            for cursor in screen.extra_cursors() {
+                let colors = resolve_extra_cursor_colors(
+                    screen,
+                    &palette,
+                    self.theme.cursor.text_color,
+                    cursor.row,
+                    cursor.col,
+                );
+                self.draw_cursor_cell(
+                    screen,
+                    cursor.row,
+                    cursor.col,
+                    cursor.shape.resolve(screen.cursor.style),
+                    &colors.cursor,
+                    &colors.text,
+                );
+            }
+        }
+
+        // Draw main cursor (only when visible and not scrolled back).
         let cursor = &screen.cursor;
-        if screen.modes.show_cursor && screen.scroll_offset == 0 {
-            let cursor_x = cursor.col as f64 * self.cell_width;
-            let cursor_y = cursor.row as f64 * self.cell_height;
-
-            // Check if cursor is on a wide character
-            let cursor_width = if let Some(cell) = screen.grid().get(cursor.row, cursor.col) {
-                if cell.is_wide() {
-                    self.cell_width * 2.0
-                } else {
-                    self.cell_width
-                }
-            } else {
-                self.cell_width
-            };
-
-            self.draw_cursor(
-                cursor_x,
-                cursor_y,
-                cursor_width,
+        if cursor_visible(screen, blink_phase) {
+            self.draw_cursor_cell(
+                screen,
+                cursor.row,
+                cursor.col,
                 cursor.style,
                 &palette.cursor,
+                &self.theme.cursor.text_color,
             );
         }
 
@@ -427,8 +541,8 @@ impl CGRenderer {
     }
 
     /// Render terminal images (Sixel graphics, etc.)
-    fn render_images(&self, screen: &cterm_core::Screen) {
-        for image in screen.visible_images() {
+    fn render_images(&self, screen: &cterm_core::Screen, layer: cterm_core::ImageLayer) {
+        for image in screen.visible_images_in_layer(layer) {
             if let Some(visible_row) = screen.image_visible_row(image) {
                 let x = image.col as f64 * self.cell_width;
                 let y = visible_row as f64 * self.cell_height;
@@ -594,8 +708,8 @@ impl CGRenderer {
         }
     }
 
-    fn draw_cell_background_sized(&self, x: f64, y: f64, width: f64, rgb: &Rgb) {
-        let rect = NSRect::new(NSPoint::new(x, y), NSSize::new(width, self.cell_height));
+    fn draw_cell_background_sized(&self, x: f64, y: f64, width: f64, height: f64, rgb: &Rgb) {
+        let rect = NSRect::new(NSPoint::new(x, y), NSSize::new(width, height));
         unsafe {
             let ns_color = Self::ns_color(rgb.r, rgb.g, rgb.b);
             let _: () = msg_send![&*ns_color, setFill];
@@ -603,10 +717,21 @@ impl CGRenderer {
         }
     }
 
-    fn draw_text_rgb(&self, value: &str, x: f64, y: f64, rgb: &Rgb, attrs: CellAttrs) {
+    #[allow(clippy::too_many_arguments)]
+    fn draw_text_rgb(
+        &self,
+        value: &str,
+        x: f64,
+        y: f64,
+        width: f64,
+        height: f64,
+        rgb: &Rgb,
+        attrs: CellAttrs,
+        font_scale: f64,
+    ) {
         let text = NSString::from_str(value);
 
-        let font = match (
+        let base_font = match (
             attrs.contains(CellAttrs::BOLD),
             attrs.contains(CellAttrs::ITALIC),
         ) {
@@ -615,6 +740,25 @@ impl CGRenderer {
             (false, true) => &self.italic_font,
             (false, false) => &self.font,
         };
+        let scaled_font = (font_scale != 1.0).then(|| {
+            let font = Self::load_font(&self.font_name, self.font.pointSize() * font_scale);
+            let fm = NSFontManager::sharedFontManager(
+                MainThreadMarker::new().expect("CoreGraphics rendering is main-thread only"),
+            );
+            match (
+                attrs.contains(CellAttrs::BOLD),
+                attrs.contains(CellAttrs::ITALIC),
+            ) {
+                (true, true) => {
+                    let bold = fm.convertFont_toHaveTrait(&font, NSFontTraitMask::BoldFontMask);
+                    fm.convertFont_toHaveTrait(&bold, NSFontTraitMask::ItalicFontMask)
+                }
+                (true, false) => fm.convertFont_toHaveTrait(&font, NSFontTraitMask::BoldFontMask),
+                (false, true) => fm.convertFont_toHaveTrait(&font, NSFontTraitMask::ItalicFontMask),
+                (false, false) => font,
+            }
+        });
+        let font: &NSFont = scaled_font.as_deref().unwrap_or(base_font);
 
         unsafe {
             let ns_color = Self::ns_color(rgb.r, rgb.g, rgb.b);
@@ -627,7 +771,8 @@ impl CGRenderer {
                 std::mem::transmute::<&NSString, &AnyObject>(&font_key),
                 std::mem::transmute::<&NSString, &AnyObject>(&color_key),
             ];
-            let values: [&AnyObject; 2] = [&**font, &*ns_color];
+            let values: [&AnyObject; 2] =
+                [std::mem::transmute::<&NSFont, &AnyObject>(font), &*ns_color];
 
             let dict: Retained<AnyObject> = msg_send![
                 class!(NSDictionary),
@@ -636,9 +781,16 @@ impl CGRenderer {
                 count: 2usize
             ];
 
-            // In a flipped view, drawAtPoint places text with point as top-left of the text
+            let rect = NSRect::new(NSPoint::new(x, y), NSSize::new(width, height));
+            let _: () = msg_send![class!(NSGraphicsContext), saveGraphicsState];
+            let clip: Retained<AnyObject> =
+                msg_send![class!(NSBezierPath), bezierPathWithRect: rect];
+            let _: () = msg_send![&*clip, addClip];
+            // Keep OSC 66 payloads on one line. The block is a clipping area,
+            // not a request for AppKit paragraph wrapping.
             let point = NSPoint::new(x, y);
             let _: () = msg_send![&*text, drawAtPoint: point, withAttributes: &*dict];
+            let _: () = msg_send![class!(NSGraphicsContext), restoreGraphicsState];
         }
     }
 
@@ -669,16 +821,21 @@ impl CGRenderer {
         }
     }
 
-    fn draw_cursor(&self, x: f64, y: f64, width: f64, style: CursorStyle, cursor_color: &Rgb) {
+    fn draw_cursor(
+        &self,
+        x: f64,
+        y: f64,
+        width: f64,
+        height: f64,
+        style: CursorStyle,
+        cursor_color: &Rgb,
+    ) {
         let rect = match style {
-            CursorStyle::Block => {
-                NSRect::new(NSPoint::new(x, y), NSSize::new(width, self.cell_height))
+            CursorStyle::Block => NSRect::new(NSPoint::new(x, y), NSSize::new(width, height)),
+            CursorStyle::Underline => {
+                NSRect::new(NSPoint::new(x, y + height - 2.0), NSSize::new(width, 2.0))
             }
-            CursorStyle::Underline => NSRect::new(
-                NSPoint::new(x, y + self.cell_height - 2.0),
-                NSSize::new(width, 2.0),
-            ),
-            CursorStyle::Bar => NSRect::new(NSPoint::new(x, y), NSSize::new(2.0, self.cell_height)),
+            CursorStyle::Bar => NSRect::new(NSPoint::new(x, y), NSSize::new(2.0, height)),
         };
         unsafe {
             let color = Self::ns_color_alpha(cursor_color.r, cursor_color.g, cursor_color.b, 0.7);
@@ -687,17 +844,64 @@ impl CGRenderer {
         }
     }
 
+    fn draw_cursor_cell(
+        &self,
+        screen: &cterm_core::Screen,
+        row: usize,
+        col: usize,
+        style: CursorStyle,
+        cursor_color: &Rgb,
+        text_color: &Rgb,
+    ) {
+        let footprint = cursor_footprint(screen, row, col);
+        let x = footprint.col as f64 * self.cell_width;
+        let y = footprint.row as f64 * self.cell_height;
+        let width = footprint.columns as f64 * self.cell_width;
+        let height = footprint.rows as f64 * self.cell_height;
+        self.draw_cursor(x, y, width, height, style, cursor_color);
+
+        if style == CursorStyle::Block {
+            if let Some(cell) = screen.get_cell(footprint.row, footprint.col) {
+                let multicell = cell.multicell.as_ref();
+                let text = multicell.map_or_else(|| cell.text(), |multicell| multicell.text());
+                if text != " "
+                    && text != "\0"
+                    && !cell.is_kitty_image_placeholder()
+                    && !cell.attrs.contains(CellAttrs::HIDDEN)
+                {
+                    let metrics = multicell.map(multicell_render_metrics);
+                    let text_x = x + metrics
+                        .map_or(0.0, |metrics| metrics.horizontal_offset * self.cell_width);
+                    let text_y = y + metrics
+                        .map_or(0.0, |metrics| metrics.vertical_offset * self.cell_height);
+                    self.draw_text_rgb(
+                        text,
+                        text_x,
+                        text_y,
+                        (width - (text_x - x)).max(self.cell_width),
+                        (height - (text_y - y)).max(self.cell_height),
+                        text_color,
+                        cell.attrs,
+                        metrics.map_or(1.0, |metrics| metrics.font_scale),
+                    );
+                }
+            }
+        }
+    }
+
     /// Draw underline for a cell
+    #[allow(clippy::too_many_arguments)]
     fn draw_underline(
         &self,
         x: f64,
         y: f64,
         width: f64,
+        height: f64,
         rgb: &Rgb,
         attrs: &CellAttrs,
         is_hyperlink: bool,
     ) {
-        let underline_y = y + self.cell_height - 2.0;
+        let underline_y = y + height - 2.0;
         let thickness = 1.0;
 
         unsafe {
@@ -768,8 +972,8 @@ impl CGRenderer {
     }
 
     /// Draw strikethrough for a cell
-    fn draw_strikethrough(&self, x: f64, y: f64, width: f64, rgb: &Rgb) {
-        let strike_y = y + self.cell_height * 0.5;
+    fn draw_strikethrough(&self, x: f64, y: f64, width: f64, height: f64, rgb: &Rgb) {
+        let strike_y = y + height * 0.5;
         unsafe {
             let color = Self::ns_color(rgb.r, rgb.g, rgb.b);
             let _: () = msg_send![&*color, setStroke];
@@ -782,7 +986,7 @@ impl CGRenderer {
     }
 
     /// Draw overline for a cell
-    fn draw_overline(&self, x: f64, y: f64, width: f64, rgb: &Rgb) {
+    fn draw_overline(&self, x: f64, y: f64, width: f64, _height: f64, rgb: &Rgb) {
         let overline_y = y + 1.0;
         unsafe {
             let color = Self::ns_color(rgb.r, rgb.g, rgb.b);

@@ -13,13 +13,20 @@ use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
     BeginPaint, EndPaint, InvalidateRect, ScreenToClient, UpdateWindow, HBRUSH, PAINTSTRUCT,
 };
-use windows::Win32::UI::Input::KeyboardAndMouse::{GetFocus, ReleaseCapture, SetCapture};
+use windows::Win32::UI::Controls::WM_MOUSELEAVE;
+use windows::Win32::UI::Input::KeyboardAndMouse::{
+    GetFocus, ReleaseCapture, SetCapture, TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT,
+};
 use windows::Win32::UI::WindowsAndMessaging::GetClientRect;
 use windows::Win32::UI::WindowsAndMessaging::*;
 
 use cterm_app::config::Config;
 use cterm_app::file_transfer::PendingFileManager;
 use cterm_app::shortcuts::ShortcutManager;
+use cterm_app::{
+    PluginAuthorization, PluginExecution, PluginRuntime, PluginRuntimeError, TemplateDaemonTarget,
+    TemplateInstancePolicy, TemplateLaunchPlan,
+};
 use cterm_core::color::{ColorPalette, Rgb};
 use cterm_core::mouse::{
     encode_mouse_event, MouseButton as ReportButton, MouseEvent as ReportMouseEvent,
@@ -28,18 +35,22 @@ use cterm_core::mouse::{
 use cterm_core::pty::{PtyConfig, PtySize};
 use cterm_core::screen::{FileTransferOperation, MouseEncoding, MouseMode, ScreenConfig};
 use cterm_core::term::{Key, Modifiers as CoreModifiers, Terminal, TerminalEvent};
-use cterm_core::{KeyEventKind, KeyboardEnhancementFlags};
-use cterm_ui::events::{Action, Modifiers};
+use cterm_core::{KeyEventKind, KeyEventMetadata, KeyboardEnhancementFlags};
+use cterm_ui::events::{Action, KeyCode, Modifiers, Shortcut};
 use cterm_ui::pane::{
     PaneBranch, PaneDirection, PaneId, PaneLayout, PaneRect, PaneTree, SplitDirection, SplitRatio,
     SplitRequest,
 };
 use cterm_ui::theme::Theme;
-use winapi::um::winuser;
+use cterm_ui::{BlinkClock, BlinkNeeds, BLINK_POLL_INTERVAL};
 
 use crate::clipboard;
 use crate::dpi::{self, DpiInfo};
 use crate::keycode;
+use crate::keycode::{
+    associated_key_text, mapped_terminal_key_with_layout, pc101_key_for_scan_code,
+    sided_virtual_key, translated_key_char, ReportedKey,
+};
 use crate::menu::{self, MenuAction};
 use crate::mouse::{self, MouseState};
 use crate::notification_bar::{NotificationAction, NotificationBar};
@@ -54,6 +65,9 @@ pub const WM_APP_BELL: u32 = WM_APP + 4;
 pub const WM_APP_DESKTOP_NOTIFICATION: u32 = WM_APP + 5;
 pub const WM_APP_NATIVE_NOTIFICATION: u32 = WM_APP + 6;
 pub const WM_APP_DAEMON_SESSION_READY: u32 = WM_APP + 7;
+pub const WM_APP_PLUGIN_RESULT: u32 = WM_APP + 8;
+
+type PluginCommandResult = Result<PluginExecution, PluginRuntimeError>;
 
 /// Commands sent to the daemon I/O thread
 pub enum DaemonCmd {
@@ -156,6 +170,7 @@ struct DaemonTabMetadata {
     title: String,
     color: Option<String>,
     background_color: Option<String>,
+    theme: Option<Theme>,
     title_locked: bool,
     template_name: Option<String>,
     keep_open: bool,
@@ -170,6 +185,14 @@ struct PaneDivider {
 
 const PREVIOUS_KEY_STATE_BIT: usize = 1 << 30;
 const EXTENDED_KEY_BIT: usize = 1 << 24;
+const BLINK_TIMER_ID: usize = 0x4354;
+
+fn configure_terminal_cursor(terminal: &mut Terminal, config: &Config) {
+    terminal.screen_mut().configure_cursor(
+        config.appearance.cursor_style.core_style(),
+        config.appearance.cursor_blink,
+    );
+}
 
 /// Classify a Win32 key message without consulting mutable keyboard state.
 fn key_event_kind(msg: u32, key_data: usize) -> Option<KeyEventKind> {
@@ -181,78 +204,6 @@ fn key_event_kind(msg: u32, key_data: usize) -> Option<KeyEventKind> {
         WM_KEYUP | WM_SYSKEYUP => Some(KeyEventKind::Release),
         _ => None,
     }
-}
-
-/// Map the standard PC-101 base-layout ASCII identity required by the kitty
-/// protocol. Ordinary layout/IME text still stays on WM_CHAR.
-fn ascii_key_for_vk(vk: u16) -> Option<char> {
-    Some(match vk as i32 {
-        value @ 0x30..=0x39 => value as u8 as char,
-        value @ 0x41..=0x5a => (b'a' + (value as u8 - b'A')) as char,
-        winuser::VK_SPACE => ' ',
-        winuser::VK_OEM_MINUS => '-',
-        winuser::VK_OEM_PLUS => '=',
-        winuser::VK_OEM_4 => '[',
-        winuser::VK_OEM_6 => ']',
-        winuser::VK_OEM_1 => ';',
-        winuser::VK_OEM_7 => '\'',
-        winuser::VK_OEM_3 => '`',
-        winuser::VK_OEM_5 => '\\',
-        winuser::VK_OEM_COMMA => ',',
-        winuser::VK_OEM_PERIOD => '.',
-        winuser::VK_OEM_2 => '/',
-        _ => return None,
-    })
-}
-
-fn mapped_terminal_key(
-    vk: u16,
-    modifiers: Modifiers,
-    enhanced_text: bool,
-    extended: bool,
-) -> Option<Key> {
-    let functional = match vk as i32 {
-        winuser::VK_UP => Key::Up,
-        winuser::VK_DOWN => Key::Down,
-        winuser::VK_LEFT => Key::Left,
-        winuser::VK_RIGHT => Key::Right,
-        winuser::VK_HOME => Key::Home,
-        winuser::VK_END => Key::End,
-        winuser::VK_PRIOR => Key::PageUp,
-        winuser::VK_NEXT => Key::PageDown,
-        winuser::VK_INSERT => Key::Insert,
-        winuser::VK_DELETE => Key::Delete,
-        winuser::VK_BACK => Key::Backspace,
-        winuser::VK_RETURN if extended => Key::NumpadEnter,
-        winuser::VK_RETURN => Key::Enter,
-        winuser::VK_TAB => Key::Tab,
-        winuser::VK_ESCAPE => Key::Escape,
-        value if (winuser::VK_NUMPAD0..=winuser::VK_NUMPAD9).contains(&value) => {
-            Key::NumpadDigit((value - winuser::VK_NUMPAD0) as u8)
-        }
-        winuser::VK_DECIMAL => Key::NumpadDecimal,
-        winuser::VK_DIVIDE => Key::NumpadDivide,
-        winuser::VK_MULTIPLY => Key::NumpadMultiply,
-        winuser::VK_SUBTRACT => Key::NumpadSubtract,
-        winuser::VK_ADD => Key::NumpadAdd,
-        value if (winuser::VK_F1..=winuser::VK_F12).contains(&value) => {
-            Key::F((value - winuser::VK_F1 + 1) as u8)
-        }
-        _ => {
-            if enhanced_text {
-                return ascii_key_for_vk(vk).map(Key::Char);
-            }
-            if modifiers.contains(Modifiers::CTRL)
-                && !modifiers.intersects(Modifiers::ALT | Modifiers::SUPER)
-            {
-                return ascii_key_for_vk(vk)
-                    .filter(char::is_ascii_alphabetic)
-                    .map(Key::Char);
-            }
-            return None;
-        }
-    };
-    Some(functional)
 }
 
 fn send_terminal_focus_event(terminal: &Arc<Mutex<Terminal>>, focused: bool) {
@@ -325,6 +276,7 @@ pub struct TabEntry {
     pub title: String,
     pub color: Option<String>,
     pub background_color: Option<String>,
+    pub theme: Theme,
     pub has_bell: bool,
     /// Whether title was explicitly set (locks out OSC updates)
     pub title_locked: bool,
@@ -338,6 +290,7 @@ impl TabEntry {
         title: String,
         color: Option<String>,
         background_color: Option<String>,
+        theme: Theme,
         title_locked: bool,
         pane: PaneEntry,
     ) -> Self {
@@ -348,6 +301,7 @@ impl TabEntry {
             title,
             color,
             background_color,
+            theme,
             has_bell: false,
             title_locked,
             pane_layout,
@@ -399,29 +353,82 @@ pub struct WindowState {
     /// Last reported pointer position, used to coalesce cell-based motion while
     /// retaining every pixel transition in mode 1016.
     last_reported_mouse_position: Option<MousePosition>,
+    /// Whether Win32 is currently armed to send `WM_MOUSELEAVE`.
+    tracking_mouse_leave: bool,
     pane_divider_drag: Option<PaneDivider>,
     /// Key releases paired with key-down events consumed by application
     /// shortcuts must not leak into enhanced keyboard reporting.
     suppressed_key_releases: HashSet<u16>,
     /// Physical keys whose presses were emitted as enhanced events.
-    reported_keys: HashMap<u16, Key>,
+    reported_keys: HashMap<u16, ReportedKey>,
     /// Modified text keys handled on WM_KEYDOWN; their generated WM_CHAR or
     /// WM_SYSCHAR messages must not be delivered a second time.
     enhanced_text_keys: HashSet<u16>,
+    /// First UTF-16 code unit of an astral WM_CHAR input sequence.
+    pending_high_surrogate: Option<u16>,
     /// Visibility of the native window; only its active tab is actually visible.
     window_visibility: cterm_core::WindowVisibility,
-    #[allow(dead_code)]
     menu_handle: winapi::shared::windef::HMENU,
+    tool_commands: menu::ToolCommandRegistry,
+    plugin_commands: menu::PluginCommandRegistry,
     /// Skip close confirmation (set during relaunch)
     pub skip_close_confirm: bool,
     /// Remote host connection manager
     pub remote_manager: cterm_client::RemoteManager,
+    blink_clock: BlinkClock,
+    blink_started: Instant,
+}
+
+fn action_restricted_in_managed_mode(action: &Action) -> bool {
+    match action {
+        Action::NewTab
+        | Action::NewWindow
+        | Action::SplitPane(_)
+        | Action::ClosePane
+        | Action::FocusPane(_)
+        | Action::ResizePane(_)
+        | Action::TogglePaneZoom
+        | Action::OpenPreferences
+        | Action::QuickOpenTemplate => true,
+        Action::CloseTab
+        | Action::NextTab
+        | Action::PrevTab
+        | Action::NextAlertedTab
+        | Action::Tab(_)
+        | Action::CloseWindow
+        | Action::Copy
+        | Action::Paste
+        | Action::SelectAll
+        | Action::ZoomIn
+        | Action::ZoomOut
+        | Action::ZoomReset
+        | Action::ToggleFullscreen
+        | Action::ScrollUp
+        | Action::ScrollDown
+        | Action::ScrollPageUp
+        | Action::ScrollPageDown
+        | Action::ScrollToTop
+        | Action::ScrollToBottom
+        | Action::PromptPrevious
+        | Action::PromptNext
+        | Action::FindText
+        | Action::ResetTerminal => false,
+    }
+}
+
+fn win32_shortcut_manager(config: &cterm_app::config::ShortcutsConfig) -> ShortcutManager {
+    let mut shortcuts = ShortcutManager::from_config(config);
+    shortcuts.bind_extra(
+        Shortcut::new(KeyCode::F11, Modifiers::empty()),
+        Action::ToggleFullscreen,
+    );
+    shortcuts
 }
 
 impl WindowState {
     /// Create a new window state
     pub fn new(hwnd: HWND, config: &Config, theme: &Theme) -> Self {
-        let shortcuts = ShortcutManager::from_config(&config.shortcuts);
+        let shortcuts = win32_shortcut_manager(&config.shortcuts);
         let dpi = DpiInfo::for_window(hwnd);
 
         let mut tab_bar = TabBar::new(theme);
@@ -430,11 +437,26 @@ impl WindowState {
         let mut notification_bar = NotificationBar::new(theme);
         notification_bar.set_dpi(dpi);
 
+        let mut tool_commands = menu::ToolCommandRegistry::default();
+        let mut plugin_commands = menu::PluginCommandRegistry::default();
+        if !crate::get_args().managed {
+            match cterm_app::load_tool_shortcuts() {
+                Ok(tools) => tool_commands.reload(&tools),
+                Err(error) => log::error!("Failed to load configured tool commands: {error}"),
+            }
+            match PluginRuntime::for_current_user() {
+                Ok(runtime) => plugin_commands.reload(runtime.catalog().commands()),
+                Err(error) => log::error!("Failed to load plugin commands: {error}"),
+            }
+        }
+
         // Create menu
         let menu_handle = menu::create_menu_bar(
-            false,
+            config.general.show_debug_menu,
             crate::get_args().updater_enabled(),
             crate::get_args().managed,
+            &tool_commands,
+            &plugin_commands,
         );
         menu::set_window_menu(hwnd.0 as *mut _, menu_handle);
 
@@ -456,14 +478,40 @@ impl WindowState {
             mouse_report_button: None,
             last_mouse_pos: (0.0, 0.0),
             last_reported_mouse_position: None,
+            tracking_mouse_leave: false,
             pane_divider_drag: None,
             suppressed_key_releases: HashSet::new(),
             reported_keys: HashMap::new(),
             enhanced_text_keys: HashSet::new(),
+            pending_high_surrogate: None,
             window_visibility: cterm_core::WindowVisibility::Visible,
             menu_handle,
+            tool_commands,
+            plugin_commands,
             skip_close_confirm: false,
             remote_manager: cterm_client::RemoteManager::new(),
+            blink_clock: BlinkClock::default(),
+            blink_started: Instant::now(),
+        }
+    }
+
+    fn on_blink_timer(&mut self) {
+        let Some(tab) = self.tabs.get(self.active_tab_index) else {
+            return;
+        };
+        let mut needs = BlinkNeeds::default();
+        let now = self.blink_started.elapsed();
+        let mut animation_changed = false;
+        for pane in tab.panes.values() {
+            let mut terminal = pane.terminal.lock().unwrap();
+            let pane_needs = BlinkNeeds::for_screen(terminal.screen());
+            animation_changed |= terminal.advance_graphics_animations(now).changed;
+            needs.cursor |= pane_needs.cursor;
+            needs.slow_cells |= pane_needs.slow_cells;
+            needs.rapid_cells |= pane_needs.rapid_cells;
+        }
+        if self.blink_clock.update(now, needs) || animation_changed {
+            self.invalidate();
         }
     }
 
@@ -538,6 +586,7 @@ impl WindowState {
                 title: initial_title,
                 color: None,
                 background_color: None,
+                theme: None,
                 title_locked,
                 template_name: None,
                 keep_open: false,
@@ -557,48 +606,39 @@ impl WindowState {
                 std::io::Error::other("secondary sessions are disabled in managed mode").into(),
             );
         }
+
+        let plan = TemplateLaunchPlan::build(template, &self.config)?;
+        if let Some(tab_id) = self.focus_template(plan.instance_policy, &plan.template_name) {
+            return Ok(tab_id);
+        }
+
+        if let Some((working_directory, git_remote)) = plan.local_workspace_preparation() {
+            cterm_app::prepare_working_directory(working_directory, git_remote)?;
+        }
+
+        let remote = template_remote_endpoint(&plan.daemon, &self.remote_manager);
         #[cfg(not(unix))]
-        if template.remote.is_some() {
+        if remote.is_some() {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::Unsupported,
                 "remote daemon templates are not supported by the Windows transport",
             )
             .into());
         }
-        let remote = if let Some(ref remote_name) = template.remote {
-            let remote_config = self
-                .config
-                .remotes
-                .iter()
-                .find(|r| r.name == *remote_name)
-                .cloned()
-                .ok_or_else(|| {
-                    std::io::Error::new(
-                        std::io::ErrorKind::NotFound,
-                        format!("remote '{remote_name}' is not configured"),
-                    )
-                })?;
-
-            Some((
-                self.remote_manager.clone(),
-                remote_config.name,
-                remote_config.host,
-                remote_config.ssh_compression,
-            ))
-        } else {
-            None
-        };
         let (cols, rows) = self.terminal_size();
-        let options = template_session_options(template, &self.config, cols as u32, rows as u32);
+        let options = plan.session_options(cols as u32, rows as u32);
+        let theme =
+            resolve_template_theme(&self.config, &self.theme, plan.appearance.theme.as_deref());
         Ok(self.spawn_daemon_tab_configured(
             options,
             DaemonTabMetadata {
-                title: template.name.clone(),
-                color: template.color.clone(),
-                background_color: template.background_color.clone(),
+                title: plan.template_name.clone(),
+                color: plan.appearance.tab_color,
+                background_color: plan.appearance.background_color,
+                theme: Some(theme),
                 title_locked: true,
-                template_name: Some(template.name.clone()),
-                keep_open: template.keep_open,
+                template_name: Some(plan.template_name),
+                keep_open: plan.keep_open,
             },
             remote,
         ))
@@ -671,6 +711,7 @@ impl WindowState {
                 title,
                 color: None,
                 background_color: None,
+                theme: None,
                 title_locked: true,
                 template_name: None,
                 keep_open: false,
@@ -700,6 +741,7 @@ impl WindowState {
                 title,
                 color,
                 background_color,
+                theme: None,
                 title_locked: true,
                 template_name: None,
                 keep_open,
@@ -718,10 +760,12 @@ impl WindowState {
             title,
             color,
             background_color,
+            theme,
             title_locked,
             template_name,
             keep_open,
         } = metadata;
+        let tab_theme = theme.unwrap_or_else(|| self.theme.clone());
         let tab_id = self.next_tab_id.fetch_add(1, Ordering::SeqCst);
         let (cols, rows) = self.terminal_size();
         let (pixel_width, pixel_height) = self.terminal_pixel_size();
@@ -741,9 +785,13 @@ impl WindowState {
         if opts.pixel_height == 0 {
             opts.pixel_height = pixel_height;
         }
-        opts.base_palette = Some(terminal_palette(&self.theme, background_color.as_deref()));
-        opts.frontend_state.appearance = self.theme.appearance();
+        opts.base_palette = Some(terminal_palette(&tab_theme, background_color.as_deref()));
+        opts.frontend_state.appearance = tab_theme.appearance();
         opts.frontend_state.visibility = self.window_visibility;
+        opts.set_cursor_defaults(
+            self.config.appearance.cursor_style.core_style(),
+            self.config.appearance.cursor_blink,
+        );
         let backend = PaneBackendContext::Daemon(Box::new(DaemonPaneContext::from_options(
             &opts,
             remote.clone(),
@@ -753,7 +801,8 @@ impl WindowState {
             scrollback_lines: self.config.general.scrollback_lines,
         };
         let mut terminal = Terminal::new(cols, rows, screen_config);
-        terminal.set_base_palette(terminal_palette(&self.theme, background_color.as_deref()));
+        configure_terminal_cursor(&mut terminal, &self.config);
+        terminal.set_base_palette(terminal_palette(&tab_theme, background_color.as_deref()));
         terminal.set_frontend_state(opts.frontend_state);
         terminal.resize_with_pixels(
             cols,
@@ -782,6 +831,7 @@ impl WindowState {
             title.clone(),
             color.clone(),
             background_color.clone(),
+            tab_theme.clone(),
             title_locked,
             PaneEntry {
                 source_id,
@@ -820,10 +870,9 @@ impl WindowState {
             self.tab_bar.set_color(tab_id, rgb);
         }
 
-        if let Some(ref bg) = background_color {
-            if let Some(ref mut renderer) = self.renderer {
-                renderer.set_background_override(Some(bg));
-            }
+        if let Some(ref mut renderer) = self.renderer {
+            renderer.set_theme(&tab_theme);
+            renderer.set_background_override(background_color.as_deref());
         }
 
         let hwnd = self.hwnd.0 as usize;
@@ -878,6 +927,7 @@ impl WindowState {
             ..Default::default()
         };
         let mut terminal = Terminal::new(cols, rows, screen_config);
+        configure_terminal_cursor(&mut terminal, &self.config);
         terminal.set_base_palette(base_palette.clone());
         terminal.set_frontend_state(frontend_state);
 
@@ -939,6 +989,7 @@ impl WindowState {
             display_title.clone(),
             color.clone(),
             None,
+            self.theme.clone(),
             title_locked,
             PaneEntry {
                 source_id,
@@ -1044,13 +1095,23 @@ impl WindowState {
                 .iter()
                 .find(|template| template.name == *name)
         }) {
-            let options =
-                template_session_options(template, &self.config, cols as u32, rows as u32);
-            context.shell = options.shell;
-            context.args = options.args;
-            context.env = options.env;
-            context.term = options.term;
-            context.ssh = options.ssh;
+            match TemplateLaunchPlan::build(template, &self.config) {
+                Ok(plan) => {
+                    let options = plan.session_options(cols as u32, rows as u32);
+                    context.shell = options.shell;
+                    context.args = options.args;
+                    context.env = options.env;
+                    context.term = options.term;
+                    context.ssh = options.ssh;
+                    context.remote = template_remote_endpoint(&plan.daemon, &self.remote_manager);
+                    context.remote_name =
+                        context.remote.as_ref().map(|(_, name, _, _)| name.clone());
+                }
+                Err(error) => log::warn!(
+                    "Could not restore template launch context for '{}': {error}",
+                    template.name
+                ),
+            }
         }
         if let Some(launch) = pane_state.launch_context.as_ref() {
             context.apply_launch_context(launch);
@@ -1064,6 +1125,8 @@ impl WindowState {
         screen_snapshot: Option<cterm_proto::proto::GetScreenResponse>,
         daemon_socket: Option<std::path::PathBuf>,
         alerted: bool,
+        theme: &Theme,
+        background_color: Option<&str>,
     ) -> Option<PaneEntry> {
         let session_id = pane_state.session_id.as_ref()?;
         let (cols, rows) = self.terminal_size();
@@ -1071,12 +1134,13 @@ impl WindowState {
         let screen_config = ScreenConfig {
             scrollback_lines: self.config.general.scrollback_lines,
         };
-        let base_palette = terminal_palette(&self.theme, None);
+        let base_palette = terminal_palette(theme, background_color);
         let frontend_state = cterm_core::FrontendState {
-            appearance: self.theme.appearance(),
+            appearance: theme.appearance(),
             visibility: self.window_visibility,
         };
         let mut terminal = Terminal::new(cols, rows, screen_config);
+        configure_terminal_cursor(&mut terminal, &self.config);
         terminal.set_base_palette(base_palette.clone());
         terminal.set_frontend_state(frontend_state);
         if let Some(ref screen) = screen_snapshot {
@@ -1132,6 +1196,8 @@ impl WindowState {
         &self,
         pane_state: &cterm_app::upgrade::PaneUpgradeState,
         reason: &str,
+        theme: &Theme,
+        background_color: Option<&str>,
     ) -> Option<PaneEntry> {
         let session_id = pane_state.session_id.clone()?;
         let (cols, rows) = self.terminal_size();
@@ -1139,9 +1205,10 @@ impl WindowState {
             scrollback_lines: self.config.general.scrollback_lines,
         };
         let mut terminal = Terminal::new(cols, rows, screen_config);
-        terminal.set_base_palette(terminal_palette(&self.theme, None));
+        configure_terminal_cursor(&mut terminal, &self.config);
+        terminal.set_base_palette(terminal_palette(theme, background_color));
         terminal.set_frontend_state(cterm_core::FrontendState {
-            appearance: self.theme.appearance(),
+            appearance: theme.appearance(),
             visibility: self.window_visibility,
         });
         let message = format!(
@@ -1481,14 +1548,16 @@ impl WindowState {
         let screen_config = ScreenConfig {
             scrollback_lines: self.config.general.scrollback_lines,
         };
+        let theme = self.active_theme();
         let background = self
             .tabs
             .get(self.active_tab_index)
             .and_then(|tab| tab.background_color.as_deref());
         let mut terminal = Terminal::with_shell(cols, rows, screen_config, &pty_config)?;
-        terminal.set_base_palette(terminal_palette(&self.theme, background));
+        configure_terminal_cursor(&mut terminal, &self.config);
+        terminal.set_base_palette(terminal_palette(theme, background));
         terminal.set_frontend_state(cterm_core::FrontendState {
-            appearance: self.theme.appearance(),
+            appearance: theme.appearance(),
             visibility: self.window_visibility,
         });
         let terminal = Arc::new(Mutex::new(terminal));
@@ -1517,12 +1586,13 @@ impl WindowState {
     ) -> Result<PaneEntry, Box<dyn std::error::Error>> {
         let (cols, rows) = self.terminal_size();
         let (pixel_width, pixel_height) = self.terminal_pixel_size();
+        let theme = self.active_theme();
         let background = self
             .tabs
             .get(self.active_tab_index)
             .and_then(|tab| tab.background_color.as_deref());
         let frontend_state = cterm_core::FrontendState {
-            appearance: self.theme.appearance(),
+            appearance: theme.appearance(),
             visibility: self.window_visibility,
         };
         let options = cterm_client::CreateSessionOpts {
@@ -1536,15 +1606,20 @@ impl WindowState {
             env: context.env.clone(),
             term: context.term.clone(),
             ssh: context.ssh.clone(),
-            base_palette: Some(terminal_palette(&self.theme, background)),
+            base_palette: Some(terminal_palette(theme, background)),
             frontend_state,
+            cursor: cterm_client::CursorDefaults {
+                style: self.config.appearance.cursor_style.core_style(),
+                blink: self.config.appearance.cursor_blink,
+            },
         };
 
         let screen_config = ScreenConfig {
             scrollback_lines: self.config.general.scrollback_lines,
         };
         let mut terminal = Terminal::new(cols, rows, screen_config);
-        terminal.set_base_palette(terminal_palette(&self.theme, background));
+        configure_terminal_cursor(&mut terminal, &self.config);
+        terminal.set_base_palette(terminal_palette(theme, background));
         terminal.set_frontend_state(frontend_state);
         terminal.resize_with_pixels(
             cols,
@@ -1928,6 +2003,7 @@ impl WindowState {
                 }
                 self.refresh_active_tab_title();
                 if let Some(ref mut renderer) = self.renderer {
+                    renderer.set_theme(&self.tabs[self.active_tab_index].theme);
                     renderer.set_background_override(
                         self.tabs[self.active_tab_index].background_color.as_deref(),
                     );
@@ -1962,11 +2038,43 @@ impl WindowState {
 
             // Apply per-tab background color override
             if let Some(ref mut renderer) = self.renderer {
+                renderer.set_theme(&self.tabs[index].theme);
                 renderer.set_background_override(self.tabs[index].background_color.as_deref());
             }
 
             self.invalidate();
         }
+    }
+
+    /// Focus a tab or pane previously launched from the named template.
+    fn focus_template(
+        &mut self,
+        policy: TemplateInstancePolicy,
+        template_name: &str,
+    ) -> Option<u64> {
+        let (tab_index, pane_id) = reusable_template_location(policy, &self.tabs, template_name)?;
+        self.switch_to_tab(tab_index);
+
+        let previous_pane = self.tabs[tab_index].pane_layout.active();
+        if previous_pane != pane_id {
+            let had_focus = self.window_has_focus();
+            if had_focus {
+                self.send_pane_focus_event(previous_pane, false);
+            }
+            if let Err(error) = self.tabs[tab_index].pane_layout.set_active(pane_id) {
+                log::error!("Failed to focus existing template pane: {error}");
+                return None;
+            }
+            if had_focus {
+                self.send_pane_focus_event(pane_id, true);
+                self.clear_active_pane_bell();
+            }
+            self.refresh_active_tab_title();
+            self.resize_tab_panes(tab_index);
+            self.invalidate();
+        }
+
+        Some(self.tabs[tab_index].id)
     }
 
     /// Switch to next tab
@@ -2010,6 +2118,13 @@ impl WindowState {
         self.tabs
             .get(self.active_tab_index)
             .and_then(TabEntry::active_terminal)
+    }
+
+    fn active_theme(&self) -> &Theme {
+        self.tabs
+            .get(self.active_tab_index)
+            .map(|tab| &tab.theme)
+            .unwrap_or(&self.theme)
     }
 
     fn source_location(&self, source_id: u64) -> Option<(usize, PaneId)> {
@@ -2190,6 +2305,7 @@ impl WindowState {
         };
         let tab_bar = &mut self.tab_bar;
         let notification_bar = &mut self.notification_bar;
+        let blink_phase = self.blink_clock.phase();
 
         {
             let terminal = first_terminal.lock().unwrap();
@@ -2200,7 +2316,13 @@ impl WindowState {
                 let terminal = terminal.lock().unwrap();
                 let mut rect = positioned.rect;
                 rect.y = rect.y.saturating_add(y_offset);
-                renderer.render_pane(terminal.screen(), rect, positioned.is_active, *alerted)?;
+                renderer.render_pane(
+                    terminal.screen(),
+                    rect,
+                    positioned.is_active,
+                    *alerted,
+                    blink_phase,
+                )?;
             }
             if let Some((target, dwrite, text_format)) = renderer.chrome_resources() {
                 tab_bar.render(&target, &dwrite, chrome_width, &text_format)?;
@@ -2221,7 +2343,14 @@ impl WindowState {
     /// Handle a physical keyboard event. Text-producing keys deliberately stay
     /// on WM_CHAR so Windows remains authoritative for layouts, dead keys, and
     /// IME composition.
-    pub fn on_key_event(&mut self, vk: u16, kind: KeyEventKind, extended: bool) -> bool {
+    pub fn on_key_event(
+        &mut self,
+        vk: u16,
+        kind: KeyEventKind,
+        extended: bool,
+        scan_code: u8,
+    ) -> bool {
+        let vk = sided_virtual_key(vk, scan_code, extended);
         let modifiers = keycode::get_modifiers();
 
         if kind == KeyEventKind::Release {
@@ -2229,11 +2358,15 @@ impl WindowState {
             if self.suppressed_key_releases.remove(&vk) {
                 return true;
             }
-            if let Some(key) = self.reported_keys.remove(&vk) {
+            if let Some(reported) = self.reported_keys.remove(&vk) {
                 if let Some(terminal) = self.active_terminal() {
                     let mut term = terminal.lock().unwrap();
                     let core_modifiers = CoreModifiers::from_bits_truncate(modifiers.bits());
-                    if let Some(bytes) = term.handle_reported_key_release(key, core_modifiers) {
+                    if let Some(bytes) = term.handle_reported_key_release_with_metadata(
+                        reported.key,
+                        core_modifiers,
+                        reported.metadata(),
+                    ) {
                         if let Err(e) = term.write(&bytes) {
                             log::error!("Failed to write key release to PTY: {}", e);
                         }
@@ -2255,29 +2388,58 @@ impl WindowState {
             }
         }
 
-        let enhanced_text = modifiers
-            .intersects(Modifiers::CTRL | Modifiers::ALT | Modifiers::SUPER)
-            && !keycode::is_altgr_active()
-            && self.active_terminal().is_some_and(|terminal| {
+        let keyboard_flags = self
+            .active_terminal()
+            .map(|terminal| {
                 terminal
                     .lock()
                     .unwrap()
                     .screen()
                     .keyboard_enhancement_flags()
-                    .contains(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
-            });
+            })
+            .unwrap_or_default();
+        let report_all =
+            keyboard_flags.contains(KeyboardEnhancementFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES);
+        let enhanced_text = !keycode::is_altgr_active()
+            && (report_all
+                || (keyboard_flags.contains(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
+                    && modifiers.intersects(
+                        Modifiers::CTRL
+                            | Modifiers::ALT
+                            | Modifiers::SUPER
+                            | Modifiers::HYPER
+                            | Modifiers::META,
+                    )));
+        let layout_char = translated_key_char(vk, scan_code, false);
 
-        let Some(key) = mapped_terminal_key(vk, modifiers, enhanced_text, extended) else {
+        let Some(key) =
+            mapped_terminal_key_with_layout(vk, modifiers, enhanced_text, extended, layout_char)
+        else {
             return false;
         };
         let core_modifiers = CoreModifiers::from_bits_truncate(modifiers.bits());
+        let shifted_key = matches!(key, Key::Char(_))
+            .then(|| translated_key_char(vk, scan_code, true))
+            .flatten();
+        let base_layout_key = matches!(key, Key::Char(_))
+            .then(|| pc101_key_for_scan_code(scan_code))
+            .flatten();
+        let associated_text = matches!(key, Key::Char(_))
+            .then(|| associated_key_text(vk, scan_code))
+            .flatten();
+        let metadata = KeyEventMetadata::new()
+            .with_shifted_key(shifted_key)
+            .with_base_layout_key(base_layout_key)
+            .with_associated_text(associated_text.as_deref());
 
         if let Some(terminal) = self.active_terminal() {
             let mut term = terminal.lock().unwrap();
-            if let Some(bytes) = term.handle_key_event(key, core_modifiers, kind) {
+            if let Some(bytes) =
+                term.handle_key_event_with_metadata(key, core_modifiers, kind, metadata)
+            {
                 let track_release = kind == KeyEventKind::Press
                     && term
-                        .handle_reported_key_release(key, core_modifiers)
+                        .handle_reported_key_release_with_metadata(key, core_modifiers, metadata)
                         .is_some();
                 if let Err(e) = term.write(&bytes) {
                     log::error!("Failed to write key event to PTY: {}", e);
@@ -2289,7 +2451,14 @@ impl WindowState {
                     self.enhanced_text_keys.insert(vk);
                 }
                 if track_release {
-                    self.reported_keys.insert(vk, key);
+                    self.reported_keys.insert(
+                        vk,
+                        ReportedKey {
+                            key,
+                            shifted_key,
+                            base_layout_key,
+                        },
+                    );
                 }
                 self.invalidate();
                 return true;
@@ -2309,7 +2478,10 @@ impl WindowState {
             let mut term = terminal.lock().unwrap();
             let mut buf = [0u8; 4];
             let s = c.encode_utf8(&mut buf);
-            term.write(s.as_bytes()).ok();
+            let encoded = term.handle_text_input(s);
+            if !encoded.is_empty() {
+                term.write(&encoded).ok();
+            }
             // Drop the lock before invalidate() — UpdateWindow dispatches WM_PAINT
             // synchronously, and render() needs to lock the terminal.
             drop(term);
@@ -2317,8 +2489,236 @@ impl WindowState {
         self.invalidate();
     }
 
+    pub fn on_utf16_code_unit(&mut self, unit: u16) {
+        if (0xd800..=0xdbff).contains(&unit) {
+            self.pending_high_surrogate = Some(unit);
+            return;
+        }
+
+        if (0xdc00..=0xdfff).contains(&unit) {
+            let Some(high) = self.pending_high_surrogate.take() else {
+                return;
+            };
+            if let Some(Ok(character)) = char::decode_utf16([high, unit]).next() {
+                self.on_char(character);
+            }
+            return;
+        }
+
+        self.pending_high_surrogate = None;
+        if let Some(character) = char::from_u32(u32::from(unit)) {
+            self.on_char(character);
+        }
+    }
+
+    fn launch_new_window(&self) {
+        let result = std::env::current_exe()
+            .and_then(|executable| std::process::Command::new(executable).spawn())
+            .map(|_| ());
+        if let Err(error) = result {
+            log::error!("Failed to launch a new cterm window: {error}");
+        }
+    }
+
+    fn show_quick_open(&mut self) {
+        let templates = cterm_app::load_sticky_tabs().unwrap_or_default();
+        let Some(template) = crate::quick_open::show_quick_open(self.hwnd, templates) else {
+            return;
+        };
+
+        log::info!("Quick open selected: {}", template.name);
+        if let Err(error) = self.new_tab_from_template(&template) {
+            log::error!("Failed to open template '{}': {error}", template.name);
+            crate::dialogs::show_warning(
+                self.hwnd.0 as *mut _,
+                "Template unavailable",
+                &error.to_string(),
+            );
+        }
+    }
+
+    fn reload_tool_commands_and_menu(&mut self) {
+        if crate::get_args().managed {
+            self.tool_commands.reload(&[]);
+            self.plugin_commands.reload(&[]);
+        } else {
+            let tools = match cterm_app::load_tool_shortcuts() {
+                Ok(tools) => tools,
+                Err(error) => {
+                    log::error!("Failed to reload configured tool commands: {error}");
+                    return;
+                }
+            };
+            self.tool_commands.reload(&tools);
+            match PluginRuntime::for_current_user() {
+                Ok(runtime) => self.plugin_commands.reload(runtime.catalog().commands()),
+                Err(error) => {
+                    log::error!("Failed to reload plugin commands: {error}");
+                    self.plugin_commands.reload(&[]);
+                }
+            }
+        }
+
+        let new_menu = menu::create_menu_bar(
+            self.config.general.show_debug_menu,
+            crate::get_args().updater_enabled(),
+            crate::get_args().managed,
+            &self.tool_commands,
+            &self.plugin_commands,
+        );
+        if menu::replace_window_menu(self.hwnd.0 as *mut _, self.menu_handle, new_menu) {
+            self.menu_handle = new_menu;
+        } else {
+            log::error!("Failed to replace the Win32 menu after configuration reload");
+        }
+    }
+
+    fn run_tool_command(&self, command_id: u16) -> bool {
+        let Some(tool) = self.tool_commands.get(command_id).cloned() else {
+            return false;
+        };
+        let cwd = self
+            .active_terminal()
+            .and_then(|terminal| terminal.lock().ok()?.foreground_cwd())
+            .or_else(|| self.config.general.working_directory.clone())
+            .or_else(|| std::env::current_dir().ok())
+            .unwrap_or_else(|| std::path::PathBuf::from("."));
+
+        match tool.execute(&cwd) {
+            Ok(()) => {
+                log::info!(
+                    "Launched configured tool '{}' in {}",
+                    tool.name,
+                    cwd.display()
+                );
+            }
+            Err(error) => {
+                log::error!("Failed to launch configured tool '{}': {error}", tool.name);
+                crate::dialogs::show_error(
+                    self.hwnd.0 as *mut _,
+                    "Tool launch failed",
+                    &format!(
+                        "Failed to launch '{}' in {}:\n\n{}",
+                        tool.name,
+                        cwd.display(),
+                        error
+                    ),
+                );
+            }
+        }
+        true
+    }
+
+    fn run_plugin_command(&self, command_id: u16) -> bool {
+        let Some(command) = self.plugin_commands.get(command_id) else {
+            return false;
+        };
+        let mut runtime = match PluginRuntime::for_current_user() {
+            Ok(runtime) => runtime,
+            Err(error) => {
+                crate::dialogs::show_error(
+                    self.hwnd.0 as *mut _,
+                    "Plugin command failed",
+                    &error.to_string(),
+                );
+                return true;
+            }
+        };
+        let invocation = match runtime.authorize_action(command.action_id()) {
+            Ok(PluginAuthorization::Granted(invocation)) => invocation,
+            Ok(PluginAuthorization::ApprovalRequired(prompt)) => {
+                if !crate::dialogs::show_confirm(
+                    self.hwnd.0 as *mut _,
+                    "Allow plugin command?",
+                    &prompt.message(),
+                ) {
+                    return true;
+                }
+                match runtime.approve(prompt) {
+                    Ok(invocation) => invocation,
+                    Err(error) => {
+                        crate::dialogs::show_error(
+                            self.hwnd.0 as *mut _,
+                            "Plugin command failed",
+                            &error.to_string(),
+                        );
+                        return true;
+                    }
+                }
+            }
+            Err(error) => {
+                crate::dialogs::show_error(
+                    self.hwnd.0 as *mut _,
+                    "Plugin command failed",
+                    &error.to_string(),
+                );
+                return true;
+            }
+        };
+        let hwnd = self.hwnd.0 as usize;
+        std::thread::spawn(move || {
+            post_plugin_result(hwnd, invocation.execute_blocking());
+        });
+        true
+    }
+
+    fn on_plugin_result(&mut self, result: PluginCommandResult) {
+        match result {
+            Ok(execution) => {
+                for diagnostic in execution.diagnostics() {
+                    log::info!("Plugin diagnostic: {diagnostic}");
+                }
+                if !execution.host_stderr().is_empty() {
+                    log::warn!(
+                        "Plugin host stderr: {}",
+                        String::from_utf8_lossy(execution.host_stderr())
+                    );
+                }
+                for action in execution.actions().iter().cloned() {
+                    self.handle_action(action);
+                }
+            }
+            Err(error) => crate::dialogs::show_error(
+                self.hwnd.0 as *mut _,
+                "Plugin command failed",
+                &error.to_string(),
+            ),
+        }
+    }
+
+    fn show_preferences(&mut self) {
+        if !crate::preferences_dialog::show_preferences_dialog(self.hwnd.0 as *mut _) {
+            return;
+        }
+
+        match cterm_app::load_config() {
+            Ok(config) => {
+                self.shortcuts = win32_shortcut_manager(&config.shortcuts);
+                self.config = config;
+                self.reload_tool_commands_and_menu();
+                // TODO: Apply theme and other changes without restart.
+                log::info!("Preferences saved and reloaded");
+            }
+            Err(error) => log::error!("Failed to reload saved preferences: {error}"),
+        }
+    }
+
+    fn reset_terminal(&mut self) {
+        if let Some(terminal) = self.active_terminal() {
+            let mut term = terminal.lock().unwrap();
+            term.screen_mut().reset();
+            drop(term);
+        }
+        self.invalidate();
+    }
+
     /// Handle an action
     fn handle_action(&mut self, action: Action) {
+        if crate::get_args().managed && action_restricted_in_managed_mode(&action) {
+            log::warn!("Ignoring {} action in managed mode", action.id());
+            return;
+        }
+
         match action {
             Action::NewTab => {
                 self.new_tab().ok();
@@ -2344,9 +2744,11 @@ impl WindowState {
             }
             Action::Copy => self.copy_selection(),
             Action::Paste => self.paste(),
+            Action::SelectAll => self.select_all(),
             Action::ZoomIn => self.zoom_in(),
             Action::ZoomOut => self.zoom_out(),
             Action::ZoomReset => self.zoom_reset(),
+            Action::ToggleFullscreen => self.toggle_fullscreen(),
             Action::ScrollUp
             | Action::ScrollDown
             | Action::ScrollPageUp
@@ -2383,33 +2785,47 @@ impl WindowState {
                 };
             }
             Action::NewWindow => {
-                // New window requires app-level handling, not implemented for shortcuts
-                log::debug!("NewWindow action from shortcut not implemented");
+                self.launch_new_window();
             }
             Action::FindText => self.show_find_dialog(),
-            Action::ResetTerminal => {
-                if let Some(terminal) = self.active_terminal() {
-                    let mut term = terminal.lock().unwrap();
-                    term.screen_mut().reset();
-                    drop(term);
-                }
-                self.invalidate();
-            }
-            _ => {}
+            Action::ResetTerminal => self.reset_terminal(),
+            Action::OpenPreferences => self.show_preferences(),
+            Action::QuickOpenTemplate => self.show_quick_open(),
         }
     }
 
     /// Handle menu command
     pub fn on_menu_command(&mut self, cmd: u16) {
+        if menu::is_plugin_command_id(cmd) {
+            if crate::get_args().managed {
+                log::warn!("Ignoring plugin command in managed mode");
+            } else if !self.run_plugin_command(cmd) {
+                log::warn!("Ignoring stale or unknown plugin command ID {cmd}");
+            }
+            return;
+        }
+        if menu::is_tool_command_id(cmd) {
+            if crate::get_args().managed {
+                log::warn!("Ignoring tool command in managed mode");
+            } else if !self.run_tool_command(cmd) {
+                // This can happen when a WM_COMMAND queued for an old menu is
+                // delivered after a configuration reload. Retired IDs are
+                // intentionally never rebound to a different tool.
+                log::warn!("Ignoring stale or unknown tool command ID {cmd}");
+            }
+            return;
+        }
+
         if let Some(action) = MenuAction::from_id(cmd) {
+            if let Some(shared_action) = action.shared_action() {
+                self.handle_action(shared_action);
+                return;
+            }
+
             if crate::get_args().managed
                 && matches!(
                     action,
-                    MenuAction::NewTab
-                        | MenuAction::NewWindow
-                        | MenuAction::QuickOpen
-                        | MenuAction::DockerPicker
-                        | MenuAction::Preferences
+                    MenuAction::DockerPicker
                         | MenuAction::TabTemplates
                         | MenuAction::AttachSession
                         | MenuAction::SSHConnect
@@ -2420,21 +2836,6 @@ impl WindowState {
                 return;
             }
             match action {
-                MenuAction::NewTab => {
-                    self.new_tab().ok();
-                }
-                MenuAction::NewWindow => {
-                    // Launch a new instance of the application
-                    if let Ok(exe) = std::env::current_exe() {
-                        std::process::Command::new(exe).spawn().ok();
-                    }
-                }
-                MenuAction::CloseTab => {
-                    if let Some(tab) = self.tabs.get(self.active_tab_index) {
-                        let id = tab.id;
-                        self.close_tab(id);
-                    }
-                }
                 MenuAction::CloseOtherTabs => {
                     // Close all but active
                     let active_id = self.tabs.get(self.active_tab_index).map(|t| t.id);
@@ -2447,23 +2848,6 @@ impl WindowState {
                             .collect();
                         for id in ids {
                             self.close_tab(id);
-                        }
-                    }
-                }
-                MenuAction::QuickOpen => {
-                    // Show Quick Open dialog
-                    let templates = cterm_app::load_sticky_tabs().unwrap_or_default();
-                    if let Some(template) = crate::quick_open::show_quick_open(self.hwnd, templates)
-                    {
-                        // Create a new tab with the selected template
-                        log::info!("Quick open selected: {}", template.name);
-                        if let Err(error) = self.new_tab_from_template(&template) {
-                            log::error!("Failed to open template '{}': {error}", template.name);
-                            crate::dialogs::show_warning(
-                                self.hwnd.0 as *mut _,
-                                "Template unavailable",
-                                &error.to_string(),
-                            );
                         }
                     }
                 }
@@ -2483,30 +2867,9 @@ impl WindowState {
                         }
                     }
                 }
-                MenuAction::Quit => {
-                    unsafe {
-                        let _ = PostMessageW(Some(self.hwnd), WM_CLOSE, WPARAM(0), LPARAM(0));
-                    };
-                }
-                MenuAction::Copy => self.copy_selection(),
                 MenuAction::CopyHtml => self.copy_selection_as_html(),
-                MenuAction::Paste => self.paste(),
-                MenuAction::SelectAll => self.select_all(),
-                MenuAction::ZoomIn => self.zoom_in(),
-                MenuAction::ZoomOut => self.zoom_out(),
-                MenuAction::ZoomReset => self.zoom_reset(),
-                MenuAction::Fullscreen => self.toggle_fullscreen(),
                 MenuAction::SetTitle => self.show_set_title_dialog(),
                 MenuAction::SetColor => self.show_set_color_dialog(),
-                MenuAction::Find => self.show_find_dialog(),
-                MenuAction::Reset => {
-                    if let Some(terminal) = self.active_terminal() {
-                        let mut term = terminal.lock().unwrap();
-                        term.screen_mut().reset();
-                        drop(term);
-                    }
-                    self.invalidate();
-                }
                 MenuAction::ClearReset => {
                     if let Some(terminal) = self.active_terminal() {
                         let mut term = terminal.lock().unwrap();
@@ -2519,42 +2882,6 @@ impl WindowState {
                 MenuAction::SendSignalKill => self.send_signal(9), // SIGKILL
                 MenuAction::SendSignalHup => self.send_signal(1), // SIGHUP
                 MenuAction::SendSignalTerm => self.send_signal(15), // SIGTERM
-                MenuAction::SplitPaneHorizontal => {
-                    self.split_active_pane(SplitDirection::Horizontal)
-                }
-                MenuAction::SplitPaneVertical => self.split_active_pane(SplitDirection::Vertical),
-                MenuAction::ClosePane => self.close_active_pane(),
-                MenuAction::FocusPaneLeft => self.focus_pane(PaneDirection::Left),
-                MenuAction::FocusPaneRight => self.focus_pane(PaneDirection::Right),
-                MenuAction::FocusPaneUp => self.focus_pane(PaneDirection::Up),
-                MenuAction::FocusPaneDown => self.focus_pane(PaneDirection::Down),
-                MenuAction::ResizePaneLeft => self.resize_active_pane(PaneDirection::Left),
-                MenuAction::ResizePaneRight => self.resize_active_pane(PaneDirection::Right),
-                MenuAction::ResizePaneUp => self.resize_active_pane(PaneDirection::Up),
-                MenuAction::ResizePaneDown => self.resize_active_pane(PaneDirection::Down),
-                MenuAction::TogglePaneZoom => self.toggle_active_pane_zoom(),
-                MenuAction::PrevTab => self.prev_tab(),
-                MenuAction::NextTab => self.next_tab(),
-                MenuAction::NextAlertedTab => self.next_alerted_tab(),
-                MenuAction::Tab1 => self.switch_to_tab(0),
-                MenuAction::Tab2 => self.switch_to_tab(1),
-                MenuAction::Tab3 => self.switch_to_tab(2),
-                MenuAction::Tab4 => self.switch_to_tab(3),
-                MenuAction::Tab5 => self.switch_to_tab(4),
-                MenuAction::Tab6 => self.switch_to_tab(5),
-                MenuAction::Tab7 => self.switch_to_tab(6),
-                MenuAction::Tab8 => self.switch_to_tab(7),
-                MenuAction::Tab9 => self.switch_to_tab(8),
-                MenuAction::Preferences => {
-                    if crate::preferences_dialog::show_preferences_dialog(self.hwnd.0 as *mut _) {
-                        // Reload config and apply changes
-                        if let Ok(config) = cterm_app::load_config() {
-                            self.config = config;
-                            // TODO: Apply theme and other changes without restart
-                            log::info!("Preferences saved and reloaded");
-                        }
-                    }
-                }
                 MenuAction::TabTemplates => {
                     if crate::templates_dialog::show_templates_dialog(self.hwnd.0 as *mut _) {
                         log::info!("Tab templates saved");
@@ -2745,6 +3072,47 @@ impl WindowState {
                 MenuAction::ManageRemotes => {
                     crate::remotes_dialog::show_remotes_dialog(self.hwnd.0 as *mut _);
                 }
+                MenuAction::NewTab
+                | MenuAction::NewWindow
+                | MenuAction::QuickOpen
+                | MenuAction::CloseTab
+                | MenuAction::Quit
+                | MenuAction::Copy
+                | MenuAction::Paste
+                | MenuAction::SelectAll
+                | MenuAction::ZoomIn
+                | MenuAction::ZoomOut
+                | MenuAction::ZoomReset
+                | MenuAction::Fullscreen
+                | MenuAction::Find
+                | MenuAction::Reset
+                | MenuAction::SplitPaneHorizontal
+                | MenuAction::SplitPaneVertical
+                | MenuAction::ClosePane
+                | MenuAction::FocusPaneLeft
+                | MenuAction::FocusPaneRight
+                | MenuAction::FocusPaneUp
+                | MenuAction::FocusPaneDown
+                | MenuAction::ResizePaneLeft
+                | MenuAction::ResizePaneRight
+                | MenuAction::ResizePaneUp
+                | MenuAction::ResizePaneDown
+                | MenuAction::TogglePaneZoom
+                | MenuAction::PrevTab
+                | MenuAction::NextTab
+                | MenuAction::NextAlertedTab
+                | MenuAction::Tab1
+                | MenuAction::Tab2
+                | MenuAction::Tab3
+                | MenuAction::Tab4
+                | MenuAction::Tab5
+                | MenuAction::Tab6
+                | MenuAction::Tab7
+                | MenuAction::Tab8
+                | MenuAction::Tab9
+                | MenuAction::Preferences => {
+                    unreachable!("shared menu actions are dispatched before native commands")
+                }
             }
         }
     }
@@ -2856,7 +3224,7 @@ impl WindowState {
     fn copy_selection_as_html(&mut self) {
         if let Some(terminal) = self.active_terminal() {
             let term = terminal.lock().unwrap();
-            if let Some(html) = term.screen().get_selected_html(&self.theme.colors) {
+            if let Some(html) = term.screen().get_selected_html(&self.active_theme().colors) {
                 // Copy HTML to clipboard
                 clipboard::copy_to_clipboard(&html).ok();
                 log::debug!("Copied {} chars as HTML to clipboard", html.len());
@@ -3018,6 +3386,7 @@ impl WindowState {
             }
         }
 
+        self.blink_clock.rearm_cursor(self.blink_started.elapsed());
         // Invalidate to redraw
         self.invalidate();
     }
@@ -3549,6 +3918,43 @@ impl WindowState {
         }
     }
 
+    fn track_mouse_leave(&mut self) {
+        if self.tracking_mouse_leave {
+            return;
+        }
+        let mut tracking = TRACKMOUSEEVENT {
+            cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32,
+            dwFlags: TME_LEAVE,
+            hwndTrack: self.hwnd,
+            dwHoverTime: 0,
+        };
+        if unsafe { TrackMouseEvent(&mut tracking) }.is_ok() {
+            self.tracking_mouse_leave = true;
+        }
+    }
+
+    fn on_mouse_leave(&mut self) {
+        self.tracking_mouse_leave = false;
+        let Some(position) = self.last_reported_mouse_position.take() else {
+            return;
+        };
+        let Some(terminal) = self.active_terminal() else {
+            return;
+        };
+        let mut term = terminal.lock().unwrap();
+        let mode = term.screen().modes.mouse_mode;
+        let encoding = term.screen().modes.mouse_encoding;
+        if let Some(sequence) = encode_mouse_event(
+            mode,
+            encoding,
+            ReportMouseEvent::Leave,
+            position,
+            current_mouse_modifiers(),
+        ) {
+            let _ = term.write(&sequence);
+        }
+    }
+
     /// Handle right-click for context menu
     pub fn on_right_click(&mut self, x: f32, y: f32) {
         // Check if click is in tab bar area
@@ -3966,6 +4372,12 @@ pub fn create_window(config: &Config, theme: &Theme) -> windows::core::Result<HW
     let state_ptr = Box::into_raw(state);
     unsafe {
         SetWindowLongPtrW(hwnd, GWLP_USERDATA, state_ptr as isize);
+        let _ = SetTimer(
+            Some(hwnd),
+            BLINK_TIMER_ID,
+            BLINK_POLL_INTERVAL.as_millis() as u32,
+            None,
+        );
     }
 
     if args.fullscreen {
@@ -4048,6 +4460,13 @@ pub fn create_window_from_upgrade(
             windows::core::Error::from_win32()
         })?;
 
+    let templates = match cterm_app::load_sticky_tabs() {
+        Ok(templates) => templates,
+        Err(error) => {
+            log::warn!("Could not load templates while restoring tab appearance: {error}");
+            Vec::new()
+        }
+    };
     let mut any_restored = false;
     for tab_state in &window_state.tabs {
         let (layout, pane_states) = match upgrade_pane_records(tab_state) {
@@ -4058,6 +4477,19 @@ pub fn create_window_from_upgrade(
             }
         };
         let pane_ids = layout.pane_ids();
+        let template_name = tab_state.template_name.as_deref().or_else(|| {
+            pane_states
+                .iter()
+                .find_map(|pane| pane.template_name.as_deref())
+        });
+        let template =
+            template_name.and_then(|name| templates.iter().find(|template| template.name == name));
+        let restored_theme = resolve_template_theme(
+            config,
+            theme,
+            template.and_then(|template| template.theme.as_deref()),
+        );
+        let background_color = template.and_then(|template| template.background_color.clone());
 
         let mut restored = Vec::with_capacity(pane_states.len());
         for pane_state in &pane_states {
@@ -4075,7 +4507,12 @@ pub fn create_window_from_upgrade(
                     "remote '{remote_name}' requires a transport that is currently unavailable on Windows"
                 );
                 log::error!("Failed to reconnect session {session_id}: {reason}");
-                if let Some(pane) = state.make_unavailable_remote_pane(pane_state, &reason) {
+                if let Some(pane) = state.make_unavailable_remote_pane(
+                    pane_state,
+                    &reason,
+                    &restored_theme,
+                    background_color.as_deref(),
+                ) {
                     restored.push(pane);
                     continue;
                 }
@@ -4122,9 +4559,14 @@ pub fn create_window_from_upgrade(
                         .socket_path()
                         .map(std::path::Path::to_path_buf)
                         .or_else(|| pane_state.daemon_socket.clone());
-                    if let Some(pane) =
-                        state.make_attached_pane(pane_state, screen, socket, alerted)
-                    {
+                    if let Some(pane) = state.make_attached_pane(
+                        pane_state,
+                        screen,
+                        socket,
+                        alerted,
+                        &restored_theme,
+                        background_color.as_deref(),
+                    ) {
                         restored.push(pane);
                     }
                     // attach_session fetched the snapshot and incremented the
@@ -4154,7 +4596,8 @@ pub fn create_window_from_upgrade(
             id: tab_state.id,
             title: tab_state.title.clone(),
             color: tab_state.color.clone(),
-            background_color: None,
+            background_color,
+            theme: restored_theme,
             has_bell,
             title_locked,
             pane_layout: layout,
@@ -4197,6 +4640,12 @@ pub fn create_window_from_upgrade(
     // Store state pointer in window
     unsafe {
         SetWindowLongPtrW(hwnd, GWLP_USERDATA, Box::into_raw(state) as isize);
+        let _ = SetTimer(
+            Some(hwnd),
+            BLINK_TIMER_ID,
+            BLINK_POLL_INTERVAL.as_millis() as u32,
+            None,
+        );
     }
 
     // Restore fullscreen/maximized state
@@ -4655,6 +5104,21 @@ fn post_daemon_session_ready(hwnd: usize, source_id: u64, ready: DaemonSessionRe
     }
 }
 
+fn post_plugin_result(hwnd: usize, result: PluginCommandResult) {
+    let result = Box::into_raw(Box::new(result));
+    let posted = unsafe {
+        PostMessageW(
+            Some(HWND(hwnd as *mut _)),
+            WM_APP_PLUGIN_RESULT,
+            WPARAM(0),
+            LPARAM(result as isize),
+        )
+    };
+    if posted.is_err() {
+        unsafe { drop(Box::from_raw(result)) };
+    }
+}
+
 /// Window procedure
 /// Whether Shift is currently held (used to bypass mouse forwarding so local
 /// interaction — hyperlink menu, scrollback — keeps working under a tracking app).
@@ -4716,6 +5180,11 @@ extern "system" fn window_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPA
             LRESULT(0)
         }
 
+        WM_TIMER if wparam.0 == BLINK_TIMER_ID => {
+            state.on_blink_timer();
+            LRESULT(0)
+        }
+
         WM_SIZE => {
             state.set_window_visibility(if wparam.0 as u32 == SIZE_MINIMIZED {
                 cterm_core::WindowVisibility::Hidden
@@ -4762,7 +5231,8 @@ extern "system" fn window_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPA
             let key_data = lparam.0 as usize;
             let kind = key_event_kind(msg, key_data)
                 .expect("matched messages always have a key-event kind");
-            if state.on_key_event(vk, kind, key_data & EXTENDED_KEY_BIT != 0) {
+            let scan_code = ((key_data >> 16) & 0xff) as u8;
+            if state.on_key_event(vk, kind, key_data & EXTENDED_KEY_BIT != 0, scan_code) {
                 LRESULT(0)
             } else {
                 unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
@@ -4771,14 +5241,26 @@ extern "system" fn window_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPA
 
         WM_CHAR => {
             if !state.suppress_generated_text_message() {
-                if let Some(c) = char::from_u32(wparam.0 as u32) {
-                    // Only handle printable characters here. Control characters like
-                    // Enter (\r), Tab (\t), Backspace (\x08), and Escape (\x1b) are
-                    // already handled from their physical key messages.
-                    // TranslateMessage generates WM_CHAR for them too, so we must
-                    // skip them here to avoid double input.
-                    if !c.is_control() {
-                        state.on_char(c);
+                let unit = wparam.0 as u16;
+                // Control characters are already handled from physical key
+                // messages. Printable UTF-16, including surrogate pairs, stays
+                // on the layout/IME-authoritative text path.
+                if unit >= 0x20 && unit != 0x7f {
+                    state.on_utf16_code_unit(unit);
+                }
+            }
+            LRESULT(0)
+        }
+
+        WM_UNICHAR => {
+            const UNICODE_NOCHAR: usize = 0xffff;
+            if wparam.0 == UNICODE_NOCHAR {
+                return LRESULT(1);
+            }
+            if !state.suppress_generated_text_message() {
+                if let Some(character) = char::from_u32(wparam.0 as u32) {
+                    if !character.is_control() {
+                        state.on_char(character);
                     }
                 }
             }
@@ -4838,7 +5320,13 @@ extern "system" fn window_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPA
         WM_MOUSEMOVE => {
             let x = (lparam.0 & 0xFFFF) as i16 as f32;
             let y = ((lparam.0 >> 16) & 0xFFFF) as i16 as f32;
+            state.track_mouse_leave();
             state.on_mouse_move(x, y);
+            LRESULT(0)
+        }
+
+        WM_MOUSELEAVE => {
+            state.on_mouse_leave();
             LRESULT(0)
         }
 
@@ -4913,6 +5401,14 @@ extern "system" fn window_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPA
             LRESULT(0)
         }
 
+        WM_APP_PLUGIN_RESULT => {
+            if lparam.0 != 0 {
+                let result = unsafe { Box::from_raw(lparam.0 as *mut PluginCommandResult) };
+                state.on_plugin_result(*result);
+            }
+            LRESULT(0)
+        }
+
         WM_APP_DESKTOP_NOTIFICATION => {
             if lparam.0 != 0 {
                 let notification = unsafe {
@@ -4968,6 +5464,9 @@ extern "system" fn window_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPA
 
         WM_DESTROY => {
             // Clean up
+            unsafe {
+                let _ = KillTimer(Some(hwnd), BLINK_TIMER_ID);
+            }
             let mut state = unsafe { Box::from_raw(state_ptr) };
             if !state.skip_close_confirm {
                 for tab in &mut state.tabs {
@@ -5164,53 +5663,167 @@ fn terminal_palette(theme: &Theme, background: Option<&str>) -> ColorPalette {
     palette
 }
 
-fn template_session_options(
-    template: &cterm_app::config::StickyTabConfig,
-    config: &Config,
-    cols: u32,
-    rows: u32,
-) -> cterm_client::CreateSessionOpts {
-    let (configured_shell, configured_args) = template.get_command_args();
-    let shell = configured_shell.or_else(|| config.general.default_shell.clone());
-    let args = if template.docker.is_none() && template.command.is_none() {
-        config.general.shell_args.clone()
-    } else {
-        configured_args
-    };
-    cterm_client::CreateSessionOpts {
-        cols,
-        rows,
-        shell,
-        args,
-        cwd: template
-            .working_directory
-            .as_ref()
-            .or(config.general.working_directory.as_ref())
-            .map(|path| path.to_string_lossy().into_owned()),
-        // Preserve the existing Win32 template environment order. The daemon
-        // collects this into a map, so configured defaults replace duplicate
-        // template entries exactly as the former local PTY path did.
-        env: template
-            .env
-            .iter()
-            .map(|(name, value)| (name.clone(), value.clone()))
-            .chain(
-                config
-                    .general
-                    .env
-                    .iter()
-                    .map(|(name, value)| (name.clone(), value.clone())),
-            )
-            .collect(),
-        term: config.general.term.clone(),
-        ssh: template.ssh.as_ref().map(|ssh| ssh.to_ssh_params()),
-        ..Default::default()
+fn template_remote_endpoint(
+    daemon: &TemplateDaemonTarget,
+    remote_manager: &cterm_client::RemoteManager,
+) -> Option<RemoteDaemonEndpoint> {
+    match daemon {
+        TemplateDaemonTarget::Local => None,
+        TemplateDaemonTarget::Named(remote) => Some((
+            remote_manager.clone(),
+            remote.name.clone(),
+            remote.host.clone(),
+            remote.ssh_compression,
+        )),
     }
+}
+
+fn theme_name_matches(requested: &str, resolved: &str) -> bool {
+    requested.eq_ignore_ascii_case(resolved)
+        || matches!(
+            (requested.to_ascii_lowercase().as_str(), resolved),
+            ("dark", "Default Dark")
+                | ("light", "Default Light")
+                | ("tokyo_night" | "tokyo-night", "Tokyo Night")
+                | ("dracula", "Dracula")
+                | ("nord", "Nord")
+        )
+}
+
+fn resolve_template_theme(
+    config: &Config,
+    default_theme: &Theme,
+    requested: Option<&str>,
+) -> Theme {
+    let Some(requested) = requested.map(str::trim).filter(|name| !name.is_empty()) else {
+        return default_theme.clone();
+    };
+
+    if let Some(custom) = config.appearance.custom_theme.as_ref() {
+        if requested.eq_ignore_ascii_case("custom") || requested.eq_ignore_ascii_case(&custom.name)
+        {
+            return custom.clone();
+        }
+    }
+
+    let mut themed_config = config.clone();
+    themed_config.appearance.custom_theme = None;
+    themed_config.appearance.theme = requested.to_string();
+    let resolved = cterm_app::resolve_theme(&themed_config);
+    if theme_name_matches(requested, &resolved.name) {
+        resolved
+    } else {
+        log::warn!("Unknown template theme '{requested}', using the window theme");
+        default_theme.clone()
+    }
+}
+
+fn reusable_template_location(
+    policy: TemplateInstancePolicy,
+    tabs: &[TabEntry],
+    template_name: &str,
+) -> Option<(usize, PaneId)> {
+    if policy != TemplateInstancePolicy::ReuseExisting {
+        return None;
+    }
+    tabs.iter().enumerate().find_map(|(tab_index, tab)| {
+        tab.panes.iter().find_map(|(pane_id, pane)| {
+            (pane.template_name.as_deref() == Some(template_name)).then_some((tab_index, *pane_id))
+        })
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_cursor_config_initializes_protocol_defaults() {
+        let mut config = Config::default();
+        config.appearance.cursor_style = cterm_app::config::CursorStyleConfig::Bar;
+        config.appearance.cursor_blink = false;
+        let mut terminal = Terminal::new(8, 2, ScreenConfig::default());
+
+        configure_terminal_cursor(&mut terminal, &config);
+
+        assert_eq!(terminal.screen().cursor.style, cterm_core::CursorStyle::Bar);
+        assert!(!terminal.screen().cursor.blink.enabled());
+        terminal.process(b"\x1b[?12h");
+        assert!(terminal.screen().cursor.blink.enabled());
+        terminal.process(b"\x1b[?12l\x1b[0 q");
+        assert_eq!(terminal.screen().cursor.style, cterm_core::CursorStyle::Bar);
+        assert!(!terminal.screen().cursor.blink.enabled());
+    }
+
+    #[test]
+    fn win32_shortcuts_add_f11_fullscreen_to_configured_bindings() {
+        let config = cterm_app::config::ShortcutsConfig::default();
+        let shortcuts = win32_shortcut_manager(&config);
+
+        assert_eq!(
+            shortcuts.match_event(KeyCode::F11, Modifiers::empty()),
+            Some(&Action::ToggleFullscreen)
+        );
+        assert_eq!(
+            shortcuts.match_event(KeyCode::T, Modifiers::CTRL | Modifiers::SHIFT),
+            Some(&Action::NewTab)
+        );
+    }
+
+    #[test]
+    fn managed_mode_blocks_hidden_creation_configuration_and_pane_actions() {
+        for action in [
+            Action::NewTab,
+            Action::NewWindow,
+            Action::QuickOpenTemplate,
+            Action::OpenPreferences,
+            Action::SplitPane(SplitDirection::Horizontal),
+            Action::SplitPane(SplitDirection::Vertical),
+            Action::ClosePane,
+            Action::FocusPane(PaneDirection::Left),
+            Action::FocusPane(PaneDirection::Right),
+            Action::FocusPane(PaneDirection::Up),
+            Action::FocusPane(PaneDirection::Down),
+            Action::ResizePane(PaneDirection::Left),
+            Action::ResizePane(PaneDirection::Right),
+            Action::ResizePane(PaneDirection::Up),
+            Action::ResizePane(PaneDirection::Down),
+            Action::TogglePaneZoom,
+        ] {
+            assert!(action_restricted_in_managed_mode(&action), "{action:?}");
+        }
+    }
+
+    #[test]
+    fn managed_mode_keeps_non_creating_shared_actions_available() {
+        for action in [
+            Action::CloseTab,
+            Action::NextTab,
+            Action::PrevTab,
+            Action::NextAlertedTab,
+            Action::Tab(1),
+            Action::CloseWindow,
+            Action::Copy,
+            Action::Paste,
+            Action::SelectAll,
+            Action::ZoomIn,
+            Action::ZoomOut,
+            Action::ZoomReset,
+            Action::ToggleFullscreen,
+            Action::ScrollUp,
+            Action::ScrollDown,
+            Action::ScrollPageUp,
+            Action::ScrollPageDown,
+            Action::ScrollToTop,
+            Action::ScrollToBottom,
+            Action::PromptPrevious,
+            Action::PromptNext,
+            Action::FindText,
+            Action::ResetTerminal,
+        ] {
+            assert!(!action_restricted_in_managed_mode(&action), "{action:?}");
+        }
+    }
 
     #[test]
     fn key_message_kind_distinguishes_press_repeat_and_release() {
@@ -5225,71 +5838,6 @@ mod tests {
             Some(KeyEventKind::Release)
         );
         assert_eq!(key_event_kind(WM_CHAR, 0), None);
-    }
-
-    #[test]
-    fn physical_mapping_keeps_layout_text_on_wm_char() {
-        assert_eq!(
-            mapped_terminal_key(winuser::VK_UP as u16, Modifiers::empty(), false, false),
-            Some(Key::Up)
-        );
-        assert_eq!(
-            mapped_terminal_key(winuser::VK_F12 as u16, Modifiers::empty(), false, false),
-            Some(Key::F(12))
-        );
-        assert_eq!(
-            mapped_terminal_key(0x41, Modifiers::empty(), false, false),
-            None
-        );
-        assert_eq!(
-            mapped_terminal_key(winuser::VK_OEM_1 as u16, Modifiers::CTRL, false, false,),
-            None
-        );
-    }
-
-    #[test]
-    fn physical_mapping_preserves_numeric_keypad_identity() {
-        assert_eq!(
-            mapped_terminal_key(winuser::VK_NUMPAD7 as u16, Modifiers::empty(), false, false,),
-            Some(Key::NumpadDigit(7))
-        );
-        assert_eq!(
-            mapped_terminal_key(winuser::VK_ADD as u16, Modifiers::empty(), false, false,),
-            Some(Key::NumpadAdd)
-        );
-        assert_eq!(
-            mapped_terminal_key(winuser::VK_RETURN as u16, Modifiers::empty(), false, true,),
-            Some(Key::NumpadEnter)
-        );
-    }
-
-    #[test]
-    fn legacy_ctrl_letters_and_enhanced_ascii_are_mapped_exactly() {
-        assert_eq!(
-            mapped_terminal_key(0x41, Modifiers::CTRL, false, false),
-            Some(Key::Char('a'))
-        );
-        assert_eq!(
-            mapped_terminal_key(0x5a, Modifiers::CTRL | Modifiers::SHIFT, false, false),
-            Some(Key::Char('z'))
-        );
-        assert_eq!(
-            mapped_terminal_key(0x41, Modifiers::CTRL | Modifiers::ALT, false, false),
-            None
-        );
-        assert_eq!(
-            mapped_terminal_key(
-                winuser::VK_OEM_1 as u16,
-                Modifiers::CTRL | Modifiers::SHIFT,
-                true,
-                false,
-            ),
-            Some(Key::Char(';'))
-        );
-        assert_eq!(
-            mapped_terminal_key(0x32, Modifiers::ALT, true, false),
-            Some(Key::Char('2'))
-        );
     }
 
     #[test]
@@ -5434,7 +5982,9 @@ mod tests {
             ..Default::default()
         };
 
-        let options = template_session_options(&template, &config, 132, 43);
+        let options = TemplateLaunchPlan::build(&template, &config)
+            .unwrap()
+            .session_options(132, 43);
         assert_eq!(options.cols, 132);
         assert_eq!(options.rows, 43);
         assert_eq!(options.shell.as_deref(), Some("program.exe"));
@@ -5456,15 +6006,171 @@ mod tests {
         config.general.shell_args = vec!["-NoLogo".to_string()];
         config.general.working_directory = Some(std::path::PathBuf::from(r"C:\work"));
 
-        let options = template_session_options(
-            &cterm_app::config::StickyTabConfig::default(),
-            &config,
-            80,
-            24,
-        );
+        let options =
+            TemplateLaunchPlan::build(&cterm_app::config::StickyTabConfig::default(), &config)
+                .unwrap()
+                .session_options(80, 24);
         assert_eq!(options.shell.as_deref(), Some("pwsh.exe"));
         assert_eq!(options.args, ["-NoLogo"]);
         assert_eq!(options.cwd.as_deref(), Some(r"C:\work"));
+    }
+
+    #[test]
+    fn template_adapter_preserves_docker_argv_and_native_ssh() {
+        let docker = cterm_app::config::StickyTabConfig {
+            docker: Some(cterm_app::config::DockerTabConfig {
+                mode: cterm_app::config::DockerMode::Run,
+                image: Some("alpine:latest".to_string()),
+                shell: Some("/bin/ash".to_string()),
+                docker_args: vec!["--pull=never".to_string()],
+                auto_remove: true,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let docker_options = TemplateLaunchPlan::build(&docker, &Config::default())
+            .unwrap()
+            .session_options(80, 24);
+        assert_eq!(docker_options.shell.as_deref(), Some("docker"));
+        assert_eq!(
+            docker_options.args,
+            [
+                "run",
+                "-it",
+                "--rm",
+                "--pull=never",
+                "alpine:latest",
+                "/bin/ash"
+            ]
+        );
+
+        let ssh = cterm_app::config::StickyTabConfig {
+            ssh: Some(cterm_app::config::SshTabConfig {
+                host: "server.example".to_string(),
+                port: Some(2222),
+                username: Some("dev".to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let ssh_plan = TemplateLaunchPlan::build(&ssh, &Config::default()).unwrap();
+        let ssh_options = ssh_plan.session_options(80, 24);
+        assert!(ssh_options.shell.is_none());
+        assert!(ssh_options.args.is_empty());
+        assert_eq!(
+            ssh_options
+                .ssh
+                .as_ref()
+                .map(|parameters| parameters.host.as_str()),
+            Some("server.example")
+        );
+        assert!(
+            template_remote_endpoint(&ssh_plan.daemon, &cterm_client::RemoteManager::new())
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn named_remote_maps_to_manager_without_local_workspace_preparation() {
+        let remote_path = std::path::PathBuf::from("/srv/remote-project");
+        let mut config = Config::default();
+        config.remotes.push(cterm_app::config::RemoteConfig {
+            name: "build".to_string(),
+            host: "dev@build.example".to_string(),
+            ssh_compression: false,
+        });
+        let template = cterm_app::config::StickyTabConfig {
+            remote: Some("build".to_string()),
+            working_directory: Some(remote_path),
+            git_remote: Some("https://example.test/project.git".to_string()),
+            ..Default::default()
+        };
+        let plan = TemplateLaunchPlan::build(&template, &config).unwrap();
+
+        assert!(plan.local_workspace_preparation().is_none());
+        let (_, name, host, compression) =
+            template_remote_endpoint(&plan.daemon, &cterm_client::RemoteManager::new()).unwrap();
+        assert_eq!(name, "build");
+        assert_eq!(host, "dev@build.example");
+        assert!(!compression);
+    }
+
+    #[test]
+    fn local_template_workspace_is_prepared_before_launch() {
+        let root = tempfile::tempdir().unwrap();
+        let workspace = root.path().join("created-by-template-launch");
+        let template = cterm_app::config::StickyTabConfig {
+            working_directory: Some(workspace.clone()),
+            ..Default::default()
+        };
+        let plan = TemplateLaunchPlan::build(&template, &Config::default()).unwrap();
+        let (directory, git_remote) = plan.local_workspace_preparation().unwrap();
+
+        assert!(!workspace.exists());
+        assert!(!cterm_app::prepare_working_directory(directory, git_remote).unwrap());
+        assert!(workspace.is_dir());
+    }
+
+    #[test]
+    fn template_theme_uses_builtin_aliases_and_preserves_unknown_fallback() {
+        let default = Theme::nord();
+        let mut config = Config::default();
+        config.appearance.custom_theme = Some(Theme::dracula());
+
+        assert_eq!(
+            resolve_template_theme(&config, &default, Some("tokyo-night")).name,
+            "Tokyo Night"
+        );
+        assert_eq!(
+            resolve_template_theme(&config, &default, Some("custom")).name,
+            "Dracula"
+        );
+        assert_eq!(
+            resolve_template_theme(&config, &default, Some("missing-theme")).name,
+            "Nord"
+        );
+        assert_eq!(resolve_template_theme(&config, &default, None).name, "Nord");
+    }
+
+    #[test]
+    fn unique_template_lookup_finds_the_existing_tab_and_pane() {
+        let layout = PaneLayout::new();
+        let pane_id = layout.active();
+        let pane = PaneEntry {
+            source_id: 1,
+            terminal: Arc::new(Mutex::new(Terminal::new(80, 24, ScreenConfig::default()))),
+            title: "Editor".to_string(),
+            reader_handle: None,
+            session_id: None,
+            daemon_socket: None,
+            title_locked: true,
+            template_name: Some("Editor".to_string()),
+            keep_open: true,
+            has_bell: false,
+            daemon_cmd_tx: None,
+            backend: PaneBackendContext::LocalPty,
+        };
+        let tab = TabEntry {
+            id: 7,
+            title: "Editor".to_string(),
+            color: None,
+            background_color: None,
+            theme: Theme::dark(),
+            has_bell: false,
+            title_locked: true,
+            pane_layout: layout,
+            panes: BTreeMap::from([(pane_id, pane)]),
+        };
+
+        let tabs = [tab];
+        assert_eq!(
+            reusable_template_location(TemplateInstancePolicy::ReuseExisting, &tabs, "Editor"),
+            Some((0, pane_id))
+        );
+        assert_eq!(
+            reusable_template_location(TemplateInstancePolicy::AlwaysCreate, &tabs, "Editor"),
+            None
+        );
     }
 
     #[test]

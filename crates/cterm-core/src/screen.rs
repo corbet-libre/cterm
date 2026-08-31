@@ -8,13 +8,19 @@ use crate::color::{Color, ColorPalette, Rgb};
 use crate::drcs::{DrcsFont, DrcsGlyph};
 use crate::grid::{Grid, Row};
 use crate::keyboard::KeyboardEnhancementFlags;
+use crate::multiple_cursors::{
+    ExtraCursor, ExtraCursorColor, ExtraCursorColorTarget, ExtraCursorColors, ExtraCursorShape,
+    MultipleCursors,
+};
 use crate::sixel::SixelImage;
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+
+mod text_sizing;
 
 /// Configuration for the screen
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -31,8 +37,62 @@ impl Default for ScreenConfig {
     }
 }
 
+/// Independent sources which can request cursor blinking.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CursorBlink {
+    configured: bool,
+    dec_mode_12: bool,
+    decscusr: Option<bool>,
+}
+
+impl Default for CursorBlink {
+    fn default() -> Self {
+        Self {
+            configured: true,
+            dec_mode_12: false,
+            decscusr: None,
+        }
+    }
+}
+
+impl CursorBlink {
+    /// Effective blink state. DEC mode 12 and the style source are additive,
+    /// matching foot's independent `decset` and `deccsusr` sources.
+    pub fn enabled(self) -> bool {
+        self.dec_mode_12 || self.decscusr.unwrap_or(self.configured)
+    }
+
+    /// Blink state selected by DECSCUSR, falling back to configuration.
+    pub fn style_enabled(self) -> bool {
+        self.decscusr.unwrap_or(self.configured)
+    }
+
+    /// DEC private mode 12 state, independent from DECSCUSR.
+    pub fn dec_mode_12(self) -> bool {
+        self.dec_mode_12
+    }
+
+    /// Explicit DECSCUSR blink selection, if an application supplied one.
+    pub fn decscusr(self) -> Option<bool> {
+        self.decscusr
+    }
+
+    /// Native frontend default used when DECSCUSR has no explicit override.
+    pub fn configured(self) -> bool {
+        self.configured
+    }
+
+    pub(crate) fn set_dec_mode_12(&mut self, enabled: bool) {
+        self.dec_mode_12 = enabled;
+    }
+
+    pub(crate) fn set_decscusr(&mut self, enabled: Option<bool>) {
+        self.decscusr = enabled;
+    }
+}
+
 /// Cursor position and state
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Cursor {
     /// Column position (0-indexed)
     pub col: usize,
@@ -40,8 +100,80 @@ pub struct Cursor {
     pub row: usize,
     /// Cursor style
     pub style: CursorStyle,
-    /// Whether cursor should blink
-    pub blink: bool,
+    /// Independent configuration/DECSCUSR and DEC mode 12 blink sources.
+    pub blink: CursorBlink,
+    /// Configured shape restored by DECSCUSR 0 and terminal reset.
+    configured_style: CursorStyle,
+}
+
+impl Default for Cursor {
+    fn default() -> Self {
+        Self {
+            col: 0,
+            row: 0,
+            style: CursorStyle::Block,
+            blink: CursorBlink::default(),
+            configured_style: CursorStyle::Block,
+        }
+    }
+}
+
+impl Cursor {
+    /// Apply native configuration as the DECSCUSR default source.
+    pub fn configure(&mut self, style: CursorStyle, blink: bool) {
+        self.configured_style = style;
+        self.style = style;
+        self.blink.configured = blink;
+        self.blink.decscusr = None;
+    }
+
+    /// Native frontend shape restored by DECSCUSR 0 and terminal resets.
+    pub fn configured_style(&self) -> CursorStyle {
+        self.configured_style
+    }
+
+    /// Restore configured style and blink while preserving DEC mode 12.
+    pub fn reset_style_to_config(&mut self) {
+        self.style = self.configured_style;
+        self.blink.set_decscusr(None);
+    }
+
+    /// Restore application-controlled cursor state from a remote snapshot.
+    /// An absent DECSCUSR override deliberately leaves the native configured
+    /// shape and blink source intact.
+    pub fn restore_protocol_snapshot(
+        &mut self,
+        style: Option<CursorStyle>,
+        decscusr: Option<bool>,
+        dec_mode_12: Option<bool>,
+    ) {
+        match decscusr {
+            Some(decscusr) => {
+                if let Some(style) = style {
+                    self.style = style;
+                }
+                self.blink.set_decscusr(Some(decscusr));
+            }
+            None => {
+                // A snapshot is authoritative: absence means the application
+                // has no DECSCUSR override. Clear any value left by an older
+                // snapshot while retaining this frontend's native defaults.
+                self.reset_style_to_config();
+            }
+        }
+        if let Some(dec_mode_12) = dec_mode_12 {
+            self.blink.set_dec_mode_12(dec_mode_12);
+        }
+    }
+
+    /// Reset protocol sources while preserving native configuration.
+    pub fn reset_protocol_state(&mut self) {
+        self.col = 0;
+        self.row = 0;
+        self.style = self.configured_style;
+        self.blink.dec_mode_12 = false;
+        self.blink.decscusr = None;
+    }
 }
 
 /// Cursor shape style
@@ -498,6 +630,54 @@ pub struct TerminalImage {
     pub pixel_width: usize,
     /// Pixel height
     pub pixel_height: usize,
+    /// Kitty graphics z-index. Negative values are rendered behind text.
+    pub z_index: i32,
+    /// Protocol-level image ID used to order equal-z Kitty placements.
+    pub protocol_image_id: u32,
+}
+
+/// Compositing phase for an inline terminal image.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ImageLayer {
+    /// Below non-default cell backgrounds and text.
+    BehindCellBackground,
+    /// Above cell backgrounds but below glyphs and decorations.
+    BehindText,
+    /// Above the text grid.
+    AboveText,
+}
+
+impl TerminalImage {
+    /// Resolve Kitty's signed z-index into a renderer-independent phase.
+    pub fn layer(&self) -> ImageLayer {
+        if self.z_index < i32::MIN / 2 {
+            ImageLayer::BehindCellBackground
+        } else if self.z_index < 0 {
+            ImageLayer::BehindText
+        } else {
+            ImageLayer::AboveText
+        }
+    }
+
+    fn paint_order(&self) -> (i32, u64, u64) {
+        let protocol_order = if self.protocol_image_id == 0 {
+            self.id
+        } else {
+            u64::from(self.protocol_image_id)
+        };
+        (self.z_index, protocol_order, self.id)
+    }
+}
+
+/// Shared decoded pixels passed from a protocol adapter into screen storage.
+#[derive(Clone)]
+pub(crate) struct DecodedRgbaImage {
+    pub data: Arc<Vec<u8>>,
+    pub width: usize,
+    pub height: usize,
+    pub z_index: i32,
+    pub protocol_image_id: u32,
+    pub clear_cells: bool,
 }
 
 /// Sentinel column value meaning "end of row" for line selection mode.
@@ -517,6 +697,8 @@ pub struct Screen {
     config: ScreenConfig,
     /// Cursor state
     pub cursor: Cursor,
+    /// Kitty multiple-cursor viewport overlays.
+    extra_cursors: MultipleCursors,
     /// Saved cursor state (for save/restore)
     saved_cursor: Option<Cursor>,
     /// Alternate saved cursor (for alternate screen)
@@ -632,6 +814,21 @@ impl ReflowedRows {
 
 fn reflow_rows(rows: &[Row], old_width: usize, new_width: usize) -> ReflowedRows {
     let new_width = new_width.max(1);
+    let multiline_blocks = rows
+        .iter()
+        .enumerate()
+        .flat_map(|(row, cells)| {
+            cells
+                .iter()
+                .enumerate()
+                .filter(|(_, cell)| {
+                    cell.multicell
+                        .as_ref()
+                        .is_some_and(|multicell| multicell.is_anchor() && multicell.rows > 1)
+                })
+                .map(move |(col, cell)| (row, col, cell.clone()))
+        })
+        .collect::<Vec<_>>();
     let mut output = Vec::new();
     let mut old_row_origins = vec![(0, 0); rows.len()];
     let mut logical_boundaries = Vec::new();
@@ -665,13 +862,23 @@ fn reflow_rows(rows: &[Row], old_width: usize, new_width: usize) -> ReflowedRows
                 text_end.max(marker_end).min(rows[row_index].len())
             };
 
-            cells.extend(
-                rows[row_index]
-                    .iter()
-                    .take(used)
-                    .filter(|cell| !cell.is_wide_spacer())
-                    .cloned(),
-            );
+            cells.extend(rows[row_index].iter().take(used).filter_map(|cell| {
+                if cell.is_wide_spacer() {
+                    return None;
+                }
+                if let Some(multicell) = cell.multicell.as_ref() {
+                    if multicell.row_offset > 0 {
+                        // Reserve the lower rows of a scaled block while the
+                        // anchor is reflowed as one horizontal unit. The block
+                        // metadata is restored after coordinate mapping.
+                        return Some(Cell::default());
+                    }
+                    if multicell.column_offset > 0 {
+                        return None;
+                    }
+                }
+                Some(cell.clone())
+            }));
         }
 
         let first_row_index = output.len();
@@ -681,11 +888,20 @@ fn reflow_rows(rows: &[Row], old_width: usize, new_width: usize) -> ReflowedRows
         let mut boundaries = vec![(first_row_index, 0)];
 
         for mut cell in cells {
-            let cell_width = if cell.is_wide() && new_width > 1 {
-                2
-            } else {
-                1
-            };
+            let cell_width = cell.multicell.as_ref().map_or_else(
+                || {
+                    if cell.is_wide() && new_width > 1 {
+                        2
+                    } else {
+                        1
+                    }
+                },
+                |multicell| usize::from(multicell.columns),
+            );
+            if cell_width > new_width {
+                boundaries.extend((0..cell_width).map(|_| (output.len(), col)));
+                continue;
+            }
 
             if col > 0 && col + cell_width > new_width || col == new_width {
                 output.push(row);
@@ -700,7 +916,17 @@ fn reflow_rows(rows: &[Row], old_width: usize, new_width: usize) -> ReflowedRows
             cell.attrs.remove(CellAttrs::WIDE_SPACER);
             row[col] = cell.clone();
 
-            if cell_width == 2 {
+            if let Some(multicell) = cell.multicell.clone() {
+                for offset in 1..cell_width {
+                    let mut spacer = cell.clone();
+                    spacer.set_char(' ');
+                    if let Some(metadata) = spacer.multicell.as_mut() {
+                        debug_assert!(metadata.same_span(&multicell));
+                        metadata.column_offset = offset as u8;
+                    }
+                    row[col + offset] = spacer;
+                }
+            } else if cell_width == 2 {
                 let mut spacer = cell;
                 spacer.set_char(' ');
                 spacer.attrs.remove(CellAttrs::WIDE);
@@ -729,6 +955,37 @@ fn reflow_rows(rows: &[Row], old_width: usize, new_width: usize) -> ReflowedRows
         logical_boundaries,
         new_width,
     };
+
+    // Rebuild every scaled block from its mapped anchor. Lower rows carry a
+    // complete copy of the metadata so rendering and selection still work if
+    // the anchor later scrolls into history.
+    for (old_row, old_col, anchor_cell) in multiline_blocks {
+        let Some(multicell) = anchor_cell.multicell.as_ref() else {
+            continue;
+        };
+        let columns = usize::from(multicell.columns);
+        let block_rows = usize::from(multicell.rows);
+        let (new_row, new_col) = reflowed.map_position(old_row, old_col);
+        if columns > new_width || new_col + columns > new_width {
+            continue;
+        }
+        while reflowed.rows.len() < new_row + block_rows {
+            reflowed.rows.push(Row::new(new_width));
+        }
+        for row_offset in 0..block_rows {
+            for column_offset in 0..columns {
+                let mut cell = anchor_cell.clone();
+                if row_offset != 0 || column_offset != 0 {
+                    cell.set_char(' ');
+                }
+                if let Some(metadata) = cell.multicell.as_mut() {
+                    metadata.row_offset = row_offset as u8;
+                    metadata.column_offset = column_offset as u8;
+                }
+                reflowed.rows[new_row + row_offset][new_col + column_offset] = cell;
+            }
+        }
+    }
 
     // Shell markers refer to positions in the old grid. Remap them through
     // the same boundary table as cursors, selections and image anchors.
@@ -790,10 +1047,8 @@ impl Screen {
             scrollback: VecDeque::with_capacity(config.scrollback_lines.min(1000)),
             alternate_grid: None,
             config,
-            cursor: Cursor {
-                blink: true,
-                ..Default::default()
-            },
+            cursor: Cursor::default(),
+            extra_cursors: MultipleCursors::default(),
             saved_cursor: None,
             alt_saved_cursor: None,
             scroll_region: ScrollRegion {
@@ -854,6 +1109,96 @@ impl Screen {
     /// Queue a response to be sent back through the PTY
     pub fn queue_response(&mut self, response: Vec<u8>) {
         self.pending_responses.push(response);
+    }
+
+    /// Whether the Kitty multiple-cursors overlay contains any positions.
+    pub fn has_extra_cursors(&self) -> bool {
+        !self.extra_cursors.is_empty()
+    }
+
+    /// Iterate over Kitty extra cursors in stable row-major order.
+    pub fn extra_cursors(&self) -> impl Iterator<Item = ExtraCursor> + '_ {
+        self.extra_cursors.iter()
+    }
+
+    /// Shared text and cursor colors used by Kitty extra cursors.
+    pub fn extra_cursor_colors(&self) -> ExtraCursorColors {
+        self.extra_cursors.colors()
+    }
+
+    /// Replace multiple-cursor state from an authoritative daemon snapshot.
+    pub fn replace_extra_cursors(
+        &mut self,
+        cursors: impl IntoIterator<Item = ExtraCursor>,
+        colors: ExtraCursorColors,
+    ) {
+        let height = self.height();
+        let width = self.width();
+        self.extra_cursors.replace(
+            cursors
+                .into_iter()
+                .filter(|cursor| cursor.row < height && cursor.col < width),
+            colors,
+        );
+        self.dirty = true;
+    }
+
+    pub(crate) fn set_extra_cursor_points(
+        &mut self,
+        shape: Option<ExtraCursorShape>,
+        points: impl IntoIterator<Item = (usize, usize)>,
+    ) {
+        if self
+            .extra_cursors
+            .set_points(shape, points, self.height(), self.width())
+        {
+            self.dirty = true;
+        }
+    }
+
+    pub(crate) fn set_extra_cursor_rectangles(
+        &mut self,
+        shape: Option<ExtraCursorShape>,
+        rectangles: &[(usize, usize, usize, usize)],
+        full_screen: bool,
+    ) {
+        if self.extra_cursors.set_rectangles(
+            shape,
+            rectangles,
+            self.height(),
+            self.width(),
+            full_screen,
+        ) {
+            self.dirty = true;
+        }
+    }
+
+    pub(crate) fn set_extra_cursor_color(
+        &mut self,
+        target: ExtraCursorColorTarget,
+        color: ExtraCursorColor,
+    ) {
+        if self.extra_cursors.set_color(target, color) {
+            self.dirty = true;
+        }
+    }
+
+    pub(crate) fn reset_extra_cursors(&mut self) {
+        if self.extra_cursors.reset() {
+            self.dirty = true;
+        }
+    }
+
+    pub(crate) fn queue_extra_cursor_support_response(&mut self) {
+        self.queue_response(b"\x1b[>1;2;3;29;30;40;100;101 q".to_vec());
+    }
+
+    pub(crate) fn queue_extra_cursor_state_response(&mut self) {
+        self.queue_response(self.extra_cursors.state_response());
+    }
+
+    pub(crate) fn queue_extra_cursor_color_response(&mut self) {
+        self.queue_response(self.extra_cursors.color_response());
     }
 
     /// Active kitty keyboard progressive-enhancement flags.
@@ -984,6 +1329,12 @@ impl Screen {
     /// Return the frontend-owned state used by terminal protocol reports.
     pub fn frontend_state(&self) -> FrontendState {
         self.frontend_state
+    }
+
+    /// Apply the native cursor defaults used by DECSCUSR 0 and terminal reset.
+    pub fn configure_cursor(&mut self, style: CursorStyle, blink: bool) {
+        self.cursor.configure(style, blink);
+        self.dirty = true;
     }
 
     /// Update the native theme class and report a change when requested.
@@ -1395,6 +1746,8 @@ impl Screen {
             self.tab_stops[i] = i % 8 == 0;
         }
 
+        self.extra_cursors.retain_within(height, width);
+
         self.dirty = true;
     }
 
@@ -1524,12 +1877,20 @@ impl Screen {
     pub fn put_char(&mut self, c: char) {
         let c = self.map_active_charset_char(c);
 
+        if self.try_extend_previous_multicell(c) {
+            return;
+        }
+
         if self.try_extend_previous_grapheme(c) {
             return;
         }
 
         let width = UnicodeWidthChar::width(c).unwrap_or(0).min(2);
         if width == 0 {
+            return;
+        }
+
+        if !self.move_cursor_past_multicell(width) {
             return;
         }
 
@@ -1555,7 +1916,10 @@ impl Screen {
         // Clear selection if writing to a selected row
         self.clear_selection_if_row_selected(self.cursor.row);
 
-        self.clear_wide_cell_at(self.cursor.row, self.cursor.col);
+        for col in self.cursor.col..self.cursor.col.saturating_add(width) {
+            self.clear_multicell_span_at(self.cursor.row, col);
+            self.clear_wide_cell_at(self.cursor.row, col);
+        }
 
         // Write the character
         if let Some(cell) = self.grid.get_mut(self.cursor.row, self.cursor.col) {
@@ -1671,9 +2035,13 @@ impl Screen {
 
     /// Insert blank cells at cursor, shifting existing cells right
     fn insert_cells(&mut self, count: usize) {
-        let cursor_row = self.cursor.row;
-        let cursor_col = self.cursor.col;
+        self.insert_cells_at(self.cursor.row, self.cursor.col, count);
+    }
+
+    fn insert_cells_at(&mut self, cursor_row: usize, cursor_col: usize, count: usize) {
         let width = self.width();
+
+        self.clear_multiline_multicells_intersecting_row_range(cursor_row, cursor_col, width);
 
         if let Some(row) = self.grid.row_mut(cursor_row) {
             for i in (cursor_col + count..width).rev() {
@@ -1687,6 +2055,7 @@ impl Screen {
                 }
             }
         }
+        self.repair_multicell_spans_in_row(cursor_row);
     }
 
     /// Move cursor to start of line
@@ -1706,6 +2075,17 @@ impl Screen {
 
     /// Scroll up within scroll region
     pub fn scroll_up(&mut self, count: usize) {
+        let full_viewport_to_history = !self.modes.alternate_screen
+            && self.scroll_region.top == 0
+            && self.scroll_region.bottom == self.height();
+        if !full_viewport_to_history {
+            self.clear_multicells_crossing_row_boundary(self.scroll_region.top);
+            self.clear_multicells_crossing_row_boundary(self.scroll_region.bottom);
+            self.clear_multicells_intersecting_rows(
+                self.scroll_region.top,
+                (self.scroll_region.top + count).min(self.scroll_region.bottom),
+            );
+        }
         let scrolled =
             self.grid
                 .scroll_up(count, self.scroll_region.top, self.scroll_region.bottom);
@@ -1776,6 +2156,12 @@ impl Screen {
 
     /// Scroll down within scroll region
     pub fn scroll_down(&mut self, count: usize) {
+        self.clear_multicells_crossing_row_boundary(self.scroll_region.top);
+        self.clear_multicells_crossing_row_boundary(self.scroll_region.bottom);
+        self.clear_multicells_intersecting_rows(
+            self.scroll_region.bottom.saturating_sub(count),
+            self.scroll_region.bottom,
+        );
         self.grid
             .scroll_down(count, self.scroll_region.top, self.scroll_region.bottom);
         self.dirty = true;
@@ -1824,13 +2210,14 @@ impl Screen {
             return;
         }
 
+        self.extra_cursors.clear_positions();
         self.modes.alternate_screen = true;
         self.alt_saved_cursor = Some(self.cursor.clone());
 
         let alt = Grid::new(self.width(), self.height());
         self.alternate_grid = Some(std::mem::replace(&mut self.grid, alt));
 
-        self.cursor = Cursor::default();
+        self.cursor.reset_protocol_state();
         self.dirty = true;
     }
 
@@ -1840,6 +2227,7 @@ impl Screen {
             return;
         }
 
+        self.extra_cursors.clear_positions();
         self.modes.alternate_screen = false;
 
         if let Some(primary) = self.alternate_grid.take() {
@@ -1879,6 +2267,7 @@ impl Screen {
 
         match mode {
             ClearMode::Below => {
+                self.clear_multicells_intersecting_row_range(cursor_row, cursor_col, width);
                 // Clear from cursor to end of line
                 if let Some(row) = self.grid.row_mut(cursor_row) {
                     for col in cursor_col..width {
@@ -1900,6 +2289,11 @@ impl Screen {
                     }
                 }
                 // Clear from start of line to cursor
+                self.clear_multicells_intersecting_row_range(
+                    cursor_row,
+                    0,
+                    cursor_col.saturating_add(1),
+                );
                 if let Some(row) = self.grid.row_mut(cursor_row) {
                     for col in 0..=cursor_col.min(width.saturating_sub(1)) {
                         row[col].reset();
@@ -1907,13 +2301,44 @@ impl Screen {
                 }
             }
             ClearMode::All => {
+                self.extra_cursors.clear_positions();
                 self.grid.clear();
             }
             ClearMode::Scrollback => {
+                self.extra_cursors.clear_positions();
                 self.scrollback.clear();
             }
         }
         self.dirty = true;
+    }
+
+    /// Move the populated viewport into history, then leave a cleared screen.
+    ///
+    /// Kitty's `CSI 22 J` extension only moves rows from the primary screen
+    /// when the scrolling margins cover the full viewport. Trailing empty rows
+    /// are not added to history and the cursor remains in place.
+    pub(crate) fn move_viewport_to_scrollback(&mut self) {
+        let height = self.height();
+        let full_viewport = !self.modes.alternate_screen
+            && self.scroll_region.top == 0
+            && self.scroll_region.bottom == height;
+        if full_viewport {
+            let populated_rows = (0..height)
+                .rfind(|&row| self.grid.row(row).is_some_and(|row| !row.is_all_empty()))
+                .map_or(0, |row| row + 1);
+            if populated_rows > 0 {
+                let saved_region = self.scroll_region;
+                self.scroll_region = ScrollRegion {
+                    top: 0,
+                    bottom: height,
+                };
+                self.scroll_up(populated_rows);
+                self.scroll_region = saved_region;
+            }
+        }
+        let visible_top = self.scrollback.len();
+        self.images.retain(|_, image| image.line < visible_top);
+        self.clear(ClearMode::All);
     }
 
     /// Clear line (or parts of it)
@@ -1931,6 +2356,7 @@ impl Screen {
             LineClearMode::All => (0, width),
         };
 
+        self.clear_multicells_intersecting_row_range(cursor_row, start, end);
         if let Some(row) = self.grid.row_mut(cursor_row) {
             if matches!(mode, LineClearMode::All) {
                 row.clear();
@@ -1970,7 +2396,12 @@ impl Screen {
                 for &param in params {
                     match param {
                         0 => {
-                            attrs.remove(CellAttrs::BOLD | CellAttrs::BLINK | CellAttrs::INVERSE);
+                            attrs.remove(
+                                CellAttrs::BOLD
+                                    | CellAttrs::BLINK
+                                    | CellAttrs::RAPID_BLINK
+                                    | CellAttrs::INVERSE,
+                            );
                             attrs.clear_underline();
                         }
                         1 => attrs.insert(CellAttrs::BOLD),
@@ -1978,11 +2409,14 @@ impl Screen {
                             attrs.clear_underline();
                             attrs.insert(CellAttrs::UNDERLINE);
                         }
-                        5 => attrs.insert(CellAttrs::BLINK),
+                        5 => {
+                            attrs.clear_blink();
+                            attrs.insert(CellAttrs::BLINK);
+                        }
                         7 => attrs.insert(CellAttrs::INVERSE),
                         22 => attrs.remove(CellAttrs::BOLD),
                         24 => attrs.clear_underline(),
-                        25 => attrs.remove(CellAttrs::BLINK),
+                        25 => attrs.clear_blink(),
                         27 => attrs.remove(CellAttrs::INVERSE),
                         _ => {}
                     }
@@ -2016,11 +2450,15 @@ impl Screen {
                     match param {
                         0 => {
                             attrs.toggle(CellAttrs::BOLD | CellAttrs::BLINK | CellAttrs::INVERSE);
+                            attrs.remove(CellAttrs::RAPID_BLINK);
                             Self::toggle_basic_underline(attrs);
                         }
                         1 => attrs.toggle(CellAttrs::BOLD),
                         4 => Self::toggle_basic_underline(attrs),
-                        5 => attrs.toggle(CellAttrs::BLINK),
+                        5 => {
+                            attrs.toggle(CellAttrs::BLINK);
+                            attrs.remove(CellAttrs::RAPID_BLINK);
+                        }
                         7 => attrs.toggle(CellAttrs::INVERSE),
                         _ => {}
                     }
@@ -2071,6 +2509,16 @@ impl Screen {
                         // Foot copies cell contents and SGR attributes, but
                         // deliberately does not copy OSC 8 URI ranges.
                         cell.hyperlink = None;
+                        if cell
+                            .multicell
+                            .as_ref()
+                            .is_some_and(|multicell| !multicell.is_anchor())
+                        {
+                            cell.set_char(' ');
+                        }
+                        // DECCRA has no multicell semantics. Copy the visible
+                        // content without manufacturing a partial OSC 66 block.
+                        cell.multicell = None;
                         cell
                     })
                     .collect::<Vec<_>>(),
@@ -2084,6 +2532,7 @@ impl Screen {
 
         for row_offset in 0..row_count {
             for col_offset in 0..col_count {
+                self.clear_multicell_span_at(dst_top + row_offset, dst_left + col_offset);
                 self.clear_wide_cell_at(dst_top + row_offset, dst_left + col_offset);
             }
         }
@@ -2120,6 +2569,9 @@ impl Screen {
         fill.hyperlink = None;
 
         for row_index in top..=bottom.min(self.height().saturating_sub(1)) {
+            self.clear_multicells_intersecting_row_range(row_index, left, right.saturating_add(1));
+        }
+        for row_index in top..=bottom.min(self.height().saturating_sub(1)) {
             for col in left..=right.min(self.width().saturating_sub(1)) {
                 self.clear_wide_cell_at(row_index, col);
                 if let Some(cell) = self.grid.get_mut(row_index, col) {
@@ -2147,6 +2599,9 @@ impl Screen {
         let mut blank = Cell::default();
         blank.bg = self.style.bg;
 
+        for row_index in top..=bottom.min(self.height().saturating_sub(1)) {
+            self.clear_multicells_intersecting_row_range(row_index, left, right.saturating_add(1));
+        }
         for row_index in top..=bottom.min(self.height().saturating_sub(1)) {
             for col in left..=right.min(self.width().saturating_sub(1)) {
                 self.clear_wide_cell_at(row_index, col);
@@ -2208,6 +2663,7 @@ impl Screen {
 
         // Clear selection if it overlaps with the modified row
         self.clear_selection_if_row_selected(cursor_row);
+        self.clear_multiline_multicells_intersecting_row_range(cursor_row, cursor_col, width);
 
         if let Some(row) = self.grid.row_mut(cursor_row) {
             // Shift characters left
@@ -2217,6 +2673,35 @@ impl Screen {
 
             // Clear the rightmost cells
             for col in width.saturating_sub(count)..width {
+                row[col].reset();
+            }
+        }
+        self.repair_multicell_spans_in_row(cursor_row);
+        self.dirty = true;
+    }
+
+    /// Insert blank cells at the cursor for CSI ICH.
+    pub(crate) fn insert_chars(&mut self, count: usize) {
+        let count = count.min(self.width().saturating_sub(self.cursor.col));
+        if count == 0 {
+            return;
+        }
+        self.clear_selection_if_row_selected(self.cursor.row);
+        self.insert_cells(count);
+        self.dirty = true;
+    }
+
+    /// Erase cells at the cursor for CSI ECH, expanding through OSC 66 spans.
+    pub(crate) fn erase_chars(&mut self, count: usize) {
+        let count = count.min(self.width().saturating_sub(self.cursor.col));
+        if count == 0 {
+            return;
+        }
+        self.clear_selection_if_row_selected(self.cursor.row);
+        let end = self.cursor.col + count;
+        self.clear_multicells_intersecting_row_range(self.cursor.row, self.cursor.col, end);
+        if let Some(row) = self.grid.row_mut(self.cursor.row) {
+            for col in self.cursor.col..end {
                 row[col].reset();
             }
         }
@@ -2231,6 +2716,13 @@ impl Screen {
 
         // Clear selection if it overlaps with the affected region
         self.clear_selection_if_rows_selected(self.cursor.row, self.scroll_region.bottom);
+
+        self.clear_multicells_crossing_row_boundary(self.cursor.row);
+        self.clear_multicells_crossing_row_boundary(self.scroll_region.bottom);
+        self.clear_multicells_intersecting_rows(
+            self.scroll_region.bottom.saturating_sub(count),
+            self.scroll_region.bottom,
+        );
 
         // Scroll the region below cursor down
         let region_bottom = self.scroll_region.bottom;
@@ -2248,6 +2740,12 @@ impl Screen {
         // Clear selection if it overlaps with the affected region
         self.clear_selection_if_rows_selected(self.cursor.row, self.scroll_region.bottom);
 
+        self.clear_multicells_crossing_row_boundary(self.scroll_region.bottom);
+        self.clear_multicells_intersecting_rows(
+            self.cursor.row,
+            (self.cursor.row + count).min(self.scroll_region.bottom),
+        );
+
         // Scroll the region from cursor up
         let region_bottom = self.scroll_region.bottom;
         self.grid.scroll_up(count, self.cursor.row, region_bottom);
@@ -2260,10 +2758,8 @@ impl Screen {
         self.grid.clear();
         self.scrollback.clear();
         self.alternate_grid = None;
-        self.cursor = Cursor {
-            blink: true,
-            ..Default::default()
-        };
+        self.cursor.reset_protocol_state();
+        self.extra_cursors.reset();
         self.saved_cursor = None;
         self.alt_saved_cursor = None;
         self.scroll_region = ScrollRegion {
@@ -2559,12 +3055,53 @@ impl Screen {
         cell_cols: usize,
         cell_rows: usize,
         sixel_image: SixelImage,
-    ) {
-        let id = self.next_image_id;
-        self.next_image_id += 1;
+    ) -> u64 {
+        self.add_rgba_image_with_size(
+            col,
+            row,
+            cell_cols,
+            cell_rows,
+            DecodedRgbaImage {
+                data: Arc::new(sixel_image.data),
+                width: sixel_image.width,
+                height: sixel_image.height,
+                z_index: 0,
+                protocol_image_id: 0,
+                clear_cells: true,
+            },
+        )
+    }
 
+    /// Add an already decoded RGBA image without copying shared pixel storage.
+    pub(crate) fn add_rgba_image_with_size(
+        &mut self,
+        col: usize,
+        row: usize,
+        cell_cols: usize,
+        cell_rows: usize,
+        pixels: DecodedRgbaImage,
+    ) -> u64 {
+        if pixels.clear_cells {
+            // SIXEL follows xterm's replacement behavior. Overlay protocols
+            // such as Kitty preserve the grid for negative-z composition.
+            self.clear_cells_for_image(col, row, cell_cols, cell_rows);
+        }
         // Calculate absolute line (scrollback + visible row)
         let absolute_line = self.scrollback.len() + row;
+        self.add_rgba_image_at_absolute_line(col, absolute_line, cell_cols, cell_rows, pixels)
+    }
+
+    /// Add decoded RGBA pixels anchored to a scrollback-aware absolute line.
+    pub(crate) fn add_rgba_image_at_absolute_line(
+        &mut self,
+        col: usize,
+        absolute_line: usize,
+        cell_cols: usize,
+        cell_rows: usize,
+        pixels: DecodedRgbaImage,
+    ) -> u64 {
+        let id = self.next_image_id;
+        self.next_image_id += 1;
 
         let image = TerminalImage {
             id,
@@ -2572,17 +3109,16 @@ impl Screen {
             line: absolute_line,
             cell_width: cell_cols,
             cell_height: cell_rows,
-            data: Arc::new(sixel_image.data),
-            pixel_width: sixel_image.width,
-            pixel_height: sixel_image.height,
+            data: pixels.data,
+            pixel_width: pixels.width,
+            pixel_height: pixels.height,
+            z_index: pixels.z_index,
+            protocol_image_id: pixels.protocol_image_id,
         };
-
-        // Clear grid cells underneath the image (xterm behavior)
-        // This ensures text doesn't show through the image
-        self.clear_cells_for_image(col, row, cell_cols, cell_rows);
 
         self.images.insert(id, image);
         self.dirty = true;
+        id
     }
 
     /// Clear grid cells that will be covered by an image
@@ -2634,7 +3170,26 @@ impl Screen {
         // HashMap iteration order is deliberately unspecified. Images are
         // painted from oldest to newest so overlapping graphics are stable and
         // a later image consistently appears on top on every backend.
-        images.sort_unstable_by_key(|image| image.id);
+        images.sort_unstable_by_key(|image| image.paint_order());
+        images
+    }
+
+    /// Get visible images belonging to one compositing phase.
+    pub fn visible_images_in_layer(&self, layer: ImageLayer) -> Vec<&TerminalImage> {
+        let scrollback_len = self.scrollback.len();
+        let first_visible_line = scrollback_len.saturating_sub(self.scroll_offset);
+        let last_visible_line = first_visible_line + self.height();
+        let mut images: Vec<_> = self
+            .images
+            .values()
+            .filter(|image| {
+                let image_bottom = image.line + image.cell_height.max(1);
+                image.layer() == layer
+                    && image_bottom > first_visible_line
+                    && image.line < last_visible_line
+            })
+            .collect();
+        images.sort_unstable_by_key(|image| image.paint_order());
         images
     }
 
@@ -2657,7 +3212,7 @@ impl Screen {
     /// Get all stored images in deterministic paint order.
     pub fn images(&self) -> Vec<&TerminalImage> {
         let mut images: Vec<_> = self.images.values().collect();
-        images.sort_unstable_by_key(|image| image.id);
+        images.sort_unstable_by_key(|image| image.paint_order());
         images
     }
 
@@ -2717,6 +3272,53 @@ impl Screen {
     /// Clear all images (called on screen clear)
     pub fn clear_images(&mut self) {
         self.images.clear();
+    }
+
+    /// Remove one image placement by its internal screen identifier.
+    pub(crate) fn remove_image(&mut self, id: u64) -> bool {
+        let removed = self.images.remove(&id).is_some();
+        self.dirty |= removed;
+        removed
+    }
+
+    /// Replace only the decoded pixels for an existing protocol placement.
+    pub(crate) fn update_rgba_image(&mut self, id: u64, pixels: DecodedRgbaImage) -> bool {
+        let Some(image) = self.images.get_mut(&id) else {
+            return false;
+        };
+        image.data = pixels.data;
+        image.pixel_width = pixels.width;
+        image.pixel_height = pixels.height;
+        image.z_index = pixels.z_index;
+        image.protocol_image_id = pixels.protocol_image_id;
+        self.dirty = true;
+        true
+    }
+
+    /// Replace the geometry and decoded pixels of an existing placement.
+    pub(crate) fn update_rgba_image_geometry(
+        &mut self,
+        id: u64,
+        col: usize,
+        absolute_line: usize,
+        cell_cols: usize,
+        cell_rows: usize,
+        pixels: DecodedRgbaImage,
+    ) -> bool {
+        let Some(image) = self.images.get_mut(&id) else {
+            return false;
+        };
+        image.col = col;
+        image.line = absolute_line;
+        image.cell_width = cell_cols;
+        image.cell_height = cell_rows;
+        image.data = pixels.data;
+        image.pixel_width = pixels.width;
+        image.pixel_height = pixels.height;
+        image.z_index = pixels.z_index;
+        image.protocol_image_id = pixels.protocol_image_id;
+        self.dirty = true;
+        true
     }
 
     /// Set the cell height hint (call from UI layer when font metrics are known)
@@ -3166,6 +3768,7 @@ impl Screen {
             (0, 0) // Not used for non-block selection
         };
 
+        let mut emitted_multicells = HashSet::new();
         for line_idx in start.line..=end_line {
             let row = self.get_row_by_absolute_line(line_idx)?;
 
@@ -3186,9 +3789,20 @@ impl Screen {
                 (sc, ec)
             };
 
-            // Extract characters from this row
+            // Extract characters from this row. Selecting any occupied cell
+            // includes an OSC 66 span once, rather than exposing its spacers.
             for col in start_col..=end_col {
                 if let Some(cell) = row.get(col) {
+                    if let Some(multicell) = cell.multicell.as_ref() {
+                        let anchor = (
+                            line_idx.saturating_sub(usize::from(multicell.row_offset)),
+                            col.saturating_sub(usize::from(multicell.column_offset)),
+                        );
+                        if emitted_multicells.insert(anchor) {
+                            result.push_str(multicell.text());
+                        }
+                        continue;
+                    }
                     // Skip wide character spacers
                     if !cell.attrs.contains(crate::cell::CellAttrs::WIDE_SPACER) {
                         result.push_str(cell.text());
@@ -3272,6 +3886,7 @@ impl Screen {
         let mut last_attrs: Option<CellAttrs> = None;
         let mut current_span_open = false;
 
+        let mut emitted_multicells = HashSet::new();
         for line_idx in start.line..=end_line {
             let row = match self.get_row_by_absolute_line(line_idx) {
                 Some(r) => r,
@@ -3294,7 +3909,19 @@ impl Screen {
             };
 
             for col in start_col..=end_col {
-                if let Some(cell) = row.get(col) {
+                if let Some(selected_cell) = row.get(col) {
+                    let (cell, text) = if let Some(multicell) = selected_cell.multicell.as_ref() {
+                        let anchor = (
+                            line_idx.saturating_sub(usize::from(multicell.row_offset)),
+                            col.saturating_sub(usize::from(multicell.column_offset)),
+                        );
+                        if !emitted_multicells.insert(anchor) {
+                            continue;
+                        }
+                        (selected_cell, multicell.text())
+                    } else {
+                        (selected_cell, selected_cell.text())
+                    };
                     // Skip wide character spacers
                     if cell.attrs.contains(CellAttrs::WIDE_SPACER) {
                         continue;
@@ -3377,7 +4004,7 @@ impl Screen {
                     }
 
                     // Append character (HTML-escaped)
-                    for c in cell.text().chars() {
+                    for c in text.chars() {
                         match c {
                             '<' => result.push_str("&lt;"),
                             '>' => result.push_str("&gt;"),
@@ -3521,6 +4148,35 @@ mod tests {
     }
 
     #[test]
+    fn terminal_images_follow_kitty_z_and_image_id_paint_order() {
+        let image = |id, z_index, protocol_image_id| TerminalImage {
+            id,
+            col: 0,
+            line: 0,
+            cell_width: 1,
+            cell_height: 1,
+            data: Arc::new(vec![255, 0, 0, 255]),
+            pixel_width: 1,
+            pixel_height: 1,
+            z_index,
+            protocol_image_id,
+        };
+        let mut screen = Screen::new(10, 3, ScreenConfig::default());
+        screen.replace_images([
+            image(1, 0, 20),
+            image(2, -1, 30),
+            image(3, 0, 10),
+            image(4, i32::MIN / 2 - 1, 40),
+        ]);
+
+        let ids: Vec<_> = screen.images().iter().map(|image| image.id).collect();
+        assert_eq!(ids, vec![4, 2, 3, 1]);
+        assert_eq!(screen.images()[0].layer(), ImageLayer::BehindCellBackground);
+        assert_eq!(screen.images()[1].layer(), ImageLayer::BehindText);
+        assert_eq!(screen.images()[2].layer(), ImageLayer::AboveText);
+    }
+
+    #[test]
     fn partially_scrolled_image_remains_visible() {
         let mut screen = Screen::new(10, 2, ScreenConfig::default());
         screen.add_image_with_size(
@@ -3554,6 +4210,8 @@ mod tests {
             data: Arc::new(vec![0, 255, 0, 255]),
             pixel_width: 1,
             pixel_height: 1,
+            z_index: 0,
+            protocol_image_id: 0,
         }]);
 
         screen.add_image_with_size(
@@ -4132,5 +4790,38 @@ mod tests {
         // Selection must stay on the same single word, just shifted up by one line.
         assert_eq!(start, SelectionPoint::new(abs_line - 1, 0));
         assert_eq!(end, SelectionPoint::new(abs_line - 1, 4));
+    }
+
+    #[test]
+    fn authoritative_cursor_snapshot_clears_stale_decscusr_override() {
+        let mut cursor = Cursor::default();
+        cursor.configure(CursorStyle::Bar, false);
+        cursor.restore_protocol_snapshot(Some(CursorStyle::Underline), Some(true), Some(true));
+        assert_eq!(cursor.style, CursorStyle::Underline);
+        assert_eq!(cursor.blink.decscusr(), Some(true));
+
+        cursor.restore_protocol_snapshot(Some(CursorStyle::Block), None, Some(false));
+        assert_eq!(cursor.style, CursorStyle::Bar);
+        assert_eq!(cursor.blink.decscusr(), None);
+        assert!(!cursor.blink.dec_mode_12());
+        assert!(!cursor.blink.enabled());
+    }
+
+    #[test]
+    fn alternate_screen_keeps_native_cursor_defaults() {
+        let mut screen = Screen::new(80, 24, ScreenConfig::default());
+        screen.configure_cursor(CursorStyle::Bar, false);
+        screen.cursor.restore_protocol_snapshot(
+            Some(CursorStyle::Underline),
+            Some(true),
+            Some(true),
+        );
+
+        screen.enter_alternate_screen();
+
+        assert_eq!(screen.cursor.configured_style(), CursorStyle::Bar);
+        assert!(!screen.cursor.blink.configured());
+        assert_eq!(screen.cursor.style, CursorStyle::Bar);
+        assert!(!screen.cursor.blink.enabled());
     }
 }

@@ -4,15 +4,21 @@
 //! different UI backends (GTK4, Qt, etc.) to implement the terminal
 //! interface.
 
+pub mod blink;
+pub mod cursor;
 pub mod events;
 pub mod pane;
 pub mod sprite;
+pub mod text_sizing;
 pub mod theme;
 pub mod traits;
 pub mod utils;
 
+pub use blink::*;
+pub use cursor::*;
 pub use events::*;
 pub use pane::*;
+pub use text_sizing::*;
 pub use theme::*;
 pub use traits::*;
 pub use utils::*;

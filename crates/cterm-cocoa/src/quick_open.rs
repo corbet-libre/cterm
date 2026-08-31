@@ -16,6 +16,7 @@ use objc2_foundation::{
     ns_string, MainThreadMarker, NSInteger, NSObjectProtocol, NSPoint, NSRange, NSRect, NSSize,
     NSString,
 };
+use objc2_quartz_core::CALayer;
 use std::cell::{Cell, RefCell};
 
 /// Height of the Quick Open overlay
@@ -132,10 +133,7 @@ define_class!(
                 _ => false, // Let the text field handle it
             }
         }
-    }
 
-    // NSTextFieldDelegate for text changes
-    unsafe impl NSTextFieldDelegate for QuickOpenOverlay {
         #[unsafe(method(controlTextDidChange:))]
         fn control_text_did_change(&self, _notification: &objc2_foundation::NSNotification) {
             self.update_filter();
@@ -147,6 +145,8 @@ define_class!(
             self.hide();
         }
     }
+
+    unsafe impl NSTextFieldDelegate for QuickOpenOverlay {}
 
     impl QuickOpenOverlay {
         #[unsafe(method(isFlipped))]
@@ -206,14 +206,12 @@ impl QuickOpenOverlay {
         // Set up appearance
         this.setWantsLayer(true);
         if let Some(layer) = this.layer() {
-            unsafe {
-                // Dark semi-transparent background
-                let color = NSColor::colorWithSRGBRed_green_blue_alpha(0.12, 0.12, 0.12, 0.95);
-                let cg_color: *mut std::ffi::c_void = msg_send![&*color, CGColor];
-                let _: () = msg_send![&*layer, setBackgroundColor: cg_color];
-                // Rounded corners
-                let _: () = msg_send![&*layer, setCornerRadius: 8.0f64];
-            }
+            // Dark semi-transparent background. Keep the CoreGraphics type
+            // intact so objc2 can validate the Objective-C ABI encoding.
+            let color = NSColor::colorWithSRGBRed_green_blue_alpha(0.12, 0.12, 0.12, 0.95);
+            let cg_color = color.CGColor();
+            layer.setBackgroundColor(Some(&cg_color));
+            layer.setCornerRadius(8.0);
         }
 
         // Create UI elements
@@ -526,9 +524,9 @@ impl QuickOpenOverlay {
                 } else {
                     NSColor::colorWithSRGBRed_green_blue_alpha(0.0, 0.0, 0.0, 0.0)
                 };
-                let cg_color: *mut std::ffi::c_void = msg_send![&*color, CGColor];
-                let _: () = msg_send![&*layer, setBackgroundColor: cg_color];
-                let _: () = msg_send![&*layer, setCornerRadius: 4.0f64];
+                let cg_color = color.CGColor();
+                layer.setBackgroundColor(Some(&cg_color));
+                layer.setCornerRadius(4.0);
             }
         }
 
@@ -638,8 +636,8 @@ impl QuickOpenOverlay {
                     } else {
                         NSColor::colorWithSRGBRed_green_blue_alpha(0.0, 0.0, 0.0, 0.0)
                     };
-                    let cg_color: *mut std::ffi::c_void = msg_send![&*color, CGColor];
-                    let _: () = msg_send![&*layer, setBackgroundColor: cg_color];
+                    let cg_color = color.CGColor();
+                    layer.setBackgroundColor(Some(&cg_color));
                 }
             }
         }
@@ -753,7 +751,7 @@ impl QuickOpenOverlay {
         }
     }
 
-    fn layer(&self) -> Option<Retained<AnyObject>> {
+    fn layer(&self) -> Option<Retained<CALayer>> {
         unsafe { msg_send![self, layer] }
     }
 

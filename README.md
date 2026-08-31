@@ -49,12 +49,14 @@ A high-performance, customizable terminal emulator built in Rust. cterm uses nat
 | macOS (Intel/Apple Silicon) | AppKit/CoreGraphics | Native build, unit/integration tests, and UI automation |
 | Windows x64 | Win32/Direct2D + ConPTY | Native build, unit/integration tests, and UI automation |
 | Linux x86_64/ARM64 | GTK4 on Wayland only | Native build, unit/integration tests, and a headless-Wayland UI smoke test |
-| FreeBSD 14.4 | No desktop UI yet | `cterm-core` and `cterm-ui` tests in a FreeBSD VM |
+| FreeBSD 14.4 | Experimental GTK4/Wayland source build | Native client/daemon build, library and daemon-integration tests, plus a compositor-backed Wayland UI smoke test in FreeBSD VMs; packages still pending |
 | Android/iOS | Not currently supported | Distant local-terminal targets; no release or CI contract yet |
 
-The three desktop renderers display terminal text, selections, cursor shapes,
-Sixel images, and text attributes natively. FreeBSD currently validates the
-portable Rust core only. Linux builds do not include or test an X11 fallback.
+The three production desktop renderers display terminal text, selections,
+cursor shapes, Sixel images, and text attributes natively. FreeBSD reuses the
+GTK4/Wayland frontend and has hard native build, test, and compositor-backed UI
+contracts, but is not a packaged release target yet. Linux builds do not
+include or test an X11 fallback.
 
 ## Installation
 
@@ -103,6 +105,15 @@ Uses native Win32/Direct2D. Install `protoc` for source builds (the public CI
 uses Chocolatey).
 
 #### Build
+
+With Nix, the repository's pinned development shell supplies Rust, `protoc`,
+and the native Linux UI dependencies:
+
+```bash
+nix develop
+```
+
+Otherwise, install the platform prerequisites above, then build normally:
 
 ```bash
 # Development build
@@ -166,6 +177,13 @@ Configuration files are stored in platform-specific locations:
 - **Windows**: `%APPDATA%\cterm\`
 
 See [docs/configuration.md](docs/configuration.md) for detailed configuration options.
+
+The fail-closed command-plugin package, ABI, isolated runner, deterministic
+discovery, machine-local grants, and shared authorization/execution bridge are
+documented in [docs/plugins.md](docs/plugins.md). GTK/Wayland, macOS, and
+Windows expose installed commands under **Tools → Plugins**, request exact
+permissions in native dialogs, and execute them outside the UI thread. Managed
+mode keeps the complete plugin surface disabled.
 
 ## Keyboard Shortcuts
 
@@ -439,15 +457,64 @@ cterm supports DEC Sixel graphics for inline image display:
 
 ### Enhanced keyboard events
 
-cterm implements the kitty progressive keyboard protocol's disambiguation and
-event-type flags. Applications can request flags `1|2` to receive unambiguous
-press, repeat, and release events for functional keys and disambiguated modified
-keys. Main and alternate screens keep independent flag stacks.
+cterm implements all five kitty progressive keyboard flags: disambiguated keys,
+press/repeat/release events, alternate keys, all-key reporting, and associated
+text. GTK/Wayland, AppKit, and Win32 provide native layout, physical-key,
+modifier, dead-key, and IME data to the shared Rust encoder. Main and alternate
+screens keep independent flag stacks.
 
-All-key, alternate-key, and associated-text reporting are currently masked out
-when requested. Those modes require layout- and IME-accurate physical key data
-that is not available consistently across GTK, AppKit, and Win32; cterm reports
-only the flags it can honor on every backend.
+### Kitty Graphics Protocol
+
+cterm accepts bounded Kitty APC graphics commands through the same shared RGBA
+pipeline used by Sixel and iTerm2 images. The first implementation tranche
+supports direct, regular-file, and secure temporary-file transfers; raw RGB,
+RGBA, and PNG images; zlib compression; chunked uploads; support queries;
+transmit/display/place/delete actions; cropping, cell scaling, pixel offsets,
+quiet replies, storage quotas, cursor suppression, and the complete placement
+delete selectors. Signed z-ordering is shared by Cocoa, GTK, and Direct2D,
+including Kitty's below-background and below-text layers; image identifiers and
+z-indices also survive daemon snapshots. POSIX and Windows named shared-memory
+transport supports bounded size/offset reads and protocol-required cleanup.
+Animation frame loading, partial-frame edits, alpha/overwrite composition,
+client-driven frame selection, and terminal-driven loading/loop playback share
+one quota-aware Rust frame store and the existing native event-loop clocks.
+Transient `N=1` usage hints propagate through frame composition and prioritize
+unplaced short-lived images for eviction under quota pressure.
+Unicode placeholders use invisible virtual placements and Kitty's complete
+297-diacritic coordinate encoding. Their aspect-preserving RGBA fragments move
+with text and scrollback, are cached per viewport, and are rendered consistently
+below text on Cocoa, GTK/Wayland, and Direct2D. Relative `P/Q/H/V` placements
+follow normal, virtual, or relative parents through named-placement updates;
+the bounded graph rejects missing parents, self-reference, cycles, and chains
+beyond 32 ancestors, and cascades parent lifetimes as required by Kitty.
+
+### Kitty miscellaneous extensions
+
+Kitty's independent bold/faint resets (`SGR 221`/`222`) and `CSI 22 J`
+viewport-to-scrollback operation are supported. Native Cocoa, GTK/Wayland, and
+Win32 pointer-leave hooks also emit Kitty's SGR-pixel mouse-leave report.
+
+### Kitty Multiple Cursors
+
+Kitty's multiple-cursors protocol supports block, beam, underline, and
+follow-main shapes; main-cursor, point, and rectangular coordinate forms;
+full-screen and selective clearing; capability, cursor-state, and color-state
+queries; and indexed, RGB, inherited, and reverse-video colors. Extra cursors
+share the main cursor's blink phase but remain visible independently of
+DECTCEM. GTK/Wayland, Cocoa, and Direct2D render the same overlay state, which
+also survives daemon snapshots and incremental screen updates.
+
+### Kitty Text Sizing
+
+Kitty OSC 66 width and scale control are supported. Fixed-width payloads and
+natural-width grapheme chunks occupy atomic multi-row cell blocks with integer
+and fractional font scaling plus horizontal and vertical alignment. Overwrite,
+ICH, DCH, ECH, IL, DL, ED, EL, rectangular erase/fill/copy, selection,
+resize/reflow, scrollback, daemon snapshots, and incremental screen updates do
+not leave split blocks behind. GTK/Wayland, Cocoa, and Direct2D share the same
+Rust layout policy, render blocks whose anchor has entered scrollback, and
+expand block, bar, and underline cursors across the occupied cells. Kitty's CPR
+probe reports both width and scale support.
 
 Test with:
 ```bash
@@ -539,10 +606,10 @@ Custom themes can be added as TOML files in the `themes/` configuration subdirec
 - [x] Docker and SSH templates
 - [x] Auto-update with release notes
 - [x] Native split panes (macOS/Linux/Windows)
+- [x] Isolated command plugins with native permission prompts
 
 ### Future
 
-- Plugin system
 - Additional foot-compatible behavior and performance work
 - Android and iOS local-terminal frontends (distant targets)
 

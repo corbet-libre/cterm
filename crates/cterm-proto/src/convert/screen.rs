@@ -7,7 +7,9 @@ use cterm_core::drcs::{DrcsFont, DrcsGlyph};
 use cterm_core::grid::Row as CoreRow;
 use cterm_core::term::Terminal;
 use cterm_core::{
-    Cell, CellAttrs, Color, ColorQuery, MouseEncoding, MouseMode, Screen, TerminalImage,
+    Cell, CellAttrs, Color, ColorQuery, CursorStyle, ExtraCursor, ExtraCursorColor,
+    ExtraCursorColors, ExtraCursorShape, MouseEncoding, MouseMode, Multicell, Rgb, Screen,
+    TerminalImage, TextSizeAlignment,
 };
 use std::sync::Arc;
 
@@ -29,6 +31,7 @@ pub fn attrs_to_proto(attrs: CellAttrs) -> proto::CellAttributes {
         overline: attrs.contains(CellAttrs::OVERLINE),
         wide: attrs.contains(CellAttrs::WIDE),
         wide_spacer: attrs.contains(CellAttrs::WIDE_SPACER),
+        rapid_blink: attrs.contains(CellAttrs::RAPID_BLINK),
     }
 }
 
@@ -80,6 +83,9 @@ pub fn proto_to_attrs(attrs: &proto::CellAttributes) -> CellAttrs {
     if attrs.wide_spacer {
         result |= CellAttrs::WIDE_SPACER;
     }
+    if attrs.rapid_blink {
+        result |= CellAttrs::RAPID_BLINK;
+    }
     result
 }
 
@@ -95,7 +101,71 @@ pub fn cell_to_proto(cell: &Cell) -> proto::Cell {
             id: h.id.clone(),
             uri: h.uri.clone(),
         }),
+        multicell: cell.multicell.as_ref().map(multicell_to_proto),
     }
+}
+
+fn text_size_alignment_to_proto(alignment: TextSizeAlignment) -> proto::TextSizeAlignment {
+    match alignment {
+        TextSizeAlignment::Start => proto::TextSizeAlignment::Start,
+        TextSizeAlignment::End => proto::TextSizeAlignment::End,
+        TextSizeAlignment::Center => proto::TextSizeAlignment::Center,
+    }
+}
+
+fn proto_to_text_size_alignment(alignment: i32) -> TextSizeAlignment {
+    match proto::TextSizeAlignment::try_from(alignment) {
+        Ok(proto::TextSizeAlignment::End) => TextSizeAlignment::End,
+        Ok(proto::TextSizeAlignment::Center) => TextSizeAlignment::Center,
+        _ => TextSizeAlignment::Start,
+    }
+}
+
+fn multicell_to_proto(multicell: &Multicell) -> proto::Multicell {
+    let (fractional_numerator, fractional_denominator) = multicell
+        .fractional_scale
+        .map_or((None, None), |(numerator, denominator)| {
+            (Some(u32::from(numerator)), Some(u32::from(denominator)))
+        });
+    proto::Multicell {
+        text: multicell.text().to_owned(),
+        columns: u32::from(multicell.columns),
+        rows: u32::from(multicell.rows),
+        column_offset: u32::from(multicell.column_offset),
+        row_offset: u32::from(multicell.row_offset),
+        scale: u32::from(multicell.scale),
+        fractional_numerator,
+        fractional_denominator,
+        vertical_alignment: text_size_alignment_to_proto(multicell.vertical_alignment) as i32,
+        horizontal_alignment: text_size_alignment_to_proto(multicell.horizontal_alignment) as i32,
+        natural_width: multicell.natural_width,
+    }
+}
+
+fn proto_to_multicell(multicell: &proto::Multicell) -> Option<Multicell> {
+    let fractional_scale = match (
+        multicell.fractional_numerator,
+        multicell.fractional_denominator,
+    ) {
+        (Some(numerator), Some(denominator)) => Some((
+            u8::try_from(numerator).ok()?,
+            u8::try_from(denominator).ok()?,
+        )),
+        (None, None) => None,
+        _ => return None,
+    };
+    Multicell::from_parts(
+        multicell.text.clone(),
+        u8::try_from(multicell.columns).ok()?,
+        u8::try_from(multicell.rows).ok()?,
+        u8::try_from(multicell.column_offset).ok()?,
+        u8::try_from(multicell.row_offset).ok()?,
+        u8::try_from(multicell.scale).ok()?,
+        fractional_scale,
+        proto_to_text_size_alignment(multicell.vertical_alignment),
+        proto_to_text_size_alignment(multicell.horizontal_alignment),
+        multicell.natural_width,
+    )
 }
 
 /// Convert a bare cell slice to a protocol row.
@@ -196,6 +266,8 @@ pub fn terminal_image_to_proto(image: &TerminalImage) -> proto::TerminalImage {
         rgba: image.data.as_ref().clone(),
         pixel_width: image.pixel_width as u32,
         pixel_height: image.pixel_height as u32,
+        z_index: image.z_index,
+        protocol_image_id: image.protocol_image_id,
     }
 }
 
@@ -226,17 +298,14 @@ pub fn proto_to_terminal_image(image: &proto::TerminalImage) -> Option<TerminalI
         data: Arc::new(image.rgba.clone()),
         pixel_width,
         pixel_height,
+        z_index: image.z_index,
+        protocol_image_id: image.protocol_image_id,
     })
 }
 
 /// Convert screen to proto representation
 pub fn screen_to_proto(screen: &Screen, include_scrollback: bool) -> proto::GetScreenResponse {
-    let cursor = proto::CursorPosition {
-        row: screen.cursor.row as u32,
-        col: screen.cursor.col as u32,
-        visible: screen.modes.show_cursor,
-        style: proto::CursorStyle::Block as i32,
-    };
+    let cursor = cursor_to_proto(screen);
 
     // Get visible rows
     let visible_rows: Vec<proto::Row> = (0..screen.height())
@@ -260,6 +329,8 @@ pub fn screen_to_proto(screen: &Screen, include_scrollback: bool) -> proto::GetS
         modes: Some(modes_to_proto(screen)),
         drcs_fonts: drcs_fonts_to_proto(screen),
         images: terminal_images_to_proto(screen),
+        extra_cursors: screen.extra_cursors().map(extra_cursor_to_proto).collect(),
+        extra_cursor_colors: Some(extra_cursor_colors_to_proto(screen.extra_cursor_colors())),
     }
 }
 
@@ -285,7 +356,129 @@ pub fn cursor_to_proto(screen: &Screen) -> proto::CursorPosition {
         row: screen.cursor.row as u32,
         col: screen.cursor.col as u32,
         visible: screen.modes.show_cursor,
-        style: proto::CursorStyle::Block as i32,
+        style: cursor_style_to_proto(screen.cursor.style) as i32,
+        style_blink_override: screen.cursor.blink.decscusr(),
+        dec_mode_12: Some(screen.cursor.blink.dec_mode_12()),
+    }
+}
+
+/// Convert a core cursor shape to its stable wire representation.
+pub fn cursor_style_to_proto(style: CursorStyle) -> proto::CursorStyle {
+    match style {
+        CursorStyle::Block => proto::CursorStyle::Block,
+        CursorStyle::Underline => proto::CursorStyle::Underline,
+        CursorStyle::Bar => proto::CursorStyle::Bar,
+    }
+}
+
+/// Decode a cursor shape while rejecting unknown future enum values.
+pub fn proto_to_cursor_style(style: i32) -> Option<CursorStyle> {
+    match proto::CursorStyle::try_from(style).ok()? {
+        proto::CursorStyle::Block => Some(CursorStyle::Block),
+        proto::CursorStyle::Underline => Some(CursorStyle::Underline),
+        proto::CursorStyle::Bar => Some(CursorStyle::Bar),
+        proto::CursorStyle::Unspecified => None,
+    }
+}
+
+fn extra_cursor_shape_to_proto(shape: ExtraCursorShape) -> proto::ExtraCursorShape {
+    match shape {
+        ExtraCursorShape::Block => proto::ExtraCursorShape::Block,
+        ExtraCursorShape::Bar => proto::ExtraCursorShape::Bar,
+        ExtraCursorShape::Underline => proto::ExtraCursorShape::Underline,
+        ExtraCursorShape::FollowMain => proto::ExtraCursorShape::FollowMain,
+    }
+}
+
+fn proto_to_extra_cursor_shape(shape: i32) -> Option<ExtraCursorShape> {
+    match proto::ExtraCursorShape::try_from(shape).ok()? {
+        proto::ExtraCursorShape::Block => Some(ExtraCursorShape::Block),
+        proto::ExtraCursorShape::Bar => Some(ExtraCursorShape::Bar),
+        proto::ExtraCursorShape::Underline => Some(ExtraCursorShape::Underline),
+        proto::ExtraCursorShape::FollowMain => Some(ExtraCursorShape::FollowMain),
+        proto::ExtraCursorShape::Unspecified => None,
+    }
+}
+
+fn extra_cursor_to_proto(cursor: ExtraCursor) -> proto::ExtraCursor {
+    proto::ExtraCursor {
+        row: cursor.row as u32,
+        col: cursor.col as u32,
+        shape: extra_cursor_shape_to_proto(cursor.shape) as i32,
+    }
+}
+
+fn proto_to_extra_cursor(cursor: &proto::ExtraCursor) -> Option<ExtraCursor> {
+    Some(ExtraCursor {
+        row: cursor.row as usize,
+        col: cursor.col as usize,
+        shape: proto_to_extra_cursor_shape(cursor.shape)?,
+    })
+}
+
+fn extra_cursor_color_to_proto(color: ExtraCursorColor) -> proto::ExtraCursorColor {
+    let mut result = proto::ExtraCursorColor::default();
+    match color {
+        ExtraCursorColor::Main => {}
+        ExtraCursorColor::Reverse => {
+            result.kind = proto::ExtraCursorColorKind::Reverse as i32;
+        }
+        ExtraCursorColor::Color(Color::Indexed(index)) => {
+            result.kind = proto::ExtraCursorColorKind::Indexed as i32;
+            result.index = u32::from(index);
+        }
+        ExtraCursorColor::Color(Color::Rgb(rgb)) => {
+            result.kind = proto::ExtraCursorColorKind::Rgb as i32;
+            result.red = u32::from(rgb.r);
+            result.green = u32::from(rgb.g);
+            result.blue = u32::from(rgb.b);
+        }
+        ExtraCursorColor::Color(Color::Default | Color::Ansi(_)) => {}
+    }
+    result
+}
+
+fn proto_to_extra_cursor_color(color: Option<&proto::ExtraCursorColor>) -> ExtraCursorColor {
+    let Some(color) = color else {
+        return ExtraCursorColor::Main;
+    };
+    match proto::ExtraCursorColorKind::try_from(color.kind) {
+        Ok(proto::ExtraCursorColorKind::Reverse) => ExtraCursorColor::Reverse,
+        Ok(proto::ExtraCursorColorKind::Indexed) => u8::try_from(color.index)
+            .map(|index| ExtraCursorColor::Color(Color::Indexed(index)))
+            .unwrap_or_default(),
+        Ok(proto::ExtraCursorColorKind::Rgb) => {
+            let rgb = u8::try_from(color.red)
+                .ok()
+                .zip(u8::try_from(color.green).ok())
+                .zip(u8::try_from(color.blue).ok())
+                .map(|((red, green), blue)| Rgb::new(red, green, blue));
+            rgb.map(|rgb| ExtraCursorColor::Color(Color::Rgb(rgb)))
+                .unwrap_or_default()
+        }
+        _ => ExtraCursorColor::Main,
+    }
+}
+
+pub fn extra_cursor_colors_to_proto(colors: ExtraCursorColors) -> proto::ExtraCursorColors {
+    proto::ExtraCursorColors {
+        text: Some(extra_cursor_color_to_proto(colors.text)),
+        cursor: Some(extra_cursor_color_to_proto(colors.cursor)),
+    }
+}
+
+fn proto_to_extra_cursor_colors(colors: Option<&proto::ExtraCursorColors>) -> ExtraCursorColors {
+    ExtraCursorColors {
+        text: proto_to_extra_cursor_color(colors.and_then(|colors| colors.text.as_ref())),
+        cursor: proto_to_extra_cursor_color(colors.and_then(|colors| colors.cursor.as_ref())),
+    }
+}
+
+/// Convert the complete multiple-cursor overlay for incremental updates.
+pub fn extra_cursors_to_proto(screen: &Screen) -> proto::ExtraCursorsUpdate {
+    proto::ExtraCursorsUpdate {
+        cursors: screen.extra_cursors().map(extra_cursor_to_proto).collect(),
+        colors: Some(extra_cursor_colors_to_proto(screen.extra_cursor_colors())),
     }
 }
 
@@ -441,6 +634,12 @@ pub fn apply_screen_snapshot(terminal: &mut Terminal, screen_data: &proto::GetSc
         screen.cursor.row = cursor.row as usize;
         screen.cursor.col = cursor.col as usize;
         screen.modes.show_cursor = cursor.visible;
+        let style = proto_to_cursor_style(cursor.style);
+        screen.cursor.restore_protocol_snapshot(
+            style,
+            cursor.style_blink_override,
+            cursor.dec_mode_12,
+        );
     }
 
     // Restore title
@@ -543,10 +742,27 @@ pub fn apply_screen_snapshot(terminal: &mut Terminal, screen_data: &proto::GetSc
             .iter()
             .filter_map(proto_to_terminal_image),
     );
+    screen.replace_extra_cursors(
+        screen_data
+            .extra_cursors
+            .iter()
+            .filter_map(proto_to_extra_cursor),
+        proto_to_extra_cursor_colors(screen_data.extra_cursor_colors.as_ref()),
+    );
 }
 
 fn apply_proto_cell(cell: &mut Cell, proto_cell: &proto::Cell) {
-    cell.set_text(&proto_cell.char);
+    cell.multicell = proto_cell.multicell.as_ref().and_then(proto_to_multicell);
+    if cell.multicell.as_ref().is_some_and(Multicell::is_anchor) {
+        let text = cell
+            .multicell
+            .as_ref()
+            .map(|multicell| multicell.text().to_owned())
+            .unwrap_or_default();
+        cell.set_text_size_payload(&text);
+    } else {
+        cell.set_text(&proto_cell.char);
+    }
     cell.fg = proto_cell
         .fg
         .as_ref()
@@ -579,7 +795,8 @@ mod tests {
 
     #[test]
     fn test_attrs_roundtrip() {
-        let attrs = CellAttrs::BOLD | CellAttrs::ITALIC | CellAttrs::UNDERLINE;
+        let attrs =
+            CellAttrs::BOLD | CellAttrs::ITALIC | CellAttrs::UNDERLINE | CellAttrs::RAPID_BLINK;
         let proto = attrs_to_proto(attrs);
         let back = proto_to_attrs(&proto);
         assert_eq!(attrs, back);
@@ -590,6 +807,109 @@ mod tests {
         let cell = Cell::new('A');
         let proto = cell_to_proto(&cell);
         assert_eq!(proto.char, "A");
+    }
+
+    #[test]
+    fn text_width_span_roundtrips_through_screen_snapshot() {
+        let mut source = Terminal::new(8, 2, ScreenConfig::default());
+        source.process(b"\x1b]66;w=3;ab;c\x07");
+        let snapshot = screen_to_proto(source.screen(), false);
+        let mut restored = Terminal::new(8, 2, ScreenConfig::default());
+
+        apply_screen_snapshot(&mut restored, &snapshot);
+
+        for col in 0..3 {
+            let source_cell = source.screen().get_cell(0, col).unwrap();
+            let restored_cell = restored.screen().get_cell(0, col).unwrap();
+            assert_eq!(restored_cell, source_cell);
+            assert_eq!(restored_cell.multicell.as_ref().unwrap().text(), "ab;c");
+        }
+    }
+
+    #[test]
+    fn scaled_text_block_roundtrips_through_screen_snapshot() {
+        let mut source = Terminal::new(8, 3, ScreenConfig::default());
+        source.process(b"\x1b]66;s=2:w=2:n=1:d=2:v=1:h=2;Title\x07");
+        let snapshot = screen_to_proto(source.screen(), false);
+        let mut restored = Terminal::new(8, 3, ScreenConfig::default());
+
+        apply_screen_snapshot(&mut restored, &snapshot);
+
+        for row in 0..2 {
+            for col in 0..4 {
+                let source_cell = source.screen().get_cell(row, col).unwrap();
+                let restored_cell = restored.screen().get_cell(row, col).unwrap();
+                assert_eq!(restored_cell, source_cell);
+                let multicell = restored_cell.multicell.as_ref().unwrap();
+                assert_eq!((multicell.rows, multicell.columns), (2, 4));
+                assert_eq!(
+                    (multicell.row_offset, multicell.column_offset),
+                    (row as u8, col as u8)
+                );
+                assert_eq!(multicell.fractional_scale, Some((1, 2)));
+            }
+        }
+    }
+
+    #[test]
+    fn cursor_snapshot_preserves_protocol_sources_and_native_defaults() {
+        let source = Terminal::new(8, 2, ScreenConfig::default());
+        let snapshot = screen_to_proto(source.screen(), false);
+        let mut restored = Terminal::new(8, 2, ScreenConfig::default());
+        restored
+            .screen_mut()
+            .configure_cursor(CursorStyle::Bar, false);
+
+        apply_screen_snapshot(&mut restored, &snapshot);
+
+        assert_eq!(restored.screen().cursor.style, CursorStyle::Bar);
+        assert!(!restored.screen().cursor.blink.enabled());
+
+        let mut source = Terminal::new(8, 2, ScreenConfig::default());
+        source.process(b"\x1b[3 q\x1b[?12h");
+        let snapshot = screen_to_proto(source.screen(), false);
+        apply_screen_snapshot(&mut restored, &snapshot);
+
+        assert_eq!(restored.screen().cursor.style, CursorStyle::Underline);
+        assert_eq!(restored.screen().cursor.blink.decscusr(), Some(true));
+        assert!(restored.screen().cursor.blink.dec_mode_12());
+        assert!(restored.screen().cursor.blink.enabled());
+
+        // A later authoritative snapshot with no DECSCUSR selection clears
+        // the prior override and returns to this frontend's native defaults.
+        let source = Terminal::new(8, 2, ScreenConfig::default());
+        let snapshot = screen_to_proto(source.screen(), false);
+        apply_screen_snapshot(&mut restored, &snapshot);
+        assert_eq!(restored.screen().cursor.style, CursorStyle::Bar);
+        assert_eq!(restored.screen().cursor.blink.decscusr(), None);
+        assert!(!restored.screen().cursor.blink.dec_mode_12());
+        assert!(!restored.screen().cursor.blink.enabled());
+    }
+
+    #[test]
+    fn screen_snapshot_roundtrips_and_authoritatively_clears_extra_cursors() {
+        let mut source = Terminal::new(8, 4, ScreenConfig::default());
+        source.process(b"\x1b[>1;2:1:2 q\x1b[>29;2:3:4 q\x1b[>30;2:1:2:3 q\x1b[>40;5:13 q");
+        let snapshot = screen_to_proto(source.screen(), false);
+        let mut restored = Terminal::new(8, 4, ScreenConfig::default());
+        apply_screen_snapshot(&mut restored, &snapshot);
+
+        assert_eq!(
+            restored.screen().extra_cursors().collect::<Vec<_>>(),
+            source.screen().extra_cursors().collect::<Vec<_>>()
+        );
+        assert_eq!(
+            restored.screen().extra_cursor_colors(),
+            source.screen().extra_cursor_colors()
+        );
+
+        let empty = screen_to_proto(Terminal::new(8, 4, ScreenConfig::default()).screen(), false);
+        apply_screen_snapshot(&mut restored, &empty);
+        assert!(!restored.screen().has_extra_cursors());
+        assert_eq!(
+            restored.screen().extra_cursor_colors(),
+            ExtraCursorColors::default()
+        );
     }
 
     #[test]
@@ -733,8 +1053,29 @@ mod tests {
             rgba: vec![1, 2, 3],
             pixel_width: 1,
             pixel_height: 1,
+            z_index: 0,
+            protocol_image_id: 0,
         };
 
         assert!(proto_to_terminal_image(&image).is_none());
+    }
+
+    #[test]
+    fn terminal_image_wire_roundtrip_preserves_kitty_layer_metadata() {
+        let image = TerminalImage {
+            id: 9,
+            col: 2,
+            line: 3,
+            cell_width: 4,
+            cell_height: 5,
+            data: Arc::new(vec![1, 2, 3, 4]),
+            pixel_width: 1,
+            pixel_height: 1,
+            z_index: -7,
+            protocol_image_id: 42,
+        };
+
+        let encoded = terminal_image_to_proto(&image);
+        assert_eq!(proto_to_terminal_image(&encoded), Some(image));
     }
 }

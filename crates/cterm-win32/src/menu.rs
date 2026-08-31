@@ -2,12 +2,188 @@
 //!
 //! Creates the application menu bar with all menu items.
 
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ptr;
 
+use cterm_app::config::ToolShortcutEntry;
+use cterm_app::PluginCommandDescriptor;
+use cterm_ui::events::Action;
+use cterm_ui::pane::{PaneDirection, SplitDirection};
 use winapi::shared::windef::HMENU;
 use winapi::um::winuser::{
-    AppendMenuW, CreateMenu, CreatePopupMenu, SetMenu, MF_POPUP, MF_SEPARATOR, MF_STRING,
+    AppendMenuW, CreateMenu, CreatePopupMenu, DestroyMenu, DrawMenuBar, SetMenu, MF_POPUP,
+    MF_SEPARATOR, MF_STRING,
 };
+
+const TOOL_COMMAND_ID_START: u16 = 0x8000;
+const TOOL_COMMAND_ID_END: u16 = 0xefff;
+const PLUGIN_COMMAND_ID_START: u16 = 0x7000;
+const PLUGIN_COMMAND_ID_END: u16 = 0x7fff;
+
+/// Stable command IDs and the exact configured tool snapshot shown in a menu.
+///
+/// IDs are keyed by tool content instead of list position. Reloading a reordered
+/// file therefore keeps every existing ID, removed IDs are retired for the
+/// lifetime of the registry, and a queued command from an old menu can never
+/// launch a different tool.
+#[derive(Debug, Default)]
+pub struct ToolCommandRegistry {
+    identity_ids: HashMap<Vec<u8>, u16>,
+    active: BTreeMap<u16, ToolShortcutEntry>,
+    order: Vec<u16>,
+}
+
+impl ToolCommandRegistry {
+    pub fn reload(&mut self, tools: &[ToolShortcutEntry]) {
+        let mut new_identities = tools
+            .iter()
+            .map(tool_identity)
+            .filter(|identity| !self.identity_ids.contains_key(identity))
+            .collect::<Vec<_>>();
+        new_identities.sort();
+        new_identities.dedup();
+
+        let mut used = self.identity_ids.values().copied().collect::<HashSet<_>>();
+        for identity in new_identities {
+            let Some(id) = allocate_tool_command_id(&identity, &used) else {
+                log::error!("Too many distinct tool commands for the Win32 menu ID range");
+                continue;
+            };
+            used.insert(id);
+            self.identity_ids.insert(identity, id);
+        }
+
+        self.active.clear();
+        self.order.clear();
+        for tool in tools {
+            let identity = tool_identity(tool);
+            let Some(&id) = self.identity_ids.get(&identity) else {
+                continue;
+            };
+            self.active.entry(id).or_insert_with(|| tool.clone());
+            self.order.push(id);
+        }
+    }
+
+    pub fn get(&self, id: u16) -> Option<&ToolShortcutEntry> {
+        self.active.get(&id)
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = (u16, &ToolShortcutEntry)> {
+        self.order
+            .iter()
+            .filter_map(|id| self.active.get(id).map(|tool| (*id, tool)))
+    }
+}
+
+/// Stable menu IDs bound to the exact descriptor snapshot currently shown.
+#[derive(Debug, Default)]
+pub struct PluginCommandRegistry {
+    identity_ids: HashMap<String, u16>,
+    active: BTreeMap<u16, PluginCommandDescriptor>,
+    order: Vec<u16>,
+}
+
+impl PluginCommandRegistry {
+    pub fn reload(&mut self, commands: &[PluginCommandDescriptor]) {
+        let mut new_identities = commands
+            .iter()
+            .map(|command| command.action_id().to_string())
+            .filter(|identity| !self.identity_ids.contains_key(identity))
+            .collect::<Vec<_>>();
+        new_identities.sort();
+        new_identities.dedup();
+
+        let mut used = self.identity_ids.values().copied().collect::<HashSet<_>>();
+        for identity in new_identities {
+            let Some(id) = allocate_command_id(
+                identity.as_bytes(),
+                &used,
+                PLUGIN_COMMAND_ID_START,
+                PLUGIN_COMMAND_ID_END,
+            ) else {
+                log::error!("Too many distinct plugin commands for the Win32 menu ID range");
+                continue;
+            };
+            used.insert(id);
+            self.identity_ids.insert(identity, id);
+        }
+
+        self.active.clear();
+        self.order.clear();
+        for command in commands {
+            let Some(&id) = self.identity_ids.get(command.action_id()) else {
+                continue;
+            };
+            self.active.entry(id).or_insert_with(|| command.clone());
+            self.order.push(id);
+        }
+    }
+
+    pub fn get(&self, id: u16) -> Option<&PluginCommandDescriptor> {
+        self.active.get(&id)
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = (u16, &PluginCommandDescriptor)> {
+        self.order
+            .iter()
+            .filter_map(|id| self.active.get(id).map(|command| (*id, command)))
+    }
+}
+
+pub fn is_tool_command_id(id: u16) -> bool {
+    (TOOL_COMMAND_ID_START..=TOOL_COMMAND_ID_END).contains(&id)
+}
+
+pub fn is_plugin_command_id(id: u16) -> bool {
+    (PLUGIN_COMMAND_ID_START..=PLUGIN_COMMAND_ID_END).contains(&id)
+}
+
+fn tool_identity(tool: &ToolShortcutEntry) -> Vec<u8> {
+    let mut identity = Vec::new();
+    push_identity_field(&mut identity, tool.name.as_bytes());
+    push_identity_field(&mut identity, tool.command.as_bytes());
+    identity.extend_from_slice(&(tool.args.len() as u64).to_le_bytes());
+    for argument in &tool.args {
+        push_identity_field(&mut identity, argument.as_bytes());
+    }
+    identity
+}
+
+fn push_identity_field(identity: &mut Vec<u8>, field: &[u8]) {
+    identity.extend_from_slice(&(field.len() as u64).to_le_bytes());
+    identity.extend_from_slice(field);
+}
+
+fn allocate_tool_command_id(identity: &[u8], used: &HashSet<u16>) -> Option<u16> {
+    allocate_command_id(identity, used, TOOL_COMMAND_ID_START, TOOL_COMMAND_ID_END)
+}
+
+fn allocate_command_id(
+    identity: &[u8],
+    used: &HashSet<u16>,
+    range_start: u16,
+    range_end: u16,
+) -> Option<u16> {
+    let range_len = u32::from(range_end - range_start) + 1;
+    let start = (stable_hash(identity) % u64::from(range_len)) as u32;
+    (0..range_len).find_map(|offset| {
+        let relative = (start + offset) % range_len;
+        let id = range_start + relative as u16;
+        (!used.contains(&id)).then_some(id)
+    })
+}
+
+fn stable_hash(bytes: &[u8]) -> u64 {
+    // FNV-1a is intentionally fixed rather than relying on the standard
+    // library's implementation-dependent hashers.
+    let mut hash = 0xcbf29ce484222325_u64;
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash
+}
 
 /// Menu action identifiers
 #[repr(u16)]
@@ -162,6 +338,75 @@ impl MenuAction {
     pub fn id(self) -> u16 {
         self as u16
     }
+
+    /// Convert menu commands backed by the shared action model.
+    ///
+    /// Commands that expose Win32-only behavior remain in the native menu
+    /// dispatcher and return `None`.
+    pub fn shared_action(self) -> Option<Action> {
+        match self {
+            Self::NewTab => Some(Action::NewTab),
+            Self::NewWindow => Some(Action::NewWindow),
+            Self::QuickOpen => Some(Action::QuickOpenTemplate),
+            Self::CloseTab => Some(Action::CloseTab),
+            Self::Quit => Some(Action::CloseWindow),
+            Self::Copy => Some(Action::Copy),
+            Self::Paste => Some(Action::Paste),
+            Self::SelectAll => Some(Action::SelectAll),
+            Self::ZoomIn => Some(Action::ZoomIn),
+            Self::ZoomOut => Some(Action::ZoomOut),
+            Self::ZoomReset => Some(Action::ZoomReset),
+            Self::Fullscreen => Some(Action::ToggleFullscreen),
+            Self::Find => Some(Action::FindText),
+            Self::Reset => Some(Action::ResetTerminal),
+            Self::SplitPaneHorizontal => Some(Action::SplitPane(SplitDirection::Horizontal)),
+            Self::SplitPaneVertical => Some(Action::SplitPane(SplitDirection::Vertical)),
+            Self::ClosePane => Some(Action::ClosePane),
+            Self::FocusPaneLeft => Some(Action::FocusPane(PaneDirection::Left)),
+            Self::FocusPaneRight => Some(Action::FocusPane(PaneDirection::Right)),
+            Self::FocusPaneUp => Some(Action::FocusPane(PaneDirection::Up)),
+            Self::FocusPaneDown => Some(Action::FocusPane(PaneDirection::Down)),
+            Self::ResizePaneLeft => Some(Action::ResizePane(PaneDirection::Left)),
+            Self::ResizePaneRight => Some(Action::ResizePane(PaneDirection::Right)),
+            Self::ResizePaneUp => Some(Action::ResizePane(PaneDirection::Up)),
+            Self::ResizePaneDown => Some(Action::ResizePane(PaneDirection::Down)),
+            Self::TogglePaneZoom => Some(Action::TogglePaneZoom),
+            Self::PrevTab => Some(Action::PrevTab),
+            Self::NextTab => Some(Action::NextTab),
+            Self::NextAlertedTab => Some(Action::NextAlertedTab),
+            Self::Tab1 => Some(Action::Tab(1)),
+            Self::Tab2 => Some(Action::Tab(2)),
+            Self::Tab3 => Some(Action::Tab(3)),
+            Self::Tab4 => Some(Action::Tab(4)),
+            Self::Tab5 => Some(Action::Tab(5)),
+            Self::Tab6 => Some(Action::Tab(6)),
+            Self::Tab7 => Some(Action::Tab(7)),
+            Self::Tab8 => Some(Action::Tab(8)),
+            Self::Tab9 => Some(Action::Tab(9)),
+            Self::Preferences => Some(Action::OpenPreferences),
+            Self::CloseOtherTabs
+            | Self::DockerPicker
+            | Self::CopyHtml
+            | Self::SetTitle
+            | Self::SetColor
+            | Self::ClearReset
+            | Self::SendSignalInt
+            | Self::SendSignalKill
+            | Self::SendSignalHup
+            | Self::SendSignalTerm
+            | Self::TabTemplates
+            | Self::CheckUpdates
+            | Self::About
+            | Self::AttachSession
+            | Self::SSHConnect
+            | Self::ManageRemotes
+            | Self::DebugRelaunch
+            | Self::DebugDumpState
+            | Self::ViewLogs
+            | Self::DebugRelaunchDaemon
+            | Self::KillDaemon => None,
+        }
+    }
 }
 
 /// Convert a Rust string to a null-terminated wide string
@@ -170,7 +415,13 @@ fn to_wide_string(s: &str) -> Vec<u16> {
 }
 
 /// Create the main menu bar
-pub fn create_menu_bar(show_debug: bool, updates_enabled: bool, managed: bool) -> HMENU {
+pub fn create_menu_bar(
+    show_debug: bool,
+    updates_enabled: bool,
+    managed: bool,
+    tool_commands: &ToolCommandRegistry,
+    plugin_commands: &PluginCommandRegistry,
+) -> HMENU {
     unsafe {
         let menu_bar = CreateMenu();
 
@@ -295,6 +546,26 @@ pub fn create_menu_bar(show_debug: bool, updates_enabled: bool, managed: bool) -
         append_menu_item(terminal_menu, MenuAction::ClearReset, "Clear and R&eset");
         append_popup_menu(menu_bar, terminal_menu, "&Terminal");
 
+        if !managed {
+            let tools_menu = CreatePopupMenu();
+            for (id, tool) in tool_commands.iter() {
+                append_command_item(tools_menu, id, &escape_menu_label(&tool.name));
+            }
+            let plugin_menu = CreatePopupMenu();
+            let mut has_plugins = false;
+            for (id, command) in plugin_commands.iter() {
+                has_plugins = true;
+                let label = format!("{} — {}", command.plugin_name(), command.command_title());
+                append_command_item(plugin_menu, id, &escape_menu_label(&label));
+            }
+            if has_plugins {
+                append_popup_menu(tools_menu, plugin_menu, "&Plugins");
+            } else {
+                DestroyMenu(plugin_menu);
+            }
+            append_popup_menu(menu_bar, tools_menu, "T&ools");
+        }
+
         // Tabs menu
         let tabs_menu = CreatePopupMenu();
         append_menu_item(
@@ -369,6 +640,17 @@ fn append_menu_item(menu: HMENU, action: MenuAction, text: &str) {
     }
 }
 
+fn append_command_item(menu: HMENU, command_id: u16, text: &str) {
+    let wide = to_wide_string(text);
+    unsafe {
+        AppendMenuW(menu, MF_STRING, command_id as usize, wide.as_ptr());
+    }
+}
+
+fn escape_menu_label(label: &str) -> String {
+    label.replace('&', "&&")
+}
+
 /// Append a separator to a menu
 fn append_separator(menu: HMENU) {
     unsafe {
@@ -391,134 +673,78 @@ pub fn set_window_menu(hwnd: winapi::shared::windef::HWND, menu: HMENU) {
     }
 }
 
-/// Accelerator key definition
-#[derive(Debug, Clone)]
-pub struct Accelerator {
-    pub action: MenuAction,
-    pub key: u16,
-    pub modifiers: AcceleratorModifiers,
-}
-
-bitflags::bitflags! {
-    /// Accelerator key modifiers
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    pub struct AcceleratorModifiers: u8 {
-        const CTRL = 1 << 0;
-        const SHIFT = 1 << 1;
-        const ALT = 1 << 2;
+/// Replace an attached menu and destroy whichever handle is no longer owned by
+/// the window. `SetMenu` does not destroy the previous menu itself.
+pub fn replace_window_menu(
+    hwnd: winapi::shared::windef::HWND,
+    old_menu: HMENU,
+    new_menu: HMENU,
+) -> bool {
+    unsafe {
+        if SetMenu(hwnd, new_menu) == 0 {
+            DestroyMenu(new_menu);
+            return false;
+        }
+        DrawMenuBar(hwnd);
+        if !old_menu.is_null() {
+            DestroyMenu(old_menu);
+        }
     }
-}
-
-/// Get the default accelerator table
-pub fn get_accelerators() -> Vec<Accelerator> {
-    use winapi::um::winuser::*;
-
-    vec![
-        // File menu
-        Accelerator {
-            action: MenuAction::NewTab,
-            key: 'T' as u16,
-            modifiers: AcceleratorModifiers::CTRL,
-        },
-        Accelerator {
-            action: MenuAction::NewWindow,
-            key: 'N' as u16,
-            modifiers: AcceleratorModifiers::CTRL,
-        },
-        Accelerator {
-            action: MenuAction::QuickOpen,
-            key: 'G' as u16,
-            modifiers: AcceleratorModifiers::CTRL,
-        },
-        Accelerator {
-            action: MenuAction::CloseTab,
-            key: 'W' as u16,
-            modifiers: AcceleratorModifiers::CTRL,
-        },
-        // Edit menu
-        Accelerator {
-            action: MenuAction::Copy,
-            key: 'C' as u16,
-            modifiers: AcceleratorModifiers::CTRL | AcceleratorModifiers::SHIFT,
-        },
-        Accelerator {
-            action: MenuAction::Paste,
-            key: 'V' as u16,
-            modifiers: AcceleratorModifiers::CTRL | AcceleratorModifiers::SHIFT,
-        },
-        Accelerator {
-            action: MenuAction::SelectAll,
-            key: 'A' as u16,
-            modifiers: AcceleratorModifiers::CTRL | AcceleratorModifiers::SHIFT,
-        },
-        // Terminal menu
-        Accelerator {
-            action: MenuAction::Find,
-            key: 'F' as u16,
-            modifiers: AcceleratorModifiers::CTRL | AcceleratorModifiers::SHIFT,
-        },
-        // Tabs menu
-        Accelerator {
-            action: MenuAction::PrevTab,
-            key: VK_TAB as u16,
-            modifiers: AcceleratorModifiers::CTRL | AcceleratorModifiers::SHIFT,
-        },
-        Accelerator {
-            action: MenuAction::NextTab,
-            key: VK_TAB as u16,
-            modifiers: AcceleratorModifiers::CTRL,
-        },
-        Accelerator {
-            action: MenuAction::Tab1,
-            key: '1' as u16,
-            modifiers: AcceleratorModifiers::ALT,
-        },
-        Accelerator {
-            action: MenuAction::Tab2,
-            key: '2' as u16,
-            modifiers: AcceleratorModifiers::ALT,
-        },
-        Accelerator {
-            action: MenuAction::Tab3,
-            key: '3' as u16,
-            modifiers: AcceleratorModifiers::ALT,
-        },
-        Accelerator {
-            action: MenuAction::Tab4,
-            key: '4' as u16,
-            modifiers: AcceleratorModifiers::ALT,
-        },
-        Accelerator {
-            action: MenuAction::Tab5,
-            key: '5' as u16,
-            modifiers: AcceleratorModifiers::ALT,
-        },
-        Accelerator {
-            action: MenuAction::Tab6,
-            key: '6' as u16,
-            modifiers: AcceleratorModifiers::ALT,
-        },
-        Accelerator {
-            action: MenuAction::Tab7,
-            key: '7' as u16,
-            modifiers: AcceleratorModifiers::ALT,
-        },
-        Accelerator {
-            action: MenuAction::Tab8,
-            key: '8' as u16,
-            modifiers: AcceleratorModifiers::ALT,
-        },
-        Accelerator {
-            action: MenuAction::Tab9,
-            key: '9' as u16,
-            modifiers: AcceleratorModifiers::ALT,
-        },
-    ]
+    true
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cterm_app::PluginCatalog;
+    use cterm_ui::events::Action;
+    use cterm_ui::pane::{PaneDirection, SplitDirection};
+    use std::collections::HashMap;
+    use std::fs;
+    use std::path::Path;
+
+    fn tool(name: &str, command: &str) -> ToolShortcutEntry {
+        ToolShortcutEntry {
+            name: name.to_string(),
+            command: command.to_string(),
+            args: vec!["--test".to_string()],
+        }
+    }
+
+    fn tool_ids(registry: &ToolCommandRegistry) -> HashMap<String, u16> {
+        registry
+            .iter()
+            .map(|(id, tool)| (tool.name.clone(), id))
+            .collect()
+    }
+
+    fn write_plugin(root: &Path, id: &str, command: &str) {
+        fs::create_dir_all(root).unwrap();
+        fs::write(
+            root.join("cterm-plugin.toml"),
+            format!(
+                "manifest_version = 1\nid = \"{id}\"\nname = \"{id}\"\nversion = \"1.0.0\"\nabi = \"1.0\"\n\n[[commands]]\nid = \"{command}\"\ntitle = \"{command}\"\n\n[capabilities.invoke-actions]\nallow = [\"cterm:new-tab\"]\n"
+            ),
+        )
+        .unwrap();
+        fs::write(root.join("plugin.wasm"), b"\0asm\x01\0\0\0").unwrap();
+    }
+
+    fn plugin_commands() -> (tempfile::TempDir, Vec<PluginCommandDescriptor>) {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("plugins");
+        write_plugin(&root.join("org.example.alpha"), "org.example.alpha", "run");
+        write_plugin(&root.join("org.example.beta"), "org.example.beta", "build");
+        let commands = PluginCatalog::discover(&root).unwrap().commands().to_vec();
+        (directory, commands)
+    }
+
+    fn plugin_ids(registry: &PluginCommandRegistry) -> HashMap<String, u16> {
+        registry
+            .iter()
+            .map(|(id, command)| (command.action_id().to_string(), id))
+            .collect()
+    }
 
     #[test]
     fn test_menu_action_roundtrip() {
@@ -547,9 +773,198 @@ mod tests {
     }
 
     #[test]
+    fn shared_menu_actions_map_to_canonical_actions() {
+        let cases = [
+            (MenuAction::NewTab, Action::NewTab),
+            (MenuAction::NewWindow, Action::NewWindow),
+            (MenuAction::QuickOpen, Action::QuickOpenTemplate),
+            (MenuAction::CloseTab, Action::CloseTab),
+            (MenuAction::Quit, Action::CloseWindow),
+            (MenuAction::Copy, Action::Copy),
+            (MenuAction::Paste, Action::Paste),
+            (MenuAction::SelectAll, Action::SelectAll),
+            (MenuAction::ZoomIn, Action::ZoomIn),
+            (MenuAction::ZoomOut, Action::ZoomOut),
+            (MenuAction::ZoomReset, Action::ZoomReset),
+            (MenuAction::Fullscreen, Action::ToggleFullscreen),
+            (MenuAction::Find, Action::FindText),
+            (MenuAction::Reset, Action::ResetTerminal),
+            (
+                MenuAction::SplitPaneHorizontal,
+                Action::SplitPane(SplitDirection::Horizontal),
+            ),
+            (
+                MenuAction::SplitPaneVertical,
+                Action::SplitPane(SplitDirection::Vertical),
+            ),
+            (MenuAction::ClosePane, Action::ClosePane),
+            (
+                MenuAction::FocusPaneLeft,
+                Action::FocusPane(PaneDirection::Left),
+            ),
+            (
+                MenuAction::FocusPaneRight,
+                Action::FocusPane(PaneDirection::Right),
+            ),
+            (
+                MenuAction::FocusPaneUp,
+                Action::FocusPane(PaneDirection::Up),
+            ),
+            (
+                MenuAction::FocusPaneDown,
+                Action::FocusPane(PaneDirection::Down),
+            ),
+            (
+                MenuAction::ResizePaneLeft,
+                Action::ResizePane(PaneDirection::Left),
+            ),
+            (
+                MenuAction::ResizePaneRight,
+                Action::ResizePane(PaneDirection::Right),
+            ),
+            (
+                MenuAction::ResizePaneUp,
+                Action::ResizePane(PaneDirection::Up),
+            ),
+            (
+                MenuAction::ResizePaneDown,
+                Action::ResizePane(PaneDirection::Down),
+            ),
+            (MenuAction::TogglePaneZoom, Action::TogglePaneZoom),
+            (MenuAction::PrevTab, Action::PrevTab),
+            (MenuAction::NextTab, Action::NextTab),
+            (MenuAction::NextAlertedTab, Action::NextAlertedTab),
+            (MenuAction::Tab1, Action::Tab(1)),
+            (MenuAction::Tab2, Action::Tab(2)),
+            (MenuAction::Tab3, Action::Tab(3)),
+            (MenuAction::Tab4, Action::Tab(4)),
+            (MenuAction::Tab5, Action::Tab(5)),
+            (MenuAction::Tab6, Action::Tab(6)),
+            (MenuAction::Tab7, Action::Tab(7)),
+            (MenuAction::Tab8, Action::Tab(8)),
+            (MenuAction::Tab9, Action::Tab(9)),
+            (MenuAction::Preferences, Action::OpenPreferences),
+        ];
+
+        for (menu_action, expected) in cases {
+            assert_eq!(menu_action.shared_action(), Some(expected));
+        }
+    }
+
+    #[test]
+    fn native_only_menu_actions_stay_outside_the_shared_dispatcher() {
+        for action in [
+            MenuAction::CloseOtherTabs,
+            MenuAction::DockerPicker,
+            MenuAction::CopyHtml,
+            MenuAction::SetTitle,
+            MenuAction::SetColor,
+            MenuAction::ClearReset,
+            MenuAction::SendSignalInt,
+            MenuAction::SendSignalKill,
+            MenuAction::SendSignalHup,
+            MenuAction::SendSignalTerm,
+            MenuAction::TabTemplates,
+            MenuAction::CheckUpdates,
+            MenuAction::About,
+            MenuAction::AttachSession,
+            MenuAction::SSHConnect,
+            MenuAction::ManageRemotes,
+            MenuAction::DebugRelaunch,
+            MenuAction::DebugDumpState,
+            MenuAction::ViewLogs,
+            MenuAction::DebugRelaunchDaemon,
+            MenuAction::KillDaemon,
+        ] {
+            assert_eq!(action.shared_action(), None);
+        }
+    }
+
+    #[test]
     fn test_to_wide_string() {
         let wide = to_wide_string("Test");
         assert_eq!(wide.len(), 5); // "Test" + null terminator
         assert_eq!(wide[4], 0); // null terminator
+    }
+
+    #[test]
+    fn tool_command_ids_survive_reordering_and_fresh_rebuilds() {
+        let alpha = tool("Alpha", "alpha.exe");
+        let beta = tool("Beta", "beta.exe");
+
+        let mut registry = ToolCommandRegistry::default();
+        registry.reload(&[alpha.clone(), beta.clone()]);
+        let original = tool_ids(&registry);
+
+        registry.reload(&[beta.clone(), alpha.clone()]);
+        assert_eq!(tool_ids(&registry), original);
+
+        let mut fresh = ToolCommandRegistry::default();
+        fresh.reload(&[beta, alpha]);
+        assert_eq!(tool_ids(&fresh), original);
+        assert!(original.values().all(|id| is_tool_command_id(*id)));
+    }
+
+    #[test]
+    fn retired_tool_ids_are_not_reused_for_different_commands() {
+        let alpha = tool("Alpha", "alpha.exe");
+        let beta = tool("Beta", "beta.exe");
+        let mut registry = ToolCommandRegistry::default();
+        registry.reload(std::slice::from_ref(&alpha));
+        let alpha_id = tool_ids(&registry)["Alpha"];
+
+        registry.reload(std::slice::from_ref(&beta));
+        let beta_id = tool_ids(&registry)["Beta"];
+
+        assert_ne!(alpha_id, beta_id);
+        assert!(registry.get(alpha_id).is_none());
+        assert_eq!(
+            registry.get(beta_id).map(|tool| tool.name.as_str()),
+            Some("Beta")
+        );
+        assert_eq!(MenuAction::from_id(beta_id), None);
+    }
+
+    #[test]
+    fn plugin_command_ids_are_stable_and_disjoint_from_tools() {
+        let (_directory, commands) = plugin_commands();
+        let mut registry = PluginCommandRegistry::default();
+        registry.reload(&commands);
+        let original = plugin_ids(&registry);
+
+        let mut reordered = commands.clone();
+        reordered.reverse();
+        registry.reload(&reordered);
+        assert_eq!(plugin_ids(&registry), original);
+
+        let mut fresh = PluginCommandRegistry::default();
+        fresh.reload(&reordered);
+        assert_eq!(plugin_ids(&fresh), original);
+        assert!(original.values().all(|id| is_plugin_command_id(*id)));
+        assert!(original.values().all(|id| !is_tool_command_id(*id)));
+    }
+
+    #[test]
+    fn retired_plugin_ids_never_target_another_command() {
+        let (_directory, commands) = plugin_commands();
+        let mut registry = PluginCommandRegistry::default();
+        registry.reload(std::slice::from_ref(&commands[0]));
+        let retired_id = plugin_ids(&registry)[commands[0].action_id()];
+
+        registry.reload(std::slice::from_ref(&commands[1]));
+        let active_id = plugin_ids(&registry)[commands[1].action_id()];
+
+        assert_ne!(retired_id, active_id);
+        assert!(registry.get(retired_id).is_none());
+        assert_eq!(
+            registry.get(active_id).map(|command| command.action_id()),
+            Some(commands[1].action_id())
+        );
+        assert_eq!(MenuAction::from_id(active_id), None);
+    }
+
+    #[test]
+    fn dynamic_tool_names_escape_native_menu_mnemonics() {
+        assert_eq!(escape_menu_label("Build & Run"), "Build && Run");
     }
 }

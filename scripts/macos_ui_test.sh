@@ -136,6 +136,43 @@ end tell
 EOF
 }
 
+run_plugin_command_for_ci() {
+    focus_cterm
+    osascript <<EOF &
+tell application "System Events"
+    set ctermProcess to first process whose unix id is $CTERM_PID
+    tell ctermProcess
+        click menu item "UI Test Plugin — Open Test Tab" of menu 1 of menu item "Plugins" of menu 1 of menu bar item "Tools" of menu bar 1
+    end tell
+end tell
+EOF
+    local menu_click_pid=$!
+
+    osascript <<EOF
+tell application "System Events"
+    set ctermProcess to first process whose unix id is $CTERM_PID
+    repeat 80 times
+        tell ctermProcess
+            repeat with candidate in windows
+                try
+                    set promptText to (value of every static text of candidate) as text
+                    if promptText contains "Allow plugin command?" then
+                        if promptText does not contain "UI Test Plugin (org.example.ui)" then error "Plugin identity is absent from native prompt"
+                        if promptText does not contain "cterm:new-tab (new)" then error "Exact new action is absent from native prompt"
+                        click button "OK" of candidate
+                        return
+                    end if
+                end try
+            end repeat
+        end tell
+        delay 0.125
+    end repeat
+    error "Native plugin approval prompt did not appear"
+end tell
+EOF
+    wait "$menu_click_pid"
+}
+
 wait_for_cterm_log() {
     local pattern="$1"
     local description="$2"
@@ -153,6 +190,123 @@ wait_for_cterm_log() {
         tail -100 "$CTERM_LOG_FILE" | while IFS= read -r line; do log "  $line"; done
     fi
     exit 1
+}
+
+cterm_log_line_count() {
+    if [ -f "$CTERM_LOG_FILE" ]; then
+        wc -l < "$CTERM_LOG_FILE" | tr -d ' '
+    else
+        echo 0
+    fi
+}
+
+wait_for_new_cterm_log() {
+    local pattern="$1"
+    local description="$2"
+    local after_line="$3"
+    local first_line=$((after_line + 1))
+
+    for _attempt in $(seq 1 40); do
+        if [ -f "$CTERM_LOG_FILE" ] &&
+            sed -n "${first_line},\$p" "$CTERM_LOG_FILE" | grep -Eq "$pattern"; then
+            log "$description"
+            return 0
+        fi
+        sleep 0.25
+    done
+
+    log "ERROR: Timed out waiting for new cterm log pattern: $pattern"
+    if [ -f "$CTERM_LOG_FILE" ]; then
+        sed -n "${first_line},\$p" "$CTERM_LOG_FILE" |
+            tail -100 |
+            while IFS= read -r line; do log "  $line"; done
+    fi
+    exit 1
+}
+
+wait_for_preferences_window() {
+    for _attempt in $(seq 1 40); do
+        if osascript -e "tell application \"System Events\" to tell (first process whose unix id is $CTERM_PID) to exists window \"Preferences\"" 2>/dev/null | grep -q true; then
+            log "Preferences window opened"
+            return 0
+        fi
+        sleep 0.25
+    done
+
+    log "ERROR: Preferences window did not open"
+    exit 1
+}
+
+save_horizontal_pane_shortcut() {
+    local old_shortcut="$1"
+    local new_shortcut="$2"
+
+    focus_cterm
+    osascript <<EOF
+tell application "System Events"
+    set ctermProcess to first process whose unix id is $CTERM_PID
+    tell ctermProcess
+        set preferencesWindow to first window whose name is "Preferences"
+        set paneTabPressed to false
+        try
+            set preferencesTabs to tab group 1 of preferencesWindow
+            if exists radio button "Pane Shortcuts" of preferencesTabs then
+                click radio button "Pane Shortcuts" of preferencesTabs
+            else
+                click radio button 4 of preferencesTabs
+            end if
+            set paneTabPressed to true
+        end try
+        if paneTabPressed is false then error "Pane Shortcuts tab not found"
+
+        delay 0.25
+        set focusedControl to value of attribute "AXFocusedUIElement" of ctermProcess
+        if (role of focusedControl as text) is not "AXTextField" then
+            key code 48
+            delay 0.25
+            set focusedControl to value of attribute "AXFocusedUIElement" of ctermProcess
+        end if
+        if (role of focusedControl as text) is not "AXTextField" then error "Pane shortcut field did not receive keyboard focus"
+        if (value of focusedControl as text) is not "$old_shortcut" then error "Unexpected first pane shortcut value"
+        set value of focusedControl to "$new_shortcut"
+
+        -- Return invokes the native default OK button, which saves through
+        -- the same callback as Apply and then closes Preferences.
+        key code 36
+    end tell
+end tell
+EOF
+}
+
+write_quick_open_template_fixture() {
+    local config_file=""
+
+    for _attempt in $(seq 1 40); do
+        config_file=$(find "$CTERM_TEST_HOME" -type f -name config.toml -print -quit 2>/dev/null || true)
+        if [ -n "$config_file" ]; then
+            break
+        fi
+        sleep 0.25
+    done
+    if [ -z "$config_file" ]; then
+        log "ERROR: Preferences did not create an isolated config file"
+        exit 1
+    fi
+
+    local config_directory
+    config_directory=$(dirname "$config_file")
+    printf '%s\n' \
+        '[[tabs]]' \
+        'name = "UI Test Template"' \
+        'command = "/bin/echo"' \
+        'args = ["cterm-template-ui-test"]' \
+        'color = "#336699"' \
+        'theme = "light"' \
+        'background_color = "#f0f0f0"' \
+        'keep_open = true' \
+        'unique = true' \
+        > "$config_directory/sticky_tabs.toml"
+    log "Installed isolated Quick Open template fixture"
 }
 
 log "=== cterm UI Automation Test (macOS) ==="
@@ -174,10 +328,34 @@ fi
 # Set up environment
 export RUST_LOG=debug
 export CTERM_LOG_FILE="$OUTPUT_DIR/cterm.log"
+export CTERM_TEST_HOME="$OUTPUT_DIR/home"
+mkdir -p "$CTERM_TEST_HOME"
+
+PLUGIN_DIR="$CTERM_TEST_HOME/Library/Application Support/com.cterm.cterm/plugins/org.example.ui"
+PLUGIN_GRANT="$CTERM_TEST_HOME/Library/Application Support/com.cterm.cterm/plugin-grants.toml"
+mkdir -p "$PLUGIN_DIR"
+cat >"$PLUGIN_DIR/cterm-plugin.toml" <<'EOF'
+manifest_version = 1
+id = "org.example.ui"
+name = "UI Test Plugin"
+version = "1.0.0"
+abi = "1.0"
+
+[[commands]]
+id = "new-tab"
+title = "Open Test Tab"
+
+[capabilities.invoke-actions]
+allow = ["cterm:new-tab"]
+EOF
+base64 -D \
+    <"$(dirname "$0")/../crates/cterm-plugin-host/tests/fixtures/ui_new_tab.wasm.base64" \
+    >"$PLUGIN_DIR/plugin.wasm"
+log "Prepared isolated native plugin fixture"
 
 # Start cterm in background
 log "Starting cterm..."
-"$CTERM_PATH" &
+HOME="$CTERM_TEST_HOME" "$CTERM_PATH" &
 CTERM_PID=$!
 log "Process started with PID: $CTERM_PID"
 
@@ -281,13 +459,26 @@ sleep 1
 # Take screenshot after ls
 take_screenshot "04_after_ls"
 
+# Exercise the full native command-plugin path before adding a regular tab.
+PLUGIN_LOG_MARK=$(cterm_log_line_count)
+log "Testing native plugin menu, approval, runner, and action dispatch..."
+run_plugin_command_for_ci
+wait_for_new_cterm_log 'Created daemon tab' \
+    "Plugin command created a tab through the native action dispatcher" \
+    "$PLUGIN_LOG_MARK"
+if [ ! -s "$PLUGIN_GRANT" ] || ! grep -Fq 'plugin = "org.example.ui"' "$PLUGIN_GRANT"; then
+    log "ERROR: accepted native plugin prompt did not persist its exact local grant"
+    exit 1
+fi
+take_screenshot "05_plugin_command"
+
 # Test Cmd+T for new tab
 log "Testing Cmd+T (new tab)..."
 send_key "t" "cmd"
 sleep 1
 
 # Take screenshot showing tabs
-take_screenshot "05_new_tab"
+take_screenshot "06_new_tab"
 
 # Exercise the native AppKit pane host. Key codes avoid keyboard-layout
 # ambiguity on the hosted runner (42=backslash, 27=minus, 36=return,
@@ -299,7 +490,7 @@ wait_for_cterm_log 'Split pane Horizontal' "Horizontal pane split succeeded"
 log "Testing native vertical pane split..."
 send_pane_shortcut 27 "ctrl+shift"
 wait_for_cterm_log 'Split pane Vertical' "Vertical pane split succeeded"
-take_screenshot "06_split_panes"
+take_screenshot "07_split_panes"
 
 log "Testing directional pane focus..."
 select_pane_menu_item "Focus Up"
@@ -318,7 +509,51 @@ wait_for_cterm_log 'Pane zoom false' "Pane unzoom succeeded"
 log "Testing pane close..."
 send_pane_shortcut 117 "ctrl+shift"
 wait_for_cterm_log 'Closed pane' "Pane close succeeded"
-take_screenshot "07_closed_pane"
+take_screenshot "08_closed_pane"
+
+# Preferences must replace ShortcutManager instances already owned by every
+# open terminal view, including panes that were created before the dialog.
+log "Testing live shortcut reload through Preferences save..."
+focus_cterm
+osascript -e 'tell application "System Events" to keystroke "," using command down'
+wait_for_preferences_window
+PREFERENCES_LOG_MARK=$(cterm_log_line_count)
+save_horizontal_pane_shortcut "Ctrl+Shift+Backslash" "Ctrl+Shift+P"
+wait_for_new_cterm_log \
+    'Preferences saved; refreshed shortcuts for [1-9][0-9]* window\(s\) and ([2-9]|[1-9][0-9]+) terminal view\(s\)' \
+    "Preferences save refreshed every pre-existing window and split pane" \
+    "$PREFERENCES_LOG_MARK"
+take_screenshot "09_preferences_saved"
+
+# Focus a pane that was inactive while Preferences was open.
+FOCUS_LOG_MARK=$(cterm_log_line_count)
+select_pane_menu_item "Focus Left"
+wait_for_new_cterm_log 'Focused pane .*Left' \
+    "Focused a pre-existing inactive pane after Preferences Apply" \
+    "$FOCUS_LOG_MARK"
+
+CUSTOM_SPLIT_LOG_MARK=$(cterm_log_line_count)
+send_pane_shortcut 35 "ctrl+shift"
+wait_for_new_cterm_log 'Split pane Horizontal' \
+    "Updated Ctrl+Shift+P binding split the pre-existing pane" \
+    "$CUSTOM_SPLIT_LOG_MARK"
+take_screenshot "10_reloaded_shortcut"
+
+# Quick Open reloads templates when shown, so an isolated local fixture can
+# exercise its real callback and the shared Cocoa launch plan without network
+# access, Docker, or host configuration.
+write_quick_open_template_fixture
+QUICK_OPEN_LOG_MARK=$(cterm_log_line_count)
+log "Testing template launch through Quick Open..."
+focus_cterm
+osascript -e 'tell application "System Events" to keystroke "g" using command down'
+sleep 0.5
+send_keys "UI Test Template"
+send_key "Return"
+wait_for_new_cterm_log 'Created daemon tab: UI Test Template' \
+    "Quick Open launched the isolated local template" \
+    "$QUICK_OPEN_LOG_MARK"
+take_screenshot "11_quick_open_template"
 
 # Close the window
 log "Closing window..."
