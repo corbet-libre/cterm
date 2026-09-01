@@ -3,6 +3,8 @@
 //! Provides a high-level interface for terminal emulation.
 
 use crate::color::ColorPalette;
+use crate::dnd::DndCommand;
+use crate::kitty_file_transfer::FileTransferCommand;
 use crate::kitty_graphics::GraphicsAnimationTick;
 use crate::parser::Parser;
 use crate::pty::{Pty, PtyConfig, PtyError, PtySize};
@@ -14,6 +16,10 @@ use crate::{KeyEventKind, KeyEventMetadata, KeyboardEnhancementFlags};
 use std::time::{Duration, Instant};
 
 const APPLICATION_SYNC_UPDATE_TIMEOUT: Duration = Duration::from_secs(1);
+// Far fewer than 256 syntactically valid OSC 5113 commands fit in this many
+// bytes. Draining between chunks therefore preserves the Screen queue's hard
+// bound without silently losing a burst from one large PTY read.
+const FILE_TRANSFER_DRAIN_CHUNK_BYTES: usize = 1024;
 
 /// Events emitted by the terminal
 #[derive(Debug, Clone)]
@@ -30,6 +36,8 @@ pub enum TerminalEvent {
     ClipboardRequest(ClipboardOperation),
     /// Terminal application requested a native desktop notification.
     DesktopNotification(DesktopNotificationAction),
+    /// Terminal application changed a native Kitty OSC 72 drag session.
+    DndCommand(DndCommand),
 }
 
 /// Terminal configuration
@@ -164,6 +172,9 @@ impl Terminal {
     /// query replies a second time. The daemon is the authoritative responder.
     pub fn process_mirror(&mut self, data: &[u8]) -> Vec<TerminalEvent> {
         let (events, _responses) = self.process_collecting(data);
+        // ctermd is the sole OSC 5113 authority. Native mirrors must not retain
+        // a second queue of raw commands that they are forbidden to execute.
+        self.screen.take_kitty_file_transfer_commands();
         events
     }
 
@@ -174,10 +185,40 @@ impl Terminal {
     /// async worker thread and outside the terminal lock. Callers MUST write the
     /// returned responses back to the PTY to keep terminal queries functioning.
     pub fn process_collecting(&mut self, data: &[u8]) -> (Vec<TerminalEvent>, Vec<Vec<u8>>) {
+        let (events, responses, _) = self.process_collecting_inner(data, false);
+        (events, responses)
+    }
+
+    /// Parse daemon-owned PTY output and losslessly drain validated OSC 5113
+    /// commands alongside ordinary terminal events and query responses.
+    pub fn process_collecting_with_file_transfers(
+        &mut self,
+        data: &[u8],
+    ) -> (Vec<TerminalEvent>, Vec<Vec<u8>>, Vec<FileTransferCommand>) {
+        self.process_collecting_inner(data, true)
+    }
+
+    fn process_collecting_inner(
+        &mut self,
+        data: &[u8],
+        drain_file_transfers: bool,
+    ) -> (Vec<TerminalEvent>, Vec<Vec<u8>>, Vec<FileTransferCommand>) {
         let mut events = Vec::new();
+        let mut file_transfers = if drain_file_transfers {
+            self.screen.take_kitty_file_transfer_commands()
+        } else {
+            Vec::new()
+        };
 
         let sync_generation = self.screen.sync_update_generation();
-        self.parser.parse(&mut self.screen, data);
+        if drain_file_transfers {
+            for chunk in data.chunks(FILE_TRANSFER_DRAIN_CHUNK_BYTES) {
+                self.parser.parse(&mut self.screen, chunk);
+                file_transfers.extend(self.screen.take_kitty_file_transfer_commands());
+            }
+        } else {
+            self.parser.parse(&mut self.screen, data);
+        }
 
         if self.screen.modes.application_sync_updates {
             if self.screen.sync_update_generation() != sync_generation
@@ -207,6 +248,12 @@ impl Terminal {
         if self.screen.has_notifications() {
             for notification in self.screen.take_notifications() {
                 events.push(TerminalEvent::DesktopNotification(notification));
+            }
+        }
+
+        if self.screen.has_dnd_commands() {
+            for command in self.screen.take_dnd_commands() {
+                events.push(TerminalEvent::DndCommand(command));
             }
         }
 
@@ -243,7 +290,7 @@ impl Terminal {
             events.push(TerminalEvent::ContentChanged);
         }
 
-        (events, responses)
+        (events, responses, file_transfers)
     }
 
     fn color_query_response(target: ColorQuery, color: crate::color::Rgb) -> Vec<u8> {
@@ -1397,6 +1444,27 @@ mod tests {
     }
 
     #[test]
+    fn daemon_collection_does_not_drop_a_single_read_transfer_burst() {
+        let mut term = Terminal::new(80, 24, ScreenConfig::default());
+        let count = crate::kitty_file_transfer::MAX_PENDING_FILE_TRANSFER_COMMANDS + 32;
+        let input = b"\x1b]5113;ac=cancel;id=x\x1b\\".repeat(count);
+
+        let (_, _, commands) = term.process_collecting_with_file_transfers(&input);
+
+        assert_eq!(commands.len(), count);
+        assert!(!term.screen().has_kitty_file_transfer_commands());
+    }
+
+    #[test]
+    fn daemon_mirror_discards_authoritative_transfer_commands() {
+        let mut term = Terminal::new(80, 24, ScreenConfig::default());
+
+        term.process_mirror(b"\x1b]5113;ac=send;id=daemon-owned\x1b\\");
+
+        assert!(!term.screen().has_kitty_file_transfer_commands());
+    }
+
+    #[test]
     fn test_process_collecting_returns_responses() {
         // A terminal with no PTY: parser responses (e.g. DSR cursor-position report)
         // must be RETURNED by process_collecting rather than written/swallowed, so the
@@ -1435,6 +1503,34 @@ mod tests {
                 if notification.id.as_deref() == Some("build")
                     && notification.title == "finished"
                     && notification.focus
+        )));
+    }
+
+    #[test]
+    fn process_emits_validated_dnd_commands_without_premature_capability_claims() {
+        let mut term = Terminal::new(80, 24, ScreenConfig::default());
+
+        let (events, responses) = term.process_collecting(
+            concat!(
+                "\x1b]72;t=q:i=3\x1b\\",
+                "\x1b]72;t=o:x=1;1:machine-id\x1b\\"
+            )
+            .as_bytes(),
+        );
+
+        assert!(responses.is_empty());
+        assert!(events.iter().any(|event| matches!(
+            event,
+            TerminalEvent::DndCommand(command)
+                if command.command_type == crate::dnd::DndCommandType::Query
+                    && command.client_id == 3
+        )));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            TerminalEvent::DndCommand(command)
+                if command.command_type == crate::dnd::DndCommandType::OfferDrag
+                    && command.cell_x == 1
+                    && command.payload == b"1:machine-id"
         )));
     }
 

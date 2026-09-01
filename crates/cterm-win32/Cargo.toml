@@ -38,9 +38,14 @@ windows = { version = "0.60", features = [
     "Win32_System_Memory",
     "Win32_System_Ole",
     "Win32_System_Com",
+    "Win32_System_Com_StructuredStorage",
+    "Win32_System_SystemServices",
     "Win32_Security",
     "Win32_Globalization",
 ]}
+# Required by `windows::core::implement`; pin it to the binding version so the
+# generated COM implementation cannot resolve another transitive windows-core.
+windows-core = "0.60"
 
 # Common dependencies
 parking_lot.workspace = true
@@ -49,6 +54,7 @@ env_logger.workspace = true
 clap.workspace = true
 tokio.workspace = true
 futures.workspace = true
+url.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 winapi = { version = "0.3", features = [

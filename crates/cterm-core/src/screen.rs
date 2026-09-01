@@ -5,9 +5,11 @@
 
 use crate::cell::{Cell, CellAttrs, CellStyle, MAX_GRAPHEME_BYTES};
 use crate::color::{Color, ColorPalette, Rgb};
+use crate::dnd::DndCommand;
 use crate::drcs::{DrcsFont, DrcsGlyph};
 use crate::grid::{Grid, Row};
 use crate::keyboard::KeyboardEnhancementFlags;
+use crate::kitty_file_transfer::{FileTransferCommand, MAX_PENDING_FILE_TRANSFER_COMMANDS};
 use crate::multiple_cursors::{
     ExtraCursor, ExtraCursorColor, ExtraCursorColorTarget, ExtraCursorColors, ExtraCursorShape,
     MultipleCursors,
@@ -727,6 +729,8 @@ pub struct Screen {
     pending_clipboard_ops: Vec<ClipboardOperation>,
     /// Pending desktop notifications from OSC 9/777/99.
     pending_notifications: Vec<DesktopNotificationAction>,
+    /// Validated Kitty OSC 72 commands for the native drag-and-drop adapter.
+    pending_dnd_commands: Vec<DndCommand>,
     /// Pending color queries (OSC 4 and OSC 10-12)
     pending_color_queries: Vec<(ColorQuery, Option<Rgb>)>,
     /// Frontend theme used for authoritative OSC color-query replies.
@@ -753,6 +757,8 @@ pub struct Screen {
     next_image_id: u64,
     /// Pending file transfer operations (iTerm2 OSC 1337 with inline=0)
     pending_file_transfers: Vec<FileTransferOperation>,
+    /// Validated Kitty OSC 5113 commands awaiting application authorization.
+    pending_kitty_file_transfer_commands: Vec<FileTransferCommand>,
     /// Next file transfer ID
     next_file_transfer_id: u64,
     /// Cell height hint in pixels (set by UI layer for image row calculations)
@@ -1066,6 +1072,7 @@ impl Screen {
             pending_responses: Vec::new(),
             pending_clipboard_ops: Vec::new(),
             pending_notifications: Vec::new(),
+            pending_dnd_commands: Vec::new(),
             pending_color_queries: Vec::new(),
             base_palette: ColorPalette::default(),
             frontend_state: FrontendState::default(),
@@ -1082,6 +1089,7 @@ impl Screen {
             // code, so real terminal images always start at one.
             next_image_id: 1,
             pending_file_transfers: Vec::new(),
+            pending_kitty_file_transfer_commands: Vec::new(),
             next_file_transfer_id: 0,
             cell_height_hint: 16.0, // Default assumption
             cell_width_hint: 8.0,   // Default assumption
@@ -1290,6 +1298,21 @@ impl Screen {
     /// Check whether terminal output queued desktop notifications.
     pub fn has_notifications(&self) -> bool {
         !self.pending_notifications.is_empty()
+    }
+
+    /// Queue a validated Kitty OSC 72 command for the native frontend.
+    pub(crate) fn queue_dnd_command(&mut self, command: DndCommand) {
+        self.pending_dnd_commands.push(command);
+    }
+
+    /// Drain all pending Kitty drag-and-drop commands.
+    pub fn take_dnd_commands(&mut self) -> Vec<DndCommand> {
+        std::mem::take(&mut self.pending_dnd_commands)
+    }
+
+    /// Whether the terminal application emitted Kitty DND commands.
+    pub fn has_dnd_commands(&self) -> bool {
+        !self.pending_dnd_commands.is_empty()
     }
 
     /// Queue a default-color query (from OSC 10-12)
@@ -1545,6 +1568,25 @@ impl Screen {
     /// Get the next file transfer ID (for pre-allocation)
     pub fn next_file_transfer_id(&self) -> u64 {
         self.next_file_transfer_id
+    }
+
+    /// Queue a validated Kitty OSC 5113 command for the application layer.
+    pub fn queue_kitty_file_transfer_command(&mut self, command: FileTransferCommand) {
+        if self.pending_kitty_file_transfer_commands.len() >= MAX_PENDING_FILE_TRANSFER_COMMANDS {
+            log::warn!("Dropping Kitty OSC 5113 command: frontend queue is full");
+            return;
+        }
+        self.pending_kitty_file_transfer_commands.push(command);
+    }
+
+    /// Drain validated Kitty OSC 5113 commands without granting file access.
+    pub fn take_kitty_file_transfer_commands(&mut self) -> Vec<FileTransferCommand> {
+        std::mem::take(&mut self.pending_kitty_file_transfer_commands)
+    }
+
+    /// Whether Kitty OSC 5113 commands are waiting for the application layer.
+    pub fn has_kitty_file_transfer_commands(&self) -> bool {
+        !self.pending_kitty_file_transfer_commands.is_empty()
     }
 
     /// Take all pending responses (drains the queue)

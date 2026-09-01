@@ -13,10 +13,12 @@ use vte::Params;
 
 use crate::cell::{CellAttrs, Hyperlink};
 use crate::color::{AnsiColor, Color, Rgb};
+use crate::dnd::DndProtocolState;
 use crate::drcs::DecdldDecoder;
 use crate::image_decode::decode_image;
 use crate::iterm2::{Iterm2Dimension, Iterm2FileParams};
 use crate::keyboard::KeyboardEnhancementFlags;
+use crate::kitty_file_transfer::parse_file_transfer_command;
 use crate::kitty_graphics::{
     GraphicsAnimationTick, InterceptorResult as KittyInterceptorResult, KittyGraphics,
 };
@@ -56,6 +58,9 @@ enum DcsState {
 const XTGETTCAP_MAX_REQUEST_SIZE: usize = 64 * 1024;
 const MAX_NOTIFICATION_TITLE_BYTES: usize = 1024;
 const MAX_NOTIFICATION_BODY_BYTES: usize = 4096;
+// OSC 66 and OSC 72 permit 4096-byte payloads in addition to command
+// metadata. VTE's 1024-byte default would silently truncate valid commands.
+const VTE_OSC_BUFFER_BYTES: usize = 8192;
 
 #[derive(Debug)]
 struct SixelSessionState {
@@ -136,7 +141,7 @@ enum KittyPayloadType {
 
 /// Parser wraps the vte parser and applies actions to a Screen
 pub struct Parser {
-    state_machine: vte::Parser,
+    state_machine: vte::Parser<VTE_OSC_BUFFER_BYTES>,
     dcs_state: DcsState,
     /// Most recent graphic character for ECMA-48 REP.
     last_printed: Option<char>,
@@ -146,6 +151,8 @@ pub struct Parser {
     osc_1337: Osc1337Interceptor,
     /// In-progress chunked Kitty OSC 99 notification.
     kitty_notification: KittyNotificationBuilder,
+    /// Chunk metadata for Kitty OSC 72 drag-and-drop commands.
+    kitty_dnd: DndProtocolState,
     /// Bounded Kitty graphics APC parser and image store.
     kitty_graphics: KittyGraphics,
     /// Optimistically active Kitty notification identifiers for p=alive.
@@ -163,12 +170,13 @@ impl Default for Parser {
 impl Parser {
     pub fn new() -> Self {
         Self {
-            state_machine: vte::Parser::new(),
+            state_machine: vte::Parser::<VTE_OSC_BUFFER_BYTES>::new_with_size(),
             dcs_state: DcsState::None,
             last_printed: None,
             saved_dec_modes: HashMap::new(),
             osc_1337: Osc1337Interceptor::new(),
             kitty_notification: KittyNotificationBuilder::default(),
+            kitty_dnd: DndProtocolState::default(),
             kitty_graphics: KittyGraphics::default(),
             active_notification_ids: HashSet::new(),
             sixel: SixelSessionState::default(),
@@ -240,6 +248,7 @@ impl Parser {
             last_printed: &mut self.last_printed,
             saved_dec_modes: &mut self.saved_dec_modes,
             kitty_notification: &mut self.kitty_notification,
+            kitty_dnd: &mut self.kitty_dnd,
             active_notification_ids: &mut self.active_notification_ids,
             sixel: &mut self.sixel,
         };
@@ -330,6 +339,7 @@ struct ScreenPerformer<'a> {
     last_printed: &'a mut Option<char>,
     saved_dec_modes: &'a mut HashMap<usize, bool>,
     kitty_notification: &'a mut KittyNotificationBuilder,
+    kitty_dnd: &'a mut DndProtocolState,
     active_notification_ids: &'a mut HashSet<String>,
     sixel: &'a mut SixelSessionState,
 }
@@ -662,11 +672,19 @@ impl vte::Perform for ScreenPerformer<'_> {
             // Kitty desktop notifications, including chunking and capability,
             // close, and liveness requests.
             99 => self.handle_osc99(params, bell_terminated),
-            // Kitty text sizing. The core advertises width support through
-            // cursor movement; integer scaling is enabled in a later stage.
+            // Kitty text sizing, including fixed-width and scaled blocks.
             66 => {
                 if let Some(request) = parse_text_size_request(params) {
                     self.screen.put_text_size(request);
+                }
+            }
+            // Kitty drag-and-drop. OS drag sessions remain frontend-owned;
+            // commands are validated here so every platform sees one shape.
+            72 => {
+                if bell_terminated {
+                    self.kitty_dnd.reset();
+                } else if let Some(command) = self.kitty_dnd.parse(params) {
+                    self.screen.queue_dnd_command(command);
                 }
             }
             // Set/query 256-color palette entries.
@@ -740,6 +758,18 @@ impl vte::Perform for ScreenPerformer<'_> {
             // iTerm2 inline images and file transfer (1337)
             1337 => {
                 self.handle_osc_1337(params);
+            }
+            // Kitty's session-based TTY file-transfer protocol requires ST;
+            // decoded commands still need explicit frontend authorization.
+            5113 => {
+                if bell_terminated {
+                    log::warn!("Rejected BEL-terminated Kitty OSC 5113 command");
+                } else {
+                    match parse_file_transfer_command(params) {
+                        Ok(command) => self.screen.queue_kitty_file_transfer_command(command),
+                        Err(error) => log::warn!("Rejected Kitty OSC 5113 command: {error}"),
+                    }
+                }
             }
             // Copy to clipboard (52)
             52 => {
@@ -2925,6 +2955,50 @@ mod tests {
     }
 
     #[test]
+    fn test_kitty_dnd_query_and_command_dispatch() {
+        let mut screen = Screen::new(8, 3, ScreenConfig::default());
+        let mut parser = Parser::new();
+
+        parser.parse(&mut screen, b"\x1b]72;t=q:i=17\x1b\\");
+        assert!(screen.take_pending_responses().is_empty());
+        let query = screen.take_dnd_commands();
+        assert_eq!(query.len(), 1);
+        assert_eq!(query[0].command_type, crate::dnd::DndCommandType::Query);
+        assert_eq!(query[0].client_id, 17);
+
+        parser.parse(
+            &mut screen,
+            b"\x1b]72;t=a:i=17;text/uri-list text/plain\x1b\\",
+        );
+        let commands = screen.take_dnd_commands();
+        assert_eq!(commands.len(), 1);
+        assert_eq!(
+            commands[0].command_type,
+            crate::dnd::DndCommandType::AcceptDrops
+        );
+        assert_eq!(commands[0].client_id, 17);
+        assert_eq!(commands[0].payload, b"text/uri-list text/plain");
+    }
+
+    #[test]
+    fn test_kitty_dnd_accepts_full_protocol_chunk_and_rejects_bel() {
+        let mut screen = Screen::new(8, 3, ScreenConfig::default());
+        let mut parser = Parser::new();
+        let payload = vec![b'x'; crate::dnd::MAX_DND_CHUNK_BYTES];
+        let mut sequence = b"\x1b]72;t=p:x=0;".to_vec();
+        sequence.extend_from_slice(&payload);
+        sequence.extend_from_slice(b"\x1b\\");
+
+        parser.parse(&mut screen, &sequence);
+        let commands = screen.take_dnd_commands();
+        assert_eq!(commands.len(), 1);
+        assert_eq!(commands[0].payload, payload);
+
+        parser.parse(&mut screen, b"\x1b]72;t=A\x07");
+        assert!(!screen.has_dnd_commands());
+    }
+
+    #[test]
     fn test_kitty_text_sizing_width_protocol_and_overwrite() {
         let mut screen = Screen::new(8, 3, ScreenConfig::default());
         let mut parser = Parser::new();
@@ -3766,6 +3840,42 @@ mod tests {
         );
         assert_eq!(screen.grid().row(0).unwrap().text().trim_end(), "recovered");
         assert!(!screen.has_file_transfers());
+    }
+
+    #[test]
+    fn test_kitty_osc_5113_queues_only_valid_st_terminated_commands() {
+        let mut screen = make_screen();
+        let mut parser = Parser::new();
+
+        parser.parse(
+            &mut screen,
+            b"\x1b]5113;ac=send;id=session-1;n=L3RtcC9maWxlLnR4dA==\x1b\\",
+        );
+        let commands = screen.take_kitty_file_transfer_commands();
+        assert_eq!(commands.len(), 1);
+        assert_eq!(
+            commands[0].action,
+            crate::kitty_file_transfer::FileTransferAction::Send
+        );
+        assert_eq!(commands[0].id, "session-1");
+        assert_eq!(commands[0].name.as_deref(), Some("/tmp/file.txt"));
+
+        parser.parse(&mut screen, b"\x1b]5113;ac=send;id=bell\x07");
+        parser.parse(&mut screen, b"\x1b]5113;ac=bogus;id=bad\x1b\\");
+        assert!(!screen.has_kitty_file_transfer_commands());
+    }
+
+    #[test]
+    fn test_kitty_osc_5113_frontend_queue_is_bounded() {
+        let mut screen = make_screen();
+        let mut parser = Parser::new();
+        for _ in 0..=crate::kitty_file_transfer::MAX_PENDING_FILE_TRANSFER_COMMANDS {
+            parser.parse(&mut screen, b"\x1b]5113;ac=cancel;id=x\x1b\\");
+        }
+        assert_eq!(
+            screen.take_kitty_file_transfer_commands().len(),
+            crate::kitty_file_transfer::MAX_PENDING_FILE_TRANSFER_COMMANDS
+        );
     }
 
     #[test]

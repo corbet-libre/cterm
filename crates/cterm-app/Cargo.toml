@@ -16,6 +16,11 @@ serde.workspace = true
 toml.workspace = true
 directories.workspace = true
 tempfile.workspace = true
+filetime.workspace = true
+fs_at.workspace = true
+cap-std.workspace = true
+pathdiff.workspace = true
+twox-hash.workspace = true
 log.workspace = true
 thiserror.workspace = true
 parking_lot.workspace = true
@@ -35,13 +40,27 @@ clap.workspace = true
 
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true
+nix.workspace = true
 
 [target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Wdk_Foundation",
+    "Wdk_Storage_FileSystem",
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
+] }
 winapi = { version = "0.3", features = [
+    "accctrl",
+    "aclapi",
+    "fileapi",
     "handleapi",
     "namedpipeapi",
     "processthreadsapi",
+    "securitybaseapi",
     "minwinbase",
     "winbase",
+    "winerror",
     "winnt",
 ] }

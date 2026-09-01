@@ -2,6 +2,9 @@
 
 A high-performance, customizable terminal emulator built in Rust. cterm uses native AppKit/CoreGraphics on macOS, Win32/Direct2D on Windows, and GTK4 on Wayland for Linux. X11 is intentionally not a supported Linux backend.
 
+The evidence-backed status of the foot and Kitty compatibility work is tracked
+in the living [parity inventory](docs/parity.md).
+
 ## Features
 
 ### Terminal Emulation
@@ -494,6 +497,49 @@ Kitty's independent bold/faint resets (`SGR 221`/`222`) and `CSI 22 J`
 viewport-to-scrollback operation are supported. Native Cocoa, GTK/Wayland, and
 Win32 pointer-leave hooks also emit Kitty's SGR-pixel mouse-leave report.
 
+### Kitty Drag and Drop
+
+Kitty OSC 72 destination negotiation and bounded data chunking are shared
+across the native frontends. GTK/Wayland, Cocoa, and Win32/OLE accept local
+file URI drops and deliver them to applications only after MIME and copy-action
+negotiation. Source-side drags, native move operations, and remote filesystem
+requests are not yet implemented and are never advertised as available.
+
+### Kitty File Transfer
+
+Kitty OSC 5113 commands pass through a bounded shared codec and an exact-token
+authorization state machine before any filesystem access is possible. The
+approved remote-to-local executor uses explicit file/session limits with
+cumulative decompressed-byte accounting, strict bounded single-member zlib
+decompression, private handle-relative same-filesystem staging, metadata
+preservation, deterministic lifecycle cleanup, and per-entry atomic commit at
+session finish. Directory trees, symbolic links, and filesystem hardlinks are
+reconstructed; hardlinks can reference only approved regular files in the same
+transfer. Missing destination directories are created component by component
+through retained handles. Retained source and
+destination-directory handles prevent namespace replacement after staging
+begins from redirecting the payload or its commit. On Unix, unsafe shared
+destination directories that are group/world-writable without the sticky bit
+are rejected; Windows staging directories use a protected owner-only DACL and
+retain the payload with read/write sharing disabled until its atomic commit.
+Approved local-to-remote sessions recursively enumerate consented directory
+handles without following symlinks, correlate parent directories, symbolic
+links, and filesystem-identity hardlinks, and retain exact regular-file handles
+and symbolic-link values for later requests. Plain and zlib data use
+Kitty-sized chunks through a bounded backpressured PTY path. Both directions
+also support Kitty's rsync transmission type with streaming rolling matches,
+XXH3-64 block hashes, XXH3-128 output verification, strict signature and delta
+validation, and bounded plain or zlib wire chunks. Changed, replaced,
+oversized, duplicate, and unlisted sources fail closed without reopening a
+client-selected pathname.
+GTK/Wayland, Cocoa, and Win32 surface daemon-owned, deny-by-default native
+consent dialogs with exact token, expiry, pane/session cancellation, and
+reconnect replay semantics; the daemon refuses relaunch while any transfer
+actor is pending, queued, staged, or draining. Authorization bypass policy,
+native prompt interaction automation, and Kitty differential tests remain open
+and are tracked in the [parity inventory](docs/parity.md); cterm does not
+advertise the protocol as complete yet.
+
 ### Kitty Multiple Cursors
 
 Kitty's multiple-cursors protocol supports block, beam, underline, and
@@ -610,7 +656,7 @@ Custom themes can be added as TOML files in the `themes/` configuration subdirec
 
 ### Future
 
-- Additional foot-compatible behavior and performance work
+- Close every open or unverified row in the living [parity inventory](docs/parity.md)
 - Android and iOS local-terminal frontends (distant targets)
 
 ## License

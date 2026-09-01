@@ -6,7 +6,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use objc2::rc::Retained;
 use objc2::runtime::AnyObject;
@@ -22,6 +22,9 @@ use objc2_foundation::{
 use parking_lot::Mutex;
 
 use cterm_app::config::{Config, ShortcutsConfig};
+use cterm_app::kitty_dnd::{
+    DndAdapterAction, DndDestination, DndLocation, DndOperation, DropData, URI_LIST_MIME,
+};
 use cterm_app::upgrade::PaneLaunchContext;
 use cterm_app::ShortcutManager;
 use cterm_core::screen::{ScreenConfig, SelectionMode};
@@ -43,6 +46,9 @@ use crate::{clipboard, keycode};
 
 const MIN_FONT_SIZE: f64 = 6.0;
 const MAX_FONT_SIZE: f64 = 72.0;
+const DAEMON_VIEW_LIFECYCLE_POLL: Duration = Duration::from_millis(25);
+const TTY_FILE_TRANSFER_RESPONSE_TIMEOUT: Duration = Duration::from_secs(2);
+const EVENT_TASK_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3);
 
 fn adjusted_font_size(current: f64, delta: f64) -> f64 {
     (current + delta).clamp(MIN_FONT_SIZE, MAX_FONT_SIZE)
@@ -86,6 +92,8 @@ struct ViewState {
     bell_changed: AtomicBool,
     /// Notifications parsed on the daemon reader thread and awaiting the main thread.
     pending_notifications: std::sync::Mutex<Vec<cterm_core::DesktopNotificationAction>>,
+    /// OSC 72 commands parsed off-main-thread and awaiting the AppKit adapter.
+    pending_dnd_commands: std::sync::Mutex<Vec<cterm_core::DndCommand>>,
 }
 
 impl Default for ViewState {
@@ -101,8 +109,79 @@ impl Default for ViewState {
             title_locked: AtomicBool::new(false),
             bell_changed: AtomicBool::new(false),
             pending_notifications: std::sync::Mutex::new(Vec::new()),
+            pending_dnd_commands: std::sync::Mutex::new(Vec::new()),
         }
     }
+}
+
+/// Resolve one daemon-originated filesystem request while its pane and reader
+/// are both alive. The AppKit sheet is addressed by a process-local token so a
+/// timeout can dismiss only this prompt; every non-click path denies.
+async fn request_tty_file_transfer_consent(
+    view_ptr: usize,
+    state: Arc<ViewState>,
+    prompt: cterm_proto::proto::TtyFileTransferApprovalEvent,
+    daemon_host: String,
+    lifecycle_cancel: tokio::sync::watch::Receiver<bool>,
+    expires_at: Option<tokio::time::Instant>,
+) -> bool {
+    let Some(expires_at) = expires_at else {
+        log::warn!("Refusing OSC 5113 approval request with an invalid expiry");
+        return false;
+    };
+    if expires_at <= tokio::time::Instant::now()
+        || *lifecycle_cancel.borrow()
+        || state.view_invalid.load(Ordering::Acquire)
+    {
+        return false;
+    }
+    let token = crate::tty_file_transfer_prompt::next_tty_file_transfer_prompt_token();
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let cancelled_for_ui = Arc::clone(&cancelled);
+    let state_for_ui = Arc::clone(&state);
+    let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+
+    dispatch2::Queue::main().exec_async(move || {
+        if cancelled_for_ui.load(Ordering::Acquire)
+            || state_for_ui.view_invalid.load(Ordering::Acquire)
+        {
+            let _ = result_tx.send(false);
+            return;
+        }
+
+        let mtm = unsafe { MainThreadMarker::new_unchecked() };
+        // The view's deallocation and this closure are serialized on AppKit's
+        // main thread. `view_invalid` is set before removal/deallocation.
+        let view = unsafe { &*(view_ptr as *const TerminalView) };
+        let Some(parent) = view.window() else {
+            let _ = result_tx.send(false);
+            return;
+        };
+        crate::tty_file_transfer_prompt::begin_tty_file_transfer_prompt(
+            mtm,
+            token,
+            &prompt,
+            &daemon_host,
+            &parent,
+            cancelled_for_ui,
+            result_tx,
+        );
+    });
+
+    let resolution = crate::tty_file_transfer_prompt::await_tty_file_transfer_prompt(
+        result_rx,
+        lifecycle_cancel,
+        expires_at,
+    )
+    .await;
+    if resolution.dismiss {
+        cancelled.store(true, Ordering::Release);
+        dispatch2::Queue::main().exec_async(move || {
+            let mtm = unsafe { MainThreadMarker::new_unchecked() };
+            crate::tty_file_transfer_prompt::cancel_tty_file_transfer_prompt(mtm, token);
+        });
+    }
+    resolution.approved
 }
 
 /// Commands sent to the daemon I/O thread
@@ -123,6 +202,17 @@ enum DaemonCommand {
     SetTemplateName(String),
     SetPalette(cterm_core::ColorPalette),
     SetFrontendState(cterm_core::FrontendState),
+}
+
+struct DaemonReaderContext {
+    session_id: String,
+    terminal: Arc<Mutex<Terminal>>,
+    state: Arc<ViewState>,
+    view_ptr: usize,
+    cmd_rx: tokio::sync::mpsc::UnboundedReceiver<DaemonCommand>,
+    daemon_socket: Option<std::path::PathBuf>,
+    base_palette: cterm_core::ColorPalette,
+    frontend_state: cterm_core::FrontendState,
 }
 
 #[derive(Clone, Default)]
@@ -173,6 +263,8 @@ pub struct TerminalViewIvars {
     notification_bar: RefCell<Option<Retained<NotificationBar>>>,
     /// Pending file manager for file transfers
     file_manager: RefCell<PendingFileManager>,
+    /// Main-thread Kitty OSC 72 destination state.
+    dnd_destination: RefCell<DndDestination>,
     /// Color palette for HTML export
     color_palette: cterm_core::color::ColorPalette,
     /// Command channel for daemon I/O (write + resize) — None for local PTY sessions
@@ -1380,8 +1472,21 @@ define_class!(
 
         // Drag-and-drop support
         #[unsafe(method(draggingEntered:))]
-        fn dragging_entered(&self, _sender: &AnyObject) -> usize {
-            1 // NSDragOperationCopy
+        fn dragging_entered(&self, sender: &AnyObject) -> usize {
+            self.handle_drag_motion(sender)
+        }
+
+        #[unsafe(method(draggingUpdated:))]
+        fn dragging_updated(&self, sender: &AnyObject) -> usize {
+            self.handle_drag_motion(sender)
+        }
+
+        #[unsafe(method(draggingExited:))]
+        fn dragging_exited(&self, _sender: Option<&AnyObject>) {
+            let frames = self.ivars().dnd_destination.borrow_mut().drag_left();
+            for frame in frames {
+                self.write_to_pty(&frame);
+            }
         }
 
         #[unsafe(method(performDragOperation:))]
@@ -1638,6 +1743,7 @@ impl TerminalView {
             reported_keys: RefCell::new(HashMap::new()),
             notification_bar: RefCell::new(None),
             file_manager: RefCell::new(PendingFileManager::new()),
+            dnd_destination: RefCell::new(DndDestination::default()),
             color_palette: {
                 let mut palette = theme.colors.clone();
                 palette.cursor = theme.cursor.color;
@@ -1734,15 +1840,16 @@ impl TerminalView {
             ..Default::default()
         };
         std::thread::spawn(move || {
-            Self::read_daemon_loop(
-                sid,
+            Self::read_daemon_loop(DaemonReaderContext {
+                session_id: sid,
                 terminal,
-                state_clone,
+                state: state_clone,
+                view_ptr,
                 cmd_rx,
                 daemon_socket,
                 base_palette,
                 frontend_state,
-            );
+            });
         });
 
         this.schedule_redraw_check(view_ptr, state);
@@ -1838,15 +1945,16 @@ impl TerminalView {
             ..Default::default()
         };
         std::thread::spawn(move || {
-            Self::read_daemon_loop(
-                sid,
+            Self::read_daemon_loop(DaemonReaderContext {
+                session_id: sid,
                 terminal,
-                state_clone,
+                state: state_clone,
+                view_ptr,
                 cmd_rx,
                 daemon_socket,
                 base_palette,
                 frontend_state,
-            );
+            });
         });
 
         this.schedule_redraw_check(view_ptr, state);
@@ -1865,15 +1973,17 @@ impl TerminalView {
     /// `daemon_socket` specifies which socket to connect to. For remote (SSH-tunneled)
     /// sessions this is the local forwarded socket; for local sessions it's None
     /// (which falls back to `connect_local()`).
-    fn read_daemon_loop(
-        session_id: String,
-        terminal: Arc<Mutex<Terminal>>,
-        state: Arc<ViewState>,
-        cmd_rx: tokio::sync::mpsc::UnboundedReceiver<DaemonCommand>,
-        daemon_socket: Option<std::path::PathBuf>,
-        base_palette: cterm_core::ColorPalette,
-        frontend_state: cterm_core::FrontendState,
-    ) {
+    fn read_daemon_loop(context: DaemonReaderContext) {
+        let DaemonReaderContext {
+            session_id,
+            terminal,
+            state,
+            view_ptr,
+            cmd_rx,
+            daemon_socket,
+            base_palette,
+            frontend_state,
+        } = context;
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -2050,13 +2160,35 @@ impl TerminalView {
             // Subscribe to event stream (process exit, etc.)
             let event_session = session.clone();
             let exit_notify_event = Arc::clone(&exit_notify);
-            tokio::spawn(async move {
+            let (event_cancel_tx, mut event_cancel_rx) = tokio::sync::watch::channel(false);
+            let event_cancel_on_stream_end = event_cancel_tx.clone();
+            let event_state = Arc::clone(&state);
+            let event_task = tokio::spawn(async move {
+                let mut file_transfer_prompts = tokio::task::JoinSet::new();
                 match event_session.stream_events().await {
                     Ok(mut stream) => {
                         use tokio_stream::StreamExt;
-                        while let Some(result) = stream.next().await {
-                            if let Ok(event) = result {
-                                match event.event {
+                        loop {
+                            while let Some(result) = file_transfer_prompts.try_join_next() {
+                                if let Err(error) = result {
+                                    log::warn!("OSC 5113 consent task failed: {error}");
+                                }
+                            }
+                            let result = tokio::select! {
+                                biased;
+                                changed = event_cancel_rx.changed() => {
+                                    if changed.is_err() || *event_cancel_rx.borrow() {
+                                        break;
+                                    }
+                                    continue;
+                                }
+                                result = stream.next() => result,
+                            };
+                            let Some(result) = result else {
+                                break;
+                            };
+                            match result {
+                                Ok(event) => match event.event {
                                     Some(
                                         cterm_proto::proto::terminal_event::Event::ProcessExited(_),
                                     ) => {
@@ -2093,7 +2225,61 @@ impl TerminalView {
                                             .respond_prompt(&prompt.prompt_id, accept, secret)
                                             .await;
                                     }
+                                    Some(
+                                        cterm_proto::proto::terminal_event::Event::TtyFileTransferApproval(
+                                            prompt,
+                                        ),
+                                    ) => {
+                                        // Do not block event delivery while consent is pending: the
+                                        // daemon may issue several bounded sessions and each expiry
+                                        // starts when its event arrives, not when a prior alert ends.
+                                        let prompt_session = event_session.clone();
+                                        let prompt_cancel = event_cancel_rx.clone();
+                                        let prompt_state = Arc::clone(&event_state);
+                                        let daemon_host = event_session.hostname().to_string();
+                                        // Anchor expiry when the event is received, before the
+                                        // spawned task can be delayed by other ready events.
+                                        let expires_at = tokio::time::Instant::now().checked_add(
+                                            Duration::from_millis(prompt.expires_in_ms),
+                                        );
+                                        file_transfer_prompts.spawn(async move {
+                                            let request_id = prompt.request_id;
+                                            let approve = request_tty_file_transfer_consent(
+                                                view_ptr,
+                                                prompt_state,
+                                                prompt,
+                                                daemon_host,
+                                                prompt_cancel,
+                                                expires_at,
+                                            )
+                                            .await;
+                                            match tokio::time::timeout(
+                                                TTY_FILE_TRANSFER_RESPONSE_TIMEOUT,
+                                                prompt_session.respond_tty_file_transfer_approval(
+                                                    request_id,
+                                                    approve,
+                                                ),
+                                            )
+                                            .await
+                                            {
+                                                Ok(Ok(true)) => {}
+                                                Ok(Ok(false)) => log::debug!(
+                                                    "OSC 5113 approval request {request_id} was already resolved"
+                                                ),
+                                                Ok(Err(error)) => log::warn!(
+                                                    "Failed to send OSC 5113 approval response: {error}"
+                                                ),
+                                                Err(_) => log::warn!(
+                                                    "Timed out sending OSC 5113 approval response"
+                                                ),
+                                            }
+                                        });
+                                    }
                                     _ => {}
+                                },
+                                Err(error) => {
+                                    log::warn!("Daemon event stream error: {error}");
+                                    break;
                                 }
                             }
                         }
@@ -2102,12 +2288,35 @@ impl TerminalView {
                         log::warn!("Failed to start daemon event stream: {}", e);
                     }
                 }
+
+                // Closing the event stream invalidates every outstanding
+                // daemon token. Wake prompts before joining them so each sheet
+                // is dismissed and a best-effort denial is sent.
+                event_cancel_on_stream_end.send_replace(true);
+                while let Some(result) = file_transfer_prompts.join_next().await {
+                    if let Err(error) = result {
+                        log::warn!("OSC 5113 consent task failed: {error}");
+                    }
+                }
             });
 
-            // Read output stream, cancellable by process exit notification
+            // Read output stream, cancellable by process exit or pane removal.
+            // Pane invalidation is also observed directly so consent does not
+            // depend on a Destroy command reaching this reader first.
+            let lifecycle_state = Arc::clone(&state);
             tokio::select! {
                 _ = exit_notify.notified() => {
                     log::info!("Process exited, stopping output stream");
+                }
+                _ = async move {
+                    loop {
+                        if lifecycle_state.view_invalid.load(Ordering::Acquire) {
+                            break;
+                        }
+                        tokio::time::sleep(DAEMON_VIEW_LIFECYCLE_POLL).await;
+                    }
+                } => {
+                    log::debug!("View invalidated, stopping daemon reader");
                 }
                 _ = async {
                     match session.stream_output().await {
@@ -2142,6 +2351,11 @@ impl TerminalView {
                                                         pending.push(notification);
                                                     }
                                                 }
+                                                TerminalEvent::DndCommand(command) => {
+                                                    if let Ok(mut pending) = state.pending_dnd_commands.lock() {
+                                                        pending.push(command);
+                                                    }
+                                                }
                                                 TerminalEvent::ContentChanged => {
                                                     content_changed = true;
                                                 }
@@ -2167,6 +2381,20 @@ impl TerminalView {
                         }
                     }
                 } => {}
+            }
+
+            // The event reader owns every pending OSC 5113 prompt. Cancel it,
+            // then await its prompt cleanup and denial RPCs. The abort fallback
+            // prevents a wedged daemon connection from retaining the reader.
+            event_cancel_tx.send_replace(true);
+            let mut event_task = event_task;
+            if tokio::time::timeout(EVENT_TASK_SHUTDOWN_TIMEOUT, &mut event_task)
+                .await
+                .is_err()
+            {
+                log::warn!("Timed out shutting down daemon event task");
+                event_task.abort();
+                let _ = event_task.await;
             }
 
             // Signal that the stream has ended
@@ -2294,6 +2522,23 @@ impl TerminalView {
                     dispatch2::Queue::main().exec_async(move || {
                         for notification in notifications {
                             crate::desktop_notification::handle(&notification);
+                        }
+                    });
+                }
+
+                let dnd_commands = state
+                    .pending_dnd_commands
+                    .lock()
+                    .map(|mut pending| std::mem::take(&mut *pending))
+                    .unwrap_or_default();
+                if !dnd_commands.is_empty() && !state.view_invalid.load(Ordering::SeqCst) {
+                    let state_clone = state.clone();
+                    dispatch2::Queue::main().exec_async(move || {
+                        if !state_clone.view_invalid.load(Ordering::SeqCst) && view_ptr != 0 {
+                            unsafe {
+                                let view = &*(view_ptr as *const TerminalView);
+                                view.apply_dnd_commands(dnd_commands);
+                            }
                         }
                     });
                 }
@@ -2534,6 +2779,29 @@ impl TerminalView {
         }
     }
 
+    fn apply_dnd_commands(&self, commands: Vec<cterm_core::DndCommand>) {
+        let mut terminal = self.ivars().terminal.lock();
+        for command in commands {
+            let actions = self
+                .ivars()
+                .dnd_destination
+                .borrow_mut()
+                .handle_command(command);
+            for action in actions {
+                match action {
+                    DndAdapterAction::Write(frame) => {
+                        if let Err(error) = terminal.write(&frame) {
+                            log::error!("Failed to write Kitty DND response to PTY: {error}");
+                            return;
+                        }
+                    }
+                    DndAdapterAction::RegistrationChanged { .. }
+                    | DndAdapterAction::DropFinished(_) => {}
+                }
+            }
+        }
+    }
+
     fn write_text_input(&self, text: &str) {
         let mut terminal = self.ivars().terminal.lock();
         let encoded = terminal.handle_text_input(text);
@@ -2544,41 +2812,141 @@ impl TerminalView {
         }
     }
 
-    /// Handle a drop operation — extract file URL, show dialog, write to PTY
-    fn handle_drop(&self, sender: &AnyObject) -> bool {
-        use cterm_app::file_drop::{build_pty_input, FileDropAction, FileDropInfo};
+    fn dnd_accepts_uri_list(&self) -> bool {
+        let destination = self.ivars().dnd_destination.borrow();
+        destination.is_enabled()
+            && (destination.registered_mimes().is_empty()
+                || destination
+                    .registered_mimes()
+                    .iter()
+                    .any(|mime| mime == URI_LIST_MIME))
+    }
+
+    fn dnd_location(&self, sender: &AnyObject) -> DndLocation {
+        let point: NSPoint = unsafe { msg_send![sender, draggingLocation] };
+        let point = self.convert_point_from_view(point, None);
+        let coordinate = |value: f64| {
+            if value.is_finite() {
+                value.floor().clamp(0.0, i32::MAX as f64) as i32
+            } else {
+                0
+            }
+        };
+        DndLocation {
+            cell_x: coordinate(point.x / self.ivars().cell_width.get()),
+            cell_y: coordinate(point.y / self.ivars().cell_height.get()),
+            pixel_x: coordinate(point.x),
+            pixel_y: coordinate(point.y),
+        }
+    }
+
+    fn handle_drag_motion(&self, sender: &AnyObject) -> usize {
+        if !self.ivars().dnd_destination.borrow().is_enabled() {
+            return 1; // Preserve the existing copy-only file-drop fallback.
+        }
+        if !self.dnd_accepts_uri_list() {
+            return 0;
+        }
+        let source_operations: usize = unsafe { msg_send![sender, draggingSourceOperationMask] };
+        if source_operations & 1 == 0 {
+            return 0;
+        }
+
+        let location = self.dnd_location(sender);
+        let frames = self.ivars().dnd_destination.borrow_mut().drag_moved(
+            location,
+            DndOperation::Copy,
+            &[URI_LIST_MIME.to_string()],
+        );
+        match frames {
+            Ok(frames) => {
+                for frame in frames {
+                    self.write_to_pty(&frame);
+                }
+            }
+            Err(error) => log::warn!("Failed to report Kitty DND motion: {error:?}"),
+        }
+        usize::from(
+            self.ivars().dnd_destination.borrow().accepted_operation() == DndOperation::Copy,
+        )
+    }
+
+    fn dropped_file_urls(sender: &AnyObject) -> Vec<(std::path::PathBuf, String)> {
         use objc2_app_kit::NSPasteboard;
 
-        let mtm = MainThreadMarker::from(self);
-
-        // Get the dragging pasteboard
         let pasteboard: Retained<NSPasteboard> = unsafe { msg_send![sender, draggingPasteboard] };
-
-        // Read file URLs from pasteboard
-        let nsurl_class = class!(NSURL);
-        let classes = NSArray::from_slice(&[nsurl_class]);
+        let classes = NSArray::from_slice(&[class!(NSURL)]);
         let urls: Option<Retained<NSArray<AnyObject>>> = unsafe {
             let options =
                 objc2_foundation::NSDictionary::<objc2_foundation::NSString, AnyObject>::new();
             pasteboard.readObjectsForClasses_options(&classes, Some(&options))
         };
-
         let Some(urls) = urls else {
-            return false;
+            return Vec::new();
         };
-        if urls.count() == 0 {
+
+        let mut result = Vec::with_capacity(urls.count());
+        for index in 0..urls.count() {
+            let url: Retained<AnyObject> = unsafe { msg_send![&*urls, objectAtIndex: index] };
+            let path: Option<Retained<NSString>> = unsafe { msg_send![&*url, path] };
+            let absolute: Option<Retained<NSString>> = unsafe { msg_send![&*url, absoluteString] };
+            let (Some(path), Some(absolute)) = (path, absolute) else {
+                continue;
+            };
+            let path = std::path::PathBuf::from(path.to_string());
+            let mut uri = absolute.to_string();
+            if path.is_dir() && !uri.ends_with('/') {
+                uri.push('/');
+            }
+            result.push((path, uri));
+        }
+        result
+    }
+
+    /// Handle a drop operation — extract file URL, show dialog, write to PTY
+    fn handle_drop(&self, sender: &AnyObject) -> bool {
+        use cterm_app::file_drop::{build_pty_input, FileDropAction, FileDropInfo};
+
+        let mtm = MainThreadMarker::from(self);
+        let urls = Self::dropped_file_urls(sender);
+        if urls.is_empty() {
             return false;
         }
 
-        // Get the first URL
-        let url: Retained<AnyObject> = unsafe { msg_send![&*urls, objectAtIndex: 0usize] };
-        let path_str: Option<Retained<NSString>> = unsafe { msg_send![&*url, path] };
-        let Some(path_str) = path_str else {
-            return false;
-        };
-        let path = std::path::PathBuf::from(path_str.to_string());
+        if self.ivars().dnd_destination.borrow().is_enabled() {
+            if !self.dnd_accepts_uri_list()
+                || self.ivars().dnd_destination.borrow().accepted_operation() != DndOperation::Copy
+            {
+                return false;
+            }
+            let payload = urls
+                .iter()
+                .map(|(_, uri)| uri.as_str())
+                .collect::<Vec<_>>()
+                .join("\r\n")
+                .into_bytes();
+            let frames = self.ivars().dnd_destination.borrow_mut().dropped(
+                self.dnd_location(sender),
+                DndOperation::Copy,
+                vec![DropData::uri_list(payload)],
+            );
+            return match frames {
+                Ok(frames) => {
+                    for frame in frames {
+                        self.write_to_pty(&frame);
+                    }
+                    true
+                }
+                Err(error) => {
+                    log::warn!("Rejected Kitty DND drop: {error:?}");
+                    false
+                }
+            };
+        }
 
-        let info = match FileDropInfo::from_path(&path) {
+        let path = &urls[0].0;
+
+        let info = match FileDropInfo::from_path(path) {
             Ok(info) => info,
             Err(e) => {
                 log::error!("Failed to read dropped file info: {}", e);
