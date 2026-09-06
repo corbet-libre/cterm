@@ -27,8 +27,12 @@ pub use daemon_auth::{validate_private_daemon_directory, validate_private_daemon
 pub const PROTOCOL_VERSION: u32 = 1;
 
 /// Generated protobuf and gRPC code
-#[allow(clippy::result_large_err)]
 pub mod proto {
+    // tonic generates every RPC method returning `Result<_, tonic::Status>`,
+    // and `tonic::Status` is ~176 bytes, which trips `result_large_err`. This
+    // is inherent to the generated code (the Err type can't be boxed here), so
+    // allow it for the whole generated module.
+    #![allow(clippy::result_large_err)]
     tonic::include_proto!("cterm.terminal");
 }
 

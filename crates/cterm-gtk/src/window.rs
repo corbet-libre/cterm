@@ -48,6 +48,85 @@ struct PaneEntry {
     launch_context: Option<cterm_app::upgrade::PaneLaunchContext>,
 }
 
+/// Session ids this process created or attached itself. The daemon broadcasts a
+/// `SessionCreated` event for every new session — including ones we just made —
+/// so the daemon-event listener consults this set to avoid adding a duplicate
+/// tab for a session this process already owns. Sessions created by *other*
+/// cterm instances are absent here, so those get mirrored as new tabs.
+fn owned_sessions() -> &'static std::sync::Mutex<std::collections::HashSet<String>> {
+    static OWNED: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+        std::sync::OnceLock::new();
+    OWNED.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()))
+}
+
+/// Record that this process owns (created/attached) the given session id.
+fn mark_owned_session(session_id: &str) {
+    if let Ok(mut set) = owned_sessions().lock() {
+        set.insert(session_id.to_string());
+    }
+}
+
+/// Whether this process created or attached the given session id itself.
+fn is_owned_session(session_id: &str) -> bool {
+    owned_sessions()
+        .lock()
+        .map(|set| set.contains(session_id))
+        .unwrap_or(false)
+}
+
+/// Daemon socket keys (as strings) that already have a running remote
+/// daemon-event listener. Prevents opening a second listener on the same
+/// SSH-tunneled daemon when multiple remote tabs are opened for it. Keyed by the
+/// synthetic tunnel socket path; the local daemon is handled separately by each
+/// window's own local listener, so it is never entered here.
+fn active_remote_listeners() -> &'static std::sync::Mutex<std::collections::HashSet<String>> {
+    static ACTIVE: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+        std::sync::OnceLock::new();
+    ACTIVE.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()))
+}
+
+/// Try to claim the remote-listener slot for `key`. Returns true if this call
+/// registered it (caller should start the listener), false if one already runs.
+fn try_claim_remote_listener(key: &str) -> bool {
+    active_remote_listeners()
+        .lock()
+        .map(|mut set| set.insert(key.to_string()))
+        .unwrap_or(false)
+}
+
+/// Release the remote-listener slot for `key` (its stream ended); a later remote
+/// tab for the same daemon may then start a fresh listener.
+fn release_remote_listener(key: &str) {
+    if let Ok(mut set) = active_remote_listeners().lock() {
+        set.remove(key);
+    }
+}
+
+/// How a daemon-event listener reaches its daemon.
+#[derive(Clone)]
+enum ListenerConnect {
+    /// The local daemon (auto-starts it if needed).
+    Local,
+    /// A specific socket path — a real local socket or a synthetic SSH-tunnel
+    /// key that `connect_unix` dials over the registered tunnel.
+    Unix(std::path::PathBuf),
+}
+
+/// A daemon-wide event decoded off the event stream, forwarded to the GTK main
+/// thread for application to this window's tabs.
+enum DaemonUiEvent {
+    /// A session was created (by any client); carries its info snapshot.
+    Created(Box<cterm_proto::proto::SessionInfo>),
+    /// A session was destroyed; carries its id.
+    Destroyed(String),
+    /// A session's metadata changed; carries the new custom title and color.
+    MetadataChanged {
+        session_id: String,
+        custom_title: String,
+        tab_color: String,
+    },
+}
+
 /// Tab entry tracking a pane tree and its stable tab ID.
 struct TabEntry {
     id: u64,
@@ -867,6 +946,9 @@ impl CtermWindow {
         cterm_window.setup_close_request_handler();
         cterm_window.setup_visibility_handler();
 
+        // Keep tabs in sync with other clients via the daemon event stream
+        cterm_window.setup_daemon_event_listener();
+
         cterm_window
     }
 
@@ -964,6 +1046,7 @@ impl CtermWindow {
         cterm_window.setup_tab_switch_handler();
         cterm_window.setup_close_request_handler();
         cterm_window.setup_visibility_handler();
+        cterm_window.setup_daemon_event_listener();
 
         cterm_window
     }
@@ -1030,6 +1113,30 @@ impl CtermWindow {
                 report_window_visibility(&notify_tabs, visible);
             });
         });
+    }
+
+    /// Subscribe to the local daemon's daemon-wide event stream and keep this
+    /// window's tabs in sync with changes made by other cterm instances.
+    ///
+    /// This is the local counterpart of the per-remote listeners started for
+    /// SSH-tunneled daemons (see [`ensure_remote_daemon_listener`]); the shared
+    /// core lives in [`spawn_daemon_event_listener`].
+    fn setup_daemon_event_listener(&self) {
+        spawn_daemon_event_listener(
+            self.notebook.clone(),
+            Rc::clone(&self.tabs),
+            Rc::clone(&self.next_tab_id),
+            Rc::clone(&self.config),
+            self.theme.clone(),
+            self.tab_bar.clone(),
+            self.window.clone(),
+            Rc::clone(&self.has_bell),
+            Rc::clone(&self.file_manager),
+            self.notification_bar.clone(),
+            ListenerConnect::Local,
+            None,
+            None,
+        );
     }
 
     /// Set up window actions for the menu
@@ -1390,7 +1497,7 @@ impl CtermWindow {
                             title_locked,
                             false,
                             Some(sid),
-                            daemon_socket,
+                            daemon_socket.clone(),
                             None,
                             None,
                             None,
@@ -1403,6 +1510,24 @@ impl CtermWindow {
                             {
                                 tab.color = tab_color;
                             }
+                        }
+
+                        // Sessions from the SSH dialog live on a remote daemon:
+                        // mirror its other sessions here too (deduped per remote).
+                        if let Some(path) = daemon_socket {
+                            ensure_remote_daemon_listener(
+                                &notebook,
+                                &tabs,
+                                &next_tab_id,
+                                &config,
+                                &theme,
+                                &tab_bar,
+                                &window_inner,
+                                &has_bell,
+                                &file_manager,
+                                &notification_bar,
+                                path,
+                            );
                         }
                     }
                 });
@@ -4213,6 +4338,10 @@ fn spawn_daemon_tab(
                     cterm_client::DaemonConnection::connect_local().await?
                 };
                 let session = conn.create_session(opts).await?;
+                // Claim ownership before the create broadcast can be processed
+                // by our own daemon-event listener, so it doesn't add a second
+                // tab for a session we created ourselves.
+                mark_owned_session(session.session_id());
                 Ok(session)
             }),
             Err(e) => Err(cterm_client::ClientError::Connection(e.to_string())),
@@ -4228,6 +4357,14 @@ fn spawn_daemon_tab(
                     Ok(session) => {
                         let sid = Some(session.session_id().to_string());
                         let daemon_socket = session.socket_path().map(|p| p.to_owned());
+                        // A session on a remote (SSH-tunneled) daemon: remember to
+                        // start a mirror listener for that daemon once the tab is
+                        // built, so its other sessions sync here too.
+                        let remote_listener_socket = if session.is_remote() {
+                            daemon_socket.clone()
+                        } else {
+                            None
+                        };
                         let cfg = config.borrow();
                         let terminal = TerminalWidget::from_daemon(session, &cfg, &theme);
                         drop(cfg);
@@ -4292,6 +4429,24 @@ fn spawn_daemon_tab(
                                 tab.terminal.set_template_name_on_daemon(&title);
                             }
                         }
+
+                        // Keep this window in sync with other sessions on the
+                        // same remote daemon (deduped per remote).
+                        if let Some(path) = remote_listener_socket.clone() {
+                            ensure_remote_daemon_listener(
+                                &notebook,
+                                &tabs,
+                                &next_tab_id,
+                                &config,
+                                &theme,
+                                &tab_bar,
+                                &window,
+                                &has_bell,
+                                &file_manager,
+                                &notification_bar,
+                                path,
+                            );
+                        }
                     }
                     Err(e) => {
                         log::error!("Failed to create daemon session: {}", e);
@@ -4320,6 +4475,53 @@ fn create_daemon_tab(
     notification_bar: &NotificationBar,
     session_id: &str,
 ) {
+    create_daemon_tab_titled(
+        notebook,
+        tabs,
+        next_tab_id,
+        config,
+        theme,
+        tab_bar,
+        window,
+        has_bell,
+        file_manager,
+        notification_bar,
+        session_id,
+        None,
+        None,
+        false,
+        None,
+        None,
+    );
+}
+
+/// Attach to an existing daemon session by id and add a tab for it, applying an
+/// optional initial title and tab color (e.g. from a `SessionInfo` broadcast by
+/// another client). `title_locked` keeps the given title from being overwritten
+/// by later OSC title updates.
+#[allow(clippy::too_many_arguments)]
+fn create_daemon_tab_titled(
+    notebook: &Notebook,
+    tabs: &Rc<RefCell<Vec<TabEntry>>>,
+    next_tab_id: &Rc<RefCell<u64>>,
+    config: &Rc<RefCell<Config>>,
+    theme: &Theme,
+    tab_bar: &TabBar,
+    window: &ApplicationWindow,
+    has_bell: &Rc<RefCell<bool>>,
+    file_manager: &Rc<RefCell<PendingFileManager>>,
+    notification_bar: &NotificationBar,
+    session_id: &str,
+    initial_title: Option<String>,
+    initial_color: Option<String>,
+    title_locked: bool,
+    // Socket to attach over: None = local daemon; Some(path) = a specific socket
+    // or SSH-tunnel key (for a session mirrored from a remote daemon). Also
+    // recorded on the resulting TabEntry so its I/O and sibling tabs route to the
+    // same daemon.
+    connect_socket: Option<std::path::PathBuf>,
+    remote_name: Option<String>,
+) {
     let cfg = config.borrow();
     let session_id = session_id.to_string();
 
@@ -4346,6 +4548,7 @@ fn create_daemon_tab(
     // Connect and attach in background thread, then create tab on main thread
     let (tx, rx) = std::sync::mpsc::channel::<DaemonAttachResult>();
 
+    let connect_for_thread = connect_socket.clone();
     std::thread::spawn(move || {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -4353,9 +4556,15 @@ fn create_daemon_tab(
 
         let result = match rt {
             Ok(rt) => rt.block_on(async {
-                let conn = cterm_client::DaemonConnection::connect_local().await?;
+                let conn = match connect_for_thread {
+                    Some(ref path) => {
+                        cterm_client::DaemonConnection::connect_unix(path, false).await?
+                    }
+                    None => cterm_client::DaemonConnection::connect_local().await?,
+                };
                 let (session, _initial_screen) =
                     conn.attach_session(&session_id, cols, rows).await?;
+                mark_owned_session(session.session_id());
                 Ok(session)
             }),
             Err(e) => Err(cterm_client::ClientError::Connection(e.to_string())),
@@ -4370,12 +4579,19 @@ fn create_daemon_tab(
                 match result {
                     Ok(session) => {
                         let sid = session.session_id().to_string();
-                        let title = "Terminal".to_string();
+                        let title = initial_title
+                            .clone()
+                            .filter(|t| !t.is_empty())
+                            .unwrap_or_else(|| "Terminal".to_string());
                         let cfg = config.borrow();
                         let terminal = TerminalWidget::from_daemon(session, &cfg, &theme);
+                        drop(cfg);
 
                         let tab_id = generate_tab_id(&next_tab_id);
                         tab_bar.add_tab(tab_id, &title);
+                        if let Some(ref color) = initial_color {
+                            tab_bar.set_color(tab_id, Some(color));
+                        }
 
                         setup_tab_callbacks(
                             &notebook,
@@ -4399,15 +4615,24 @@ fn create_daemon_tab(
                             tab_id,
                             title,
                             terminal,
-                            false,
+                            title_locked,
                             false,
                             Some(sid),
-                            None,
-                            None,
+                            connect_socket.clone(),
+                            remote_name.clone(),
                             None,
                             None,
                             None,
                         );
+
+                        // Record the color on the TabEntry so later lookups and
+                        // redraws keep it.
+                        if initial_color.is_some() {
+                            if let Some(tab) = tabs.borrow_mut().iter_mut().find(|t| t.id == tab_id)
+                            {
+                                tab.color = initial_color.clone();
+                            }
+                        }
                     }
                     Err(e) => {
                         log::error!("Failed to attach to daemon session: {}", e);
@@ -4423,6 +4648,257 @@ fn create_daemon_tab(
 
 type DaemonAttachResult =
     std::result::Result<cterm_client::SessionHandle, cterm_client::ClientError>;
+
+/// Core of a daemon-wide event listener: subscribe to one daemon's event stream
+/// on a background thread and mirror its session lifecycle / metadata changes
+/// into this window's tabs (new session → tab, destroyed → tab removed, metadata
+/// → color/title updated). Used for both the local daemon and each SSH-tunneled
+/// remote daemon.
+///
+/// `connect` selects the daemon. `tag_socket` is recorded on mirrored tabs so
+/// their I/O and sibling tabs route to the same daemon (None for local, the
+/// tunnel key for a remote). `dedup_key`, when set, claims a process-wide slot
+/// so a remote daemon gets only one listener no matter how many of its tabs are
+/// opened; the slot is released when the stream ends.
+#[allow(clippy::too_many_arguments)]
+fn spawn_daemon_event_listener(
+    notebook: Notebook,
+    tabs: Rc<RefCell<Vec<TabEntry>>>,
+    next_tab_id: Rc<RefCell<u64>>,
+    config: Rc<RefCell<Config>>,
+    theme: Theme,
+    tab_bar: TabBar,
+    window: ApplicationWindow,
+    has_bell: Rc<RefCell<bool>>,
+    file_manager: Rc<RefCell<PendingFileManager>>,
+    notification_bar: NotificationBar,
+    connect: ListenerConnect,
+    tag_socket: Option<std::path::PathBuf>,
+    dedup_key: Option<String>,
+) {
+    // For remote daemons, ensure only one listener per daemon.
+    if let Some(ref key) = dedup_key {
+        if !try_claim_remote_listener(key) {
+            return;
+        }
+    }
+
+    let (tx, rx) = std::sync::mpsc::channel::<DaemonUiEvent>();
+
+    let dedup_for_thread = dedup_key.clone();
+    std::thread::spawn(move || {
+        let rt = match tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        {
+            Ok(rt) => rt,
+            Err(e) => {
+                log::warn!("daemon event listener: failed to build runtime: {e}");
+                if let Some(key) = dedup_for_thread {
+                    release_remote_listener(&key);
+                }
+                return;
+            }
+        };
+
+        rt.block_on(async move {
+            let conn = match connect {
+                ListenerConnect::Local => cterm_client::DaemonConnection::connect_local().await,
+                ListenerConnect::Unix(ref path) => {
+                    cterm_client::DaemonConnection::connect_unix(path, false).await
+                }
+            };
+            match conn {
+                Ok(conn) => match conn.stream_daemon_events().await {
+                    Ok(mut stream) => {
+                        use tokio_stream::StreamExt;
+                        while let Some(result) = stream.next().await {
+                            let event = match result {
+                                Ok(e) => e,
+                                Err(e) => {
+                                    log::debug!("daemon event stream ended: {e}");
+                                    break;
+                                }
+                            };
+                            let ui_event = match event.event {
+                                Some(cterm_proto::proto::daemon_event::Event::SessionCreated(
+                                    c,
+                                )) => match c.session {
+                                    Some(info) => DaemonUiEvent::Created(Box::new(info)),
+                                    None => continue,
+                                },
+                                Some(
+                                    cterm_proto::proto::daemon_event::Event::SessionDestroyed(d),
+                                ) => DaemonUiEvent::Destroyed(d.session_id),
+                                Some(
+                                    cterm_proto::proto::daemon_event::Event::SessionMetadataChanged(
+                                        m,
+                                    ),
+                                ) => DaemonUiEvent::MetadataChanged {
+                                    session_id: m.session_id,
+                                    custom_title: m.custom_title,
+                                    tab_color: m.tab_color,
+                                },
+                                None => continue,
+                            };
+                            // If the receiver is gone the window has closed; stop.
+                            if tx.send(ui_event).is_err() {
+                                break;
+                            }
+                        }
+                    }
+                    Err(e) => log::warn!("daemon event listener: subscribe failed: {e}"),
+                },
+                Err(e) => log::warn!("daemon event listener: connect failed: {e}"),
+            }
+            if let Some(key) = dedup_for_thread {
+                release_remote_listener(&key);
+            }
+        });
+    });
+
+    glib::timeout_add_local(std::time::Duration::from_millis(50), move || loop {
+        let ui_event = match rx.try_recv() {
+            Ok(ev) => ev,
+            Err(std::sync::mpsc::TryRecvError::Empty) => {
+                return glib::ControlFlow::Continue;
+            }
+            // Background thread ended (daemon gone / window closing).
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                return glib::ControlFlow::Break;
+            }
+        };
+
+        match ui_event {
+            DaemonUiEvent::Created(info) => {
+                // Skip sessions we created ourselves, and any we already show.
+                let already = is_owned_session(&info.session_id)
+                    || tabs
+                        .borrow()
+                        .iter()
+                        .any(|t| t.session_id.as_deref() == Some(info.session_id.as_str()));
+                if already || !info.running {
+                    continue;
+                }
+                let title = if !info.custom_title.is_empty() {
+                    Some(info.custom_title.clone())
+                } else if !info.title.is_empty() {
+                    Some(info.title.clone())
+                } else {
+                    None
+                };
+                let color = if info.tab_color.is_empty() {
+                    None
+                } else {
+                    Some(info.tab_color.clone())
+                };
+                let title_locked = !info.custom_title.is_empty();
+                create_daemon_tab_titled(
+                    &notebook,
+                    &tabs,
+                    &next_tab_id,
+                    &config,
+                    &theme,
+                    &tab_bar,
+                    &window,
+                    &has_bell,
+                    &file_manager,
+                    &notification_bar,
+                    &info.session_id,
+                    title,
+                    color,
+                    title_locked,
+                    tag_socket.clone(),
+                    None,
+                );
+            }
+            DaemonUiEvent::Destroyed(session_id) => {
+                let tab_id = tabs
+                    .borrow()
+                    .iter()
+                    .find(|t| t.session_id.as_deref() == Some(session_id.as_str()))
+                    .map(|t| t.id);
+                if let Some(id) = tab_id {
+                    remove_tab_from_ui(&notebook, &tabs, &tab_bar, &window, id);
+                }
+            }
+            DaemonUiEvent::MetadataChanged {
+                session_id,
+                custom_title,
+                tab_color,
+            } => {
+                let tab_id = tabs
+                    .borrow()
+                    .iter()
+                    .find(|t| t.session_id.as_deref() == Some(session_id.as_str()))
+                    .map(|t| t.id);
+                let Some(id) = tab_id else { continue };
+
+                let color = if tab_color.is_empty() {
+                    None
+                } else {
+                    Some(tab_color.clone())
+                };
+                // Apply visual color only — do NOT push back to the daemon, or
+                // we'd echo the change we just received.
+                tab_bar.set_color(id, color.as_deref());
+
+                if !custom_title.is_empty() {
+                    tab_bar.set_title(id, &custom_title);
+                }
+
+                let mut tabs_mut = tabs.borrow_mut();
+                if let Some(tab) = tabs_mut.iter_mut().find(|t| t.id == id) {
+                    tab.color = color;
+                    if custom_title.is_empty() {
+                        // Custom title cleared elsewhere: let OSC titles win again.
+                        tab.title_locked = false;
+                    } else {
+                        tab.title = custom_title.clone();
+                        tab.title_locked = true;
+                    }
+                }
+            }
+        }
+    });
+}
+
+/// Start a daemon-event listener for a session that lives on a remote
+/// (SSH-tunneled) daemon, so sessions opened on that remote by other clients
+/// appear/update/close as tabs here too. Deduplicated per remote socket, so it
+/// is safe to call for every remote tab. `socket_path` is the session's tunnel
+/// key, which `connect_unix` dials over the existing tunnel.
+#[allow(clippy::too_many_arguments)]
+fn ensure_remote_daemon_listener(
+    notebook: &Notebook,
+    tabs: &Rc<RefCell<Vec<TabEntry>>>,
+    next_tab_id: &Rc<RefCell<u64>>,
+    config: &Rc<RefCell<Config>>,
+    theme: &Theme,
+    tab_bar: &TabBar,
+    window: &ApplicationWindow,
+    has_bell: &Rc<RefCell<bool>>,
+    file_manager: &Rc<RefCell<PendingFileManager>>,
+    notification_bar: &NotificationBar,
+    socket_path: std::path::PathBuf,
+) {
+    let key = socket_path.to_string_lossy().into_owned();
+    spawn_daemon_event_listener(
+        notebook.clone(),
+        Rc::clone(tabs),
+        Rc::clone(next_tab_id),
+        Rc::clone(config),
+        theme.clone(),
+        tab_bar.clone(),
+        window.clone(),
+        Rc::clone(has_bell),
+        Rc::clone(file_manager),
+        notification_bar.clone(),
+        ListenerConnect::Unix(socket_path.clone()),
+        Some(socket_path),
+        Some(key),
+    );
+}
 
 /// Create a new terminal tab from a template
 #[allow(clippy::too_many_arguments)]

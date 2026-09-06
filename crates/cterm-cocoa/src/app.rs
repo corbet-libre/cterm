@@ -133,6 +133,67 @@ async fn detach_snapshot_handles(sessions: &[cterm_app::daemon_reconnect::Reconn
     }
 }
 
+/// Session ids this process created or attached itself. The daemon broadcasts a
+/// `SessionCreated` event for every new session — including ones we just made —
+/// so the daemon-event listener consults this set to avoid opening a duplicate
+/// tab for a session this process already owns. Sessions created by *other*
+/// cterm instances are absent here, so those get mirrored as new tabs.
+fn owned_sessions() -> &'static std::sync::Mutex<std::collections::HashSet<String>> {
+    static OWNED: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+        std::sync::OnceLock::new();
+    OWNED.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()))
+}
+
+/// Record that this process owns (created/attached) the given session id.
+pub(crate) fn mark_owned_session(session_id: &str) {
+    if let Ok(mut set) = owned_sessions().lock() {
+        set.insert(session_id.to_string());
+    }
+}
+
+/// Whether this process created or attached the given session id itself.
+fn is_owned_session(session_id: &str) -> bool {
+    owned_sessions()
+        .lock()
+        .map(|set| set.contains(session_id))
+        .unwrap_or(false)
+}
+
+/// Socket keys that already have a running remote daemon-event listener, so a
+/// remote (SSH-tunneled) daemon gets only one listener no matter how many of its
+/// tabs are opened. The local daemon has its own dedicated listener and is never
+/// entered here.
+fn active_remote_listeners() -> &'static std::sync::Mutex<std::collections::HashSet<String>> {
+    static ACTIVE: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+        std::sync::OnceLock::new();
+    ACTIVE.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()))
+}
+
+/// Claim the remote-listener slot for `key`; returns true if newly claimed.
+fn try_claim_remote_listener(key: &str) -> bool {
+    active_remote_listeners()
+        .lock()
+        .map(|mut set| set.insert(key.to_string()))
+        .unwrap_or(false)
+}
+
+/// Release the remote-listener slot for `key` (its stream ended).
+fn release_remote_listener(key: &str) {
+    if let Ok(mut set) = active_remote_listeners().lock() {
+        set.remove(key);
+    }
+}
+
+/// How a daemon-event listener reaches its daemon.
+#[derive(Clone)]
+enum ListenerConnect {
+    /// The local daemon (auto-starts it if needed).
+    Local,
+    /// A specific socket path — a real local socket or a synthetic SSH-tunnel
+    /// key that `connect_unix` dials over the registered tunnel.
+    Unix(std::path::PathBuf),
+}
+
 /// Application state stored in the delegate
 pub struct AppDelegateIvars {
     config: std::cell::RefCell<Config>,
@@ -162,6 +223,9 @@ define_class!(
 
             let mtm = MainThreadMarker::from(self);
             crate::desktop_notification::request_authorization();
+
+            // Keep tabs in sync with other cterm instances on the same daemon.
+            self.setup_daemon_event_listener();
 
             // Check for seamless upgrade state
             if let Some(upgrade_state) = take_upgrade_state() {
@@ -856,6 +920,7 @@ define_class!(
                                     let (handle, _) =
                                         conn.attach_session(&session_id, cols, rows).await?;
                                     handle.detach().await?;
+                                    mark_owned_session(&session_id);
                                     Ok::<_, cterm_client::ClientError>(handle)
                                 }) {
                                     Ok(handle) => {
@@ -985,6 +1050,7 @@ define_class!(
                                     ..Default::default()
                                 })
                                 .await?;
+                            mark_owned_session(handle.session_id());
                             sessions.push(cterm_app::daemon_reconnect::ReconnectedSession {
                                 handle,
                                 title: String::new(),
@@ -1017,8 +1083,13 @@ define_class!(
                                     host.clone()
                                 };
 
+                                // Honor the session's stored tab color (set by
+                                // any client); leave it uncolored otherwise.
+                                // Previously every empty-color remote tab was
+                                // forced green, which repainted all tabs on
+                                // connect.
                                 let tab_color = if recon.tab_color.is_empty() {
-                                    Some("#22c55e".to_string()) // Green for remote
+                                    None
                                 } else {
                                     Some(recon.tab_color.clone())
                                 };
@@ -1114,6 +1185,17 @@ define_class!(
                 "Registered window ({} total)",
                 self.ivars().windows.borrow().len()
             );
+
+            // If this window's session lives on a remote (SSH-tunneled) daemon,
+            // ensure a mirror listener runs for that daemon so its other sessions
+            // sync here too. The local daemon has its own dedicated listener, so
+            // skip the default local socket. Deduped per socket, so registering
+            // many remote tabs starts at most one listener each.
+            if let Some(socket) = window.active_terminal().and_then(|tv| tv.daemon_socket()) {
+                if socket != cterm_client::default_socket_path() {
+                    self.ensure_remote_daemon_listener(socket);
+                }
+            }
         }
 
         /// Debug menu: Relaunch cterm with state preservation (uses real upgrade path)
@@ -1252,6 +1334,256 @@ define_class!(
     }
 );
 
+/// Daemon-wide event synchronization: keep this process's windows/tabs in sync
+/// with session changes made by other cterm instances on the same daemon.
+impl AppDelegate {
+    /// Subscribe to the local daemon's event stream and keep this process's
+    /// windows/tabs in sync. Local counterpart of the per-remote listeners
+    /// started by [`AppDelegate::ensure_remote_daemon_listener`].
+    fn setup_daemon_event_listener(&self) {
+        self.spawn_daemon_event_listener(ListenerConnect::Local, None);
+    }
+
+    /// Start a mirror listener for a remote (SSH-tunneled) daemon so sessions
+    /// opened on it by other clients appear/update/close as tabs here too.
+    /// Deduplicated per tunnel socket, so it is safe to call for every remote
+    /// tab. `connect_unix` dials `socket_path` over the existing tunnel.
+    fn ensure_remote_daemon_listener(&self, socket_path: std::path::PathBuf) {
+        let key = socket_path.to_string_lossy().into_owned();
+        self.spawn_daemon_event_listener(ListenerConnect::Unix(socket_path), Some(key));
+    }
+
+    /// Core listener: subscribe to one daemon's event stream on a background
+    /// thread and apply session lifecycle / metadata changes to the tab display
+    /// on the main thread. Sessions this process created itself are filtered out
+    /// via [`is_owned_session`] so we never double-add our own tabs. When
+    /// `dedup_key` is set, claims a process-wide slot (released when the stream
+    /// ends) so a remote daemon gets only one listener.
+    fn spawn_daemon_event_listener(&self, connect: ListenerConnect, dedup_key: Option<String>) {
+        if let Some(ref key) = dedup_key {
+            if !try_claim_remote_listener(key) {
+                return;
+            }
+        }
+
+        // SAFETY: the delegate lives for the whole application; we only ever
+        // dereference this pointer on the main thread inside exec_async.
+        let delegate_ptr = self as *const AppDelegate as usize;
+        let dedup_for_thread = dedup_key.clone();
+
+        std::thread::spawn(move || {
+            let rt = match tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(rt) => rt,
+                Err(e) => {
+                    log::warn!("daemon event listener: failed to build runtime: {e}");
+                    if let Some(key) = dedup_for_thread {
+                        release_remote_listener(&key);
+                    }
+                    return;
+                }
+            };
+
+            rt.block_on(async move {
+                let conn = match connect {
+                    ListenerConnect::Local => {
+                        cterm_client::DaemonConnection::connect_local().await
+                    }
+                    ListenerConnect::Unix(ref path) => {
+                        cterm_client::DaemonConnection::connect_unix(path, false).await
+                    }
+                };
+                match conn {
+                    Ok(conn) => match conn.stream_daemon_events().await {
+                        Ok(mut stream) => {
+                            use tokio_stream::StreamExt;
+                            while let Some(result) = stream.next().await {
+                                let event = match result {
+                                    Ok(e) => e,
+                                    Err(e) => {
+                                        log::debug!("daemon event stream ended: {e}");
+                                        break;
+                                    }
+                                };
+                                match event.event {
+                                    Some(
+                                        cterm_proto::proto::daemon_event::Event::SessionCreated(c),
+                                    ) => {
+                                        let Some(info) = c.session else { continue };
+                                        // Skip sessions we created ourselves.
+                                        if is_owned_session(&info.session_id) {
+                                            continue;
+                                        }
+                                        let session_id = info.session_id.clone();
+                                        // Attach here (we have a runtime) then
+                                        // build the tab on the main thread.
+                                        let Some(recon) =
+                                            cterm_app::daemon_reconnect::attach_session_from_info(
+                                                &conn, info,
+                                            )
+                                            .await
+                                        else {
+                                            continue;
+                                        };
+                                        mark_owned_session(&session_id);
+                                        dispatch2::Queue::main().exec_async(move || {
+                                            let mtm =
+                                                unsafe { MainThreadMarker::new_unchecked() };
+                                            let delegate = unsafe {
+                                                &*(delegate_ptr as *const AppDelegate)
+                                            };
+                                            delegate.add_mirrored_tab(mtm, recon, &session_id);
+                                        });
+                                    }
+                                    Some(
+                                        cterm_proto::proto::daemon_event::Event::SessionDestroyed(
+                                            d,
+                                        ),
+                                    ) => {
+                                        let session_id = d.session_id;
+                                        dispatch2::Queue::main().exec_async(move || {
+                                            let delegate = unsafe {
+                                                &*(delegate_ptr as *const AppDelegate)
+                                            };
+                                            delegate.remove_mirrored_tab(&session_id);
+                                        });
+                                    }
+                                    Some(
+                                        cterm_proto::proto::daemon_event::Event::SessionMetadataChanged(
+                                            m,
+                                        ),
+                                    ) => {
+                                        dispatch2::Queue::main().exec_async(move || {
+                                            let delegate = unsafe {
+                                                &*(delegate_ptr as *const AppDelegate)
+                                            };
+                                            delegate.apply_mirrored_metadata(
+                                                &m.session_id,
+                                                &m.custom_title,
+                                                &m.tab_color,
+                                            );
+                                        });
+                                    }
+                                    None => {}
+                                }
+                            }
+                        }
+                        Err(e) => log::warn!("daemon event listener: subscribe failed: {e}"),
+                    },
+                    Err(e) => log::warn!("daemon event listener: connect failed: {e}"),
+                }
+                if let Some(key) = dedup_for_thread {
+                    release_remote_listener(&key);
+                }
+            });
+        });
+    }
+
+    /// Find the tracked window whose active terminal is attached to `session_id`.
+    fn find_window_for_session(&self, session_id: &str) -> Option<Retained<CtermWindow>> {
+        self.ivars()
+            .windows
+            .borrow()
+            .iter()
+            .find(|w| {
+                w.active_terminal()
+                    .and_then(|tv| tv.session_id())
+                    .as_deref()
+                    == Some(session_id)
+            })
+            .cloned()
+    }
+
+    /// Build a tab for a session created by another client and add it to the
+    /// current key window's tab group (or a standalone window if none exists).
+    fn add_mirrored_tab(
+        &self,
+        mtm: MainThreadMarker,
+        recon: cterm_app::daemon_reconnect::ReconnectedSession,
+        session_id: &str,
+    ) {
+        // Another attach may have won the race; don't add a duplicate.
+        if self.find_window_for_session(session_id).is_some() {
+            return;
+        }
+
+        let config = self.ivars().config.borrow().clone();
+        let theme = self.ivars().theme.clone();
+        let new_window = CtermWindow::from_daemon_with_screen(mtm, &config, &theme, recon);
+
+        // Track the window so close/lifecycle handling works.
+        let _: () = unsafe { msg_send![self, registerWindow: &*new_window] };
+
+        // Prefer the current key window as the tab-group parent; fall back to
+        // any other tracked window; otherwise leave it standalone.
+        let app = NSApplication::sharedApplication(mtm);
+        if let Some(parent) = app.keyWindow() {
+            parent.addTabbedWindow_ordered(&new_window, objc2_app_kit::NSWindowOrderingMode::Above);
+        } else {
+            let existing = self
+                .ivars()
+                .windows
+                .borrow()
+                .iter()
+                .find(|w| !std::ptr::eq(&***w, &*new_window))
+                .cloned();
+            if let Some(existing) = existing {
+                existing.addTabbedWindow_ordered(
+                    &new_window,
+                    objc2_app_kit::NSWindowOrderingMode::Above,
+                );
+            }
+        }
+        new_window.makeKeyAndOrderFront(None);
+        log::info!("Mirrored new daemon tab for session {session_id}");
+    }
+
+    /// Close the tab/window mirroring a session destroyed elsewhere. Skips the
+    /// close when it would shut the last window (and thus quit the app) so that
+    /// another client destroying a shared session can't quit us unexpectedly.
+    fn remove_mirrored_tab(&self, session_id: &str) {
+        let Some(window) = self.find_window_for_session(session_id) else {
+            return;
+        };
+        if self.ivars().windows.borrow().len() > 1 {
+            // close() bypasses the running-process confirmation (performClose:)
+            // — the session is already gone.
+            window.close();
+        } else {
+            log::info!("Session {session_id} destroyed elsewhere; keeping last window open");
+        }
+    }
+
+    /// Apply a metadata (custom title / tab color) change broadcast by another
+    /// client to the mirroring window — visually only, never echoed back.
+    fn apply_mirrored_metadata(&self, session_id: &str, custom_title: &str, tab_color: &str) {
+        let Some(window) = self.find_window_for_session(session_id) else {
+            return;
+        };
+
+        let color = if tab_color.is_empty() {
+            None
+        } else {
+            Some(tab_color)
+        };
+        window.set_tab_color_visual(color);
+
+        if custom_title.is_empty() {
+            // Custom title cleared elsewhere: let OSC titles win again.
+            if let Some(tv) = window.active_terminal() {
+                tv.set_title_locked(false);
+            }
+        } else {
+            window.setTitle(&NSString::from_str(custom_title));
+            if let Some(tv) = window.active_terminal() {
+                tv.set_title_locked(true);
+            }
+        }
+    }
+}
+
 impl AppDelegate {
     pub fn new(mtm: MainThreadMarker, config: Config, theme: Theme) -> Retained<Self> {
         let this = mtm.alloc::<Self>();
@@ -1324,6 +1656,9 @@ impl AppDelegate {
                 };
                 let (handle, screen) = connection.attach_session(session_id, 80, 24).await?;
                 handle.detach().await?;
+                // Claim ownership so our own daemon-event listener doesn't
+                // add a second tab for a session we just re-attached.
+                mark_owned_session(session_id);
                 Ok::<_, cterm_client::ClientError>((handle, screen))
             })
             .map_err(|error| format!("failed to reconnect session {session_id}: {error}"))?;

@@ -286,6 +286,8 @@ impl TerminalService for TerminalServiceImpl {
             .map_err(Status::from)?;
 
         session.set_custom_title(req.custom_title);
+        self.session_manager
+            .broadcast_session_metadata_changed(&session);
 
         Ok(Response::new(SetSessionTitleResponse { success: true }))
     }
@@ -309,6 +311,11 @@ impl TerminalService for TerminalServiceImpl {
         }
         if mask & 4 != 0 {
             session.set_template_name(req.template_name);
+        }
+
+        if mask != 0 {
+            self.session_manager
+                .broadcast_session_metadata_changed(&session);
         }
 
         Ok(Response::new(SetSessionMetadataResponse { success: true }))
@@ -712,6 +719,27 @@ impl TerminalService for TerminalServiceImpl {
         let tty_transfers = tty_transfer_snapshot.chain(tty_transfer_live);
 
         let stream = events.merge(prompts).merge(tty_transfers);
+        Ok(Response::new(Box::pin(stream)))
+    }
+
+    type StreamDaemonEventsStream =
+        Pin<Box<dyn Stream<Item = Result<DaemonEvent, Status>> + Send + 'static>>;
+
+    async fn stream_daemon_events(
+        &self,
+        _request: Request<StreamDaemonEventsRequest>,
+    ) -> Result<Response<Self::StreamDaemonEventsStream>, Status> {
+        let rx = self.session_manager.subscribe_daemon_events();
+        let stream = BroadcastStream::new(rx).filter_map(|result| match result {
+            Ok(event) => Some(Ok(event)),
+            Err(BroadcastStreamRecvError::Lagged(count)) => {
+                log::warn!(
+                    "stream_daemon_events: client lagged, dropped {} events",
+                    count,
+                );
+                None
+            }
+        });
         Ok(Response::new(Box::pin(stream)))
     }
 

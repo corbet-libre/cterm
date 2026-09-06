@@ -10,6 +10,13 @@ is omitted for readability.
 ## [Unreleased]
 
 ### Added
+- Merged upstream `KarpelesLab/cterm` tab-sync work (through `df1d883`):
+  live tab sync across every cterm connected to the same daemon via a new
+  daemon-wide event stream broadcasting session lifecycle (created/destroyed)
+  and tab-metadata (custom title / color) changes, so a tab opened, closed,
+  renamed, or recolored in one client now appears and updates in all of them.
+  Works on macOS and GTK, for the local daemon and SSH-tunneled remote daemons
+  alike.
 - Notification hardening: pinned `w=0` never-expire semantics (no terminal
   timer; persists until replaced, closed, evicted, or frontend exit; daemon
   `p=alive` survives UI reconnects) with activation/close ordering guarantees,
@@ -350,6 +357,11 @@ is omitted for readability.
   longer be mistaken for client updates.
 - Cocoa split-pane layout releases mutable model borrows before re-entry, and
   obtains its CoreGraphics drawing context through the typed AppKit binding.
+- Merged upstream: macOS no longer forces every remote tab green on connect —
+  a tab keeps the color it was given (or none), matching the local reconnect
+  path.
+- Merged upstream: the GTK "SSH Remote" dialog closes immediately on Connect,
+  like macOS.
 
 ## [0.0.19] - 2026-07-09
 
