@@ -581,6 +581,12 @@ pub enum NotificationUrgency {
 }
 
 /// A desktop notification requested by a terminal application.
+///
+/// Shared Kitty OSC 99 model for the daemon parser and all three native
+/// frontends. Fields beyond the original title/body/focus/close subset carry
+/// the full 0.36+ protocol; frontends degrade gracefully per the matrix in
+/// `docs/parity.md` (GTK has no native sound control, Win32 balloons have no
+/// buttons, user-dismiss detection is best-effort outside Win32).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct DesktopNotification {
     /// Stable Kitty notification identifier, when supplied.
@@ -597,9 +603,37 @@ pub struct DesktopNotification {
     pub muted: bool,
     /// Focus the terminal when the notification is activated.
     pub focus: bool,
+    /// Send an activation report (`a=report`) when the user activates the
+    /// notification or one of its buttons.
+    pub report_activation: bool,
+    /// Send a close report (`c=1`) when the notification is dismissed.
+    pub report_close: bool,
+    /// When the notification may be delivered (`o=`).
+    pub occasion: crate::notifications::NotificationOccasion,
+    /// Application identity for user filtering (`f=`, base64, optional).
+    pub app_name: Option<String>,
+    /// Notification types for user filtering (`t=`, base64, repeatable).
+    pub notif_types: Vec<String>,
+    /// Preferred icon names (`n=`, base64, repeatable, first hit wins).
+    pub icon_names: Vec<String>,
+    /// Transmitted icon bytes (`p=icon`, PNG/JPEG/GIF, via `e=1`).
+    pub icon_data: Option<Vec<u8>>,
+    /// Icon-cache key (`g=`) for the transmitted or previously cached icon.
+    pub icon_cache_id: Option<String>,
+    /// Button labels (`p=buttons`, U+2028-separated, 1-based in reports).
+    pub buttons: Vec<String>,
+    /// Named `s=` sound when not silent (e.g. `error`, `info`); `None`
+    /// means the platform default. Accepted everywhere, rendered as the
+    /// default outside platforms with named-sound support.
+    pub sound_name: Option<String>,
 }
 
 /// A native notification operation emitted by the terminal parser.
+///
+/// Box-free by design: notifications are rare (not per-frame), so the 256-byte
+/// `Show` variant avoids heap churn on every terminal event match. The size
+/// lint is suppressed locally for that reason.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DesktopNotificationAction {
     Show(DesktopNotification),

@@ -1,4 +1,25 @@
 //! Native macOS desktop notifications through UserNotifications.framework.
+//!
+//! Shared-model delivery for Kitty OSC 99: occasion (`o=`) filtering,
+//! expiry (`w=`) auto-close, and `a=report` / `c=1` reports generated with
+//! the shared `cterm_core::notifications` builders and written back through
+//! the per-view report sink (mirror terminal write path → daemon PTY).
+//!
+//! Platform notes (see the per-platform matrix in `docs/parity.md`):
+//! - UserNotifications has no dismiss signal, so `c=1` notifications get an
+//!   immediate `p=close;untracked` disclaimer (poll `p=alive` instead) plus
+//!   a real `p=close` when the terminal itself closes the notification
+//!   (activation, expiry, or app close).
+//! - Buttons degrade: macOS surfaces notification actions as a hover menu,
+//!   so button labels are kept in the shared model and activation reports
+//!   without a button number.
+//! - Custom icons degrade: transmitted bytes/names are kept in the shared
+//!   model (a `UNNotificationAttachment` file-URL hop is the open path).
+//! - Named `s=` sounds degrade to the default sound; `silent` suppresses it.
+//!
+//! NOTE (seam-reuse, uncompiled on Linux): this module follows the same
+//! registry + report-sink pattern as the GTK delivery so all three
+//! frontends share one core state machine. macOS builds must verify.
 
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
@@ -26,6 +47,22 @@ static ACTIVE_NOTIFICATION_IDS: LazyLock<Mutex<HashMap<String, String>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 static FOCUS_NOTIFICATION_IDS: LazyLock<Mutex<HashSet<String>>> =
     LazyLock::new(|| Mutex::new(HashSet::new()));
+/// Report preferences + sink per native notification ID, mirroring the GTK
+/// delivery registry so activation/close reports share one core model.
+static REPORT_REGISTRY: LazyLock<Mutex<HashMap<String, ReportEntry>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Writes one Kitty report back to the issuing PTY (mirror terminal write
+/// path → daemon input channel). Provided by `terminal_view.rs` per view.
+pub type ReportSink = std::sync::Arc<dyn Fn(&[u8]) + Send + Sync>;
+
+#[derive(Clone)]
+struct ReportEntry {
+    protocol_id: Option<String>,
+    report_activation: bool,
+    report_close: bool,
+    sink: ReportSink,
+}
 
 struct NotificationDelegateIvars;
 
@@ -66,9 +103,29 @@ define_class!(
             if let Ok(mut active) = ACTIVE_NOTIFICATION_IDS.lock() {
                 active.retain(|_, current| current != &native_id);
             }
+            let report = REPORT_REGISTRY
+                .lock()
+                .ok()
+                .and_then(|mut registry| registry.remove(&native_id));
             if focus {
                 let app = NSApplication::sharedApplication(MainThreadMarker::from(self));
                 app.activateIgnoringOtherApps(true);
+            }
+            // Activation first, then close when both were requested — the
+            // Kitty `a=report` + `c=1` contract.
+            if let Some(entry) = report {
+                if entry.report_activation {
+                    (entry.sink)(&cterm_core::notifications::activation_report(
+                        entry.protocol_id.as_deref(),
+                        None,
+                    ));
+                }
+                if entry.report_close {
+                    (entry.sink)(&cterm_core::notifications::close_report(
+                        entry.protocol_id.as_deref(),
+                        false,
+                    ));
+                }
             }
             completion.call(());
         }
@@ -173,14 +230,45 @@ pub fn request_authorization() {
     );
 }
 
-pub fn handle(action: &cterm_core::DesktopNotificationAction) {
+pub fn handle(action: &cterm_core::DesktopNotificationAction, report: ReportSink) {
     match action {
-        cterm_core::DesktopNotificationAction::Show(notification) => show(notification),
+        cterm_core::DesktopNotificationAction::Show(notification) => show(notification, report),
         cterm_core::DesktopNotificationAction::Close(id) => close(id),
     }
 }
 
-fn show(notification: &cterm_core::DesktopNotification) {
+fn show(notification: &cterm_core::DesktopNotification, report: ReportSink) {
+    // Occasion (`o=`) filtering against best-effort native state. Tab
+    // visibility is owned by the view layer; here `invisible` degrades to
+    // `unfocused` (documented in the parity matrix).
+    let is_focused = NSRunningApplication::currentApplication().isActive();
+    if !cterm_core::notifications::should_deliver(notification.occasion, is_focused, true) {
+        log::debug!(
+            "Suppressing desktop notification {:?} for occasion {:?} (focused={is_focused})",
+            notification.id,
+            notification.occasion,
+        );
+        return;
+    }
+    if !notification.buttons.is_empty() {
+        // Button labels stay in the shared model; activation reports without
+        // a button number (hover-menu actions are the open path).
+        log::debug!(
+            "Ignoring {} notification button(s) on UserNotifications",
+            notification.buttons.len()
+        );
+    }
+    if notification.icon_names.iter().any(|name| !name.is_empty())
+        || notification.icon_data.is_some()
+    {
+        // Custom icons degrade to the application icon (attachment file-URL
+        // hop is the open path).
+        log::debug!("Ignoring custom notification icon on UserNotifications");
+    }
+    if let Some(sound) = notification.sound_name.as_deref() {
+        // Named sounds degrade to the default sound.
+        log::debug!("Ignoring named notification sound {sound:?} on UserNotifications");
+    }
     let Some(center) = notification_center() else {
         return;
     };
@@ -238,15 +326,43 @@ fn show(notification: &cterm_core::DesktopNotification) {
         UNNotificationRequest::requestWithIdentifier_content_trigger(&identifier, &content, None);
     center.addNotificationRequest_withCompletionHandler(&request, None);
 
+    // Track reporting preferences for the delegate callback.
+    if let Ok(mut registry) = REPORT_REGISTRY.lock() {
+        if registry.len() >= 128 {
+            if let Some(oldest) = registry.keys().next().cloned() {
+                registry.remove(&oldest);
+            }
+        }
+        registry.insert(
+            native_id.clone(),
+            ReportEntry {
+                protocol_id: notification.id.clone(),
+                report_activation: notification.report_activation,
+                report_close: notification.report_close,
+                sink: report.clone(),
+            },
+        );
+    }
+    // No OS dismiss signal exists here: tell the app up front that dismissal
+    // is untracked (it should poll `p=alive`). A real `p=close` still follows
+    // terminal-initiated closes (activation, expiry) below.
+    if notification.report_close {
+        report(&cterm_core::notifications::close_report(
+            notification.id.as_deref(),
+            true,
+        ));
+    }
+
     if let Some(milliseconds) = notification.expire_time.filter(|value| *value > 0) {
         let protocol_id = notification.id.clone();
+        let native_id_owned = native_id.clone();
         std::thread::spawn(move || {
             std::thread::sleep(Duration::from_millis(milliseconds as u64));
             if let Some(protocol_id) = protocol_id {
                 let should_close = ACTIVE_NOTIFICATION_IDS
                     .lock()
                     .map(|mut active| {
-                        if active.get(&protocol_id) == Some(&native_id) {
+                        if active.get(&protocol_id) == Some(&native_id_owned) {
                             active.remove(&protocol_id);
                             true
                         } else {
@@ -258,7 +374,19 @@ fn show(notification: &cterm_core::DesktopNotification) {
                     return;
                 }
             }
-            close_native(&native_id);
+            let report_close = REPORT_REGISTRY
+                .lock()
+                .ok()
+                .and_then(|mut registry| registry.remove(&native_id_owned))
+                .map(|entry| (entry.report_close, entry.protocol_id, entry.sink));
+            close_native(&native_id_owned);
+            // Terminal-enforced expiry is an observed close.
+            if let Some((true, protocol_id, sink)) = report_close {
+                sink(&cterm_core::notifications::close_report(
+                    protocol_id.as_deref(),
+                    false,
+                ));
+            }
         });
     }
 }
@@ -269,6 +397,9 @@ fn close(protocol_id: &str) {
         .ok()
         .and_then(|mut active| active.remove(protocol_id));
     if let Some(native_id) = native_id {
+        if let Ok(mut registry) = REPORT_REGISTRY.lock() {
+            registry.remove(&native_id);
+        }
         close_native(&native_id);
     }
 }
@@ -276,6 +407,9 @@ fn close(protocol_id: &str) {
 fn close_native(native_id: &str) {
     if let Ok(mut ids) = FOCUS_NOTIFICATION_IDS.lock() {
         ids.remove(native_id);
+    }
+    if let Ok(mut registry) = REPORT_REGISTRY.lock() {
+        registry.remove(native_id);
     }
     let identifier = NSString::from_str(native_id);
     let identifiers = NSArray::from_slice(&[&*identifier]);

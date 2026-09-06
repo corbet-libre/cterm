@@ -6272,7 +6272,26 @@ extern "system" fn window_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPA
                 let notification = unsafe {
                     Box::from_raw(lparam.0 as *mut cterm_core::DesktopNotificationAction)
                 };
-                crate::desktop_notification::handle(hwnd, &notification);
+                // Reports travel back through the issuing pane's mirror
+                // terminal write path (daemon input channel → PTY), the same
+                // seam Kitty DND frames use.
+                let source_id = wparam.0 as u64;
+                if let Some(terminal) = state.terminal_for_source(source_id) {
+                    let direct: crate::desktop_notification::ReportSink =
+                        std::sync::Arc::new(move |report: &[u8]| {
+                            if let Err(error) = terminal.lock().unwrap().write(report) {
+                                log::error!(
+                                    "Failed to write desktop notification report to PTY: {error}"
+                                );
+                            }
+                        });
+                    crate::desktop_notification::handle(hwnd, &notification, direct);
+                } else {
+                    // Pane already gone: still deliver (show/withdraw), but
+                    // reports have nowhere to go.
+                    let sink: crate::desktop_notification::ReportSink = std::sync::Arc::new(|_| {});
+                    crate::desktop_notification::handle(hwnd, &notification, sink);
+                }
             }
             LRESULT(0)
         }

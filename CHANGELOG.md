@@ -10,6 +10,18 @@ is omitted for readability.
 ## [Unreleased]
 
 ### Added
+- Kitty OSC 99 desktop-notification completion over one shared
+  `cterm-core::notifications` model: `a=report` activation reports (whole
+  notification plus 1-based button numbers) and `c=1` close reports
+  (`untracked` where the OS gives no dismiss signal, real closes on
+  terminal-observed activation/expiry), `p=icon`/`n=`/`g=` icons with a
+  bounded cache, `p=buttons` buttons, `o=` occasion filtering,
+  `f=`/`t=` filter identity, named `s=` sounds, `w=` terminal-enforced
+  expiry, `p=alive` liveness on a bounded live-ID set, and a capability
+  reply advertising exactly the wired set. GTK delivery is fully wired
+  (targeted actions, icons, expiry, reports via the mirror PTY path);
+  Cocoa/Win32 reuse the same core seams (not compiled on Linux — see
+  `docs/notifications.md` for the per-platform matrix and open questions).
 - Kitty screen unscrolling (`CSI Ps + T`): scroll down within the scroll
   region, refilling the new top lines from scrollback instead of blanking
   them. Falls back to blank lines on the alternate screen or with empty

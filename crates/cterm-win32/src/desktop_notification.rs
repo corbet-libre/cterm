@@ -1,4 +1,18 @@
 //! Native Windows notification balloons with Kitty replacement and close IDs.
+//!
+//! Shared-model delivery for Kitty OSC 99: occasion (`o=`) filtering,
+//! expiry (`w=`) auto-close, and `a=report` / `c=1` reports generated with
+//! the shared `cterm_core::notifications` builders and written back through
+//! the per-pane report sink (mirror terminal write path → daemon PTY).
+//!
+//! Platform notes (see the per-platform matrix in `docs/parity.md`):
+//! - Balloons have no buttons: `p=buttons` is accepted by the core parser
+//!   but has no native surface here (toast migration is the open path).
+//! - Icons degrade to the application icon: transmitted bytes/names are kept
+//!   in the model for other frontends.
+//! - Named `s=` sounds degrade to the default balloon sound; `silent` maps
+//!   to `NIIF_NOSOUND`. Unlike GTK/Cocoa, balloon hide/timeout/click events
+//!   give real dismiss tracking, so no `untracked` disclaimer is sent.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
@@ -12,7 +26,8 @@ use windows::Win32::UI::Shell::{
     NIN_BALLOONUSERCLICK, NOTIFYICONDATAW, NOTIFYICONDATAW_0,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    LoadIconW, SetForegroundWindow, ShowWindow, IDI_APPLICATION, SW_RESTORE,
+    GetForegroundWindow, IsWindowVisible, LoadIconW, SetForegroundWindow, ShowWindow,
+    IDI_APPLICATION, SW_RESTORE,
 };
 
 use crate::window::WM_APP_NATIVE_NOTIFICATION;
@@ -28,11 +43,20 @@ struct ActiveNotification {
     protocol_id: Option<String>,
     generation: u64,
     focus: bool,
+    report_activation: bool,
+    report_close: bool,
+    report_sink: Option<ReportSink>,
 }
 
-pub fn handle(hwnd: HWND, action: &cterm_core::DesktopNotificationAction) {
+/// Writes one Kitty report back to the issuing PTY (mirror terminal write
+/// path → daemon input channel). Provided by `window.rs` per pane.
+pub type ReportSink = std::sync::Arc<dyn Fn(&[u8]) + Send + Sync>;
+
+pub fn handle(hwnd: HWND, action: &cterm_core::DesktopNotificationAction, report: ReportSink) {
     match action {
-        cterm_core::DesktopNotificationAction::Show(notification) => show(hwnd, notification),
+        cterm_core::DesktopNotificationAction::Show(notification) => {
+            show(hwnd, notification, report);
+        }
         cterm_core::DesktopNotificationAction::Close(id) => close(hwnd, id),
     }
 }
@@ -56,16 +80,84 @@ pub fn native_event(hwnd: HWND, native_id: u32, event: u32) {
         return;
     }
 
-    if event == NIN_BALLOONUSERCLICK && notification.focus {
-        unsafe {
-            let _ = ShowWindow(hwnd, SW_RESTORE);
-            let _ = SetForegroundWindow(hwnd);
+    if event == NIN_BALLOONUSERCLICK {
+        if notification.focus {
+            unsafe {
+                let _ = ShowWindow(hwnd, SW_RESTORE);
+                let _ = SetForegroundWindow(hwnd);
+            }
+        }
+        if notification.report_activation {
+            let report = cterm_core::notifications::activation_report(
+                notification.protocol_id.as_deref(),
+                None,
+            );
+            if let Some(sink) = notification.report_sink.as_ref() {
+                sink(&report);
+            }
+            // Per the Kitty spec, an activated notification with `c=1` sends
+            // both the activation and the close report.
+            if notification.report_close {
+                let closed = cterm_core::notifications::close_report(
+                    notification.protocol_id.as_deref(),
+                    false,
+                );
+                if let Some(sink) = notification.report_sink.as_ref() {
+                    sink(&closed);
+                }
+            }
+        } else if notification.report_close {
+            // Dismiss/timeout without activation still closes the report loop.
+            let closed =
+                cterm_core::notifications::close_report(notification.protocol_id.as_deref(), false);
+            if let Some(sink) = notification.report_sink.as_ref() {
+                sink(&closed);
+            }
+        }
+    } else if notification.report_close {
+        let closed =
+            cterm_core::notifications::close_report(notification.protocol_id.as_deref(), false);
+        if let Some(sink) = notification.report_sink.as_ref() {
+            sink(&closed);
         }
     }
     remove_native(hwnd, native_id);
 }
 
-fn show(hwnd: HWND, notification: &cterm_core::DesktopNotification) {
+fn show(hwnd: HWND, notification: &cterm_core::DesktopNotification, report: ReportSink) {
+    // Occasion (`o=`) filtering against best-effort native state.
+    let (is_focused, is_visible) = unsafe {
+        (
+            GetForegroundWindow() == hwnd,
+            IsWindowVisible(hwnd).as_bool(),
+        )
+    };
+    if !cterm_core::notifications::should_deliver(notification.occasion, is_focused, is_visible) {
+        log::debug!(
+            "Suppressing desktop notification {:?} for occasion {:?} (focused={is_focused}, visible={is_visible})",
+            notification.id,
+            notification.occasion,
+        );
+        return;
+    }
+    if !notification.buttons.is_empty() {
+        // Balloons expose no button surface; the request stays in the shared
+        // model so other frontends (and future toast migration) honor it.
+        log::debug!(
+            "Ignoring {} notification button(s) on Win32 balloons",
+            notification.buttons.len()
+        );
+    }
+    if notification.icon_names.iter().any(|name| !name.is_empty())
+        || notification.icon_data.is_some()
+    {
+        // Custom icons degrade to the application icon on balloons.
+        log::debug!("Ignoring custom notification icon on Win32 balloons");
+    }
+    if let Some(sound) = notification.sound_name.as_deref() {
+        // Named sounds degrade to the default balloon sound.
+        log::debug!("Ignoring named notification sound {sound:?} on Win32 balloons");
+    }
     let hwnd_value = hwnd.0 as usize;
     let generation = NEXT_GENERATION.fetch_add(1, Ordering::Relaxed);
     let (native_id, replace) = {
@@ -86,6 +178,9 @@ fn show(hwnd: HWND, notification: &cterm_core::DesktopNotification) {
                 protocol_id: notification.id.clone(),
                 generation,
                 focus: notification.focus,
+                report_activation: notification.report_activation,
+                report_close: notification.report_close,
+                report_sink: Some(report.clone()),
             },
         );
         (native_id, existing.is_some())
@@ -125,10 +220,22 @@ fn show(hwnd: HWND, notification: &cterm_core::DesktopNotification) {
         return;
     }
 
+    let report_sink = report.clone();
+    let protocol_id = notification.id.clone();
+    let report_close = notification.report_close;
     std::thread::spawn(move || {
         std::thread::sleep(Duration::from_millis(timeout as u64));
         if remove_if_current(native_id, generation) {
             remove_native(HWND(hwnd_value as *mut _), native_id);
+            // Terminal-enforced expiry is a close the terminal observes, so
+            // it gets a real (tracked) close report, unlike user dismissals
+            // on stacks without OS signals.
+            if report_close {
+                report_sink(&cterm_core::notifications::close_report(
+                    protocol_id.as_deref(),
+                    false,
+                ));
+            }
         }
     });
 }
