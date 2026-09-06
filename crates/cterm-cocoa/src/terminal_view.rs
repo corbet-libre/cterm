@@ -2437,10 +2437,10 @@ impl TerminalView {
                 }
 
                 let now = started.elapsed();
-                let mut terminal = terminal.lock();
-                let blink_needs = BlinkNeeds::for_screen(terminal.screen());
-                let animation_changed = terminal.advance_graphics_animations(now).changed;
-                drop(terminal);
+                let mut terminal_guard = terminal.lock();
+                let blink_needs = BlinkNeeds::for_screen(terminal_guard.screen());
+                let animation_changed = terminal_guard.advance_graphics_animations(now).changed;
+                drop(terminal_guard);
                 if blink_clock.update(now, blink_needs) || animation_changed {
                     state
                         .blink_phase
