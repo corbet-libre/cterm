@@ -3,12 +3,11 @@
 mod support;
 
 use std::hint::black_box;
-use std::time::Duration;
 
 use criterion::{criterion_group, criterion_main, BatchSize, Criterion};
 use cterm_core::Screen;
 
-use support::{corpus, terminal, COLS, ROWS};
+use support::{corpus, terminal, timing, COLS, ROWS};
 
 fn populated_screen(data: &[u8], scrollback_lines: usize) -> Screen {
     let (mut screen, mut parser) = terminal(scrollback_lines);
@@ -18,9 +17,9 @@ fn populated_screen(data: &[u8], scrollback_lines: usize) -> Screen {
 
 fn configure_group(group: &mut criterion::BenchmarkGroup<'_, criterion::measurement::WallTime>) {
     group
-        .sample_size(40)
-        .warm_up_time(Duration::from_secs(2))
-        .measurement_time(Duration::from_secs(5));
+        .sample_size(timing::sample_size())
+        .warm_up_time(timing::warm_up_time())
+        .measurement_time(timing::measurement_time());
 }
 
 fn resize_viewport(c: &mut Criterion) {

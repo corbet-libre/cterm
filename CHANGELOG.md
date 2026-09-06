@@ -131,6 +131,13 @@ is omitted for readability.
   signature block sizing, padded/unpadded base64 agreement, chunk-split
   invariance, and decompressed-byte session accounting
   (`scripts/kitty_transfer_vectors.sh`).
+- Local performance regression gate for the deterministic cterm-core
+  Criterion suite (no CI change): `scripts/check_perf_baseline.sh`
+  (`mint`/`check`, same-host relative change, FAIL past +10% median with the
+  95% confidence interval above zero, optional host-local absolute ceilings,
+  `--quick` smoke mode) plus a bench inventory, threshold scheme, and
+  proposed-not-applied CI wiring in `crates/cterm-core/benches/README.md`.
+  Plain `cargo bench -p cterm-core` behavior is unchanged.
 
 ### Fixed
 - Streamed OSC 1337 interception now replays incomplete, cancelled, and

@@ -20,6 +20,39 @@ pub fn terminal(scrollback_lines: usize) -> (Screen, Parser) {
     )
 }
 
+/// Criterion timing knobs, overridable for fast local smoke runs.
+///
+/// Defaults preserve the pinned configuration (40 samples, 2 s warm-up,
+/// 5 s measurement), so a plain `cargo bench -p cterm-core` behaves exactly
+/// as before. The CLI flags (`--sample-size`, `--warm-up-time`,
+/// `--measurement-time`) cannot override these because Criterion gives
+/// programmatic group settings precedence; the environment variables below
+/// exist so `scripts/check_perf_baseline.sh --quick` can smoke-run the
+/// suite end to end in seconds.
+pub mod timing {
+    use std::time::Duration;
+
+    fn env_u64(name: &str, default: u64) -> u64 {
+        std::env::var(name)
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .filter(|&v| v > 0)
+            .unwrap_or(default)
+    }
+
+    pub fn sample_size() -> usize {
+        env_u64("CTERM_BENCH_SAMPLE_SIZE", 40) as usize
+    }
+
+    pub fn warm_up_time() -> Duration {
+        Duration::from_secs(env_u64("CTERM_BENCH_WARMUP_SECS", 2))
+    }
+
+    pub fn measurement_time() -> Duration {
+        Duration::from_secs(env_u64("CTERM_BENCH_MEASUREMENT_SECS", 5))
+    }
+}
+
 pub mod corpus {
     /// A representative shell session combining text, colors, cursor motion,
     /// and occasional screen clears.
