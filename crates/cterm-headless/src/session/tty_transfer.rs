@@ -6,11 +6,14 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::Duration;
 
-use cterm_app::{TtyTransferAction, TtyTransferFilesystem, TtyTransferLimits, TtyTransferManager};
-use cterm_core::FileTransferCommand;
+use cterm_app::{
+    BypassDecision, TtyTransferAction, TtyTransferFilesystem, TtyTransferLimits, TtyTransferManager,
+};
+use cterm_core::{FileTransferAction, FileTransferCommand};
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::Instant;
 
+use super::transfer_policy::SharedTransferContext;
 use super::SessionState;
 
 const COMMAND_QUEUE_CAPACITY: usize = 512;
@@ -64,6 +67,7 @@ impl TtyTransferController {
             filesystem,
             Arc::clone(&active),
             Arc::clone(&queued),
+            session.transfer_context(),
         ));
         Ok(Self {
             tx,
@@ -164,6 +168,7 @@ async fn run_worker(
     filesystem: TtyTransferFilesystem,
     active: Arc<AtomicBool>,
     queued: Arc<AtomicUsize>,
+    transfer_context: SharedTransferContext,
 ) {
     struct ActivityReset {
         active: Arc<AtomicBool>,
@@ -183,6 +188,12 @@ async fn run_worker(
     let mut filesystem = filesystem;
     let mut pending: HashMap<u64, (String, Instant)> = HashMap::new();
     let mut approved_idle: HashMap<String, Instant> = HashMap::new();
+    // Policy decisions for live sessions, keyed by wire transfer id. Stored at
+    // session start (where Kitty fixes `bypass_ok` in `ActiveSend` /
+    // `ActiveReceive.__init__`) and consumed when the approval request is
+    // emitted, so `Allow`/`Deny` resolve without ever publishing a prompt. The
+    // stock config only ever yields `Prompt`, which stores nothing.
+    let mut bypass: HashMap<String, BypassDecision> = HashMap::new();
     let mut expiry = tokio::time::interval(Duration::from_secs(1));
     expiry.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
@@ -193,10 +204,33 @@ async fn run_worker(
                 let (actions, protocol_id, newly_approved) = match message {
                     WorkerMessage::Protocol(command) => {
                         let transfer_id = command.id.clone();
+                        // Consult the consent seam at session start, before the
+                        // state machine can emit an approval request. The first
+                        // decision wins (Kitty fixes `bypass_ok` at session
+                        // creation); `Prompt` stores nothing, keeping today's
+                        // always-prompt path byte-identical.
+                        if matches!(
+                            command.action,
+                            FileTransferAction::Send | FileTransferAction::Receive
+                        ) && !bypass.contains_key(&transfer_id)
+                        {
+                            let decision = transfer_context.evaluate_session_start(&command);
+                            if decision != BypassDecision::Prompt {
+                                bypass.insert(transfer_id.clone(), decision);
+                            }
+                        }
                         let was_pending = pending
                             .iter()
                             .find_map(|(request_id, (id, _))| (id == &transfer_id).then_some(*request_id));
                         let actions = manager.handle(command);
+                        let actions =
+                            resolve_bypass_decisions(&mut manager, actions, &mut bypass);
+                        // A session that never reached approval (rejected
+                        // start, invalid receive paths) must not retain a
+                        // stale policy decision.
+                        if !manager.has_session(&transfer_id) {
+                            bypass.remove(&transfer_id);
+                        }
                         // Publish manager-owned work before any approval event
                         // becomes observable. Relaunch quiescence must never
                         // see an idle controller after the UI has seen a live
@@ -217,6 +251,7 @@ async fn run_worker(
                             let _ = accepted_tx.send(false);
                             continue;
                         };
+                        bypass.remove(&transfer_id);
                         if let Some(session) = session.upgrade() {
                             session.clear_tty_transfer_prompt(request_id);
                         }
@@ -256,6 +291,7 @@ async fn run_worker(
                         }
                         pending.clear();
                         approved_idle.clear();
+                        bypass.clear();
                         let actions = manager.reject_all("ECANCELED:Terminal session closed");
                         let _ = dispatch_actions(
                             &session,
@@ -307,7 +343,9 @@ async fn run_worker(
                     .filter_map(|(request_id, (_, deadline))| (*deadline <= now).then_some(*request_id))
                     .collect();
                 for request_id in expired {
-                    pending.remove(&request_id);
+                    if let Some((transfer_id, _)) = pending.remove(&request_id) {
+                        bypass.remove(&transfer_id);
+                    }
                     if let Some(session) = session.upgrade() {
                         session.clear_tty_transfer_prompt(request_id);
                     }
@@ -330,6 +368,7 @@ async fn run_worker(
                     .collect();
                 for session_id in expired {
                     approved_idle.remove(&session_id);
+                    bypass.remove(&session_id);
                     let actions = manager.reject_session(
                         &session_id,
                         "ETIMEDOUT:Transfer session idle",
@@ -399,6 +438,46 @@ async fn dispatch_actions(
     Some(filesystem)
 }
 
+/// Resolve stored policy decisions for freshly emitted approval requests.
+///
+/// Called with the actions [`TtyTransferManager::handle`] just returned,
+/// before anything is dispatched, so `Allow`/`Deny` never publish a prompt:
+/// `Allow` auto-approves and `Deny` refuses through the exact same manager
+/// calls a native dialog decision would use, making the PTY bytes identical
+/// to a user clicking Allow/Deny. `Prompt` (and sessions with no stored
+/// decision — the stock-config case) keeps the `RequestApproval` for the
+/// normal prompt path. Consumed decisions are removed; anything left behind
+/// belongs to a session still collecting receive paths.
+fn resolve_bypass_decisions(
+    manager: &mut TtyTransferManager,
+    actions: Vec<TtyTransferAction>,
+    decisions: &mut HashMap<String, BypassDecision>,
+) -> Vec<TtyTransferAction> {
+    if decisions.is_empty() {
+        return actions;
+    }
+    let mut resolved = Vec::with_capacity(actions.len());
+    let mut followups = Vec::new();
+    for action in actions {
+        match action {
+            TtyTransferAction::RequestApproval(request) => {
+                match decisions.remove(&request.session_id) {
+                    Some(BypassDecision::Allow) => {
+                        followups.extend(manager.approve(request.request_id));
+                    }
+                    Some(BypassDecision::Deny) => {
+                        followups.extend(manager.deny(request.request_id));
+                    }
+                    _ => resolved.push(TtyTransferAction::RequestApproval(request)),
+                }
+            }
+            other => resolved.push(other),
+        }
+    }
+    resolved.extend(followups);
+    resolved
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -450,5 +529,121 @@ mod tests {
         };
         assert!(manager.handle(command).is_empty());
         assert_eq!(manager.active_sessions(), 1);
+    }
+
+    fn send_start(id: &str) -> FileTransferCommand {
+        FileTransferCommand {
+            action: FileTransferAction::Send,
+            id: id.into(),
+            file_id: None,
+            bypass: None,
+            quiet: 0,
+            mtime: None,
+            permissions: None,
+            size: None,
+            name: None,
+            status: None,
+            parent: None,
+            data: Vec::new(),
+            compression: None,
+            file_type: None,
+            transmission_type: None,
+        }
+    }
+
+    fn is_single_write(actions: &[TtyTransferAction]) -> bool {
+        matches!(actions, [TtyTransferAction::Write(_)])
+    }
+
+    /// `Allow` auto-approves through the same manager call a dialog approval
+    /// uses: exactly one `OK` write, no approval request published.
+    #[test]
+    fn bypass_allow_resolves_without_publishing_a_prompt() {
+        let mut manager = TtyTransferManager::new();
+        let mut decisions = HashMap::new();
+        decisions.insert("allowed".to_string(), BypassDecision::Allow);
+        let actions = manager.handle(send_start("allowed"));
+        let actions = resolve_bypass_decisions(&mut manager, actions, &mut decisions);
+        assert!(decisions.is_empty());
+        assert!(is_single_write(&actions));
+        assert!(!actions
+            .iter()
+            .any(|action| matches!(action, TtyTransferAction::RequestApproval(_))));
+        assert_eq!(manager.active_sessions(), 1);
+    }
+
+    /// `Deny` hard-refuses without prompting: one `EPERM` write, no session
+    /// retained, no approval request published.
+    #[test]
+    fn bypass_deny_refuses_without_publishing_a_prompt() {
+        let mut manager = TtyTransferManager::new();
+        let mut decisions = HashMap::new();
+        decisions.insert("denied".to_string(), BypassDecision::Deny);
+        let actions = manager.handle(send_start("denied"));
+        let actions = resolve_bypass_decisions(&mut manager, actions, &mut decisions);
+        assert!(decisions.is_empty());
+        assert!(is_single_write(&actions));
+        assert!(!actions
+            .iter()
+            .any(|action| matches!(action, TtyTransferAction::RequestApproval(_))));
+        assert_eq!(manager.active_sessions(), 0);
+    }
+
+    /// `Prompt` (and the stock-config empty map) keeps the approval request
+    /// for the normal prompt path, byte-identical to today.
+    #[test]
+    fn bypass_prompt_keeps_todays_approval_path() {
+        let mut manager = TtyTransferManager::new();
+        let mut decisions = HashMap::new();
+        decisions.insert("asked".to_string(), BypassDecision::Prompt);
+        let actions = manager.handle(send_start("asked"));
+        let actions = resolve_bypass_decisions(&mut manager, actions, &mut decisions);
+        assert!(decisions.is_empty());
+        assert!(matches!(
+            actions.as_slice(),
+            [TtyTransferAction::RequestApproval(_)]
+        ));
+
+        let mut empty = HashMap::new();
+        let actions = manager.handle(send_start("plain"));
+        let actions = resolve_bypass_decisions(&mut manager, actions, &mut empty);
+        assert!(matches!(
+            actions.as_slice(),
+            [TtyTransferAction::RequestApproval(_)]
+        ));
+    }
+
+    /// A stored decision survives receive-path collection and resolves when
+    /// the approval request is finally emitted.
+    #[test]
+    fn bypass_allow_survives_receive_path_collection() {
+        let mut manager = TtyTransferManager::new();
+        let mut decisions = HashMap::new();
+        decisions.insert("collection".to_string(), BypassDecision::Allow);
+
+        let mut start = send_start("collection");
+        start.action = FileTransferAction::Receive;
+        start.size = Some(1);
+        let actions = manager.handle(start);
+        let actions = resolve_bypass_decisions(&mut manager, actions, &mut decisions);
+        assert!(actions.is_empty());
+        // Still collecting: the decision waits, the session lives.
+        assert_eq!(decisions.len(), 1);
+        assert_eq!(manager.active_sessions(), 1);
+
+        let mut path = send_start("collection");
+        path.action = FileTransferAction::File;
+        path.file_id = Some("f1".into());
+        path.name = Some("one.txt".into());
+        let actions = manager.handle(path);
+        let actions = resolve_bypass_decisions(&mut manager, actions, &mut decisions);
+        assert!(decisions.is_empty());
+        assert!(matches!(actions.first(), Some(TtyTransferAction::Write(_))));
+        assert!(!actions
+            .iter()
+            .any(|action| matches!(action, TtyTransferAction::RequestApproval(_))));
+        assert!(actions
+            .iter()
+            .any(|action| matches!(action, TtyTransferAction::CompleteReceiveListing { .. })));
     }
 }

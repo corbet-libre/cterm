@@ -96,6 +96,23 @@ pub async fn run_server(
 
     let session_manager = Arc::new(SessionManager::with_scrollback(config.scrollback_lines));
 
+    // Load the operator `[transfer]` consent config and mint the daemon's
+    // process-lifetime bypass keypair. A missing or unreadable config keeps
+    // the stock always-prompt default (fail-closed); only an explicit opt-in
+    // config plus a verifying wire credential can ever skip a prompt.
+    let transfer_config = match cterm_app::load_config() {
+        Ok(config) => config.transfer,
+        Err(error) => {
+            log::warn!(
+                "Transfer consent config unavailable ({error}); keeping always-prompt defaults"
+            );
+            cterm_app::TransferConfig::default()
+        }
+    };
+    session_manager.set_transfer_context(Arc::new(crate::session::transfer_context_for_startup(
+        transfer_config,
+    )));
+
     // Restore sessions from relaunch state if provided
     #[cfg(unix)]
     if let Some(ref state_path) = relaunch_state_path {

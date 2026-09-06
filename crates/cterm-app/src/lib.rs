@@ -77,8 +77,8 @@ pub use template_launch::{
 pub use transfer_bypass::{
     b85decode, b85encode, current_time_ns, encode_bypass_credential, encrypt_bypass_credential,
     hash_bypass_token, parse_kitty_public_key_env, verify_bypass_credential, TransferBypassError,
-    TransferBypassKeypair, BYPASS_TIMESTAMP_WINDOW_NS, KITTY_PUBLIC_KEY_VERSION,
-    MAX_BYPASS_WIRE_BYTES,
+    TransferBypassKeypair, BYPASS_TIMESTAMP_WINDOW_NS, KITTY_PUBLIC_KEY_ENV,
+    KITTY_PUBLIC_KEY_VERSION, MAX_BYPASS_WIRE_BYTES,
 };
 pub use upgrade::{execute_upgrade, receive_upgrade, UpgradeError};
 pub use upgrade::{UpdateError, UpdateInfo, Updater, UpgradeState};

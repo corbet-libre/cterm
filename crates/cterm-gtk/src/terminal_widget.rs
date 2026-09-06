@@ -9,7 +9,8 @@ use std::time::{Duration, Instant};
 
 use gtk4::prelude::*;
 use gtk4::{
-    gdk, gio, glib, pango, DrawingArea, EventControllerKey, EventControllerScroll, GestureClick,
+    gdk, gio, glib, pango, DragSource, DrawingArea, EventControllerKey, EventControllerScroll,
+    GestureClick,
 };
 use parking_lot::Mutex;
 
@@ -126,10 +127,22 @@ pub struct TerminalWidget {
     /// Shared Kitty OSC 72 state used by PTY and GTK drop callbacks.
     dnd_destination: Rc<RefCell<DndDestination>>,
     /// Shared Kitty OSC 72 source-side state for outbound drags. Command
-    /// routing lives here; the native `GtkDragSource` session that consumes
-    /// `BeginOsDrag` is still open (gesture arbitration with text selection
-    /// is unresolved — see `notify_source_gesture`).
+    /// routing lives here; the live `GtkDragSource` session that consumes
+    /// `BeginOsDrag` is built in `apply_dnd_source_actions` (see the
+    /// gesture-arbitration policy on [`SOURCE_DRAG_THRESHOLD_PX`]).
     dnd_source: Rc<RefCell<DndSource>>,
+    /// Live outbound-drag `GtkDragSource`, if one is attached. Created upfront
+    /// in `setup_source_drag` and configured from each negotiated
+    /// [`OsDragOffer`] on `BeginOsDrag`; torn down on `CancelOsDrag`/drag-end.
+    /// The actual OS drag start still needs a compositor (see
+    /// `apply_dnd_source_actions`).
+    dnd_drag_session: Rc<RefCell<Option<DragSource>>>,
+    /// Left-press anchor (widget pixels) for source-gesture arbitration. Set
+    /// on primary-button press, cleared on release; motion past
+    /// [`SOURCE_DRAG_THRESHOLD_PX`] while an application is armed emits the
+    /// `t=o` gesture. Selection proceeds regardless (Kitty-faithful
+    /// coexistence — see `should_emit_source_gesture`).
+    source_gesture_anchor: Rc<RefCell<Option<(f64, f64)>>>,
     /// Command channel for daemon I/O — None for local PTY sessions
     daemon_cmd_tx: Option<tokio::sync::mpsc::UnboundedSender<DaemonCommand>>,
 }
@@ -1112,9 +1125,14 @@ impl TerminalWidget {
         let drawing_area_click = self.drawing_area.clone();
         let selecting_pressed = Rc::clone(&selecting);
         let pressed_button_click = Rc::clone(&pressed_button);
+        let source_anchor_pressed = Rc::clone(&self.source_gesture_anchor);
 
         click_controller.connect_pressed(move |gesture, n_press, x, y| {
             drawing_area_click.grab_focus();
+            // Record the press anchor for source-gesture arbitration (Kitty
+            // `initial_left_press`; see `notify_source_gesture`). One-shot:
+            // cleared on release or once the threshold emits.
+            *source_anchor_pressed.borrow_mut() = Some((x, y));
 
             let dims = cell_dims_click.borrow();
             let col = (x / dims.width).floor() as usize;
@@ -1184,8 +1202,16 @@ impl TerminalWidget {
         let drawing_area_released = self.drawing_area.clone();
         let selecting_released = Rc::clone(&selecting);
         let pressed_button_released = Rc::clone(&pressed_button);
+        let source_anchor_released = Rc::clone(&self.source_gesture_anchor);
+        let dnd_source_released = Rc::clone(&self.dnd_source);
 
         click_controller.connect_released(move |gesture, _n_press, x, y| {
+            // The press gesture is over: clear the arbitration anchor and
+            // retire a gesture that never started a drag (Kitty clears
+            // `initial_left_press` on release; `gesture_ended` is a no-op
+            // past `GestureSent`).
+            *source_anchor_released.borrow_mut() = None;
+            dnd_source_released.borrow_mut().gesture_ended();
             // If this press was forwarded to a mouse-tracking app, report the release
             // and skip the selection-finalize path.
             let reported_button = pressed_button_released.borrow_mut().take();
@@ -1428,8 +1454,38 @@ impl TerminalWidget {
         let selecting_motion = Rc::clone(&selecting);
         let last_position_motion = Rc::clone(&last_position);
         let pressed_button_motion = Rc::clone(&pressed_button);
+        let source_anchor_motion = Rc::clone(&self.source_gesture_anchor);
+        let dnd_source_motion = Rc::clone(&self.dnd_source);
+        let dnd_session_motion = Rc::clone(&self.dnd_drag_session);
+        let cell_dims_gesture = Rc::clone(&self.cell_dims);
 
         motion_controller.connect_motion(move |controller, x, y| {
+            // Source-gesture arbitration (Kitty-faithful coexistence): if an
+            // application is armed and the pointer travelled past
+            // `SOURCE_DRAG_THRESHOLD_PX` since the primary press, emit `t=o`
+            // once and keep going — selection below still extends. Runs
+            // before (and regardless of) mouse-tracking forwarding, like
+            // Kitty's post-handling threshold check in `handle_move_event`.
+            {
+                let armed = dnd_source_motion.borrow().is_armed();
+                let anchor = *source_anchor_motion.borrow();
+                if should_emit_source_gesture(armed, anchor, (x, y)) {
+                    *source_anchor_motion.borrow_mut() = None;
+                    let location = gtk_dnd_location(x, y, *cell_dims_gesture.borrow());
+                    let actions = dnd_source_motion.borrow_mut().user_gesture(location);
+                    let mut term = terminal_motion.lock();
+                    apply_dnd_source_actions(
+                        &mut term,
+                        &dnd_source_motion,
+                        &drawing_area_motion,
+                        &dnd_session_motion,
+                        actions,
+                    );
+                    drop(term);
+                    drawing_area_motion.queue_draw();
+                    // Fall through: selection still extends below.
+                }
+            }
             let dims = cell_dims_motion.borrow();
             let col = (x / dims.width).floor() as usize;
             let row = (y / dims.height).floor() as usize;
@@ -1617,19 +1673,244 @@ impl TerminalWidget {
 
     /// Report a user drag-start gesture to the source-side negotiation.
     ///
-    /// This is the entry point for a future drag-gesture controller: it emits
-    /// the `t=o` location event the application needs before offering MIME
-    /// types. It is intentionally not connected yet — left-button drags own
-    /// text selection today, so arbitrating a drag-start gesture (modifier,
-    /// empty-selection threshold, or app-driven region) needs a product
-    /// decision first. Gestures while no application is armed are ignored.
+    /// Gesture-vs-selection arbitration policy (Kitty-faithful, verified
+    /// against Kitty 0.48.2):
+    ///
+    /// - Kitty records every left press (`kitty/mouse.c:879-881`,
+    ///   `initial_left_press`) and, on motion, sends the `t=o` gesture once
+    ///   the pointer travels past `drag_threshold` (default 5 px,
+    ///   `kitty/options/types.py:584`) *while an application is armed*
+    ///   (`can_offer`, `kitty/mouse.c:677-686`). Selection proceeds
+    ///   regardless: the two coexist, with small movements staying
+    ///   selection-only and larger armed movements emitting `t=o` in
+    ///   addition. The protocol itself mandates no particular gesture
+    ///   (`docs/dnd-protocol.rst`: "typically holding the left mouse button
+    ///   down and dragging a short distance, but this protocol does not
+    ///   mandate any particular gesture").
+    /// - This frontend mirrors that: the primary-button press records a
+    ///   pixel anchor (see `setup_input`); motion past
+    ///   [`SOURCE_DRAG_THRESHOLD_PX`] while [`DndSource::is_armed`] emits
+    ///   the gesture via [`should_emit_source_gesture`]. Text selection is
+    ///   never suppressed for the drag — both proceed, exactly like Kitty.
+    ///   Unarmed gestures belong to selection (or mouse tracking) only.
+    /// - Shift bypasses mouse tracking into selection, matching the
+    ///   existing click/motion paths; the threshold check still runs, so a
+    ///   Shift-drag past threshold while armed also emits `t=o`.
+    ///
+    /// Gestures while no application is armed are ignored.
+    /// The live OS session for the resulting offer is built in
+    /// `apply_dnd_source_actions` (`BeginOsDrag` arm); remote (`t=k`) reads
+    /// surface a consent prompt ([`TerminalWidget::prompt_dnd_remote_read`]).
+    ///
+    /// The motion controller in `setup_input` inlines this same body (it
+    /// cannot borrow `self`); keep the two in sync.
     #[allow(dead_code)]
     fn notify_source_gesture(&self, x: f64, y: f64) {
         let location = gtk_dnd_location(x, y, *self.cell_dims.borrow());
         let actions = self.dnd_source.borrow_mut().user_gesture(location);
         let source = Rc::clone(&self.dnd_source);
+        let drawing_area = self.drawing_area.clone();
+        let drag_session = Rc::clone(&self.dnd_drag_session);
         let mut terminal = self.terminal.lock();
-        apply_dnd_source_actions(&mut terminal, &source, actions);
+        apply_dnd_source_actions(
+            &mut terminal,
+            &source,
+            &drawing_area,
+            &drag_session,
+            actions,
+        );
+    }
+
+    /// Attach the upfront `GtkDragSource` controller for outbound drags.
+    ///
+    /// The controller is armed with the broad `COPY|MOVE` mask; each
+    /// negotiated [`OsDragOffer`] narrows it via `set_actions` in the
+    /// `BeginOsDrag` arm of `apply_dnd_source_actions`. `prepare` serves the
+    /// currently presented offer bytes (see [`build_source_content`]) so OS
+    /// drop targets never trigger a PTY round trip. `drag-begin` confirms
+    /// the session to the application (`os_drag_started` → `t=E;OK`);
+    /// `drag-end`/`drag-cancel` report finish/abort. Creating the controller
+    /// is headless-safe (plain GObject init); starting a real OS drag needs
+    /// a compositor — see `apply_dnd_source_actions` (`BeginOsDrag` arm) for
+    /// the headless-vs-compositor split.
+    fn setup_source_drag(&self) {
+        let source = Rc::clone(&self.dnd_source);
+        let terminal = Arc::clone(&self.terminal);
+        let drag_source = DragSource::new();
+        drag_source.set_actions(gdk::DragAction::COPY | gdk::DragAction::MOVE);
+        let source_for_prepare = Rc::clone(&source);
+        drag_source.connect_prepare(move |_, _, _| {
+            let offer = {
+                let borrowed = source_for_prepare.borrow();
+                OsDragOffer {
+                    mime_types: borrowed.offered_mimes().to_vec(),
+                    operation: borrowed.offered_operation(),
+                    location: DndLocation::default(),
+                    has_image: false,
+                }
+            };
+            build_source_content(&offer, &source_for_prepare.borrow())
+        });
+        let source_for_begin = Rc::clone(&source);
+        let terminal_for_begin = Arc::clone(&terminal);
+        drag_source.connect_drag_begin(move |_, _| {
+            // The OS took over the gesture: confirm to the application. This
+            // is idempotent (`os_drag_started` is a no-op outside `Offered`),
+            // so the explicit confirm in the `BeginOsDrag` arm cannot
+            // double-answer.
+            let actions = source_for_begin.borrow_mut().os_drag_started();
+            let mut term = terminal_for_begin.lock();
+            for action in actions {
+                if let DndSourceAction::Write(frame) = action {
+                    let _ = term.write(&frame);
+                }
+            }
+        });
+        let source_for_end = Rc::clone(&source);
+        let terminal_for_end = Arc::clone(&terminal);
+        let session_for_end = Rc::clone(&self.dnd_drag_session);
+        drag_source.connect_drag_end(move |_, _, delete_data| {
+            // `delete_data` is the GTK move-completion hint; the Kitty
+            // `x=2:o=` action hint already flowed via progress events, so the
+            // finish frame only records canceled vs completed.
+            let canceled = false;
+            let _ = delete_data;
+            let actions = source_for_end.borrow_mut().os_finished(canceled);
+            let mut term = terminal_for_end.lock();
+            // Tear down the holder first so a re-entrant offer cannot observe
+            // a stale controller.
+            *session_for_end.borrow_mut() = None;
+            for action in actions {
+                if let DndSourceAction::Write(frame) = action {
+                    let _ = term.write(&frame);
+                }
+            }
+        });
+        let source_for_cancel = Rc::clone(&source);
+        let terminal_for_cancel = Arc::clone(&terminal);
+        let session_for_cancel = Rc::clone(&self.dnd_drag_session);
+        drag_source.connect_drag_cancel(move |_, _, _| {
+            let actions = source_for_cancel.borrow_mut().os_abort("ECANCELED");
+            let mut term = terminal_for_cancel.lock();
+            *session_for_cancel.borrow_mut() = None;
+            for action in actions {
+                if let DndSourceAction::Write(frame) = action {
+                    let _ = term.write(&frame);
+                }
+            }
+            true
+        });
+        self.drawing_area.add_controller(drag_source.clone());
+        *self.dnd_drag_session.borrow_mut() = Some(drag_source);
+    }
+
+    /// Build the live drag session for one negotiated [`OsDragOffer`].
+    ///
+    /// Deny-by-default consent prompt for a remote (`t=k`) entry read.
+    ///
+    /// Reuses the OSC 5522 clipboard adapter's dialog semantics
+    /// ([`TerminalWidget::prompt_rich_clipboard_read`]): modal question,
+    /// `Allow once` / `Always allow` / `Deny` with `Deny` as the default,
+    /// exact-token display, fully asynchronous `connect_response` (safe on
+    /// the main thread where the mirror runs). Scope differences are stated
+    /// in the body: the opt-in is surface-scoped (this `DndSource` only,
+    /// survives individual drags like the clipboard's remembered token,
+    /// clears with the surface), gated to remote reads (same-machine drags
+    /// never prompt), and expires with the drag (no timer: the token becomes
+    /// a no-op once the drag finishes/aborts, and window-close counts as
+    /// `Deny`). Cancellation (close button, Escape, drag abort while open)
+    /// denies the exact token.
+    ///
+    /// Needs a compositor/display for the dialog; headless callers (and a
+    /// missing root window) fail closed via `deny`. Covered headless: body
+    /// text + choice resolution (see `kitty_dnd_remote_prompt_*` tests).
+    /// Needs compositor smoke: real dialog interaction for each button plus
+    /// cancel-while-drag-aborts.
+    fn prompt_dnd_remote_read(
+        drawing_area: &DrawingArea,
+        terminal: &Arc<Mutex<Terminal>>,
+        source: &Rc<RefCell<DndSource>>,
+        request: cterm_app::kitty_dnd_source::RemoteReadApprovalRequest,
+    ) {
+        use gtk4::{ButtonsType, DialogFlags, MessageDialog, MessageType, ResponseType};
+
+        let Some(window) = drawing_area.root().and_downcast::<gtk4::Window>() else {
+            log::info!(
+                "Denying Kitty DND remote read (no parent window for consent prompt): entry={:?}",
+                request.entry
+            );
+            let denied = source.borrow_mut().deny(request.request_id);
+            let mut term = terminal.lock();
+            // Route the denial writes directly; no session/dialog side
+            // effects apply on this path.
+            for action in denied {
+                if let DndSourceAction::Write(frame) = action {
+                    let _ = term.write(&frame);
+                }
+            }
+            return;
+        };
+        let (title, body) = dnd_remote_prompt_texts(&request);
+        let dialog = MessageDialog::new(
+            Some(&window),
+            DialogFlags::MODAL,
+            MessageType::Question,
+            ButtonsType::None,
+            &title,
+        );
+        dialog.format_secondary_text(Some(&body));
+        dialog.add_button("Allow once", ResponseType::Other(DND_REMOTE_ALLOW_ONCE));
+        dialog.add_button("Always allow", ResponseType::Other(DND_REMOTE_ALLOW_ALWAYS));
+        dialog.add_button("Deny", ResponseType::Other(DND_REMOTE_DENY));
+        dialog.set_default_response(ResponseType::Other(DND_REMOTE_DENY));
+        let terminal = Arc::clone(terminal);
+        let source = Rc::clone(source);
+        let pending = Rc::new(RefCell::new(Some(request)));
+        dialog.connect_response(move |dialog, response| {
+            dialog.close();
+            let Some(request) = pending.borrow_mut().take() else {
+                return;
+            };
+            let choice = match response {
+                ResponseType::Other(choice) => choice,
+                _ => DND_REMOTE_DENY,
+            };
+            match resolve_dnd_remote_choice(choice) {
+                DndRemotePromptOutcome::AllowOnce => {
+                    let approved = source.borrow_mut().approve(request.request_id);
+                    let mut term = terminal.lock();
+                    for action in approved {
+                        if let DndSourceAction::Write(frame) = action {
+                            let _ = term.write(&frame);
+                        }
+                    }
+                }
+                DndRemotePromptOutcome::AllowAlways => {
+                    source.borrow_mut().set_allow_remote_reads(true);
+                    log::info!(
+                        "Kitty DND remote reads always-allowed for this surface (request {})",
+                        request.request_id
+                    );
+                    let approved = source.borrow_mut().approve(request.request_id);
+                    let mut term = terminal.lock();
+                    for action in approved {
+                        if let DndSourceAction::Write(frame) = action {
+                            let _ = term.write(&frame);
+                        }
+                    }
+                }
+                DndRemotePromptOutcome::Deny => {
+                    let denied = source.borrow_mut().deny(request.request_id);
+                    let mut term = terminal.lock();
+                    for action in denied {
+                        if let DndSourceAction::Write(frame) = action {
+                            let _ = term.write(&frame);
+                        }
+                    }
+                }
+            }
+        });
+        dialog.show();
     }
 
     /// Set up file drag-and-drop
@@ -1878,6 +2159,8 @@ impl TerminalWidget {
             visual_bell_flash: Rc::new(RefCell::new(None)),
             dnd_destination: Rc::new(RefCell::new(DndDestination::default())),
             dnd_source: Rc::new(RefCell::new(DndSource::default())),
+            dnd_drag_session: Rc::new(RefCell::new(None)),
+            source_gesture_anchor: Rc::new(RefCell::new(None)),
             daemon_cmd_tx: Some(cmd_tx.clone()),
         };
 
@@ -1887,6 +2170,7 @@ impl TerminalWidget {
         widget.setup_visibility_reporting();
         widget.setup_input();
         widget.setup_drop();
+        widget.setup_source_drag();
         widget.setup_daemon_reader(
             sid,
             cmd_rx,
@@ -1977,6 +2261,8 @@ impl TerminalWidget {
             visual_bell_flash: Rc::new(RefCell::new(None)),
             dnd_destination: Rc::new(RefCell::new(DndDestination::default())),
             dnd_source: Rc::new(RefCell::new(DndSource::default())),
+            dnd_drag_session: Rc::new(RefCell::new(None)),
+            source_gesture_anchor: Rc::new(RefCell::new(None)),
             daemon_cmd_tx: Some(cmd_tx.clone()),
         };
 
@@ -1986,6 +2272,7 @@ impl TerminalWidget {
         widget.setup_visibility_reporting();
         widget.setup_input();
         widget.setup_drop();
+        widget.setup_source_drag();
         widget.setup_daemon_reader(
             sid,
             cmd_rx,
@@ -2384,6 +2671,7 @@ impl TerminalWidget {
         let on_file_transfer = Rc::clone(&self.on_file_transfer);
         let dnd_destination = Rc::clone(&self.dnd_destination);
         let dnd_source = Rc::clone(&self.dnd_source);
+        let dnd_drag_session = Rc::clone(&self.dnd_drag_session);
         let blink_clock = Rc::clone(&self.blink_clock);
         let blink_started = self.blink_started;
         glib::timeout_add_local(Duration::from_millis(10), move || {
@@ -2400,6 +2688,11 @@ impl TerminalWidget {
                         // terminal for occasion filtering and PTY reports.
                         let mut deferred_rich = Vec::new();
                         let mut deferred_notifications = Vec::new();
+                        // Remote-read approvals need the terminal `Arc` for
+                        // the async dialog callback, but the lock is held
+                        // across this loop — defer them past `drop(term)`,
+                        // like the rich-clipboard path.
+                        let mut deferred_dnd_approvals = Vec::new();
 
                         for event in events {
                             match event {
@@ -2469,11 +2762,30 @@ impl TerminalWidget {
                                         | DndCommandType::UriListData => {
                                             let actions =
                                                 dnd_source.borrow_mut().handle_command(command);
+                                            // Approvals need the `Arc` dialog
+                                            // path past the lock; everything
+                                            // else routes synchronously here.
+                                            let (approvals, rest): (Vec<_>, Vec<_>) =
+                                                actions.into_iter().partition(|action| {
+                                                    matches!(
+                                                        action,
+                                                        DndSourceAction::RequestApproval(_)
+                                                    )
+                                                });
                                             apply_dnd_source_actions(
                                                 &mut term,
                                                 &dnd_source,
-                                                actions,
+                                                &drawing_area,
+                                                &dnd_drag_session,
+                                                rest,
                                             );
+                                            for action in approvals {
+                                                if let DndSourceAction::RequestApproval(request) =
+                                                    action
+                                                {
+                                                    deferred_dnd_approvals.push(request);
+                                                }
+                                            }
                                         }
                                         _ => {
                                             let actions = dnd_destination
@@ -2500,6 +2812,15 @@ impl TerminalWidget {
 
                         for op in deferred_rich {
                             Self::handle_rich_clipboard_request(&terminal_main, &drawing_area, op);
+                        }
+
+                        for request in deferred_dnd_approvals {
+                            Self::prompt_dnd_remote_read(
+                                &drawing_area,
+                                &terminal_main,
+                                &dnd_source,
+                                request,
+                            );
                         }
 
                         for notification in &deferred_notifications {
@@ -2625,9 +2946,111 @@ fn apply_dnd_actions(terminal: &mut Terminal, actions: Vec<DndAdapterAction>) {
     }
 }
 
+/// Pixel distance past which a primary-button motion becomes a drag-source
+/// gesture while an application is armed. Mirrors Kitty's `drag_threshold`
+/// default (5 px, `kitty/options/types.py:584`); the motion path in
+/// `kitty/mouse.c:677-686` sends `t=o` once
+/// `distance(initial_left_press, mouse_pos) > drag_threshold` while
+/// `can_offer` holds. `docs/dnd-protocol.rst` leaves the gesture
+/// platform-specific ("typically holding the left mouse button down and
+/// dragging a short distance"), so matching the 5 px default is the
+/// Kitty-faithful choice.
+pub(crate) const SOURCE_DRAG_THRESHOLD_PX: f64 = 5.0;
+
+/// Euclidean pixel distance between a press anchor and the current pointer.
+pub(crate) fn source_gesture_distance(anchor: (f64, f64), current: (f64, f64)) -> f64 {
+    let dx = current.0 - anchor.0;
+    let dy = current.1 - anchor.1;
+    dx.hypot(dy)
+}
+
+/// Whether a motion event should emit the source-side `t=o` gesture.
+///
+/// Kitty-faithful arbitration: emit exactly once per press when the
+/// application is armed **and** the pointer travelled past
+/// [`SOURCE_DRAG_THRESHOLD_PX`]. Selection is never suppressed — the caller
+/// keeps extending it; the gesture is emitted *in addition* (see
+/// `TerminalWidget::notify_source_gesture`). Unarmed, anchored-less, or
+/// below-threshold motions return `false` and belong to selection (or mouse
+/// tracking) only. Compositor-free: pure arithmetic over the recorded anchor.
+pub(crate) fn should_emit_source_gesture(
+    armed: bool,
+    anchor: Option<(f64, f64)>,
+    current: (f64, f64),
+) -> bool {
+    if !armed {
+        return false;
+    }
+    let Some(anchor) = anchor else {
+        return false;
+    };
+    if !anchor.0.is_finite()
+        || !anchor.1.is_finite()
+        || !current.0.is_finite()
+        || !current.1.is_finite()
+    {
+        return false;
+    }
+    source_gesture_distance(anchor, current) > SOURCE_DRAG_THRESHOLD_PX
+}
+
+/// Map a negotiated source operation to the GTK action mask for the live
+/// `GtkDragSource` session. `Either` offers both so the drop target picks;
+/// the terminal only *reports* the pick (`t=e:x=2:o=`) and never deletes
+/// local data. Compositor-free.
+pub(crate) fn source_drag_gdk_actions(operation: DndOperation) -> gdk::DragAction {
+    gtk_accepted_operation(operation)
+}
+
+/// Button ids for the remote-read consent prompt. They mirror the clipboard
+/// adapter's `ALLOW_ONCE`/`ALLOW_ALWAYS`/`DENY` numbering so reviewers can
+/// compare the two dialogs side by side.
+pub(crate) const DND_REMOTE_ALLOW_ONCE: u16 = 0;
+pub(crate) const DND_REMOTE_ALLOW_ALWAYS: u16 = 1;
+pub(crate) const DND_REMOTE_DENY: u16 = 2;
+
+/// Outcome of the remote-read consent prompt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DndRemotePromptOutcome {
+    AllowOnce,
+    AllowAlways,
+    Deny,
+}
+
+/// Resolve a dialog button (or window-close) to a prompt outcome.
+/// Anything but the two allow buttons — including close/Escape — denies
+/// fail-closed, exactly like the clipboard adapter. Compositor-free.
+pub(crate) fn resolve_dnd_remote_choice(choice: u16) -> DndRemotePromptOutcome {
+    match choice {
+        DND_REMOTE_ALLOW_ONCE => DndRemotePromptOutcome::AllowOnce,
+        DND_REMOTE_ALLOW_ALWAYS => DndRemotePromptOutcome::AllowAlways,
+        _ => DndRemotePromptOutcome::Deny,
+    }
+}
+
+/// Title + body for the remote-read consent prompt.
+///
+/// Shows the exact token (`request_id`), the entry reference, the
+/// surface-scoped `Always allow` meaning, and the drag-lifecycle expiry.
+/// No file bytes are shown (they arrive only after approval). Compositor-free.
+pub(crate) fn dnd_remote_prompt_texts(
+    request: &cterm_app::kitty_dnd_source::RemoteReadApprovalRequest,
+) -> (String, String) {
+    let title = "Allow remote file read?".to_string();
+    let body = format!(
+        "A terminal application wants to read a remote file entry (entry {}, part {} of {}, request #{}).\n\n\
+        \"Allow once\" reads exactly this entry. \"Always allow\" remembers remote reads for this terminal surface only (same-machine drags never prompt); it clears when the surface closes.\n\n\
+        The approval expires when the drag finishes or is cancelled; closing this dialog denies the read.",
+        request.entry.entry, request.entry.num, request.entry.parent, request.request_id
+    );
+    (title, body)
+}
+
 fn apply_dnd_source_actions(
     terminal: &mut Terminal,
     source: &Rc<RefCell<DndSource>>,
+    drawing_area: &DrawingArea,
+    drag_session: &Rc<RefCell<Option<DragSource>>>,
     actions: Vec<DndSourceAction>,
 ) {
     for action in actions {
@@ -2639,34 +3062,86 @@ fn apply_dnd_source_actions(
                 }
             }
             DndSourceAction::BeginOsDrag(offer) => {
-                // No native `GtkDragSource` session exists yet (see
-                // `notify_source_gesture`), so claiming `OK` would lie to the
-                // application. Validate that the offer is servable, then fail
-                // closed; the application keeps its registration and may
-                // retry once a session lands.
-                let servable = build_source_content(&offer, &source.borrow()).is_some();
-                log::info!(
-                    "Kitty DND source drag not started (no native session; servable={servable})"
-                );
-                let failed = source.borrow_mut().os_drag_failed("ENOSYS");
-                apply_dnd_source_actions(terminal, source, failed);
+                // Build the live session from the negotiated offer. The
+                // session serves pre-sent bytes and narrows the action mask;
+                // `drag-begin` confirms to the app. Unservable offers fail
+                // closed so the application keeps its registration.
+                let gdk_actions = source_drag_gdk_actions(offer.operation);
+                let content = build_source_content(&offer, &source.borrow());
+                match (gdk_actions.is_empty(), content) {
+                    (false, Some(content)) => {
+                        if let Some(session) = drag_session.borrow().as_ref() {
+                            session.set_actions(gdk_actions);
+                            session.set_content(Some(&content));
+                            log::info!(
+                                "Kitty DND source session live: actions={gdk_actions:?} mimes={:?}",
+                                offer.mime_types
+                            );
+                            let confirm = source.borrow_mut().os_drag_started();
+                            // Recurse for the confirm writes only; the
+                            // confirm never emits another `BeginOsDrag`.
+                            apply_dnd_source_actions(
+                                terminal,
+                                source,
+                                drawing_area,
+                                drag_session,
+                                confirm,
+                            );
+                        } else {
+                            log::warn!(
+                                "Kitty DND source drag requested with no DragSource attached"
+                            );
+                            let failed = source.borrow_mut().os_drag_failed("ENOSYS");
+                            apply_dnd_source_actions(
+                                terminal,
+                                source,
+                                drawing_area,
+                                drag_session,
+                                failed,
+                            );
+                        }
+                    }
+                    _ => {
+                        log::info!(
+                            "Kitty DND source drag not servable (mimes={:?}); failing closed",
+                            offer.mime_types
+                        );
+                        let failed = source.borrow_mut().os_drag_failed("ENOSYS");
+                        apply_dnd_source_actions(
+                            terminal,
+                            source,
+                            drawing_area,
+                            drag_session,
+                            failed,
+                        );
+                    }
+                }
             }
             DndSourceAction::CancelOsDrag => {
-                log::debug!("Kitty DND source drag cancelled; no native session to tear down");
+                if let Some(session) = drag_session.borrow_mut().take() {
+                    drawing_area.remove_controller(&session);
+                }
+                log::debug!("Kitty DND source drag cancelled; native session torn down");
             }
             DndSourceAction::OsDataReady { .. } | DndSourceAction::OsDataFailed { .. } => {
-                log::debug!("Kitty DND source data update dropped (no native session)");
+                // Pre-sent bytes are already served via the `ContentProvider`;
+                // on-demand `t=e:x=5` round trips complete through the same
+                // provider on the next `prepare`. Nothing to push to the OS
+                // synchronously here.
+                log::debug!("Kitty DND source data update absorbed (served via ContentProvider)");
             }
             DndSourceAction::RequestApproval(request) => {
-                // Fail closed: without a native consent prompt the terminal
-                // must not pull remote entry bytes over the PTY. Denying
-                // aborts the drag with `t=E;EPERM`.
+                // The live `DndCommand` path defers these to
+                // `prompt_dnd_remote_read` after dropping the terminal lock
+                // (see `setup_daemon_reader`). Direct callers (headless tests,
+                // synthetic lists) fail closed here so a missing prompt can
+                // never authorize a read.
                 log::info!(
-                    "Denying Kitty DND remote read (no consent prompt): entry={:?}",
+                    "Denying Kitty DND remote read (no consent prompt on this path): entry={:?}",
                     request.entry
                 );
                 let denied = source.borrow_mut().deny(request.request_id);
-                apply_dnd_source_actions(terminal, source, denied);
+                apply_dnd_source_actions(terminal, source, drawing_area, drag_session, denied);
             }
         }
     }
@@ -3811,7 +4286,117 @@ mod tests {
             gtk_accepted_operation(DndOperation::Move),
             gdk::DragAction::MOVE
         );
+        assert_eq!(
+            gtk_accepted_operation(DndOperation::Either),
+            gdk::DragAction::COPY | gdk::DragAction::MOVE
+        );
         assert!(gtk_accepted_operation(DndOperation::None).is_empty());
+    }
+
+    /// Headless: the live session maps the negotiated operation to the GTK
+    /// mask (`Either` offers both so the target picks; the terminal only
+    /// reports the pick and never deletes data).
+    #[test]
+    fn kitty_dnd_source_session_maps_negotiated_operation() {
+        assert_eq!(
+            source_drag_gdk_actions(DndOperation::Copy),
+            gdk::DragAction::COPY
+        );
+        assert_eq!(
+            source_drag_gdk_actions(DndOperation::Move),
+            gdk::DragAction::MOVE
+        );
+        assert_eq!(
+            source_drag_gdk_actions(DndOperation::Either),
+            gdk::DragAction::COPY | gdk::DragAction::MOVE
+        );
+        assert!(source_drag_gdk_actions(DndOperation::None).is_empty());
+    }
+
+    /// Headless: Kitty-faithful gesture arbitration. Armed + past-threshold
+    /// emits; unarmed, anchor-less, below-threshold, and non-finite inputs
+    /// stay selection-only. Selection itself is never suppressed by this
+    /// function (the caller keeps extending it).
+    #[test]
+    fn kitty_dnd_source_gesture_arbitration_is_thresholded_and_armed() {
+        let anchor = Some((10.0, 10.0));
+        // Past the 5 px default: emits when armed.
+        assert!(should_emit_source_gesture(true, anchor, (16.0, 10.0)));
+        assert!(should_emit_source_gesture(true, anchor, (10.0, 16.0)));
+        // Below/at threshold: selection-only.
+        assert!(!should_emit_source_gesture(true, anchor, (12.0, 10.0)));
+        assert!(!should_emit_source_gesture(true, anchor, (10.0, 10.0)));
+        // Unarmed or anchor-less: never emits, however far the pointer went.
+        assert!(!should_emit_source_gesture(false, anchor, (100.0, 100.0)));
+        assert!(!should_emit_source_gesture(true, None, (100.0, 100.0)));
+        // Non-finite coordinates fail closed.
+        assert!(!should_emit_source_gesture(true, anchor, (f64::NAN, 10.0)));
+        assert!(!should_emit_source_gesture(
+            true,
+            Some((f64::INFINITY, 10.0)),
+            (100.0, 100.0)
+        ));
+        // Distance helper is Euclidean.
+        assert!((source_gesture_distance((0.0, 0.0), (3.0, 4.0)) - 5.0).abs() < 1e-9);
+        assert_eq!(SOURCE_DRAG_THRESHOLD_PX, 5.0);
+    }
+
+    /// Headless: the remote-read prompt reuses the clipboard adapter's
+    /// semantics — exact-token display, surface scope, drag-lifecycle expiry —
+    /// and fail-closed choice resolution (anything but the two allows denies).
+    #[test]
+    fn kitty_dnd_remote_prompt_body_and_choice() {
+        use cterm_app::kitty_dnd_source::{RemoteEntryRef, RemoteReadApprovalRequest};
+
+        let request = RemoteReadApprovalRequest {
+            request_id: 42,
+            entry: RemoteEntryRef {
+                entry: 3,
+                num: 1,
+                parent: 0,
+            },
+            client_id: 7,
+        };
+        let (title, body) = dnd_remote_prompt_texts(&request);
+        assert_eq!(title, "Allow remote file read?");
+        // Exact-token display: the request id must appear so the user can
+        // correlate the dialog with logs.
+        assert!(
+            body.contains("42"),
+            "body must show the exact token: {body}"
+        );
+        assert!(body.contains("entry 3"), "body must show the entry: {body}");
+        assert!(
+            body.contains("Always allow"),
+            "body must state the surface-scoped opt-in: {body}"
+        );
+        assert!(
+            body.contains("same-machine") || body.contains("Same-machine"),
+            "body must note same-machine drags never prompt: {body}"
+        );
+        assert!(
+            body.contains("expires") || body.contains("Expires"),
+            "body must state drag-lifecycle expiry: {body}"
+        );
+        assert!(
+            body.contains("denies") || body.contains("Denies") || body.contains("Deny"),
+            "body must state close-means-deny: {body}"
+        );
+        assert_eq!(
+            resolve_dnd_remote_choice(DND_REMOTE_ALLOW_ONCE),
+            DndRemotePromptOutcome::AllowOnce
+        );
+        assert_eq!(
+            resolve_dnd_remote_choice(DND_REMOTE_ALLOW_ALWAYS),
+            DndRemotePromptOutcome::AllowAlways
+        );
+        assert_eq!(
+            resolve_dnd_remote_choice(DND_REMOTE_DENY),
+            DndRemotePromptOutcome::Deny
+        );
+        // Window-close/Escape and unknown buttons deny fail-closed, like the
+        // clipboard adapter's `ResponseType::Other` fallback.
+        assert_eq!(resolve_dnd_remote_choice(99), DndRemotePromptOutcome::Deny);
     }
 
     #[test]

@@ -21,6 +21,33 @@ is omitted for readability.
   (Allow once / Always allow with exact-token storage / Deny, exact-token
   display, 120 s frontend-local expiry, lifecycle cancellation through the
   existing consent seams).
+- Daemon transfer-consent integration with defaults unchanged (still
+  always-prompt out of the box; no policy decided): the operator `[transfer]`
+  config plus one process-lifetime bypass keypair are plumbed from daemon
+  startup into every session's transfer worker, `evaluate_transfer_bypass_with_policy`
+  is consulted at session start before any prompt publishes (`Allow`
+  auto-approves and `Deny` hard-refuses through the same manager calls a
+  dialog decision uses, so PTY bytes match a clicked Allow/Deny; `Prompt`
+  keeps today's path byte-identical), and `KITTY_PUBLIC_KEY` is advertised to
+  every local PTY child exactly as Kitty does (per-process key,
+  `kitty/boss.py:425`; env set for every child, `kitty/child.py:385`;
+  client-supplied values overwritten; private half held in daemon memory
+  only, never written to disk, rotating each restart with stale values
+  failing closed to prompt). Headless regression tests pin allow/deny/ask,
+  keypair generation + advertisement, and wrong-password-still-prompts.
+- Live GTK drag-source sessions from the negotiated OSC 72 offer: the
+  `GtkDragSource` serves pre-sent bytes via `ContentProvider` with the
+  negotiated copy/move/either operation mapped to the matching `GdkDragAction`
+  mask (`drag-begin` confirms `t=E;OK`, `drag-end`/`drag-cancel` report
+  finish/abort), the gesture arbitrates Kitty-faithfully (left-press pixel
+  anchor, `t=o` emitted once past 5 px while armed — `kitty/mouse.c:677-686`,
+  `drag_threshold` default 5 — with text selection proceeding regardless),
+  and remote (`t=k`) reads surface the clipboard adapter's consent semantics
+  (modal Allow once / Always allow surface-scoped / Deny-default with
+  exact-token display, drag-lifecycle expiry, and close-means-deny).
+  Headless unit tests cover action mapping, arbitration, content selection,
+  and prompt plumbing; real drag takeover, drop delivery, and dialog
+  interaction still need the Wayland compositor smoke.
 - Kitty-precursor alignment fixes, verified against Kitty 0.48.2 sources:
   OSC 5522 malformed reads silently ignored with a log and no reply
   (EINVAL stays write-side only); drag-source `t=k` exact-token approval
