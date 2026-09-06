@@ -3,19 +3,18 @@
 mod support;
 
 use std::hint::black_box;
-use std::time::Duration;
 
 use criterion::{criterion_group, criterion_main, BatchSize, Criterion, Throughput};
 
-use support::{corpus, terminal};
+use support::{corpus, terminal, timing};
 
 fn parse_workload(c: &mut Criterion, name: &str, data: Vec<u8>) {
     let mut group = c.benchmark_group(format!("parser/{name}"));
     group
         .throughput(Throughput::Bytes(data.len() as u64))
-        .sample_size(40)
-        .warm_up_time(Duration::from_secs(2))
-        .measurement_time(Duration::from_secs(5));
+        .sample_size(timing::sample_size())
+        .warm_up_time(timing::warm_up_time())
+        .measurement_time(timing::measurement_time());
 
     group.bench_function("cterm-core", |b| {
         b.iter_batched(
