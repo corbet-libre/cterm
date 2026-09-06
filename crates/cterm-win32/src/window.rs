@@ -25,6 +25,7 @@ use cterm_app::file_transfer::PendingFileManager;
 use cterm_app::kitty_dnd::{
     DndAdapterAction, DndDestination, DndLocation, DndOperation, DropData, URI_LIST_MIME,
 };
+use cterm_app::kitty_dnd_source::{DndSource, DndSourceAction};
 use cterm_app::shortcuts::ShortcutManager;
 use cterm_app::{
     PluginAuthorization, PluginExecution, PluginRuntime, PluginRuntimeError, TemplateDaemonTarget,
@@ -496,6 +497,9 @@ pub struct PaneEntry {
     /// Command sender for daemon-backed panes.
     pub daemon_cmd_tx: Option<tokio::sync::mpsc::UnboundedSender<DaemonCmd>>,
     dnd_destination: DndDestination,
+    /// Kitty OSC 72 source-side state. Command routing shares the GTK core;
+    /// the OLE `DoDragDrop`/`IDataObject` session is still open.
+    dnd_source: DndSource,
     backend: PaneBackendContext,
 }
 
@@ -846,6 +850,52 @@ impl WindowState {
         let Some(pane) = self.tabs[tab_index].panes.get_mut(&pane_id) else {
             return;
         };
+        // Capability queries stay on the destination side; the source state
+        // deliberately emits no `t=q` response.
+        match command.command_type {
+            cterm_core::DndCommandType::OfferDrag
+            | cterm_core::DndCommandType::PresentData
+            | cterm_core::DndCommandType::ChangeDragImage
+            | cterm_core::DndCommandType::DragOfferEvent
+            | cterm_core::DndCommandType::DragOfferError
+            | cterm_core::DndCommandType::UriListData => {
+                let mut actions = pane.dnd_source.handle_command(command);
+                // No OLE drag session exists yet: fail session actions closed
+                // through the shared core handshake instead of claiming `OK`.
+                let mut index = 0;
+                while index < actions.len() {
+                    match actions[index].clone() {
+                        DndSourceAction::BeginOsDrag(_) => {
+                            log::info!("Kitty DND source drag not started (no OLE session)");
+                            actions.extend(pane.dnd_source.os_drag_failed("ENOSYS"));
+                        }
+                        DndSourceAction::RequestApproval(request) => {
+                            log::info!(
+                                "Denying Kitty DND remote read (no consent prompt): entry={:?}",
+                                request.entry
+                            );
+                            actions.extend(pane.dnd_source.deny(request.request_id));
+                        }
+                        _ => {}
+                    }
+                    index += 1;
+                }
+                let frames = actions
+                    .into_iter()
+                    .filter_map(|action| match action {
+                        DndSourceAction::Write(frame) => Some(frame),
+                        DndSourceAction::BeginOsDrag(_)
+                        | DndSourceAction::CancelOsDrag
+                        | DndSourceAction::OsDataReady { .. }
+                        | DndSourceAction::OsDataFailed { .. }
+                        | DndSourceAction::RequestApproval(_) => None,
+                    })
+                    .collect();
+                self.write_dnd_frames(source_id, frames);
+                return;
+            }
+            _ => {}
+        }
         let actions = pane.dnd_destination.handle_command(command);
         self.apply_dnd_actions(source_id, actions);
     }
@@ -1171,6 +1221,7 @@ impl WindowState {
                 has_bell: false,
                 daemon_cmd_tx: Some(cmd_tx),
                 dnd_destination: DndDestination::default(),
+                dnd_source: DndSource::default(),
                 backend,
             },
         );
@@ -1330,6 +1381,7 @@ impl WindowState {
                 has_bell: false,
                 daemon_cmd_tx: Some(cmd_tx),
                 dnd_destination: DndDestination::default(),
+                dnd_source: DndSource::default(),
                 backend: PaneBackendContext::Daemon(Box::new(attached_context)),
             },
         );
@@ -1516,6 +1568,7 @@ impl WindowState {
             has_bell: alerted,
             daemon_cmd_tx: Some(command_sender),
             dnd_destination: DndDestination::default(),
+            dnd_source: DndSource::default(),
             backend: PaneBackendContext::Daemon(Box::new(context)),
         })
     }
@@ -1556,6 +1609,7 @@ impl WindowState {
             has_bell: true,
             daemon_cmd_tx: None,
             dnd_destination: DndDestination::default(),
+            dnd_source: DndSource::default(),
             backend: PaneBackendContext::Daemon(Box::new(
                 self.restored_daemon_context(pane_state, None, cols, rows),
             )),
@@ -1911,6 +1965,7 @@ impl WindowState {
             has_bell: false,
             daemon_cmd_tx: None,
             dnd_destination: DndDestination::default(),
+            dnd_source: DndSource::default(),
             backend: PaneBackendContext::LocalPty,
         })
     }
@@ -1994,6 +2049,7 @@ impl WindowState {
             has_bell: false,
             daemon_cmd_tx: Some(command_sender),
             dnd_destination: DndDestination::default(),
+            dnd_source: DndSource::default(),
             backend: PaneBackendContext::Daemon(Box::new(context)),
         })
     }
@@ -7109,6 +7165,7 @@ mod tests {
             has_bell: false,
             daemon_cmd_tx: None,
             dnd_destination: DndDestination::default(),
+            dnd_source: DndSource::default(),
             backend: PaneBackendContext::LocalPty,
         };
         let tab = TabEntry {

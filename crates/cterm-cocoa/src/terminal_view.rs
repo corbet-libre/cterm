@@ -25,6 +25,7 @@ use cterm_app::config::{Config, ShortcutsConfig};
 use cterm_app::kitty_dnd::{
     DndAdapterAction, DndDestination, DndLocation, DndOperation, DropData, URI_LIST_MIME,
 };
+use cterm_app::kitty_dnd_source::{DndSource, DndSourceAction};
 use cterm_app::upgrade::PaneLaunchContext;
 use cterm_app::ShortcutManager;
 use cterm_core::screen::{ScreenConfig, SelectionMode};
@@ -266,6 +267,10 @@ pub struct TerminalViewIvars {
     file_manager: RefCell<PendingFileManager>,
     /// Main-thread Kitty OSC 72 destination state.
     dnd_destination: RefCell<DndDestination>,
+    /// Main-thread Kitty OSC 72 source-side state. Command routing shares the
+    /// GTK core; the `NSDraggingSession` that consumes `BeginOsDrag` is still
+    /// open (file promises / pre-sent data bridging needed).
+    dnd_source: RefCell<DndSource>,
     /// Color palette for HTML export
     color_palette: cterm_core::color::ColorPalette,
     /// Command channel for daemon I/O (write + resize) — None for local PTY sessions
@@ -1745,6 +1750,7 @@ impl TerminalView {
             notification_bar: RefCell::new(None),
             file_manager: RefCell::new(PendingFileManager::new()),
             dnd_destination: RefCell::new(DndDestination::default()),
+            dnd_source: RefCell::new(DndSource::default()),
             color_palette: {
                 let mut palette = theme.colors.clone();
                 palette.cursor = theme.cursor.color;
@@ -2789,6 +2795,66 @@ impl TerminalView {
     fn apply_dnd_commands(&self, commands: Vec<cterm_core::DndCommand>) {
         let mut terminal = self.ivars().terminal.lock();
         for command in commands {
+            // Capability queries stay on the destination side; the source
+            // state deliberately emits no `t=q` response.
+            match command.command_type {
+                cterm_core::DndCommandType::OfferDrag
+                | cterm_core::DndCommandType::PresentData
+                | cterm_core::DndCommandType::ChangeDragImage
+                | cterm_core::DndCommandType::DragOfferEvent
+                | cterm_core::DndCommandType::DragOfferError
+                | cterm_core::DndCommandType::UriListData => {
+                    let actions = self.ivars().dnd_source.borrow_mut().handle_command(command);
+                    // No NSDraggingSession exists yet, so every session action
+                    // fails closed through the shared core handshake instead
+                    // of claiming `OK` to the application.
+                    let mut actions = actions;
+                    let mut index = 0;
+                    while index < actions.len() {
+                        let action = actions[index].clone();
+                        index += 1;
+                        match action {
+                            DndSourceAction::Write(frame) => {
+                                if let Err(error) = terminal.write(&frame) {
+                                    log::error!(
+                                        "Failed to write Kitty DND source response to PTY: {error}"
+                                    );
+                                    return;
+                                }
+                            }
+                            DndSourceAction::BeginOsDrag(_) => {
+                                log::info!(
+                                    "Kitty DND source drag not started (no NSDraggingSession)"
+                                );
+                                actions.extend(
+                                    self.ivars()
+                                        .dnd_source
+                                        .borrow_mut()
+                                        .os_drag_failed("ENOSYS"),
+                                );
+                            }
+                            DndSourceAction::RequestApproval(request) => {
+                                // Fail closed without a native consent prompt.
+                                log::info!(
+                                    "Denying Kitty DND remote read (no consent prompt): entry={:?}",
+                                    request.entry
+                                );
+                                actions.extend(
+                                    self.ivars()
+                                        .dnd_source
+                                        .borrow_mut()
+                                        .deny(request.request_id),
+                                );
+                            }
+                            DndSourceAction::CancelOsDrag
+                            | DndSourceAction::OsDataReady { .. }
+                            | DndSourceAction::OsDataFailed { .. } => {}
+                        }
+                    }
+                    continue;
+                }
+                _ => {}
+            }
             let actions = self
                 .ivars()
                 .dnd_destination

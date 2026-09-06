@@ -23,6 +23,13 @@ is omitted for readability.
   cancellation cleanup, and per-entry atomic commit at session finish.
 - Kitty OSC 72 destination negotiation and local file drops on GTK/Wayland,
   Cocoa, and Win32/OLE.
+- Kitty OSC 72 drag sources: shared-core outbound negotiation (application
+  arm/disarm, user-gesture gating, chunked MIME offers, pre-sent data up to
+  64 MiB, drag-image validation, copy/move/either mapping with change-only
+  progress reports) with fail-closed remote (`t=k`) entry reads behind
+  exact-token approval, routed on GTK/Wayland, Cocoa, and Win32. Native OS
+  drag sessions, consent prompts, and local-direct reads remain open: session
+  requests fail closed (`ENOSYS`/deny) instead of claiming `OK`.
 - A fail-closed command-plugin foundation with fixed WebAssembly packages,
   strict manifests, content-addressed trust, exact per-action grants, and a
   bounded versioned protobuf ABI, plus a separate one-shot Wasmi/WASIp1 runner
