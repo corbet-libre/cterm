@@ -64,6 +64,11 @@ is omitted for readability.
   DECRARA toggles the full boolean set and deliberately leaves colors
   untouched, since color reversal is undefined. No renderer change was
   needed: rectangle-styled cells are identical to SGR-styled ones.
+- Kitty no-argument save/restore of safe terminal modes (bare `CSI ? s` /
+  `CSI ? r` over ANSI 4/20 and the side-effect-free DEC set, excluding
+  DECOM/DECCOLM), plus Kitty private DCS `echo`, `print`, and
+  `restore-cursor-appearance` with strict validation. Remote control and
+  the kitten/overlay/ssh/ask/clone/edit commands stay fail-closed.
 
 ### Fixed
 - Streamed OSC 1337 interception now replays incomplete, cancelled, and
