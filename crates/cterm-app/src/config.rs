@@ -41,6 +41,8 @@ pub struct Config {
     pub tabs: TabsConfig,
     /// Kitty OSC 5113 transfer consent overrides (all default to prompting).
     pub transfer: TransferConfig,
+    /// Desktop-notification user filtering (defaults to allow-all).
+    pub notifications: NotificationConfig,
     /// Shortcut bindings
     pub shortcuts: ShortcutsConfig,
     /// Named remote hosts (for daemon-backed remote sessions)
@@ -168,6 +170,71 @@ impl TransferConfig {
         self.bypass_password
             .as_deref()
             .filter(|secret| !secret.is_empty())
+    }
+}
+
+/// User-configured desktop-notification filtering over the Kitty OSC 99
+/// `f=` (application name) and `t=` (notification types) filter identity.
+///
+/// Every list defaults to empty, which allows everything — today's
+/// behavior. Otherwise deny wins over allow, and a non-empty allow-list
+/// requires a positive match (untagged notifications, e.g. legacy OSC
+/// 9/777 with no `f=`/`t=`, never match a deny entry but also never satisfy
+/// an allow-list). Matching is exact and case-sensitive after trimming;
+/// blank entries are ignored. See
+/// `cterm_core::notifications::NotificationFilter` for the enforced rule.
+///
+/// ```toml
+/// [notifications]
+/// # allow_apps = ["myapp"]  # only these f= names deliver when non-empty
+/// # deny_apps = ["spammy"]  # these f= names never deliver (wins over allow)
+/// # allow_types = ["email"] # a listed t= is required when non-empty
+/// # deny_types = ["marketing"]
+/// ```
+///
+/// Deliberately simpler than Kitty's `filter_notification`
+/// `field:regexp` boolean grammar (which also matches title/body):
+/// TOML-native allow/deny lists cover the common cases, and unknown future
+/// keys stay ignored via `#[serde(default)]`. Title/body/regex filtering
+/// stays future work.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct NotificationConfig {
+    /// `f=` names that may deliver when non-empty.
+    #[serde(default)]
+    pub allow_apps: Vec<String>,
+    /// `f=` names that never deliver (wins over `allow_apps`).
+    #[serde(default)]
+    pub deny_apps: Vec<String>,
+    /// `t=` types of which at least one must be present when non-empty.
+    #[serde(default)]
+    pub allow_types: Vec<String>,
+    /// `t=` types that never deliver (wins over `allow_types`).
+    #[serde(default)]
+    pub deny_types: Vec<String>,
+}
+
+impl NotificationConfig {
+    /// Compile to the shared-model filter (trims entries, drops empties).
+    pub fn to_filter(&self) -> cterm_core::NotificationFilter {
+        fn clean(values: &[String]) -> Vec<String> {
+            values
+                .iter()
+                .filter_map(|value| cterm_core::notifications::normalize_filter_entry(value))
+                .collect()
+        }
+        cterm_core::NotificationFilter {
+            allow_apps: clean(&self.allow_apps),
+            deny_apps: clean(&self.deny_apps),
+            allow_types: clean(&self.allow_types),
+            deny_types: clean(&self.deny_types),
+        }
+    }
+
+    /// Whether this config filters anything (a default config returns true:
+    /// allow everything, today's behavior).
+    pub fn is_allow_all(&self) -> bool {
+        self.to_filter().is_allow_all()
     }
 }
 
@@ -1794,5 +1861,70 @@ mod tests {
         // No password serializes without a password key.
         let serialized = toml::to_string_pretty(&TransferConfig::default()).unwrap();
         assert!(!serialized.contains("bypass_password"));
+    }
+
+    #[test]
+    fn test_notification_config_defaults_to_allow_all() {
+        let config = NotificationConfig::default();
+        assert!(config.is_allow_all());
+        assert!(config.to_filter().is_allow_all());
+        // A fresh top-level config and a file without a [notifications]
+        // table both behave like today (everything delivers).
+        let top = Config::default();
+        assert!(top.notifications.is_allow_all());
+        let parsed: Config = toml::from_str("[general]\n").unwrap();
+        assert!(parsed.notifications.is_allow_all());
+        assert!(parsed.notifications.to_filter().is_allow_all());
+    }
+
+    #[test]
+    fn test_notification_config_parses_explicit_lists() {
+        let toml_str = r#"
+            [notifications]
+            allow_apps = ["myapp", "ci"]
+            deny_apps = ["spammy"]
+            allow_types = ["email"]
+            deny_types = ["marketing"]
+        "#;
+        let config: Config = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.notifications.allow_apps, vec!["myapp", "ci"]);
+        assert_eq!(config.notifications.deny_apps, vec!["spammy"]);
+        let filter = config.notifications.to_filter();
+        assert!(!filter.is_allow_all());
+        assert!(filter.allows(Some("myapp"), &["email".to_owned()]));
+        assert!(!filter.allows(Some("spammy"), &["email".to_owned()]));
+        assert!(!filter.allows(Some("myapp"), &["marketing".to_owned()]));
+        assert!(!filter.allows(Some("other"), &["email".to_owned()]));
+        assert!(!filter.allows(None, &[]));
+    }
+
+    #[test]
+    fn test_notification_config_normalizes_entries() {
+        let toml_str = r#"
+            [notifications]
+            allow_apps = ["  myapp  ", "", "   "]
+            deny_types = ["marketing"]
+        "#;
+        let config: Config = toml::from_str(toml_str).unwrap();
+        let filter = config.notifications.to_filter();
+        assert_eq!(filter.allow_apps, vec!["myapp"]);
+        assert_eq!(filter.deny_types, vec!["marketing"]);
+        assert!(filter.allows(Some("myapp"), &[]));
+        // A typeless notification passes the (empty) type dimension here.
+        assert!(!filter.allows(Some("other"), &[]));
+    }
+
+    #[test]
+    fn test_notification_config_round_trip() {
+        let config = NotificationConfig {
+            allow_apps: vec!["myapp".into()],
+            deny_apps: vec![],
+            allow_types: vec!["email".into()],
+            deny_types: vec![],
+        };
+        let serialized = toml::to_string_pretty(&config).unwrap();
+        assert!(serialized.contains("allow_apps"));
+        let parsed: NotificationConfig = toml::from_str(&serialized).unwrap();
+        assert_eq!(parsed, config);
     }
 }

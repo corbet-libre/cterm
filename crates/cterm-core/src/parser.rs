@@ -4784,6 +4784,53 @@ mod tests {
     }
 
     #[test]
+    fn test_osc99_never_expire_stays_alive_until_replaced_or_closed() {
+        let mut screen = make_screen();
+        let mut parser = Parser::new();
+
+        // `w=0` parses to the never-expire marker and is tracked for `p=alive`
+        // exactly like any identified notification.
+        parser.parse(&mut screen, b"\x1b]99;i=pinned:w=0;Stay up\x1b\\");
+        match screen.take_notifications().pop().unwrap() {
+            DesktopNotificationAction::Show(notification) => {
+                assert_eq!(notification.id.as_deref(), Some("pinned"));
+                assert_eq!(notification.expire_time, Some(0));
+                assert!(crate::notifications::never_expires(
+                    notification.expire_time
+                ));
+                assert_eq!(
+                    crate::notifications::expiry_policy(notification.expire_time),
+                    crate::notifications::ExpiryPolicy::Never
+                );
+            }
+            other => panic!("expected Show, got {other:?}"),
+        }
+        // Frontend-side expiry never prunes the parser set: the daemon answer
+        // stays optimistic until the app itself closes or replaces the ID.
+        parser.parse(&mut screen, b"\x1b]99;i=q:p=alive;\x1b\\");
+        let reply = String::from_utf8(screen.take_pending_responses().pop().unwrap()).unwrap();
+        assert!(reply.contains(";pinned"));
+
+        // Replace keeps the ID alive (single entry, no duplicate) and emits a
+        // second Show for the frontend to supersede the banner.
+        parser.parse(&mut screen, b"\x1b]99;i=pinned:w=0;Still up\x1b\\");
+        assert_eq!(screen.take_notifications().len(), 1);
+        parser.parse(&mut screen, b"\x1b]99;i=q:p=alive;\x1b\\");
+        let reply = String::from_utf8(screen.take_pending_responses().pop().unwrap()).unwrap();
+        assert_eq!(reply.matches("pinned").count(), 1);
+
+        // Explicit close drops it from `p=alive` and emits one Close event.
+        parser.parse(&mut screen, b"\x1b]99;i=pinned:p=close;\x1b\\");
+        assert_eq!(
+            screen.take_notifications(),
+            vec![DesktopNotificationAction::Close("pinned".into())]
+        );
+        parser.parse(&mut screen, b"\x1b]99;i=q:p=alive;\x1b\\");
+        let reply = String::from_utf8(screen.take_pending_responses().pop().unwrap()).unwrap();
+        assert!(!reply.contains("pinned"));
+    }
+
+    #[test]
     fn test_clear_screen() {
         let mut screen = make_screen();
         let mut parser = Parser::new();

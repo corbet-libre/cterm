@@ -201,19 +201,164 @@ pub fn capability_reply(query_id: &str, bell_terminated: bool) -> Vec<u8> {
     .into_bytes()
 }
 
-/// Effective native timeout in milliseconds: `None` means OS default (`w`
-/// absent/negative), `Some(0)` means never expire (best effort), positive
-/// values are terminal-enforced auto-close deadlines.
-pub fn effective_timeout_ms(expire_time: Option<i32>) -> Option<u64> {
+/// Terminal-side expiry policy for one notification's `w=` value.
+///
+/// Kitty ground truth (`desktop-notifications.rst`, Kitty 0.36+): an absent
+/// or negative `w` (the default is `-1`) defers to whatever expiry policy
+/// the OS notification service has; `w=0` requests never-expire (best
+/// effort — some platforms honor it and some do not); positive values are
+/// terminal-enforced auto-close deadlines (robust: the terminal withdraws
+/// the notification itself, so it is guaranteed closed past the deadline
+/// barring earlier user/OS dismissal).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExpiryPolicy {
+    /// No terminal timer; the OS notification service decides the lifetime.
+    OsDefault,
+    /// Never schedule a terminal auto-close. The notification persists in
+    /// the frontend registry and the daemon `p=alive` set until the app
+    /// replaces it (same `i=`), explicitly closes it (`p=close`), it is
+    /// evicted by the bounded live-ID cap, or the frontend process exits.
+    /// The OS may still retire the visible banner (best effort). A daemon
+    /// reconnect does not clear the daemon-side `p=alive` entry (sessions
+    /// survive UI restarts), but the frontend registry is process-local:
+    /// after a UI restart the banner is gone locally with no replay while
+    /// the daemon still lists the ID until the app closes it.
+    Never,
+    /// Terminal-enforced auto-close after this many milliseconds, with a
+    /// real (tracked) close report when `c=1` was requested.
+    After(u64),
+}
+
+/// Resolve one raw `w=` value to its terminal-side expiry policy.
+pub fn expiry_policy(expire_time: Option<i32>) -> ExpiryPolicy {
     match expire_time {
-        Some(milliseconds) if milliseconds > 0 => Some(milliseconds as u64),
-        _ => None,
+        Some(milliseconds) if milliseconds > 0 => ExpiryPolicy::After(milliseconds as u64),
+        Some(0) => ExpiryPolicy::Never,
+        _ => ExpiryPolicy::OsDefault,
     }
 }
 
-/// Whether `w=` requests never-expire semantics (best effort per platform).
+/// Effective native timeout in milliseconds: `Some` is a terminal-enforced
+/// auto-close deadline (`w > 0`); `None` means no terminal timer — either
+/// the OS default (`w` absent/negative) or never-expire (`w = 0`, see
+/// [`never_expires`] / [`expiry_policy`] to tell them apart).
+pub fn effective_timeout_ms(expire_time: Option<i32>) -> Option<u64> {
+    match expiry_policy(expire_time) {
+        ExpiryPolicy::After(milliseconds) => Some(milliseconds),
+        ExpiryPolicy::OsDefault | ExpiryPolicy::Never => None,
+    }
+}
+
+/// Whether `w=` requests never-expire semantics (`w = 0` exactly).
+/// Never-expire schedules no terminal timer on any backend; see
+/// [`ExpiryPolicy::Never`] for the exact persistence contract.
 pub fn never_expires(expire_time: Option<i32>) -> bool {
-    expire_time == Some(0)
+    expiry_policy(expire_time) == ExpiryPolicy::Never
+}
+
+/// Ordered terminal-to-application reports for one user activation.
+///
+/// Kitty contract: when a notification requested both activation
+/// (`a=report`) and close (`c=1`) reports, activation emits the activation
+/// report FIRST followed by the close report. Either report may also appear
+/// alone; expiry/replace emit only the close report (never an activation),
+/// and a close report never precedes its activation.
+pub fn activation_close_sequence(
+    id: Option<&str>,
+    button: Option<usize>,
+    report_activation: bool,
+    report_close: bool,
+) -> Vec<Vec<u8>> {
+    let mut reports = Vec::with_capacity(2);
+    if report_activation {
+        reports.push(activation_report(id, button));
+    }
+    if report_close {
+        reports.push(close_report(id, false));
+    }
+    reports
+}
+
+/// Normalize one user-configured filter entry: surrounding whitespace is
+/// insignificant, empty entries never match anything. Matching itself is an
+/// exact, case-sensitive comparison against the parsed `f=`/`t=` identity.
+pub fn normalize_filter_entry(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_owned())
+}
+
+/// User-configured notification allow/deny lists over the `f=` application
+/// name and `t=` notification types.
+///
+/// All lists empty (the default) allows everything — today's behavior.
+/// Otherwise: deny wins over allow, and a non-empty allow-list requires a
+/// positive match. Untagged notifications (no `f=`/`t=`, e.g. legacy OSC
+/// 9/777) therefore never match a deny entry but also never satisfy an
+/// allow-list. This is intentionally simpler than Kitty's
+/// `filter_notification` `field:regexp` boolean grammar (which also matches
+/// title/body): exact per-app/type lists cover the common cases with
+/// TOML-native config; title/body/regex filtering stays future work.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct NotificationFilter {
+    /// `f=` names that may deliver when non-empty (untagged never matches).
+    pub allow_apps: Vec<String>,
+    /// `f=` names that never deliver (wins over `allow_apps`).
+    pub deny_apps: Vec<String>,
+    /// `t=` types of which at least one must be present when non-empty.
+    pub allow_types: Vec<String>,
+    /// `t=` types that never deliver (wins over `allow_types`).
+    pub deny_types: Vec<String>,
+}
+
+impl NotificationFilter {
+    /// Whether this filter allows everything (all lists empty).
+    pub fn is_allow_all(&self) -> bool {
+        self.allow_apps.is_empty()
+            && self.deny_apps.is_empty()
+            && self.allow_types.is_empty()
+            && self.deny_types.is_empty()
+    }
+
+    /// Whether a notification with this filter identity may be delivered.
+    /// Enforcement point for frontends: call before occasion filtering and
+    /// before any registry/report side effects.
+    pub fn allows(&self, app_name: Option<&str>, notif_types: &[String]) -> bool {
+        if let Some(app) = app_name {
+            if self.deny_apps.iter().any(|denied| denied == app) {
+                return false;
+            }
+        }
+        if notif_types
+            .iter()
+            .any(|kind| self.deny_types.iter().any(|denied| denied == kind))
+        {
+            return false;
+        }
+        if !self.allow_apps.is_empty()
+            && !app_name.is_some_and(|app| self.allow_apps.iter().any(|allowed| allowed == app))
+        {
+            return false;
+        }
+        if !self.allow_types.is_empty()
+            && !notif_types
+                .iter()
+                .any(|kind| self.allow_types.iter().any(|allowed| allowed == kind))
+        {
+            return false;
+        }
+        true
+    }
+}
+
+/// Shared-model enforcement seam: whether a notification with this filter
+/// identity may be delivered under `filter`. Tested identically to
+/// [`NotificationFilter::allows`].
+pub fn notification_allowed(
+    filter: &NotificationFilter,
+    app_name: Option<&str>,
+    notif_types: &[String],
+) -> bool {
+    filter.allows(app_name, notif_types)
 }
 
 /// Bounded live-ID set backing `p=alive` and replace/close. Insertion-ordered
@@ -248,8 +393,14 @@ impl ActiveNotificationSet {
     }
 
     /// Forget one closed notification. Returns true when it was tracked.
+    /// Also prunes pending eviction-order entries so show/close churn over
+    /// many IDs cannot grow the order queue without bound.
     pub fn remove(&mut self, id: &str) -> bool {
-        self.ids.remove(id)
+        let removed = self.ids.remove(id);
+        if removed {
+            self.order.retain(|entry| entry != id);
+        }
+        removed
     }
 
     /// Whether an ID is currently considered alive.
@@ -407,6 +558,188 @@ mod tests {
             false
         ));
         assert_eq!(NotificationOccasion::parse("bogus"), None);
+    }
+
+    #[test]
+    fn expiry_policy_distinguishes_default_never_and_deadline() {
+        assert_eq!(expiry_policy(None), ExpiryPolicy::OsDefault);
+        assert_eq!(expiry_policy(Some(-1)), ExpiryPolicy::OsDefault);
+        assert_eq!(expiry_policy(Some(i32::MIN)), ExpiryPolicy::OsDefault);
+        assert_eq!(expiry_policy(Some(0)), ExpiryPolicy::Never);
+        assert_eq!(expiry_policy(Some(1)), ExpiryPolicy::After(1));
+        assert_eq!(expiry_policy(Some(5000)), ExpiryPolicy::After(5000));
+    }
+
+    #[test]
+    fn effective_timeout_schedules_only_positive_deadlines() {
+        // Neither the OS default nor never-expire schedules a terminal timer;
+        // use `expiry_policy`/`never_expires` to tell them apart. w>0
+        // behavior is unchanged.
+        assert_eq!(effective_timeout_ms(None), None);
+        assert_eq!(effective_timeout_ms(Some(-1)), None);
+        assert_eq!(effective_timeout_ms(Some(0)), None);
+        assert_eq!(effective_timeout_ms(Some(250)), Some(250));
+    }
+
+    #[test]
+    fn never_expires_is_exactly_w_zero() {
+        assert!(!never_expires(None));
+        assert!(!never_expires(Some(-1)));
+        assert!(never_expires(Some(0)));
+        assert!(!never_expires(Some(1)));
+    }
+
+    #[test]
+    fn activation_close_sequence_orders_activation_before_close() {
+        // Both flags: activation first, then the tracked (non-untracked)
+        // close — the Kitty activation contract.
+        assert_eq!(
+            activation_close_sequence(Some("job"), None, true, true),
+            vec![
+                activation_report(Some("job"), None),
+                close_report(Some("job"), false),
+            ]
+        );
+        // Button numbers ride on the activation report only.
+        assert_eq!(
+            activation_close_sequence(Some("ask"), Some(2), true, true),
+            vec![
+                activation_report(Some("ask"), Some(2)),
+                close_report(Some("ask"), false),
+            ]
+        );
+        // Either report alone.
+        assert_eq!(
+            activation_close_sequence(Some("job"), None, true, false),
+            vec![activation_report(Some("job"), None)]
+        );
+        assert_eq!(
+            activation_close_sequence(Some("job"), None, false, true),
+            vec![close_report(Some("job"), false)]
+        );
+        // Neither requested: expiry/replace paths must not reuse this helper
+        // to fabricate reports.
+        assert!(activation_close_sequence(Some("job"), None, false, false).is_empty());
+    }
+
+    #[test]
+    fn filter_defaults_to_allow_all() {
+        let filter = NotificationFilter::default();
+        assert!(filter.is_allow_all());
+        // Today's behavior: untagged legacy notifications deliver, and so
+        // does any tagged one.
+        assert!(notification_allowed(&filter, None, &[]));
+        assert!(notification_allowed(
+            &filter,
+            Some("anything"),
+            &["marketing".to_owned()]
+        ));
+    }
+
+    #[test]
+    fn filter_deny_wins_over_allow() {
+        let filter = NotificationFilter {
+            allow_apps: vec!["editor".to_owned()],
+            deny_apps: vec!["editor".to_owned()],
+            allow_types: vec!["email".to_owned()],
+            deny_types: vec!["email".to_owned()],
+        };
+        assert!(!filter.is_allow_all());
+        assert!(!notification_allowed(
+            &filter,
+            Some("editor"),
+            &["email".to_owned()]
+        ));
+        // Non-denied values still pass their allow-lists.
+        let filter = NotificationFilter {
+            allow_apps: vec!["editor".to_owned(), "ci".to_owned()],
+            deny_apps: vec!["spammy".to_owned()],
+            allow_types: vec!["email".to_owned()],
+            deny_types: vec!["marketing".to_owned()],
+        };
+        assert!(notification_allowed(
+            &filter,
+            Some("ci"),
+            &["email".to_owned()]
+        ));
+        assert!(!notification_allowed(
+            &filter,
+            Some("spammy"),
+            &["email".to_owned()]
+        ));
+        assert!(!notification_allowed(
+            &filter,
+            Some("ci"),
+            &["marketing".to_owned()]
+        ));
+    }
+
+    #[test]
+    fn filter_allow_lists_require_a_positive_match() {
+        let filter = NotificationFilter {
+            allow_apps: vec!["myapp".to_owned()],
+            ..Default::default()
+        };
+        assert!(notification_allowed(&filter, Some("myapp"), &[]));
+        assert!(!notification_allowed(&filter, Some("other"), &[]));
+        // Untagged app names never satisfy an allow-list but never match a
+        // deny-list either.
+        assert!(!notification_allowed(&filter, None, &[]));
+        let deny_only = NotificationFilter {
+            deny_apps: vec!["spammy".to_owned()],
+            ..Default::default()
+        };
+        assert!(notification_allowed(&deny_only, None, &[]));
+        assert!(notification_allowed(&deny_only, Some("myapp"), &[]));
+
+        let types = NotificationFilter {
+            allow_types: vec!["email".to_owned()],
+            ..Default::default()
+        };
+        assert!(notification_allowed(
+            &types,
+            Some("myapp"),
+            &["chat".to_owned(), "email".to_owned()]
+        ));
+        assert!(!notification_allowed(
+            &types,
+            Some("myapp"),
+            &["chat".to_owned()]
+        ));
+        // Typeless notifications cannot satisfy a type allow-list.
+        assert!(!notification_allowed(&types, Some("myapp"), &[]));
+        assert!(!notification_allowed(&types, None, &[]));
+    }
+
+    #[test]
+    fn filter_entries_normalize_whitespace_and_empties() {
+        assert_eq!(
+            normalize_filter_entry("  myapp  "),
+            Some("myapp".to_owned())
+        );
+        assert_eq!(normalize_filter_entry(""), None);
+        assert_eq!(normalize_filter_entry("   "), None);
+    }
+
+    #[test]
+    fn active_set_remove_prunes_eviction_order() {
+        let mut set = ActiveNotificationSet::default();
+        set.insert("a".to_owned());
+        set.insert("b".to_owned());
+        set.insert("c".to_owned());
+        assert!(set.remove("b"));
+        // Churn: refill to the cap. Without order pruning the stale `b`
+        // entry would linger in the queue; eviction must still drop the
+        // oldest *live* ID (`a`) first.
+        for index in 0..(MAX_ACTIVE_NOTIFICATIONS - 2) {
+            set.insert(format!("fill-{index}"));
+        }
+        assert_eq!(set.len(), MAX_ACTIVE_NOTIFICATIONS);
+        let evicted = set.insert("new".to_owned());
+        assert_eq!(evicted.as_deref(), Some("a"));
+        assert!(!set.contains("a"));
+        assert!(set.contains("c"));
+        assert!(set.contains("new"));
     }
 
     #[test]

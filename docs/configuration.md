@@ -68,6 +68,22 @@ show_tab_bar = "always"
 tab_bar_position = "top"
 ```
 
+### Desktop Notification Filtering
+
+```toml
+[notifications]
+# Operator allow/deny lists over the Kitty OSC 99 `f=` (application name)
+# and `t=` (notification types) identity. All lists default to empty, which
+# allows everything (today's behavior). Deny wins over allow; a non-empty
+# allow-list requires a positive match (exact, case-sensitive). Untagged
+# notifications (e.g. legacy OSC 9/777) never match deny entries but also
+# never satisfy an allow-list. Enforced on GTK before delivery.
+# allow_apps = ["myapp"]
+# deny_apps = ["spammy"]
+# allow_types = ["email"]
+# deny_types = ["marketing"]
+```
+
 ### Keyboard Shortcuts
 
 ```toml

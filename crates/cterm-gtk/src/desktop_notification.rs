@@ -1,9 +1,11 @@
 //! Native desktop notification delivery through GApplication.
 //!
-//! Shared-model delivery for Kitty OSC 99: occasion (`o=`) filtering, icon
-//! names/data, buttons with per-button activation reports, expiry (`w=`)
-//! auto-withdraw, and `a=report` / `c=1` reports written back through the
-//! mirror terminal's daemon input channel.
+//! Shared-model delivery for Kitty OSC 99: user filtering (`f=`/`t=`
+//! allow/deny lists from `[notifications]`), occasion (`o=`) filtering,
+//! icon names/data, buttons with per-button activation reports, expiry
+//! (`w=`) auto-close with `w=0` never-expire honored (no timer scheduled),
+//! and `a=report` / `c=1` reports written back through the mirror
+//! terminal's daemon input channel (activation always precedes its close).
 //!
 //! Platform notes (see the per-platform matrix in `docs/parity.md`):
 //! - Sounds degrade: `GNotification` exposes no sound control, so `silent`
@@ -12,7 +14,9 @@
 //! - User dismiss has no OS signal on this stack, so `c=1` notifications get
 //!   an immediate `p=close;untracked` disclaimer (poll `p=alive` instead) plus
 //!   a real `p=close` when the terminal itself closes the notification
-//!   (expiry, replace, or app close).
+//!   (activation, expiry, replace, or app close).
+//! - `w=0` persists in the registry until replaced, explicitly closed, or
+//!   app exit; the OS may still retire the banner (best effort per Kitty).
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -85,14 +89,25 @@ fn on_notification_activated(registry_id: &str, button: Option<usize>) {
         registry.get(registry_id).map(|entry| {
             (
                 entry.terminal.clone(),
+                entry.generation,
                 entry.focus,
                 entry.report_activation,
+                entry.report_close,
                 entry.protocol_id.clone(),
                 entry.button_count,
             )
         })
     });
-    let Some((terminal, focus, report_activation, protocol_id, button_count)) = entry else {
+    let Some((
+        terminal,
+        generation,
+        focus,
+        report_activation,
+        report_close,
+        protocol_id,
+        button_count,
+    )) = entry
+    else {
         return;
     };
     // Ignore button numbers outside the advertised set (stale actions after
@@ -119,17 +134,82 @@ fn on_notification_activated(registry_id: &str, button: Option<usize>) {
             window.present();
         }
     }
-    if report_activation {
-        let report = cterm_core::notifications::activation_report(protocol_id.as_deref(), button);
-        if let Err(error) = terminal.lock().write(&report) {
-            log::warn!("Failed to send notification activation report: {error}");
+    if report_activation || report_close {
+        // Shared-model ordering: the activation report always precedes its
+        // close report, matching the Cocoa/Win32 seams.
+        for report in cterm_core::notifications::activation_close_sequence(
+            protocol_id.as_deref(),
+            button,
+            report_activation,
+            report_close,
+        ) {
+            if let Err(error) = terminal.lock().write(&report) {
+                log::warn!("Failed to send notification activation report: {error}");
+            }
+        }
+    }
+    if report_close {
+        // The terminal considers an activation-closed notification closed:
+        // drop the current-generation entry and withdraw the banner so a
+        // pending expiry timer cannot emit a duplicate close. A replace
+        // installs a newer generation first, so only the current entry is
+        // ever removed here.
+        if let Ok(mut registry) = REPORT_REGISTRY.lock() {
+            let current = registry
+                .get(registry_id)
+                .is_some_and(|entry| entry.generation == generation);
+            if current {
+                registry.remove(registry_id);
+            }
+        }
+        if let Some(application) = gio::Application::default() {
+            if let Some(id) = protocol_id.as_deref() {
+                application.withdraw_notification(id);
+            }
         }
     }
 }
 
 /// Deliver one parsed notification action, sending Kitty reports back through
-/// `terminal` (mirror write path → daemon PTY).
+/// `terminal` (mirror write path → daemon PTY). The user filter comes from
+/// the operator `[notifications]` config; a missing/unreadable config fails
+/// open to allow-all (today's behavior).
 pub fn handle(action: &cterm_core::DesktopNotificationAction, terminal: &TerminalRef) {
+    let filter = match cterm_app::config::load_config() {
+        Ok(config) => config.notifications.to_filter(),
+        Err(error) => {
+            log::debug!("Notification filter unavailable ({error}); allowing all");
+            cterm_core::NotificationFilter::default()
+        }
+    };
+    handle_with_filter(action, terminal, &filter);
+}
+
+/// Deliver with an explicit user filter. Filtered `Show` actions return
+/// before any GTK side effects: never shown, never registered for
+/// activation, never reported (the daemon's optimistic `p=alive` set still
+/// answers polls). App-initiated `Close` actions always pass through so a
+/// banner can still be withdrawn.
+pub fn handle_with_filter(
+    action: &cterm_core::DesktopNotificationAction,
+    terminal: &TerminalRef,
+    filter: &cterm_core::NotificationFilter,
+) {
+    if let cterm_core::DesktopNotificationAction::Show(notification) = action {
+        if !cterm_core::notifications::notification_allowed(
+            filter,
+            notification.app_name.as_deref(),
+            &notification.notif_types,
+        ) {
+            log::debug!(
+                "Suppressing desktop notification {:?} by user filter (app={:?}, types={:?})",
+                notification.id,
+                notification.app_name,
+                notification.notif_types,
+            );
+            return;
+        }
+    }
     ensure_actions_registered();
     let Some(application) = gio::Application::default() else {
         log::warn!("Cannot deliver desktop notification before GApplication startup");
@@ -228,8 +308,12 @@ fn show(
     }
 
     // Expiry (`w=`): terminal-enforced auto-close with a real close report.
-    if let Some(timeout_ms) =
-        cterm_core::notifications::effective_timeout_ms(notification.expire_time)
+    // `Never` (w=0) schedules no timer: the entry persists until replaced,
+    // explicitly closed, or app exit (the OS may still retire the banner —
+    // best effort per the Kitty spec). `OsDefault` (absent/negative)
+    // likewise leaves the lifetime to the notification service.
+    if let cterm_core::notifications::ExpiryPolicy::After(timeout_ms) =
+        cterm_core::notifications::expiry_policy(notification.expire_time)
     {
         let protocol_id = notification.id.clone();
         let native_id = notification.id.clone();
@@ -281,4 +365,70 @@ fn close(application: &gio::Application, id: &str) {
     // App-initiated closes need no report (the app already knows). Terminal
     // replaces route through `show`, which sends `untracked` again when the
     // replacement requests close reports.
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_terminal() -> TerminalRef {
+        std::sync::Arc::new(parking_lot::Mutex::new(cterm_core::term::Terminal::new(
+            80,
+            24,
+            cterm_core::screen::ScreenConfig::default(),
+        )))
+    }
+
+    #[test]
+    fn user_filter_denies_before_any_side_effect() {
+        let terminal = test_terminal();
+        let written = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = std::sync::Arc::clone(&written);
+        terminal.lock().set_write_fn(Box::new(move |data: &[u8]| {
+            sink.lock().unwrap().push(data.to_vec());
+            Ok(())
+        }));
+        let filter = cterm_core::NotificationFilter {
+            deny_apps: vec!["spammy".to_owned()],
+            ..Default::default()
+        };
+        let denied = cterm_core::DesktopNotificationAction::Show(cterm_core::DesktopNotification {
+            id: Some("gtk-filter-denied-1".to_owned()),
+            title: "Hi".into(),
+            app_name: Some("spammy".to_owned()),
+            // Even with close reports requested, a filtered notification
+            // must not emit the `untracked` disclaimer.
+            report_close: true,
+            ..Default::default()
+        });
+        handle_with_filter(&denied, &terminal, &filter);
+        assert!(written.lock().unwrap().is_empty());
+        assert!(!REPORT_REGISTRY
+            .lock()
+            .unwrap()
+            .contains_key("gtk-filter-denied-1"));
+    }
+
+    #[test]
+    fn user_filter_allow_all_passes_untagged_without_display() {
+        // Without a GApplication (headless tests) delivery stops at the
+        // application lookup, but the filter gate must not stop it first:
+        // no panic, no registry write either way.
+        let terminal = test_terminal();
+        let allowed =
+            cterm_core::DesktopNotificationAction::Show(cterm_core::DesktopNotification {
+                id: Some("gtk-filter-allowed-1".to_owned()),
+                title: "Hi".into(),
+                ..Default::default()
+            });
+        handle_with_filter(
+            &allowed,
+            &terminal,
+            &cterm_core::NotificationFilter::default(),
+        );
+        assert!(!REPORT_REGISTRY
+            .lock()
+            .unwrap()
+            .contains_key("gtk-filter-allowed-1"));
+    }
 }

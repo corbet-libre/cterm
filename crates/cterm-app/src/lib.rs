@@ -34,7 +34,7 @@ pub mod upgrade;
 pub use config::{
     background_sync, load_config, load_sticky_tabs, load_tool_shortcuts, save_config,
     save_config_with_sync, save_sticky_tabs, save_tool_shortcuts, set_config_dir_override, Config,
-    ToolShortcutEntry, TransferConfig, TransferConsentMode,
+    NotificationConfig, ToolShortcutEntry, TransferConfig, TransferConsentMode,
 };
 pub use daemon_reconnect::{
     check_daemon_sessions, reconnect_all_sessions, ReconnectCheck, ReconnectedSession,
