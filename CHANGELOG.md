@@ -10,6 +10,27 @@ is omitted for readability.
 ## [Unreleased]
 
 ### Added
+- Compositor-free graphics-pipeline differential suite (tests and fixtures
+  only): a 41-vector pipeline suite
+  (`crates/cterm-core/tests/graphics_differential.rs`) pinning Sixel decode
+  to RGBA (primaries, repeat, CR/LF geometry, raster hints, DEC mode 1070
+  private/shared palettes, palette-overflow clamping, byte/dimension budgets),
+  Kitty transfers (raw RGB/RGBA, PNG, zlib round-trip plus truncated-stream
+  rejection, 2- and 3-chunk reassembly with byte-level split invariance,
+  interleaved-delete abort, crop/scale/offset geometry, AlphaBlend vs
+  Overwrite order, cursor and layer metadata), iTerm2 PNG/GIF inline display,
+  cross-protocol equality (same 2x6 red/blue source through Sixel vs Kitty-raw
+  vs Kitty-PNG vs iTerm2-PNG byte-equal; quality-95 JPEG documented with a max
+  32/255 per-channel delta), and hostile bounds that fail closed within the
+  documented budgets (64 MiB, 10,000 px Kitty/Sixel, 4096 px image-decode cap:
+  zero/oversized dimensions, RGB-expansion bombs, truncated PNG/zlib/base64,
+  bad chunk markers, palette-management clamping, oversized iTerm2 images);
+  plus 7 quota/composition determinism vectors in
+  `kitty_graphics/tests.rs` (transient N=1 priority regardless of insertion
+  order, oldest-first within a hint class, placed images never evicted for
+  unplaced data, deterministic victims, blend/overwrite order, zero/oversized
+  raw dimensions, 3-chunk reassembly). Native/compositor pixel assertions on
+  Cocoa, GTK, and Win32 remain open.
 - Kitty OSC 99 desktop-notification completion over one shared
   `cterm-core::notifications` model: `a=report` activation reports (whole
   notification plus 1-based button numbers) and `c=1` close reports
