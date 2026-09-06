@@ -49,6 +49,7 @@ use cterm_ui::theme::Theme;
 use cterm_ui::{BlinkClock, BlinkNeeds, BLINK_POLL_INTERVAL};
 
 use crate::clipboard;
+use crate::dnd_source;
 use crate::dpi::{self, DpiInfo};
 use crate::drop_target::DropRegistration;
 use crate::keycode;
@@ -499,9 +500,20 @@ pub struct PaneEntry {
     /// Command sender for daemon-backed panes.
     pub daemon_cmd_tx: Option<tokio::sync::mpsc::UnboundedSender<DaemonCmd>>,
     dnd_destination: DndDestination,
-    /// Kitty OSC 72 source-side state. Command routing shares the GTK core;
-    /// the OLE `DoDragDrop`/`IDataObject` session is still open.
+    /// Kitty OSC 72 source-side state. `BeginOsDrag` builds the live OLE
+    /// `DoDragDrop`/`IDataObject` session (pre-sent bytes via standard +
+    /// registered clipboard formats, file content via staged `CF_HDROP`).
     dnd_source: DndSource,
+    /// Press anchor (client coordinates) for source-gesture arbitration: every
+    /// primary press records one; motion past the drag threshold while armed
+    /// emits `t=o` once. Cleared on release or emit.
+    dnd_gesture_anchor: Option<(f32, f32)>,
+    /// Staged temp files listed in the live `CF_HDROP` manifest, cleaned up
+    /// when the drag finishes, aborts, or is cancelled.
+    dnd_staged_files: Vec<std::path::PathBuf>,
+    /// Ingressed remote-entry bytes keyed by `(entry, num, parent)`,
+    /// available to `CF_HDROP` staging at drop time.
+    dnd_promise_store: std::collections::HashMap<(i32, i32, i32), Vec<u8>>,
     backend: PaneBackendContext,
 }
 
@@ -853,9 +865,6 @@ impl WindowState {
         let Some((tab_index, pane_id)) = self.source_location(source_id) else {
             return;
         };
-        let Some(pane) = self.tabs[tab_index].panes.get_mut(&pane_id) else {
-            return;
-        };
         // Capability queries stay on the destination side; the source state
         // deliberately emits no `t=q` response.
         match command.command_type {
@@ -865,45 +874,306 @@ impl WindowState {
             | cterm_core::DndCommandType::DragOfferEvent
             | cterm_core::DndCommandType::DragOfferError
             | cterm_core::DndCommandType::UriListData => {
-                let mut actions = pane.dnd_source.handle_command(command);
-                // No OLE drag session exists yet: fail session actions closed
-                // through the shared core handshake instead of claiming `OK`.
-                let mut index = 0;
-                while index < actions.len() {
-                    match actions[index].clone() {
-                        DndSourceAction::BeginOsDrag(_) => {
-                            log::info!("Kitty DND source drag not started (no OLE session)");
-                            actions.extend(pane.dnd_source.os_drag_failed("ENOSYS"));
+                let actions = {
+                    let Some(pane) = self.tabs[tab_index].panes.get_mut(&pane_id) else {
+                        return;
+                    };
+                    pane.dnd_source.handle_command(command)
+                };
+                // `BeginOsDrag` builds the live OLE session; unservable offers
+                // fail closed through the shared core handshake instead of
+                // claiming `OK` to the application.
+                let mut queue: std::collections::VecDeque<DndSourceAction> =
+                    actions.into_iter().collect();
+                while let Some(action) = queue.pop_front() {
+                    match action {
+                        DndSourceAction::Write(frame) => {
+                            self.write_dnd_frames(source_id, vec![frame]);
+                        }
+                        DndSourceAction::BeginOsDrag(offer) => {
+                            // `start_os_drag` runs `DoDragDrop` without pane
+                            // borrows held and returns the confirm/fail-closed
+                            // follow-ups for us to write here.
+                            let follow_ups = self.start_os_drag(source_id, offer);
+                            for follow in follow_ups {
+                                queue.push_back(follow);
+                            }
                         }
                         DndSourceAction::RequestApproval(request) => {
-                            log::info!(
-                                "Denying Kitty DND remote read (no consent prompt): entry={:?}",
-                                request.entry
-                            );
-                            actions.extend(pane.dnd_source.deny(request.request_id));
+                            // Remote (`t=k`) entry read: deny-by-default
+                            // consent dialog mirroring the rich-clipboard
+                            // prompt semantics.
+                            let immediate = self.prompt_dnd_remote_read(source_id, request);
+                            for follow in immediate {
+                                queue.push_back(follow);
+                            }
                         }
-                        _ => {}
+                        DndSourceAction::CancelOsDrag => {
+                            self.cancel_os_drag_session(source_id);
+                        }
+                        DndSourceAction::OsDataReady { entry, data, .. } => {
+                            // Retain ingressed remote-entry bytes for
+                            // `CF_HDROP` staging at drop time. MIME data is
+                            // already served via the data object, like GTK's
+                            // provider.
+                            if let Some(entry) = entry {
+                                if let Some(pane) = self.tabs[tab_index].panes.get_mut(&pane_id) {
+                                    pane.dnd_promise_store.insert(
+                                        (entry.entry, entry.num, entry.parent),
+                                        data.clone(),
+                                    );
+                                }
+                            }
+                        }
+                        DndSourceAction::OsDataFailed { .. } => {}
                     }
-                    index += 1;
                 }
-                let frames = actions
-                    .into_iter()
-                    .filter_map(|action| match action {
-                        DndSourceAction::Write(frame) => Some(frame),
-                        DndSourceAction::BeginOsDrag(_)
-                        | DndSourceAction::CancelOsDrag
-                        | DndSourceAction::OsDataReady { .. }
-                        | DndSourceAction::OsDataFailed { .. }
-                        | DndSourceAction::RequestApproval(_) => None,
-                    })
-                    .collect();
-                self.write_dnd_frames(source_id, frames);
                 return;
             }
             _ => {}
         }
-        let actions = pane.dnd_destination.handle_command(command);
+        let actions = {
+            let Some(pane) = self.tabs[tab_index].panes.get_mut(&pane_id) else {
+                return;
+            };
+            pane.dnd_destination.handle_command(command)
+        };
         self.apply_dnd_actions(source_id, actions);
+    }
+
+    /// Build the live OLE session for one negotiated `BeginOsDrag`.
+    ///
+    /// Runs without pane borrows held across `DoDragDrop` (which pumps
+    /// messages and may re-enter the window) and returns follow-up actions
+    /// for the caller to write: `t=E;OK` once the session is live, or
+    /// `t=E;<code>` fail-closed when the offer is unservable or the session
+    /// cannot start.
+    fn start_os_drag(
+        &mut self,
+        source_id: u64,
+        offer: cterm_app::kitty_dnd_source::OsDragOffer,
+    ) -> Vec<DndSourceAction> {
+        use cterm_app::kitty_dnd_source::{uri_list_file_entries, MAX_SESSION_FILE_ENTRIES};
+        let Some((tab_index, pane_id)) = self.source_location(source_id) else {
+            return Vec::new();
+        };
+        // Snapshot offer state without holding the borrow across OLE calls.
+        let (presented, needs_approval) = {
+            let Some(pane) = self.tabs[tab_index].panes.get_mut(&pane_id) else {
+                return Vec::new();
+            };
+            (
+                pane.dnd_source.presented_snapshot(),
+                pane.dnd_source.remote_read_needs_approval(),
+            )
+        };
+        let payloads = dnd_source::session_plan(&offer, &presented);
+        let allowed = dnd_source::drag_effect_mask(offer.operation);
+        {
+            use windows::Win32::System::Ole::DROPEFFECT_NONE;
+            if payloads.is_empty() || allowed == DROPEFFECT_NONE {
+                log::info!(
+                    "Kitty DND source drag not servable (mimes={:?}); failing closed",
+                    offer.mime_types
+                );
+                let Some(pane) = self.tabs[tab_index].panes.get_mut(&pane_id) else {
+                    return Vec::new();
+                };
+                return pane.dnd_source.os_drag_failed("ENOSYS");
+            }
+        }
+        // Derive file entries from retained uri-list payloads. Only entries
+        // with already-retained bytes join this drag's `CF_HDROP` manifest;
+        // missing entries are prefetched below for next time.
+        let mut staged_inputs: Vec<(String, Vec<u8>)> = Vec::new();
+        let mut prefetch: Vec<cterm_app::kitty_dnd_source::RemoteEntryRef> = Vec::new();
+        {
+            let Some(pane) = self.tabs.get(tab_index).and_then(|t| t.panes.get(&pane_id)) else {
+                return Vec::new();
+            };
+            for payload in &payloads {
+                if payload.kind != cterm_app::kitty_dnd_source::DragPayloadKind::UriList {
+                    continue;
+                }
+                for file_entry in uri_list_file_entries(&payload.data, MAX_SESSION_FILE_ENTRIES) {
+                    let key = (
+                        file_entry.entry.entry,
+                        file_entry.entry.num,
+                        file_entry.entry.parent,
+                    );
+                    if let Some(bytes) = pane.dnd_promise_store.get(&key) {
+                        staged_inputs.push((file_entry.file_name, bytes.clone()));
+                    } else if !pane.dnd_promise_store.contains_key(&key)
+                        && !prefetch.contains(&file_entry.entry)
+                    {
+                        prefetch.push(file_entry.entry);
+                    }
+                }
+            }
+        }
+        // Confirm to the application (`t=E;OK`); idempotent like GTK's
+        // `drag-begin` arm, so a re-entrant confirm cannot double-answer.
+        let mut follow_ups = {
+            let Some(pane) = self.tabs[tab_index].panes.get_mut(&pane_id) else {
+                return Vec::new();
+            };
+            pane.dnd_source.os_drag_started()
+        };
+        // Prefetch approval-free entry reads so same-machine Explorer drops
+        // hit without prompting. Approval-gated entries prompt once (first
+        // entry) instead of spamming one dialog per entry; the rest stay
+        // lazy for next time.
+        if !prefetch.is_empty() {
+            if needs_approval {
+                if let Some(first) = prefetch.first().copied() {
+                    let approval_actions = {
+                        let Some(pane) = self.tabs[tab_index].panes.get_mut(&pane_id) else {
+                            return Vec::new();
+                        };
+                        pane.dnd_source.os_request_remote_entry(first)
+                    };
+                    for action in approval_actions {
+                        match action {
+                            DndSourceAction::Write(frame) => {
+                                follow_ups.push(DndSourceAction::Write(frame));
+                            }
+                            DndSourceAction::RequestApproval(request) => {
+                                let answer = self.prompt_dnd_remote_read(source_id, request);
+                                follow_ups.extend(answer);
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            } else {
+                for entry in prefetch {
+                    let prefetched = {
+                        let Some(pane) = self.tabs[tab_index].panes.get_mut(&pane_id) else {
+                            continue;
+                        };
+                        pane.dnd_source.os_request_remote_entry(entry)
+                    };
+                    for action in prefetched {
+                        match action {
+                            DndSourceAction::Write(frame) => {
+                                follow_ups.push(DndSourceAction::Write(frame));
+                            }
+                            _ => {
+                                log::info!("Kitty DND prefetch unexpectedly gated; failing closed");
+                                self.cancel_os_drag_session(source_id);
+                                let Some(pane) = self.tabs[tab_index].panes.get_mut(&pane_id)
+                                else {
+                                    return Vec::new();
+                                };
+                                return pane.dnd_source.os_drag_failed("ENOSYS");
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        // Stage retained files and build the data object. Missing bytes were
+        // prefetched above and join the *next* drag's manifest.
+        let staged_paths = if staged_inputs.is_empty() {
+            Vec::new()
+        } else {
+            match dnd_source::stage_uri_list_files(&staged_inputs) {
+                Ok(paths) => paths,
+                Err(error) => {
+                    log::warn!("Kitty DND file staging failed, continuing text-only: {error}");
+                    Vec::new()
+                }
+            }
+        };
+        if !staged_paths.is_empty() {
+            if let Some(pane) = self.tabs[tab_index].panes.get_mut(&pane_id) {
+                pane.dnd_staged_files = staged_paths.clone();
+            }
+        }
+        let hdrop = dnd_source::build_hdrop_bytes(&staged_paths);
+        let formats = dnd_source::drag_clipboard_formats(&payloads, hdrop);
+        if formats.is_empty() {
+            self.cancel_os_drag_session(source_id);
+            let Some(pane) = self.tabs[tab_index].panes.get_mut(&pane_id) else {
+                return Vec::new();
+            };
+            return pane.dnd_source.os_drag_failed("ENOSYS");
+        }
+        log::info!(
+            "Kitty DND source session live: mimes={:?}",
+            offer.mime_types
+        );
+        // `DoDragDrop` pumps messages: no pane borrows held across it.
+        let performed = dnd_source::run_drag_loop(formats, allowed);
+        // Report finish and clean up staging. A re-entrant offer cannot
+        // observe stale files because cleanup runs before the finish write.
+        let frames = {
+            let Some(pane) = self.tabs[tab_index].panes.get_mut(&pane_id) else {
+                return follow_ups;
+            };
+            let frames = dnd_source::finish_os_drag_frames(&mut pane.dnd_source, performed);
+            let staged = std::mem::take(&mut pane.dnd_staged_files);
+            dnd_source::cleanup_staged_files(&staged);
+            frames
+        };
+        for frame in frames {
+            follow_ups.push(DndSourceAction::Write(frame));
+        }
+        follow_ups
+    }
+
+    /// Deny-by-default consent dialog for a remote (`t=k`) entry read.
+    ///
+    /// Mirrors the rich-clipboard consent flow: the dialog is modal to the
+    /// main window, Deny is the focused default, the exact token
+    /// (`request_id`) is displayed, expiry is 120 s via dialog timer, and a
+    /// late answer (drag already finished) is dropped so consent can never
+    /// outlive its drag. Returns immediate fail-closed writes for the caller.
+    /// At most one dialog is shown synchronously per call; stacked approvals
+    /// deny fail-closed via core's exact-token matching.
+    fn prompt_dnd_remote_read(
+        &mut self,
+        source_id: u64,
+        request: cterm_app::kitty_dnd_source::RemoteReadApprovalRequest,
+    ) -> Vec<DndSourceAction> {
+        let Some((tab_index, pane_id)) = self.source_location(source_id) else {
+            return Vec::new();
+        };
+        // No pane borrows held across the modal dialog (nested message loop).
+        let choice = dnd_source::show_prompt(self.hwnd, &request);
+        let Some(pane) = self.tabs[tab_index].panes.get_mut(&pane_id) else {
+            return Vec::new();
+        };
+        if !pane.dnd_source.is_dragging() {
+            log::info!("Dropping Kitty DND remote answer (drag already finished)");
+            return Vec::new();
+        }
+        match choice {
+            dnd_source::DndRemoteChoice::AllowAlways => {
+                pane.dnd_source.set_allow_remote_reads(true);
+                log::info!(
+                    "Kitty DND remote reads always-allowed for this surface (request {})",
+                    request.request_id
+                );
+                pane.dnd_source.approve(request.request_id)
+            }
+            dnd_source::DndRemoteChoice::AllowOnce => pane.dnd_source.approve(request.request_id),
+            dnd_source::DndRemoteChoice::Deny => pane.dnd_source.deny(request.request_id),
+        }
+    }
+
+    /// Tear down our side of the live drag session and staged files. OLE owns
+    /// the modal loop itself; this only releases our files and lets late
+    /// callbacks fail closed via phase checks.
+    fn cancel_os_drag_session(&mut self, source_id: u64) {
+        let Some((tab_index, pane_id)) = self.source_location(source_id) else {
+            return;
+        };
+        if let Some(pane) = self.tabs[tab_index].panes.get_mut(&pane_id) {
+            let staged = std::mem::take(&mut pane.dnd_staged_files);
+            dnd_source::cleanup_staged_files(&staged);
+        }
+        log::debug!("Kitty DND source drag cancelled; OLE session torn down");
     }
 
     fn allocate_source_id(&self) -> u64 {
@@ -1228,6 +1498,9 @@ impl WindowState {
                 daemon_cmd_tx: Some(cmd_tx),
                 dnd_destination: DndDestination::default(),
                 dnd_source: DndSource::default(),
+                dnd_gesture_anchor: None,
+                dnd_staged_files: Vec::new(),
+                dnd_promise_store: std::collections::HashMap::new(),
                 backend,
             },
         );
@@ -1388,6 +1661,9 @@ impl WindowState {
                 daemon_cmd_tx: Some(cmd_tx),
                 dnd_destination: DndDestination::default(),
                 dnd_source: DndSource::default(),
+                dnd_gesture_anchor: None,
+                dnd_staged_files: Vec::new(),
+                dnd_promise_store: std::collections::HashMap::new(),
                 backend: PaneBackendContext::Daemon(Box::new(attached_context)),
             },
         );
@@ -1575,6 +1851,9 @@ impl WindowState {
             daemon_cmd_tx: Some(command_sender),
             dnd_destination: DndDestination::default(),
             dnd_source: DndSource::default(),
+            dnd_gesture_anchor: None,
+            dnd_staged_files: Vec::new(),
+            dnd_promise_store: std::collections::HashMap::new(),
             backend: PaneBackendContext::Daemon(Box::new(context)),
         })
     }
@@ -1616,6 +1895,9 @@ impl WindowState {
             daemon_cmd_tx: None,
             dnd_destination: DndDestination::default(),
             dnd_source: DndSource::default(),
+            dnd_gesture_anchor: None,
+            dnd_staged_files: Vec::new(),
+            dnd_promise_store: std::collections::HashMap::new(),
             backend: PaneBackendContext::Daemon(Box::new(
                 self.restored_daemon_context(pane_state, None, cols, rows),
             )),
@@ -1993,6 +2275,9 @@ impl WindowState {
             daemon_cmd_tx: None,
             dnd_destination: DndDestination::default(),
             dnd_source: DndSource::default(),
+            dnd_gesture_anchor: None,
+            dnd_staged_files: Vec::new(),
+            dnd_promise_store: std::collections::HashMap::new(),
             backend: PaneBackendContext::LocalPty,
         })
     }
@@ -2077,6 +2362,9 @@ impl WindowState {
             daemon_cmd_tx: Some(command_sender),
             dnd_destination: DndDestination::default(),
             dnd_source: DndSource::default(),
+            dnd_gesture_anchor: None,
+            dnd_staged_files: Vec::new(),
+            dnd_promise_store: std::collections::HashMap::new(),
             backend: PaneBackendContext::Daemon(Box::new(context)),
         })
     }
@@ -4103,6 +4391,57 @@ impl WindowState {
                     .any(|mime| mime == URI_LIST_MIME))
     }
 
+    /// Kitty DnD source-gesture arbitration for one motion event.
+    ///
+    /// When an application is armed and the pointer travelled past the drag
+    /// threshold since the primary press, emits `t=o` once. Selection and
+    /// mouse-tracking keep flowing after this returns — they are never
+    /// suppressed.
+    fn emit_source_gesture(&mut self, x: f32, y: f32) {
+        let Some((pane_id, rect)) = self.pane_at_client_point(x, y) else {
+            return;
+        };
+        let Some(dimensions) = self.renderer.as_ref().map(|r| r.cell_dimensions()) else {
+            return;
+        };
+        let y_offset = self.terminal_y_offset();
+        let tab_index = self.active_tab_index;
+        // End the pane borrow before writing frames below (which re-borrows).
+        let (actions, source_id) = {
+            let Some(pane) = self
+                .tabs
+                .get_mut(tab_index)
+                .and_then(|tab| tab.panes.get_mut(&pane_id))
+            else {
+                return;
+            };
+            let armed = pane.dnd_source.is_armed();
+            let anchor = pane.dnd_gesture_anchor;
+            if !dnd_source::should_emit_source_gesture(armed, anchor, (x, y)) {
+                return;
+            }
+            pane.dnd_gesture_anchor = None;
+            let rel_x = (x - rect.x as f32).max(0.0);
+            let rel_y = (y - y_offset - rect.y as f32).max(0.0);
+            let location = dnd_source::dnd_location_for_point(
+                rel_x,
+                rel_y,
+                dimensions.width,
+                dimensions.height,
+            );
+            let actions = pane.dnd_source.user_gesture(location);
+            (actions, pane.source_id)
+        };
+        let frames = actions
+            .into_iter()
+            .filter_map(|action| match action {
+                DndSourceAction::Write(frame) => Some(frame),
+                _ => None,
+            })
+            .collect();
+        self.write_dnd_frames(source_id, frames);
+    }
+
     pub(crate) fn native_dnd_moved(
         &mut self,
         x: i32,
@@ -4448,12 +4787,36 @@ impl WindowState {
             self.mouse_report_button = Some(ReportButton::Left);
             self.last_reported_mouse_position = self.terminal_mouse_position(x, y);
         }
+
+        // Record the press anchor for Kitty DnD source-gesture arbitration
+        // (Kitty `initial_left_press`); cleared on release or once the
+        // threshold emits. Recorded for every primary press, like GTK.
+        if let Some((pane_id, _)) = self.pane_at_client_point(x, y) {
+            let active = self.active_tab_index;
+            if let Some(pane) = self
+                .tabs
+                .get_mut(active)
+                .and_then(|tab| tab.panes.get_mut(&pane_id))
+            {
+                pane.dnd_gesture_anchor = Some((x, y));
+            }
+        }
     }
 
     /// Handle mouse button release.
     pub fn on_mouse_up(&mut self, x: f32, y: f32) {
         if self.end_divider_drag() {
             return;
+        }
+        // The press gesture is over: clear the arbitration anchors and retire
+        // gestures that never started a drag (Kitty clears
+        // `initial_left_press` on release; `gesture_ended` is a no-op past
+        // `GestureSent`).
+        for tab in &mut self.tabs {
+            for pane in tab.panes.values_mut() {
+                pane.dnd_gesture_anchor = None;
+                pane.dnd_source.gesture_ended();
+            }
         }
         // If a press was forwarded to a mouse-tracking app, report the release.
         if let Some(button) = self.mouse_report_button.take() {
@@ -4569,6 +4932,13 @@ impl WindowState {
         if self.update_divider_drag(x, y) {
             return;
         }
+
+        // Kitty DnD source gesture (Kitty-faithful coexistence): an armed
+        // application that sees the pointer travel past the drag threshold
+        // gets `t=o` once, in addition to tracking/selection which keeps
+        // flowing below. Runs before (and regardless of) mouse-tracking
+        // forwarding.
+        self.emit_source_gesture(x, y);
 
         // Forward held-button or all-motion reporting. Cell encodings are
         // coalesced by cell; mode 1016 preserves every pixel transition.
@@ -7356,6 +7726,9 @@ mod tests {
             daemon_cmd_tx: None,
             dnd_destination: DndDestination::default(),
             dnd_source: DndSource::default(),
+            dnd_gesture_anchor: None,
+            dnd_staged_files: Vec::new(),
+            dnd_promise_store: std::collections::HashMap::new(),
             backend: PaneBackendContext::LocalPty,
         };
         let tab = TabEntry {

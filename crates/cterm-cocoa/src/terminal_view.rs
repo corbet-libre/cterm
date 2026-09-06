@@ -10,10 +10,10 @@ use std::time::{Duration, Instant};
 
 use objc2::rc::Retained;
 use objc2::runtime::AnyObject;
-use objc2::{class, define_class, msg_send, sel, DefinedClass, MainThreadOnly};
+use objc2::{class, define_class, msg_send, sel, DefinedClass, MainThreadOnly, Message};
 use objc2_app_kit::{
-    NSApplication, NSEvent, NSMenu, NSMenuItem, NSRequestUserAttentionType, NSTextInputClient,
-    NSView,
+    NSApplication, NSDragOperation, NSEvent, NSMenu, NSMenuItem, NSRequestUserAttentionType,
+    NSTextInputClient, NSView,
 };
 use objc2_foundation::{
     MainThreadMarker, NSArray, NSAttributedString, NSNumber, NSObjectProtocol, NSPoint, NSRange,
@@ -25,7 +25,10 @@ use cterm_app::config::{Config, ShortcutsConfig};
 use cterm_app::kitty_dnd::{
     DndAdapterAction, DndDestination, DndLocation, DndOperation, DropData, URI_LIST_MIME,
 };
-use cterm_app::kitty_dnd_source::{DndSource, DndSourceAction};
+use cterm_app::kitty_dnd_source::{
+    DndSource, DndSourceAction, DragPayloadKind, OsDragOffer, RemoteEntryRef,
+    RemoteReadApprovalRequest,
+};
 use cterm_app::upgrade::PaneLaunchContext;
 use cterm_app::ShortcutManager;
 use cterm_core::screen::{ScreenConfig, SelectionMode};
@@ -36,6 +39,8 @@ use cterm_ui::theme::Theme;
 use cterm_ui::{Action, BlinkClock, BlinkNeeds, BlinkPhase, KeyCode, Modifiers};
 
 use crate::cg_renderer::CGRenderer;
+use crate::dnd_source;
+use crate::dnd_source::DndRemoteChoice;
 use crate::file_transfer::PendingFileManager;
 use crate::keycode::{
     direct_modified_key_char, exactly_one_char, key_event_kind, modifier_key_for_keycode,
@@ -286,9 +291,34 @@ pub struct TerminalViewIvars {
     /// Main-thread Kitty OSC 72 destination state.
     dnd_destination: RefCell<DndDestination>,
     /// Main-thread Kitty OSC 72 source-side state. Command routing shares the
-    /// GTK core; the `NSDraggingSession` that consumes `BeginOsDrag` is still
-    /// open (file promises / pre-sent data bridging needed).
+    /// GTK core; `BeginOsDrag` builds the live `NSDraggingSession` in
+    /// [`TerminalView::start_os_drag`] (pre-sent bytes via
+    /// `NSPasteboardItem`, file content via `NSFilePromiseProvider`).
     dnd_source: RefCell<DndSource>,
+    /// Press anchor (view coordinates) for source-gesture arbitration: every
+    /// primary press records one; motion past the drag threshold while armed
+    /// emits `t=o` once. Cleared on release or emit.
+    source_gesture_anchor: RefCell<Option<(f64, f64)>>,
+    /// Gesture `NSEvent` stashed when `t=o` is emitted; consumed by
+    /// `BeginOsDrag` as the event that proves a genuine user drag.
+    source_gesture_event: RefCell<Option<Retained<NSEvent>>>,
+    /// Live drag session parts, retained for the drag lifetime. AppKit owns
+    /// the session; these refs keep the delegates alive and are released on
+    /// `endedAtPoint:`, abort, or cancel (late callbacks fail closed).
+    dnd_drag_session: RefCell<Option<Retained<objc2_app_kit::NSDraggingSession>>>,
+    dnd_drag_source: RefCell<Option<Retained<crate::dnd_source::DndDragSource>>>,
+    dnd_promise_delegate: RefCell<Option<Retained<crate::dnd_source::DndFilePromiseDelegate>>>,
+    /// Ingressed remote-entry bytes keyed by `(entry, num, parent)`,
+    /// available to file-promise fulfillment at drop time. A lock (not a
+    /// `RefCell` like the rest of the ivars) because the promise fulfillment
+    /// queue reads it off the main thread; writers stay on the main thread.
+    dnd_promise_store: Mutex<HashMap<(i32, i32, i32), Vec<u8>>>,
+    /// Lifecycle sender for the open remote-read prompt, if any: the drag
+    /// finishing, aborting, or being cancelled resolves the prompt as a
+    /// denial (drag-lifecycle expiry).
+    dnd_remote_cancel: RefCell<Option<tokio::sync::watch::Sender<bool>>>,
+    /// Token of the open remote-read prompt sheet, if any.
+    dnd_remote_token: RefCell<Option<u64>>,
     /// Color palette for HTML export
     color_palette: cterm_core::color::ColorPalette,
     /// Command channel for daemon I/O (write + resize) — None for local PTY sessions
@@ -669,6 +699,13 @@ define_class!(
             let location_in_window = event.locationInWindow();
             let location = self.convert_point_from_view(location_in_window, None);
 
+            // Record the press anchor for Kitty DnD source-gesture
+            // arbitration (Kitty `initial_left_press`); cleared on release
+            // or once the threshold emits. Recorded for every primary
+            // press, like GTK.
+            *self.ivars().source_gesture_anchor.borrow_mut() =
+                Some((location.x, location.y));
+
             // Calculate cell position
             let col = (location.x / self.ivars().cell_width.get())
                 .floor()
@@ -736,6 +773,13 @@ define_class!(
                     return;
                 }
             }
+            // The press gesture is over: clear the arbitration anchor and
+            // retire a gesture that never started a drag (Kitty clears
+            // `initial_left_press` on release; `gesture_ended` is a no-op
+            // past `GestureSent`).
+            *self.ivars().source_gesture_anchor.borrow_mut() = None;
+            *self.ivars().source_gesture_event.borrow_mut() = None;
+            self.ivars().dnd_source.borrow_mut().gesture_ended();
             if !self.ivars().is_selecting.get() {
                 return;
             }
@@ -784,13 +828,21 @@ define_class!(
                     return;
                 }
             }
-            if !self.ivars().is_selecting.get() {
-                return;
-            }
 
             // Convert window coordinates to view coordinates
             let location_in_window = event.locationInWindow();
             let location = self.convert_point_from_view(location_in_window, None);
+
+            // Kitty DnD source gesture (Kitty-faithful coexistence): an
+            // armed application that sees the pointer travel past the drag
+            // threshold gets `t=o` once, in addition to the selection
+            // extended below. Runs before (and regardless of)
+            // mouse-tracking forwarding.
+            self.emit_source_gesture(&location, event);
+
+            if !self.ivars().is_selecting.get() {
+                return;
+            }
 
             // Calculate cell position (clamp to valid range)
             let col = (location.x / self.ivars().cell_width.get())
@@ -1790,6 +1842,14 @@ impl TerminalView {
             file_manager: RefCell::new(PendingFileManager::new()),
             dnd_destination: RefCell::new(DndDestination::default()),
             dnd_source: RefCell::new(DndSource::default()),
+            source_gesture_anchor: RefCell::new(None),
+            source_gesture_event: RefCell::new(None),
+            dnd_drag_session: RefCell::new(None),
+            dnd_drag_source: RefCell::new(None),
+            dnd_promise_delegate: RefCell::new(None),
+            dnd_promise_store: Mutex::new(HashMap::new()),
+            dnd_remote_cancel: RefCell::new(None),
+            dnd_remote_token: RefCell::new(None),
             color_palette: {
                 let mut palette = theme.colors.clone();
                 palette.cursor = theme.cursor.color;
@@ -2890,9 +2950,9 @@ impl TerminalView {
                 | cterm_core::DndCommandType::DragOfferError
                 | cterm_core::DndCommandType::UriListData => {
                     let actions = self.ivars().dnd_source.borrow_mut().handle_command(command);
-                    // No NSDraggingSession exists yet, so every session action
-                    // fails closed through the shared core handshake instead
-                    // of claiming `OK` to the application.
+                    // `BeginOsDrag` builds the live `NSDraggingSession`;
+                    // unservable offers fail closed through the shared core
+                    // handshake instead of claiming `OK` to the application.
                     let mut actions = actions;
                     let mut index = 0;
                     while index < actions.len() {
@@ -2907,33 +2967,42 @@ impl TerminalView {
                                     return;
                                 }
                             }
-                            DndSourceAction::BeginOsDrag(_) => {
-                                log::info!(
-                                    "Kitty DND source drag not started (no NSDraggingSession)"
-                                );
-                                actions.extend(
-                                    self.ivars()
-                                        .dnd_source
-                                        .borrow_mut()
-                                        .os_drag_failed("ENOSYS"),
-                                );
+                            DndSourceAction::BeginOsDrag(offer) => {
+                                // `start_os_drag` runs the AppKit session
+                                // build without the terminal lock and returns
+                                // the confirm/fail-closed follow-ups for us
+                                // to write here.
+                                drop(terminal);
+                                let follow_ups = self.start_os_drag(offer);
+                                terminal = self.ivars().terminal.lock();
+                                actions.extend(follow_ups);
                             }
                             DndSourceAction::RequestApproval(request) => {
-                                // Fail closed without a native consent prompt.
-                                log::info!(
-                                    "Denying Kitty DND remote read (no consent prompt): entry={:?}",
-                                    request.entry
-                                );
-                                actions.extend(
-                                    self.ivars()
-                                        .dnd_source
-                                        .borrow_mut()
-                                        .deny(request.request_id),
-                                );
+                                // Remote (`t=k`) entry read: deny-by-default
+                                // consent sheet mirroring the rich-clipboard
+                                // prompt semantics. Immediate fail-closed
+                                // writes (if any) join the queue below.
+                                let immediate = self.prompt_dnd_remote_read(request);
+                                actions.extend(immediate);
                             }
-                            DndSourceAction::CancelOsDrag
-                            | DndSourceAction::OsDataReady { .. }
-                            | DndSourceAction::OsDataFailed { .. } => {}
+                            DndSourceAction::CancelOsDrag => {
+                                drop(terminal);
+                                self.cancel_os_drag_session();
+                                terminal = self.ivars().terminal.lock();
+                            }
+                            DndSourceAction::OsDataReady { entry, data, .. } => {
+                                // Retain ingressed remote-entry bytes for
+                                // file-promise fulfillment at drop time. MIME
+                                // data is already served via the session
+                                // items, like GTK's provider.
+                                if let Some(entry) = entry {
+                                    self.ivars().dnd_promise_store.lock().insert(
+                                        (entry.entry, entry.num, entry.parent),
+                                        data.clone(),
+                                    );
+                                }
+                            }
+                            DndSourceAction::OsDataFailed { .. } => {}
                         }
                     }
                     continue;
@@ -2958,6 +3027,457 @@ impl TerminalView {
                 }
             }
         }
+    }
+
+    /// Kitty DnD source-gesture arbitration for one motion event.
+    ///
+    /// When an application is armed and the pointer travelled past the drag
+    /// threshold since the primary press, emits `t=o` once and stashes the
+    /// event that proves a genuine user drag for `BeginOsDrag`. Selection
+    /// keeps extending after this returns — it is never suppressed.
+    fn emit_source_gesture(&self, location: &NSPoint, event: &NSEvent) {
+        let armed = self.ivars().dnd_source.borrow().is_armed();
+        let anchor = *self.ivars().source_gesture_anchor.borrow();
+        if !dnd_source::should_emit_source_gesture(armed, anchor, (location.x, location.y)) {
+            return;
+        }
+        *self.ivars().source_gesture_anchor.borrow_mut() = None;
+        let gesture = dnd_source::dnd_location_for_point(
+            location.x,
+            location.y,
+            self.ivars().cell_width.get(),
+            self.ivars().cell_height.get(),
+        );
+        let actions = self.ivars().dnd_source.borrow_mut().user_gesture(gesture);
+        if actions.is_empty() {
+            return;
+        }
+        *self.ivars().source_gesture_event.borrow_mut() = Some(event.retain());
+        let mut terminal = self.ivars().terminal.lock();
+        for action in actions {
+            if let DndSourceAction::Write(frame) = action {
+                if let Err(error) = terminal.write(&frame) {
+                    log::error!("Failed to write Kitty DND source gesture to PTY: {error}");
+                    break;
+                }
+            }
+        }
+    }
+
+    /// Build the live `NSDraggingSession` for one negotiated `BeginOsDrag`.
+    ///
+    /// Runs without the terminal lock (AppKit calls below must never run
+    /// under it) and returns follow-up actions for the caller to write to
+    /// the PTY under its lock: `t=E;OK` once the session is live, or
+    /// `t=E;<code>` fail-closed when the offer is unservable, no gesture
+    /// event proves a real drag, or the session cannot start.
+    fn start_os_drag(&self, offer: OsDragOffer) -> Vec<DndSourceAction> {
+        use cterm_app::kitty_dnd_source::{uri_list_file_entries, MAX_SESSION_FILE_ENTRIES};
+
+        let fail = |view: &TerminalView| {
+            view.ivars()
+                .dnd_source
+                .borrow_mut()
+                .os_drag_failed("ENOSYS")
+        };
+        let presented = self.ivars().dnd_source.borrow().presented_snapshot();
+        let payloads = dnd_source::session_plan(&offer, &presented);
+        let mask = dnd_source::drag_operation_mask(offer.operation);
+        if payloads.is_empty() || mask.is_empty() {
+            log::info!(
+                "Kitty DND source drag not servable (mimes={:?}); failing closed",
+                offer.mime_types
+            );
+            return fail(self);
+        }
+        let Some(event) = self.ivars().source_gesture_event.borrow_mut().take() else {
+            log::info!("Kitty DND source drag without a gesture event; failing closed");
+            return fail(self);
+        };
+        let mtm = MainThreadMarker::from(self);
+        let drag_frame = NSRect::new(
+            NSPoint::new(
+                f64::from(offer.location.pixel_x).max(0.0),
+                f64::from(offer.location.pixel_y).max(0.0),
+            ),
+            NSSize::new(24.0, 24.0),
+        );
+
+        // Pasteboard items for the pre-sent bytes plus one file promise per
+        // retained uri-list file entry. Custom `t=p` drag images stay a
+        // documented gap: AppKit synthesizes the visible image from the
+        // item contents.
+        let mut items = Vec::new();
+        let mut prefetch = Vec::new();
+        let delegate = dnd_source::DndFilePromiseDelegate::with_view(mtm, self);
+        for payload in &payloads {
+            if let Some(item) = dnd_source::dragging_item_for_payload(payload) {
+                item.setDraggingFrame(drag_frame);
+                items.push(item);
+            }
+            if payload.kind == DragPayloadKind::UriList {
+                for file_entry in uri_list_file_entries(&payload.data, MAX_SESSION_FILE_ENTRIES) {
+                    let Some(provider) =
+                        delegate.make_provider(file_entry.entry, &file_entry.file_name)
+                    else {
+                        continue;
+                    };
+                    if let Some(item) = dnd_source::dragging_item_for_provider(&provider) {
+                        item.setDraggingFrame(drag_frame);
+                        items.push(item);
+                    }
+                    let key = (
+                        file_entry.entry.entry,
+                        file_entry.entry.num,
+                        file_entry.entry.parent,
+                    );
+                    if !self.ivars().dnd_promise_store.lock().contains_key(&key) {
+                        prefetch.push(file_entry.entry);
+                    }
+                }
+            }
+        }
+        if items.is_empty() {
+            return fail(self);
+        }
+        let drag_source = dnd_source::DndDragSource::with_view(mtm, self, mask);
+        let session = dnd_source::begin_os_drag_session(self, &event, &drag_source, mask, &items);
+        let Some(session) = session else {
+            log::info!("Kitty DND source drag session failed to start; failing closed");
+            return fail(self);
+        };
+        // Retain the session parts for the drag lifetime.
+        *self.ivars().dnd_drag_session.borrow_mut() = Some(session);
+        *self.ivars().dnd_drag_source.borrow_mut() = Some(drag_source);
+        *self.ivars().dnd_promise_delegate.borrow_mut() = Some(delegate);
+        log::info!(
+            "Kitty DND source session live: mimes={:?}",
+            offer.mime_types
+        );
+        // Confirm to the application (`t=E;OK`); idempotent like GTK's
+        // `drag-begin` arm, so a re-entrant confirm cannot double-answer.
+        let mut follow_ups = self.ivars().dnd_source.borrow_mut().os_drag_started();
+        // Prefetch approval-free entry reads so same-machine Finder drops
+        // hit without prompting. Approval-gated entries stay lazy (the
+        // promise miss path) so one drag never spams one prompt per entry.
+        if !self
+            .ivars()
+            .dnd_source
+            .borrow()
+            .remote_read_needs_approval()
+        {
+            for entry in prefetch {
+                let prefetched = self
+                    .ivars()
+                    .dnd_source
+                    .borrow_mut()
+                    .os_request_remote_entry(entry);
+                let mut gated = false;
+                for action in prefetched {
+                    match action {
+                        DndSourceAction::Write(_) => follow_ups.push(action),
+                        _ => gated = true,
+                    }
+                }
+                if gated {
+                    log::info!("Kitty DND prefetch unexpectedly gated; failing closed");
+                    self.ivars().dnd_drag_session.borrow_mut().take();
+                    self.ivars().dnd_drag_source.borrow_mut().take();
+                    self.ivars().dnd_promise_delegate.borrow_mut().take();
+                    return fail(self);
+                }
+            }
+        }
+        follow_ups
+    }
+
+    /// Deny-by-default consent sheet for a remote (`t=k`) entry read.
+    ///
+    /// Mirrors the rich-clipboard consent flow: the expiry is anchored when
+    /// the command is received, at most one sheet is open per view (a second
+    /// approval while one is open denies fail-closed), and the answer is
+    /// applied on the main queue behind an `is_dragging` guard so consent
+    /// can never outlive its drag. Returns immediate fail-closed writes for
+    /// the caller (expired, torn-down view, or stacked prompt).
+    fn prompt_dnd_remote_read(&self, request: RemoteReadApprovalRequest) -> Vec<DndSourceAction> {
+        let expires_at = tokio::time::Instant::now() + dnd_source::DND_REMOTE_PROMPT_TTL;
+        if expires_at <= tokio::time::Instant::now()
+            || self.ivars().state.view_invalid.load(Ordering::Acquire)
+        {
+            log::info!(
+                "Denying Kitty DND remote read (view going away): entry={:?}",
+                request.entry
+            );
+            return self
+                .ivars()
+                .dnd_source
+                .borrow_mut()
+                .deny(request.request_id);
+        }
+        if self.ivars().dnd_remote_token.borrow().is_some() {
+            log::info!(
+                "Denying Kitty DND remote read (prompt already open): entry={:?}",
+                request.entry
+            );
+            return self
+                .ivars()
+                .dnd_source
+                .borrow_mut()
+                .deny(request.request_id);
+        }
+        let token = dnd_source::next_dnd_remote_prompt_token();
+        let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+        *self.ivars().dnd_remote_cancel.borrow_mut() = Some(cancel_tx);
+        *self.ivars().dnd_remote_token.borrow_mut() = Some(token);
+        let terminal = Arc::clone(&self.ivars().terminal);
+        let state = Arc::clone(&self.ivars().state);
+        let view_ptr = self as *const TerminalView as usize;
+        std::thread::spawn(move || {
+            Self::dnd_remote_consent_worker(
+                terminal, state, view_ptr, token, request, cancel_rx, expires_at,
+            );
+        });
+        Vec::new()
+    }
+
+    /// Worker for one remote-read consent sheet: opens the sheet on the main
+    /// queue, awaits result/expiry/lifecycle-cancel on a private runtime,
+    /// then answers on the main queue behind the drag-liveness guard.
+    fn dnd_remote_consent_worker(
+        terminal: Arc<parking_lot::Mutex<cterm_core::Terminal>>,
+        state: Arc<ViewState>,
+        view_ptr: usize,
+        token: u64,
+        request: RemoteReadApprovalRequest,
+        lifecycle_cancel: tokio::sync::watch::Receiver<bool>,
+        expires_at: tokio::time::Instant,
+    ) {
+        let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let cancelled_for_ui = Arc::clone(&cancelled);
+        let state_for_ui = Arc::clone(&state);
+        let request_for_ui = request.clone();
+        dispatch2::Queue::main().exec_async(move || {
+            if cancelled_for_ui.load(Ordering::Acquire)
+                || state_for_ui.view_invalid.load(Ordering::Acquire)
+            {
+                let _ = result_tx.send(DndRemoteChoice::Deny);
+                return;
+            }
+            let mtm = unsafe { MainThreadMarker::new_unchecked() };
+            let view = unsafe { &*(view_ptr as *const TerminalView) };
+            let Some(parent) = view.window() else {
+                let _ = result_tx.send(DndRemoteChoice::Deny);
+                return;
+            };
+            dnd_source::begin_dnd_remote_prompt(
+                mtm,
+                token,
+                &request_for_ui,
+                &parent,
+                cancelled_for_ui,
+                result_tx,
+            );
+        });
+
+        let outcome = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map(|runtime| {
+                runtime.block_on(dnd_source::await_dnd_remote_prompt(
+                    result_rx,
+                    lifecycle_cancel,
+                    expires_at,
+                ))
+            })
+            .unwrap_or(dnd_source::PromptOutcome {
+                choice: DndRemoteChoice::Deny,
+                dismiss: true,
+            });
+        if outcome.dismiss {
+            cancelled.store(true, Ordering::Release);
+            dispatch2::Queue::main().exec_async(move || {
+                let mtm = unsafe { MainThreadMarker::new_unchecked() };
+                dnd_source::cancel_dnd_remote_prompt(mtm, token);
+            });
+        }
+        let _ = terminal;
+        dispatch2::Queue::main().exec_async(move || {
+            let view = unsafe { &*(view_ptr as *const TerminalView) };
+            view.answer_dnd_remote_read(token, request, outcome.choice);
+        });
+    }
+
+    /// Answer one remote-read consent sheet on the main queue. Only the
+    /// currently open prompt answers, and only while its drag is still live
+    /// — late answers are dropped so consent can never outlive its drag.
+    fn answer_dnd_remote_read(
+        &self,
+        token: u64,
+        request: RemoteReadApprovalRequest,
+        choice: DndRemoteChoice,
+    ) {
+        if self.ivars().dnd_remote_token.borrow().as_ref() != Some(&token) {
+            return;
+        }
+        *self.ivars().dnd_remote_token.borrow_mut() = None;
+        self.ivars().dnd_remote_cancel.borrow_mut().take();
+        if !self.ivars().dnd_source.borrow().is_dragging() {
+            log::info!("Dropping Kitty DND remote answer (drag already finished)");
+            return;
+        }
+        let actions = match choice {
+            DndRemoteChoice::AllowAlways => {
+                self.ivars()
+                    .dnd_source
+                    .borrow_mut()
+                    .set_allow_remote_reads(true);
+                log::info!(
+                    "Kitty DND remote reads always-allowed for this surface (request {})",
+                    request.request_id
+                );
+                self.ivars()
+                    .dnd_source
+                    .borrow_mut()
+                    .approve(request.request_id)
+            }
+            DndRemoteChoice::AllowOnce => self
+                .ivars()
+                .dnd_source
+                .borrow_mut()
+                .approve(request.request_id),
+            DndRemoteChoice::Deny => self
+                .ivars()
+                .dnd_source
+                .borrow_mut()
+                .deny(request.request_id),
+        };
+        // A denial aborts the drag: release the session refs with it.
+        let mut terminal = self.ivars().terminal.lock();
+        for action in actions {
+            match action {
+                DndSourceAction::Write(frame) => {
+                    if let Err(error) = terminal.write(&frame) {
+                        log::error!("Failed to write Kitty DND remote answer to PTY: {error}");
+                        break;
+                    }
+                }
+                DndSourceAction::CancelOsDrag => {
+                    drop(terminal);
+                    self.cancel_os_drag_session();
+                    terminal = self.ivars().terminal.lock();
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Tear down our side of the live drag session. AppKit owns the session
+    /// itself and ends it via the delegate, whose callbacks fail closed via
+    /// phase checks after this runs.
+    fn cancel_os_drag_session(&self) {
+        self.ivars().dnd_drag_session.borrow_mut().take();
+        self.ivars().dnd_drag_source.borrow_mut().take();
+        self.ivars().dnd_promise_delegate.borrow_mut().take();
+        self.dnd_cancel_remote_prompt();
+        log::debug!("Kitty DND source drag cancelled; native session torn down");
+    }
+
+    /// Resolve the open remote prompt as a denial (drag-lifecycle expiry).
+    fn dnd_cancel_remote_prompt(&self) {
+        if let Some(cancel) = self.ivars().dnd_remote_cancel.borrow_mut().take() {
+            let _ = cancel.send(true);
+        }
+        if let Some(token) = self.ivars().dnd_remote_token.borrow_mut().take() {
+            let mtm = MainThreadMarker::from(self);
+            dnd_source::cancel_dnd_remote_prompt(mtm, token);
+        }
+    }
+
+    /// The OS drag session ended: report finish to the application and
+    /// release the session. Called by the drag-source delegate on the main
+    /// thread; fail-closed outside `Dragging`.
+    pub(crate) fn dnd_drag_ended(&self, operation: NSDragOperation) {
+        let frames =
+            dnd_source::finish_os_drag_frames(&mut self.ivars().dnd_source.borrow_mut(), operation);
+        // Release the session refs first so a re-entrant offer cannot observe
+        // a stale session, then expire the prompt with the drag.
+        self.ivars().dnd_drag_session.borrow_mut().take();
+        self.ivars().dnd_drag_source.borrow_mut().take();
+        self.ivars().dnd_promise_delegate.borrow_mut().take();
+        self.dnd_cancel_remote_prompt();
+        let mut terminal = self.ivars().terminal.lock();
+        for frame in frames {
+            if let Err(error) = terminal.write(&frame) {
+                log::error!("Failed to write Kitty DND source finish to PTY: {error}");
+                break;
+            }
+        }
+    }
+
+    /// Retained ingress bytes for one promised entry, for the fulfillment
+    /// queue. Lock-based (not main-confined) because fulfillment reads off
+    /// the main thread.
+    pub(crate) fn dnd_promise_bytes(&self, entry: RemoteEntryRef) -> Option<Vec<u8>> {
+        self.ivars()
+            .dnd_promise_store
+            .lock()
+            .get(&(entry.entry, entry.num, entry.parent))
+            .cloned()
+    }
+
+    /// Ask core for one promised entry's bytes (consent prompt / `t=k` write
+    /// when the drag is still live; a no-op otherwise) so a follow-up drag
+    /// succeeds. Called from the promise fulfillment queue; hops to main
+    /// because `DndSource` is main-confined. A prompt is never opened from
+    /// this path — an approval-gated miss denies fail-closed instead.
+    pub(crate) fn dnd_request_promise_entry(&self, entry: RemoteEntryRef) {
+        let view_ptr = self as *const TerminalView as usize;
+        dispatch2::Queue::main().exec_async(move || {
+            let view = unsafe { &*(view_ptr as *const TerminalView) };
+            if view.ivars().state.view_invalid.load(Ordering::SeqCst) {
+                return;
+            }
+            let actions = view
+                .ivars()
+                .dnd_source
+                .borrow_mut()
+                .os_request_remote_entry(entry);
+            let mut terminal = view.ivars().terminal.lock();
+            for action in actions {
+                match action {
+                    DndSourceAction::Write(frame) => {
+                        if let Err(error) = terminal.write(&frame) {
+                            log::error!(
+                                "Failed to write Kitty DND promise prefetch to PTY: {error}"
+                            );
+                            break;
+                        }
+                    }
+                    DndSourceAction::RequestApproval(request) => {
+                        let denied = view
+                            .ivars()
+                            .dnd_source
+                            .borrow_mut()
+                            .deny(request.request_id);
+                        for action in denied {
+                            if let DndSourceAction::Write(frame) = action {
+                                if let Err(error) = terminal.write(&frame) {
+                                    log::error!(
+                                        "Failed to write Kitty DND promise denial to PTY: {error}"
+                                    );
+                                    break;
+                                }
+                            }
+                        }
+                        drop(terminal);
+                        view.cancel_os_drag_session();
+                        terminal = view.ivars().terminal.lock();
+                    }
+                    _ => {}
+                }
+            }
+        });
     }
 
     fn write_text_input(&self, text: &str) {
