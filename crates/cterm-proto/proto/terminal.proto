@@ -735,6 +735,10 @@ message TerminalModes {
   // Kitty OSC 5522 paste-event mode for reconnecting frontends, so a
   // relaunch keeps reporting user pastes as MIME listings (or not).
   bool rich_clipboard_paste_events = 20;
+  // DECSACE attribute-change extent for reconnecting frontends, so a
+  // relaunch keeps applying DECCARA/DECRARA with the same geometry.
+  // True is the scan-order stream (`CSI 0/1 * x`, the power-on default).
+  bool attribute_change_stream = 21;
 }
 
 enum MouseTrackingMode {

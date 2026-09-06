@@ -18,6 +18,8 @@
 
 use std::collections::{HashMap, VecDeque};
 
+use regex::Regex;
+
 /// Maximum decoded bytes for one notification title.
 pub const MAX_NOTIFICATION_TITLE_BYTES: usize = 1024;
 /// Maximum decoded bytes for one notification body.
@@ -288,16 +290,17 @@ pub fn normalize_filter_entry(raw: &str) -> Option<String> {
 }
 
 /// User-configured notification allow/deny lists over the `f=` application
-/// name and `t=` notification types.
+/// name and `t=` notification types, plus Kitty-style `filter_notification`
+/// deny rules over title/body/app/type.
 ///
-/// All lists empty (the default) allows everything — today's behavior.
-/// Otherwise: deny wins over allow, and a non-empty allow-list requires a
-/// positive match. Untagged notifications (no `f=`/`t=`, e.g. legacy OSC
-/// 9/777) therefore never match a deny entry but also never satisfy an
-/// allow-list. This is intentionally simpler than Kitty's
-/// `filter_notification` `field:regexp` boolean grammar (which also matches
-/// title/body): exact per-app/type lists cover the common cases with
-/// TOML-native config; title/body/regex filtering stays future work.
+/// All lists and rules empty (the default) allows everything — today's
+/// behavior. Otherwise: deny wins over allow, a non-empty allow-list
+/// requires a positive match, and any matching deny rule suppresses
+/// delivery. Untagged notifications (no `f=`/`t=`, e.g. legacy OSC 9/777)
+/// therefore never match a deny entry but also never satisfy an allow-list.
+/// Exact per-app/type lists cover the common cases with TOML-native config;
+/// `filter_rules` adds Kitty's `field:regexp` boolean grammar (also matching
+/// title/body) for the rest. See [`parse_filter_rule`].
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct NotificationFilter {
     /// `f=` names that may deliver when non-empty (untagged never matches).
@@ -308,15 +311,18 @@ pub struct NotificationFilter {
     pub allow_types: Vec<String>,
     /// `t=` types that never deliver (wins over `allow_types`).
     pub deny_types: Vec<String>,
+    /// Compiled Kitty-style deny rules (see [`parse_filter_rule`]).
+    pub filter_rules: Vec<FilterRule>,
 }
 
 impl NotificationFilter {
-    /// Whether this filter allows everything (all lists empty).
+    /// Whether this filter allows everything (all lists and rules empty).
     pub fn is_allow_all(&self) -> bool {
         self.allow_apps.is_empty()
             && self.deny_apps.is_empty()
             && self.allow_types.is_empty()
             && self.deny_types.is_empty()
+            && self.filter_rules.is_empty()
     }
 
     /// Whether a notification with this filter identity may be delivered.
@@ -348,6 +354,25 @@ impl NotificationFilter {
         }
         true
     }
+
+    /// Whether a notification with full title/body/identity may be delivered:
+    /// the allow/deny lists must pass and no `filter_rules` deny rule may
+    /// match. Enforcement point for frontends once title/body are known;
+    /// call before occasion filtering and before any registry/report side
+    /// effects, like [`NotificationFilter::allows`].
+    pub fn allows_full(
+        &self,
+        app_name: Option<&str>,
+        notif_types: &[String],
+        title: &str,
+        body: &str,
+    ) -> bool {
+        self.allows(app_name, notif_types)
+            && !self
+                .filter_rules
+                .iter()
+                .any(|rule| rule.matches(title, body, app_name, notif_types))
+    }
 }
 
 /// Shared-model enforcement seam: whether a notification with this filter
@@ -359,6 +384,411 @@ pub fn notification_allowed(
     notif_types: &[String],
 ) -> bool {
     filter.allows(app_name, notif_types)
+}
+
+/// Shared-model enforcement seam with title/body: whether a notification
+/// may be delivered under `filter`, including its deny rules. Tested
+/// identically to [`NotificationFilter::allows_full`].
+pub fn notification_allowed_full(
+    filter: &NotificationFilter,
+    app_name: Option<&str>,
+    notif_types: &[String],
+    title: &str,
+    body: &str,
+) -> bool {
+    filter.allows_full(app_name, notif_types, title, body)
+}
+
+/// One matchable field of a Kitty-style `filter_notification` rule.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FilterField {
+    Title,
+    Body,
+    App,
+    Type,
+}
+
+/// One compiled `field:regexp` item of a [`FilterRule`]. Equality is over
+/// field and pattern text only, so filters stay comparable like the
+/// allow/deny lists.
+#[derive(Debug, Clone)]
+pub struct FilterItem {
+    /// Which notification field the pattern searches (unanchored).
+    pub field: FilterField,
+    /// Original pattern text, for logs and equality.
+    pub pattern: String,
+    regex: Regex,
+}
+
+impl PartialEq for FilterItem {
+    fn eq(&self, other: &Self) -> bool {
+        self.field == other.field && self.pattern == other.pattern
+    }
+}
+
+impl Eq for FilterItem {}
+
+impl FilterItem {
+    fn matches(&self, title: &str, body: &str, app: Option<&str>, types: &[String]) -> bool {
+        match self.field {
+            FilterField::Title => self.regex.is_match(title),
+            FilterField::Body => self.regex.is_match(body),
+            FilterField::App => app.is_some_and(|name| self.regex.is_match(name)),
+            // Kitty matches when ANY of the notification's types matches.
+            FilterField::Type => types.iter().any(|kind| self.regex.is_match(kind)),
+        }
+    }
+}
+
+/// Boolean combination of [`FilterItem`]s. Structural equality is over
+/// field/pattern text only (see [`FilterItem`]).
+#[derive(Debug, Clone)]
+enum FilterAst {
+    /// The exact rule `all`: matches every notification.
+    All,
+    Item(FilterItem),
+    Not(Box<FilterAst>),
+    And(Box<FilterAst>, Box<FilterAst>),
+    Or(Box<FilterAst>, Box<FilterAst>),
+}
+
+impl PartialEq for FilterAst {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (FilterAst::All, FilterAst::All) => true,
+            (FilterAst::Item(a), FilterAst::Item(b)) => a == b,
+            (FilterAst::Not(a), FilterAst::Not(b)) => a == b,
+            (FilterAst::And(a1, a2), FilterAst::And(b1, b2))
+            | (FilterAst::Or(a1, a2), FilterAst::Or(b1, b2)) => a1 == b1 && a2 == b2,
+            _ => false,
+        }
+    }
+}
+
+impl Eq for FilterAst {}
+
+impl FilterAst {
+    fn matches(&self, title: &str, body: &str, app: Option<&str>, types: &[String]) -> bool {
+        match self {
+            FilterAst::All => true,
+            FilterAst::Item(item) => item.matches(title, body, app, types),
+            FilterAst::Not(inner) => !inner.matches(title, body, app, types),
+            FilterAst::And(first, second) => {
+                first.matches(title, body, app, types) && second.matches(title, body, app, types)
+            }
+            FilterAst::Or(first, second) => {
+                first.matches(title, body, app, types) || second.matches(title, body, app, types)
+            }
+        }
+    }
+}
+
+/// One compiled user `filter_notification` deny rule (Kitty grammar): a
+/// matching rule suppresses delivery. Equality is over the source text.
+#[derive(Debug, Clone)]
+pub struct FilterRule {
+    /// Original (trimmed) rule text, for logs and equality.
+    pub source: String,
+    ast: FilterAst,
+}
+
+impl PartialEq for FilterRule {
+    fn eq(&self, other: &Self) -> bool {
+        self.source == other.source
+    }
+}
+
+impl Eq for FilterRule {}
+
+impl FilterRule {
+    fn matches(&self, title: &str, body: &str, app: Option<&str>, types: &[String]) -> bool {
+        self.ast.matches(title, body, app, types)
+    }
+}
+
+/// Lexer token for [`parse_filter_rule`], mirroring Kitty's
+/// `search_query_parser` scanner (`(`/`)`/words/quoted strings).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum FilterToken {
+    Open,
+    Close,
+    Word(String),
+    Quoted(String),
+}
+
+/// Placeholder substitutions for Kitty's pre-lex escapes (`\\`, `\"`,
+/// `\(`, `\)`), restored after scanning so escapes never confuse the lexer.
+const FILTER_ESCAPES: [(char, char); 4] =
+    [('\\', '\x01'), ('"', '\x02'), ('(', '\x03'), (')', '\x04')];
+
+fn restore_filter_escapes(text: &str) -> String {
+    let mut restored = text.to_string();
+    for (escaped, placeholder) in FILTER_ESCAPES {
+        restored = restored.replace(placeholder, &escaped.to_string());
+    }
+    restored
+}
+
+fn tokenize_filter_rule(rule: &str) -> Result<Vec<FilterToken>, String> {
+    let mut text = rule.to_string();
+    for (escaped, placeholder) in FILTER_ESCAPES {
+        text = text.replace(&format!("\\{escaped}"), &placeholder.to_string());
+    }
+    let chars: Vec<(usize, char)> = text.char_indices().collect();
+    let mut tokens = Vec::new();
+    let mut index = 0;
+    while index < chars.len() {
+        let (byte, delimiter) = chars[index];
+        match delimiter {
+            '(' => {
+                tokens.push(FilterToken::Open);
+                index += 1;
+            }
+            ')' => {
+                tokens.push(FilterToken::Close);
+                index += 1;
+            }
+            '"' => {
+                let mut end = index + 1;
+                while end < chars.len() && chars[end].1 != '"' {
+                    end += 1;
+                }
+                if end >= chars.len() {
+                    return Err(format!("unterminated quote in filter rule {rule:?}"));
+                }
+                tokens.push(FilterToken::Quoted(restore_filter_escapes(
+                    &text[byte + 1..chars[end].0],
+                )));
+                index = end + 1;
+            }
+            other if other.is_whitespace() => {
+                index += 1;
+            }
+            _ => {
+                let mut end = index;
+                while end < chars.len()
+                    && !matches!(chars[end].1, '(' | ')' | '"')
+                    && !chars[end].1.is_whitespace()
+                {
+                    end += 1;
+                }
+                let end_byte = if end < chars.len() {
+                    chars[end].0
+                } else {
+                    text.len()
+                };
+                tokens.push(FilterToken::Word(restore_filter_escapes(
+                    &text[byte..end_byte],
+                )));
+                index = end;
+            }
+        }
+    }
+    Ok(tokens)
+}
+
+/// Recursive-descent parser for [`parse_filter_rule`], mirroring Kitty's
+/// `search_query_parser`: `or` binds loosest, then (possibly implicit)
+/// `and`, then prefix `not`, then parenthesized groups and
+/// `field:pattern` items. Operators are case-insensitive.
+struct FilterRuleParser {
+    tokens: Vec<FilterToken>,
+    pos: usize,
+}
+
+const FILTER_FIELDS: [(&str, FilterField); 4] = [
+    ("title", FilterField::Title),
+    ("body", FilterField::Body),
+    ("app", FilterField::App),
+    ("type", FilterField::Type),
+];
+
+impl FilterRuleParser {
+    /// Lowercased bare-word lookahead (`None` for groups/quotes/EOF).
+    fn operator(&self) -> Option<String> {
+        match self.tokens.get(self.pos) {
+            Some(FilterToken::Word(word)) => Some(word.to_lowercase()),
+            _ => None,
+        }
+    }
+
+    fn or_expression(&mut self, rule: &str) -> Result<FilterAst, String> {
+        let mut lhs = self.and_expression(rule)?;
+        while self.operator().as_deref() == Some("or") {
+            self.pos += 1;
+            let rhs = self.or_expression(rule)?;
+            lhs = FilterAst::Or(Box::new(lhs), Box::new(rhs));
+        }
+        Ok(lhs)
+    }
+
+    fn and_expression(&mut self, rule: &str) -> Result<FilterAst, String> {
+        let mut lhs = self.not_expression(rule)?;
+        loop {
+            if self.operator().as_deref() == Some("and") {
+                self.pos += 1;
+            } else {
+                // Implicit AND before another operand — but never before
+                // `or`, `)`, or end of input, exactly like Kitty.
+                let implicit = match self.tokens.get(self.pos) {
+                    Some(FilterToken::Word(_)) | Some(FilterToken::Quoted(_)) => {
+                        self.operator().as_deref() != Some("or")
+                    }
+                    Some(FilterToken::Open) => true,
+                    _ => false,
+                };
+                if !implicit {
+                    break;
+                }
+            }
+            let rhs = self.and_expression(rule)?;
+            lhs = FilterAst::And(Box::new(lhs), Box::new(rhs));
+        }
+        Ok(lhs)
+    }
+
+    fn not_expression(&mut self, rule: &str) -> Result<FilterAst, String> {
+        if self.operator().as_deref() == Some("not") {
+            self.pos += 1;
+            return Ok(FilterAst::Not(Box::new(self.not_expression(rule)?)));
+        }
+        self.location_expression(rule)
+    }
+
+    fn location_expression(&mut self, rule: &str) -> Result<FilterAst, String> {
+        match self.tokens.get(self.pos) {
+            Some(FilterToken::Open) => {
+                self.pos += 1;
+                let inner = self.or_expression(rule)?;
+                match self.tokens.get(self.pos) {
+                    Some(FilterToken::Close) => {
+                        self.pos += 1;
+                        Ok(inner)
+                    }
+                    _ => Err(format!("missing ) in filter rule {rule:?}")),
+                }
+            }
+            Some(FilterToken::Word(_)) | Some(FilterToken::Quoted(_)) => self.base_token(rule),
+            _ => Err(format!(
+                "invalid syntax in filter rule {rule:?}: expected a field:pattern item or (group)"
+            )),
+        }
+    }
+
+    fn base_token(&mut self, rule: &str) -> Result<FilterAst, String> {
+        let word = match self.tokens.get(self.pos) {
+            Some(FilterToken::Quoted(_)) => {
+                return Err(format!(
+                    "no field specified before quoted string in filter rule {rule:?}"
+                ));
+            }
+            Some(FilterToken::Word(word)) => word.clone(),
+            _ => {
+                return Err(format!(
+                    "invalid syntax in filter rule {rule:?}: expected a field:pattern item"
+                ));
+            }
+        };
+        self.pos += 1;
+        let segments: Vec<&str> = word.split(':').collect();
+        let field = FILTER_FIELDS
+            .iter()
+            .find(|(name, _)| *name == segments[0].to_lowercase())
+            .map(|(_, field)| *field);
+        let Some(field) = field else {
+            if segments.len() > 1 {
+                return Err(format!(
+                    "{:?} is not a recognized field in filter rule {rule:?} \
+                     (expected title/body/app/type)",
+                    segments[0]
+                ));
+            }
+            return Err(format!(
+                "no field specified before {word:?} in filter rule {rule:?}"
+            ));
+        };
+        // `field:` followed by a quoted string takes the quoted value (a
+        // single bare segment before the quote is dropped, exactly like
+        // Kitty's `base_token`).
+        let pattern = if segments.len() == 2 {
+            match self.tokens.get(self.pos) {
+                Some(FilterToken::Quoted(quoted)) => {
+                    let pattern = quoted.clone();
+                    self.pos += 1;
+                    pattern
+                }
+                _ => segments[1].to_string(),
+            }
+        } else {
+            segments[1..].join(":")
+        };
+        let regex = Regex::new(&pattern).map_err(|error| {
+            format!("invalid regexp {pattern:?} in filter rule {rule:?}: {error}")
+        })?;
+        Ok(FilterAst::Item(FilterItem {
+            field,
+            pattern,
+            regex,
+        }))
+    }
+}
+
+/// Parse one user `filter_notification` rule with Kitty's grammar
+/// (`kitty/search_query_parser.py` + `kitty/notifications.py`
+/// `matches_rule`): `all` matches everything; otherwise a boolean
+/// combination (`or`/`and`/implicit-`and`/`not`/parens, case-insensitive
+/// operators) of `field:regexp` items over `title`/`body`/`app`/`type`
+/// (case-insensitive field names, colons preserved in values, quoted
+/// values with `\"`/`\\`/`\(`/`\)` escapes). Patterns are unanchored
+/// searches like Python `re.search`; `type` matches when any of the
+/// notification's types matches.
+///
+/// Invalid rules (bad syntax, unknown field, bad regexp) return `Err`:
+/// callers log and ignore them, so one bad rule never silences all
+/// notifications — Kitty's fail-open behavior. Rust regexp syntax is
+/// RE2-like: patterns using backreferences or look-around do not compile
+/// and are ignored with a warning.
+pub fn parse_filter_rule(rule: &str) -> Result<FilterRule, String> {
+    let trimmed = rule.trim();
+    if trimmed == "all" {
+        return Ok(FilterRule {
+            source: trimmed.to_string(),
+            ast: FilterAst::All,
+        });
+    }
+    let tokens = tokenize_filter_rule(trimmed)?;
+    let mut parser = FilterRuleParser { tokens, pos: 0 };
+    let ast = parser.or_expression(trimmed)?;
+    if parser.pos != parser.tokens.len() {
+        return Err(format!(
+            "extra characters at end of filter rule {trimmed:?}"
+        ));
+    }
+    Ok(FilterRule {
+        source: trimmed.to_string(),
+        ast,
+    })
+}
+
+/// Compile user `filter_notification` rules, skipping blank entries and
+/// logging + ignoring invalid ones (Kitty's fail-open behavior).
+pub fn compile_filter_rules(rules: &[String]) -> Vec<FilterRule> {
+    rules
+        .iter()
+        .filter_map(|rule| {
+            let trimmed = rule.trim();
+            if trimmed.is_empty() {
+                return None;
+            }
+            match parse_filter_rule(trimmed) {
+                Ok(rule) => Some(rule),
+                Err(error) => {
+                    log::warn!("Ignoring invalid notification filter rule {trimmed:?}: {error}");
+                    None
+                }
+            }
+        })
+        .collect()
 }
 
 /// Bounded live-ID set backing `p=alive` and replace/close. Insertion-ordered
@@ -643,6 +1073,7 @@ mod tests {
             deny_apps: vec!["editor".to_owned()],
             allow_types: vec!["email".to_owned()],
             deny_types: vec!["email".to_owned()],
+            filter_rules: Vec::new(),
         };
         assert!(!filter.is_allow_all());
         assert!(!notification_allowed(
@@ -656,6 +1087,7 @@ mod tests {
             deny_apps: vec!["spammy".to_owned()],
             allow_types: vec!["email".to_owned()],
             deny_types: vec!["marketing".to_owned()],
+            filter_rules: Vec::new(),
         };
         assert!(notification_allowed(
             &filter,
@@ -810,5 +1242,192 @@ mod tests {
         );
         assert_eq!(decode_notification_base64(b"!!!"), None);
         assert_eq!(decode_notification_base64(b"a"), None);
+    }
+
+    fn rule_matches(
+        rule: &str,
+        title: &str,
+        body: &str,
+        app: Option<&str>,
+        types: &[&str],
+    ) -> bool {
+        let rule = parse_filter_rule(rule).unwrap_or_else(|error| panic!("{rule:?}: {error}"));
+        let types: Vec<String> = types.iter().map(|kind| kind.to_string()).collect();
+        rule.matches(title, body, app, &types)
+    }
+
+    #[test]
+    fn filter_rules_match_kitty_doc_examples() {
+        // Kitty's own documented examples (`filter_notification` docs).
+        assert!(rule_matches(
+            r#"title:hello or body:"abc.*def""#,
+            "say hello",
+            "",
+            None,
+            &[]
+        ));
+        assert!(!rule_matches(
+            r#"title:hello or body:"abc.*def""#,
+            "bye",
+            "abcXYZ",
+            None,
+            &[]
+        ));
+        assert!(rule_matches(
+            r#"title:hello or body:"abc.*def""#,
+            "bye",
+            "abc123def",
+            None,
+            &[]
+        ));
+        assert!(rule_matches(
+            r#"app:"[ng]?vim" and not body:"(?i)update""#,
+            "done",
+            "saved",
+            Some("nvim"),
+            &[]
+        ));
+        assert!(!rule_matches(
+            r#"app:"[ng]?vim" and not body:"(?i)update""#,
+            "done",
+            "UPDATE available",
+            Some("gvim"),
+            &[]
+        ));
+        assert!(!rule_matches(
+            r#"app:"[ng]?vim" and not body:"(?i)update""#,
+            "done",
+            "saved",
+            Some("emacs"),
+            &[]
+        ));
+        assert!(rule_matches("all", "", "", None, &[]));
+    }
+
+    #[test]
+    fn filter_rules_combine_with_boolean_precedence() {
+        // `and` binds tighter than `or`; juxtaposition is an implicit `and`.
+        assert!(rule_matches(
+            "title:a or title:b and title:c",
+            "b c",
+            "",
+            None,
+            &[]
+        ));
+        assert!(rule_matches(
+            "title:a or title:b and title:c",
+            "a",
+            "",
+            None,
+            &[]
+        ));
+        assert!(!rule_matches(
+            "title:a or title:b and title:c",
+            "b",
+            "",
+            None,
+            &[]
+        ));
+        assert!(rule_matches("title:a title:b", "a b", "", None, &[]));
+        assert!(!rule_matches("title:a title:b", "a", "", None, &[]));
+        assert!(rule_matches(
+            "(title:a or title:b) and title:c",
+            "b c",
+            "",
+            None,
+            &[]
+        ));
+        assert!(!rule_matches(
+            "(title:a or title:b) and title:c",
+            "b",
+            "",
+            None,
+            &[]
+        ));
+        assert!(rule_matches("not not title:a", "a", "", None, &[]));
+        assert!(rule_matches("NOT TITLE:A", "a", "", None, &[]));
+        // `type` matches when ANY of the notification's types matches.
+        assert!(rule_matches("type:email", "", "", None, &["chat", "email"]));
+        assert!(!rule_matches("type:email", "", "", None, &["chat"]));
+        // A missing app identity never matches `app:` items.
+        assert!(!rule_matches("app:.*", "t", "b", None, &[]));
+    }
+
+    #[test]
+    fn filter_rules_keep_kitty_token_quirks() {
+        // Colons survive inside values; `field:` plus a quoted string takes
+        // the quoted value (a single bare segment is dropped, like Kitty).
+        assert!(rule_matches("title:a:b", "a:b", "", None, &[]));
+        assert!(rule_matches(r#"title: "a b""#, "a b", "", None, &[]));
+        assert!(rule_matches(
+            r#"title:ignored "kept""#,
+            "kept",
+            "",
+            None,
+            &[]
+        ));
+        // Escapes survive the lexer: quoted `\"` is a literal quote in the
+        // value, and `\\` becomes a regex backslash, so `title:a\\b` is the
+        // word-boundary pattern `a\b` (matching "a b" but not "ab"),
+        // exactly like Kitty's pre-lex substitution.
+        assert!(rule_matches(r#"title:"a\"b""#, "a\"b", "", None, &[]));
+        assert!(rule_matches(r"title:a\\b", "a b", "", None, &[]));
+        assert!(!rule_matches(r"title:a\\b", "ab", "", None, &[]));
+        // An unescaped group paren instead breaks the regexp, so the rule
+        // is invalid (fail-open), like Kitty.
+        assert!(parse_filter_rule(r"title:a\(b").is_err());
+        // An empty pattern searches everything, like Python `re.search("")`.
+        assert!(rule_matches("title:", "anything", "", None, &[]));
+    }
+
+    #[test]
+    fn filter_rules_reject_invalid_syntax_fail_open() {
+        // Unknown fields, bare words, unbalanced groups, bad regexps and
+        // Python-only constructs are all `Err` (callers log and ignore).
+        for bad in [
+            "hello",
+            "\"quoted\"",
+            "frobnicate:a",
+            "title:a and",
+            "(title:a",
+            "title:a)",
+            "title:\"unterminated",
+            "title:(unclosed",
+            "title:a(?=b)",
+            "title:\\1",
+        ] {
+            assert!(parse_filter_rule(bad).is_err(), "{bad:?}");
+        }
+        assert!(compile_filter_rules(&[
+            "title:ok".to_string(),
+            "hello".to_string(),
+            String::new()
+        ])
+        .iter()
+        .map(|rule| rule.source.as_str())
+        .eq(["title:ok"]));
+    }
+
+    #[test]
+    fn filter_rules_compose_with_allow_deny_lists() {
+        let filter = NotificationFilter {
+            allow_apps: vec!["editor".to_owned()],
+            filter_rules: compile_filter_rules(&["body:secret".to_string()]),
+            ..Default::default()
+        };
+        assert!(!filter.is_allow_all());
+        // Allow-list passes but the deny rule matches: suppressed.
+        assert!(!filter.allows_full(Some("editor"), &[], "build", "contains a secret note"));
+        // Allow-list passes and no rule matches: delivered.
+        assert!(filter.allows_full(Some("editor"), &[], "build", "all green"));
+        // Allow-list still enforced independently of rules.
+        assert!(!filter.allows_full(Some("other"), &[], "build", "all green"));
+        assert!(notification_allowed_full(
+            &filter,
+            Some("editor"),
+            &[],
+            "build",
+            "all green"
+        ));
     }
 }

@@ -72,11 +72,12 @@ pub use pointer_shape::{
 pub use pty::save_original_nofile_limit;
 pub use pty::{Pty, PtyConfig, PtyError, PtySize};
 pub use screen::{
-    ClipboardOperation, ClipboardSelection, ColorQuery, CursorStyle, DesktopNotification,
-    DesktopNotificationAction, FileTransferOperation, FrontendState, ImageLayer, KittyColorKey,
-    KittyColorSetting, KittyColorSnapshot, KittyQueryField, MouseEncoding, MouseMode,
-    NotificationUrgency, Screen, SearchResult, Selection, SelectionMode, SelectionPoint,
-    TerminalImage, ThemeAppearance, WindowVisibility, MAX_OSC21_FIELDS, MAX_OSC21_KEY_LEN,
+    AttributeChangeExtent, ClipboardOperation, ClipboardSelection, ColorQuery, CursorStyle,
+    DesktopNotification, DesktopNotificationAction, FileTransferOperation, FrontendState,
+    ImageLayer, KittyColorKey, KittyColorSetting, KittyColorSnapshot, KittyQueryField,
+    MouseEncoding, MouseMode, NotificationUrgency, Screen, SearchResult, Selection, SelectionMode,
+    SelectionPoint, TerminalImage, ThemeAppearance, WindowVisibility, MAX_OSC21_FIELDS,
+    MAX_OSC21_KEY_LEN,
 };
 pub use sixel::{SixelDecoder, SixelImage};
 pub use ssh::{

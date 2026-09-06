@@ -95,17 +95,26 @@ OSC 9/777) never match a deny entry but also never satisfy an allow-list.
 # deny_apps = ["spammy"]  # these f= names never deliver (wins over allow)
 # allow_types = ["email"] # a listed t= is required when non-empty
 # deny_types = ["marketing"]
+# filter_rules = ["app:spammy or body:\"(?i)promo\""]  # matching rules deny
 ```
 
-Enforced in the shared model (`NotificationFilter::allows`) before
+`filter_rules` adds Kitty's `filter_notification` grammar: `all` denies
+everything, otherwise a boolean combination (`or`/`and`/implicit-`and`/
+`not`/parens, case-insensitive operators) of `field:regexp` items over
+`title`/`body`/`app`/`type` (case-insensitive field names, colons kept in
+values, `"quoted values"` with `\"`/`\\`/`\(`/`\)` escapes). Patterns are
+unanchored searches (`type` matches when any of the notification's types
+matches); invalid rules are logged and ignored, so one bad rule never
+silences everything. Regexp syntax is Rust RE2-like: patterns needing
+backreferences or look-around do not compile and are ignored with a
+warning.
+
+Enforced in the shared model (`NotificationFilter::allows_full`) before
 delivery and before any registry/report side effects: filtered
 notifications are never shown, never tracked for activation, and never
 reported (the daemon's optimistic `p=alive` set still answers polls).
 Wired on GTK (missing/unreadable config fails open to allow-all);
-Cocoa/Win32 still allow-all (no behavior change there). Deliberately
-simpler than Kitty's `filter_notification` `field:regexp` boolean grammar
-(which also matches title/body): title/body/regex filtering stays future
-work.
+Cocoa/Win32 still allow-all (no behavior change there).
 
 ## Report ordering (pinned)
 

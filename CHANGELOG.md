@@ -10,6 +10,16 @@ is omitted for readability.
 ## [Unreleased]
 
 ### Added
+- Notification `filter_rules`: Kitty `filter_notification` deny rules
+  (`field:regexp` over title/body/app/type with and/or/not/parens/quotes
+  and `all`, unanchored Rust-regexp search, invalid rules logged and
+  ignored), enforced in the shared model on GTK alongside the allow/deny
+  lists.
+- DECSACE attribute-change extent (`CSI Ps * x`): DECCARA/DECRARA honor the
+  exact rectangle (`2`) or the scan-order stream (`0`/`1`/missing, the DEC
+  power-on default, matching Kitty), with reset on RIS/DECSTR, a
+  Kitty-faithful DECRQSS report (`1`/`0`), daemon-snapshot round-trip, and
+  xterm-faithful DECRARA color skipping pinned by tests.
 - Merged upstream `KarpelesLab/cterm` tab-sync work (through `df1d883`):
   live tab sync across every cterm connected to the same daemon via a new
   daemon-wide event stream broadcasting session lifecycle (created/destroyed)

@@ -196,10 +196,12 @@ pub fn handle_with_filter(
     filter: &cterm_core::NotificationFilter,
 ) {
     if let cterm_core::DesktopNotificationAction::Show(notification) = action {
-        if !cterm_core::notifications::notification_allowed(
+        if !cterm_core::notifications::notification_allowed_full(
             filter,
             notification.app_name.as_deref(),
             &notification.notif_types,
+            &notification.title,
+            &notification.body,
         ) {
             log::debug!(
                 "Suppressing desktop notification {:?} by user filter (app={:?}, types={:?})",
