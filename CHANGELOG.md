@@ -45,9 +45,35 @@ is omitted for readability.
   and remote (`t=k`) reads surface the clipboard adapter's consent semantics
   (modal Allow once / Always allow surface-scoped / Deny-default with
   exact-token display, drag-lifecycle expiry, and close-means-deny).
-  Headless unit tests cover action mapping, arbitration, content selection,
-  and prompt plumbing; real drag takeover, drop delivery, and dialog
-  interaction still need the Wayland compositor smoke.
+   Headless unit tests cover action mapping, arbitration, content selection,
+   and prompt plumbing; real drag takeover, drop delivery, and dialog
+   interaction still need the Wayland compositor smoke.
+- Live Cocoa/Win32 drag-source sessions from the negotiated OSC 72 offer,
+  foreign-target type-checked (`aarch64`/`x86_64-apple-darwin`,
+  `x86_64-pc-windows-msvc`) but still awaiting macOS/Windows runtime
+  verification: Cocoa builds the live `NSDraggingSession` (pre-sent bytes via
+  `NSPasteboardItem` with `text/plain` also as `NSPasteboardTypeString`, PNG
+  via `NSPasteboardTypePNG`, file content via `NSFilePromiseProvider` from
+  retained ingress, copy/move/either mapped to the matching `NSDragOperation`
+  mask, session creation confirms `t=E;OK`, `endedAtPoint:` reports finish,
+  `CancelOsDrag` tears down) and Win32 runs OLE `DoDragDrop` with an
+  `IDataObject` serving the negotiated formats (`CF_UNICODETEXT`/`CF_TEXT`
+  plus registered MIME formats, `CF_HDROP` from staged temp files holding
+  retained ingress bytes, copy/move/either mapped to `DROPEFFECT`,
+  `DoDragDrop` return reports finish/abort, `CancelOsDrag` cleans staging);
+  both arbitrate the gesture Kitty-faithfully (primary-press pixel anchor,
+  `t=o` once past 5 px while armed, selection/tracking never suppressed) and
+  prompt different-machine `t=k` reads with the rich-clipboard semantics
+  (modal Allow once / Always allow surface-scoped / Deny-default with
+  exact-token display, 120 s frontend-local expiry, drag-lifecycle expiry,
+  close-means-deny; same-machine drags never prompt). Shared session-plan
+  helpers (`classify_drag_mime`, `servable_drag_payloads`, copy/move matrix,
+  bounded sanitized uri-list file entries) plus per-backend headless unit
+  tests (gesture/effect/format/prompt, Cocoa 9 + Win32 9 green without OS);
+  custom `t=p` drag images stay a documented gap (AppKit synthesizes from
+  item contents; Win32 serves bytes without image mapping), as do live
+  session takeover, file delivery, operation negotiation, dialog interaction,
+  and staged-file cleanup timing.
 - Kitty-precursor alignment fixes, verified against Kitty 0.48.2 sources:
   OSC 5522 malformed reads silently ignored with a log and no reply
   (EINVAL stays write-side only); drag-source `t=k` exact-token approval

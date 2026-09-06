@@ -132,6 +132,241 @@ pub struct OsDragOffer {
     pub has_image: bool,
 }
 
+/// Bound on file entries derived from one retained `text/uri-list` payload
+/// for native file-promise / `CF_HDROP` manifests. Denial-of-service limit:
+/// each entry can become a Finder promise or a staged temp file.
+pub const MAX_SESSION_FILE_ENTRIES: usize = 64;
+/// Bound on a derived promise/manifest file name, in characters.
+pub const MAX_SESSION_FILE_NAME_CHARS: usize = 128;
+
+/// Kind of one servable drag payload, shared by the Cocoa
+/// (`NSDraggingSession`), Win32 (OLE `IDataObject`) and GTK
+/// (`ContentProvider`) session builders so every backend serves the same
+/// negotiated bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DragPayloadKind {
+    /// `text/*` (but not `text/uri-list`): served as plain text.
+    Text,
+    /// Exactly `text/uri-list`: served as text plus, where the offer carries
+    /// file content destined for a file manager, file promises / `CF_HDROP`.
+    UriList,
+    /// Exactly `image/png` (or a retained PNG drag image): served as PNG.
+    Png,
+    /// Any other MIME type: served under its own name where the OS allows
+    /// named formats, never coerced into text.
+    Other,
+}
+
+/// Classify one offered MIME type for the native session builders.
+/// Case-insensitive with surrounding whitespace ignored; classification only
+/// steers native format routing, never the wire offer.
+pub fn classify_drag_mime(mime: &str) -> DragPayloadKind {
+    let normalized = mime.trim().to_ascii_lowercase();
+    if normalized == URI_LIST_MIME {
+        DragPayloadKind::UriList
+    } else if normalized == "image/png" {
+        DragPayloadKind::Png
+    } else if normalized.starts_with("text/") {
+        DragPayloadKind::Text
+    } else {
+        DragPayloadKind::Other
+    }
+}
+
+/// One offered MIME type with complete pre-sent bytes, ready to serve to an
+/// OS drop target without another PTY round trip.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServablePayload {
+    pub mime_type: String,
+    pub kind: DragPayloadKind,
+    pub data: Vec<u8>,
+}
+
+/// Collect the offered MIME types (in offer order) that have complete
+/// pre-sent bytes. This is exactly what GTK's `build_source_content` serves
+/// via its `ContentProvider`, and what the Cocoa/Win32 session builders must
+/// serve: offered-but-unpresented types are skipped rather than served empty,
+/// and on-demand (`t=e:x=5`) bytes that arrive later are absorbed the same
+/// way on every backend.
+pub fn servable_drag_payloads(
+    offer: &OsDragOffer,
+    presented: &[PresentedMime],
+) -> Vec<ServablePayload> {
+    let mut payloads = Vec::new();
+    for mime in &offer.mime_types {
+        if let Some(item) = presented.iter().find(|item| &item.mime_type == mime) {
+            payloads.push(ServablePayload {
+                mime_type: item.mime_type.clone(),
+                kind: classify_drag_mime(&item.mime_type),
+                data: item.data.clone(),
+            });
+        }
+    }
+    payloads
+}
+
+/// Whether the negotiated operation lets the drop target copy.
+pub fn drag_operation_allows_copy(operation: DndOperation) -> bool {
+    matches!(operation, DndOperation::Copy | DndOperation::Either)
+}
+
+/// Whether the negotiated operation lets the drop target move. The terminal
+/// still only *reports* the pick (`t=e:x=2:o=`); it never deletes local data.
+pub fn drag_operation_allows_move(operation: DndOperation) -> bool {
+    matches!(operation, DndOperation::Move | DndOperation::Either)
+}
+
+/// Whether any servable payload carries a `text/uri-list` body that file
+/// promises / `CF_HDROP` manifests can be derived from.
+pub fn has_servable_uri_list(payloads: &[ServablePayload]) -> bool {
+    payloads
+        .iter()
+        .any(|payload| payload.kind == DragPayloadKind::UriList && !payload.data.is_empty())
+}
+
+/// Whether an OS drag session can be built from this offer at all: at least
+/// one presented payload and a non-`None` operation. Anything else fails
+/// closed through `os_drag_failed` so the application keeps its registration
+/// instead of hearing a `t=E;OK` the frontend cannot honor.
+pub fn drag_session_is_servable(offer: &OsDragOffer, presented: &[PresentedMime]) -> bool {
+    if !drag_operation_allows_copy(offer.operation) && !drag_operation_allows_move(offer.operation)
+    {
+        return false;
+    }
+    !servable_drag_payloads(offer, presented).is_empty()
+}
+
+/// One file entry derived from retained `text/uri-list` bytes: a `file:` URL
+/// destined for a file manager plus a sanitized leaf name for the native
+/// promise / manifest. The URL's 1-based line number is the entry index the
+/// shared core uses for `t=k` reads (`num`/`parent` stay `0`: top-level
+/// entries only; directory-member promises are an explicit non-goal until
+/// the ingress timing is proven on-host).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UriListFileEntry {
+    pub url: String,
+    pub file_name: String,
+    pub entry: RemoteEntryRef,
+}
+
+/// Derive promise/manifest candidates from retained `text/uri-list` bytes.
+///
+/// Splits on CRLF/LF per the `text/uri-list` spec, skips blanks and `#`
+/// comments, keeps only `file:` URLs, skips directory URLs (trailing `/`),
+/// sanitizes leaf names (no separators, controls, or leading dots; bounded
+/// length; `..` can never escape), and caps the entry count. Pure: never
+/// touches the filesystem and never opens application-supplied paths — the
+/// URL text only *names* promises whose bytes come from the shared core's
+/// retained ingress.
+pub fn uri_list_file_entries(data: &[u8], max_entries: usize) -> Vec<UriListFileEntry> {
+    let text = String::from_utf8_lossy(data);
+    let mut entries = Vec::new();
+    // Line numbers are 1-based over *all* lines (comments/blank included),
+    // matching the `t=k` entry index the application numbers by.
+    let mut line_number: i32 = 0;
+    for line in text.split(['\r', '\n']) {
+        line_number = line_number.saturating_add(1);
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if entries.len() >= max_entries {
+            break;
+        }
+        // Only `file:` URLs can become Finder/Explorer files. Case-insensitive
+        // scheme per RFC 3986; anything else (https:, data:, ...) stays
+        // text-only so a drop target can never be aimed at a remote fetch.
+        if line.len() < "file:".len() || !line[..5].eq_ignore_ascii_case("file:") {
+            continue;
+        }
+        // Directory URLs (trailing `/`) are not single-file promises.
+        if line.ends_with('/') {
+            continue;
+        }
+        let Some(file_name) = uri_list_file_name(line) else {
+            continue;
+        };
+        entries.push(UriListFileEntry {
+            url: line.to_string(),
+            file_name,
+            entry: RemoteEntryRef {
+                entry: line_number,
+                num: 0,
+                parent: 0,
+            },
+        });
+    }
+    entries
+}
+
+fn uri_list_file_name(url: &str) -> Option<String> {
+    // Strip `file://[localhost]` authority; what remains is the path. A bare
+    // `file:` URL without slashes names no file.
+    let without_scheme = url.get(5..)?;
+    let path = without_scheme
+        .strip_prefix("//")
+        .map(|rest| rest.split_at(rest.find('/').unwrap_or(rest.len())).1)
+        .unwrap_or(without_scheme);
+    if path.is_empty() {
+        return None;
+    }
+    let leaf = path.rsplit('/').next().unwrap_or("");
+    if leaf.is_empty() {
+        return None;
+    }
+    let decoded = percent_decode_lossy(leaf);
+    let mut name = String::with_capacity(decoded.len().min(MAX_SESSION_FILE_NAME_CHARS));
+    for character in decoded.chars().take(MAX_SESSION_FILE_NAME_CHARS) {
+        if character == '/'
+            || character == '\\'
+            || character == ':'
+            || character == '\0'
+            || character.is_control()
+        {
+            name.push('_');
+        } else {
+            name.push(character);
+        }
+    }
+    // A name of only dots (or empty after sanitizing) would address the
+    // parent directory or itself; fall back to a fixed leaf instead.
+    let trimmed = name.trim();
+    if trimmed.is_empty() || trimmed.chars().all(|character| character == '.') {
+        return Some("dropped-file".to_string());
+    }
+    // Leading dots hide files on Unix drops; neutralize without losing the rest.
+    let name = name.trim_start_matches('.').to_string();
+    if name.is_empty() {
+        return Some("dropped-file".to_string());
+    }
+    Some(name)
+}
+
+fn percent_decode_lossy(value: &str) -> String {
+    let bytes = value.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        let hex = if bytes[index] == b'%' {
+            bytes
+                .get(index + 1..index + 3)
+                .filter(|hex| hex[0].is_ascii_hexdigit() && hex[1].is_ascii_hexdigit())
+        } else {
+            None
+        };
+        if let Some(hex) = hex {
+            let high = (hex[0] as char).to_digit(16).unwrap_or(0);
+            let low = (hex[1] as char).to_digit(16).unwrap_or(0);
+            decoded.push((high * 16 + low) as u8);
+            index += 3;
+        } else {
+            decoded.push(bytes[index]);
+            index += 1;
+        }
+    }
+    String::from_utf8_lossy(&decoded).into_owned()
+}
+
 /// Reference to one remote URI-list entry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct RemoteEntryRef {
@@ -284,6 +519,15 @@ impl DndSource {
     /// per-entry approval. `false` (default) is fail-closed.
     pub fn allow_remote_reads(&self) -> bool {
         self.policy.allow_remote_reads
+    }
+
+    /// Whether a remote (`t=k`) entry read would currently surface
+    /// [`DndSourceAction::RequestApproval`] instead of proceeding directly
+    /// to `t=k`. Frontends use this to prefetch only approval-free reads at
+    /// session build time; approval-gated reads stay lazy so one drag never
+    /// spams one prompt per entry.
+    pub fn remote_read_needs_approval(&self) -> bool {
+        !(self.policy.allow_remote_reads || self.is_same_machine())
     }
 
     /// Record an explicit user opt-in ("Always allow" in the native remote-read
@@ -2207,5 +2451,170 @@ mod tests {
         assert!(is_remote_peer(Some(&local), "2:anything"));
         assert!(is_remote_peer(None, &local));
         assert!(is_remote_peer(Some(&local), ""));
+    }
+
+    #[test]
+    fn approval_query_drives_prefetch_gating() {
+        // Unknown locality (no machine id) needs approval by default.
+        let source = DndSource::default();
+        assert!(source.remote_read_needs_approval());
+        // Opt-in clears it.
+        let mut source = DndSource::default();
+        source.set_allow_remote_reads(true);
+        assert!(!source.remote_read_needs_approval());
+        // Same-machine peers never need it.
+        let local = local_machine_id().expect("test host provides /etc/machine-id");
+        let mut source = DndSource::default();
+        arm_with_peer(&mut source, Some(&local));
+        assert!(!source.remote_read_needs_approval());
+    }
+
+    #[test]
+    fn drag_mime_classification_routes_native_formats() {
+        assert_eq!(
+            classify_drag_mime("text/uri-list"),
+            DragPayloadKind::UriList
+        );
+        assert_eq!(
+            classify_drag_mime("  TEXT/URI-LIST "),
+            DragPayloadKind::UriList
+        );
+        assert_eq!(classify_drag_mime("text/plain"), DragPayloadKind::Text);
+        assert_eq!(
+            classify_drag_mime("text/html; charset=utf-8"),
+            DragPayloadKind::Text
+        );
+        assert_eq!(classify_drag_mime("image/png"), DragPayloadKind::Png);
+        assert_eq!(
+            classify_drag_mime("application/octet-stream"),
+            DragPayloadKind::Other
+        );
+        assert_eq!(classify_drag_mime(""), DragPayloadKind::Other);
+        // `text/uri-list` is exact: a longer type with the same prefix is text.
+        assert_eq!(
+            classify_drag_mime("text/uri-list-extra"),
+            DragPayloadKind::Text
+        );
+    }
+
+    #[test]
+    fn drag_operation_copy_move_matrix() {
+        assert!(drag_operation_allows_copy(DndOperation::Copy));
+        assert!(!drag_operation_allows_move(DndOperation::Copy));
+        assert!(!drag_operation_allows_copy(DndOperation::Move));
+        assert!(drag_operation_allows_move(DndOperation::Move));
+        assert!(drag_operation_allows_copy(DndOperation::Either));
+        assert!(drag_operation_allows_move(DndOperation::Either));
+        assert!(!drag_operation_allows_copy(DndOperation::None));
+        assert!(!drag_operation_allows_move(DndOperation::None));
+    }
+
+    fn presented_offer(
+        mimes: &str,
+        presented: &[(&str, &[u8])],
+    ) -> (OsDragOffer, Vec<PresentedMime>) {
+        let offer = OsDragOffer {
+            mime_types: mimes.split(' ').map(str::to_string).collect(),
+            operation: DndOperation::Either,
+            location: DndLocation::default(),
+            has_image: false,
+        };
+        let presented = presented
+            .iter()
+            .map(|(mime, data)| PresentedMime {
+                mime_type: mime.to_string(),
+                data: data.to_vec(),
+            })
+            .collect();
+        (offer, presented)
+    }
+
+    #[test]
+    fn servable_payloads_mirror_the_gtk_provider() {
+        // Offer order is kept; offered-but-unpresented types are skipped
+        // rather than served empty — the same contract GTK's
+        // `build_source_content` enforces for its `ContentProvider`.
+        let (offer, presented) =
+            presented_offer("text/plain text/uri-list", &[("text/plain", b"hi")]);
+        let payloads = servable_drag_payloads(&offer, &presented);
+        assert_eq!(payloads.len(), 1);
+        assert_eq!(payloads[0].mime_type, "text/plain");
+        assert_eq!(payloads[0].kind, DragPayloadKind::Text);
+        assert_eq!(payloads[0].data, b"hi");
+
+        let (offer, presented) = presented_offer(
+            "text/uri-list text/plain",
+            &[("text/plain", b"hi"), ("text/uri-list", b"file:///tmp/a")],
+        );
+        let payloads = servable_drag_payloads(&offer, &presented);
+        assert_eq!(payloads.len(), 2);
+        assert_eq!(payloads[0].kind, DragPayloadKind::UriList);
+        assert_eq!(payloads[1].kind, DragPayloadKind::Text);
+
+        let (offer, presented) = presented_offer("text/plain", &[]);
+        assert!(servable_drag_payloads(&offer, &presented).is_empty());
+        assert!(!has_servable_uri_list(&servable_drag_payloads(
+            &offer, &presented
+        )));
+
+        let (offer, presented) = presented_offer(
+            "text/uri-list",
+            &[
+                ("text/uri-list", b"file:///tmp/a"),
+                ("text/plain", b"stray"),
+            ],
+        );
+        // Stray presented data outside the offer is never served.
+        let payloads = servable_drag_payloads(&offer, &presented);
+        assert_eq!(payloads.len(), 1);
+        assert!(has_servable_uri_list(&payloads));
+        assert!(drag_session_is_servable(&offer, &presented));
+
+        // `None` operations are never servable, however much data arrived.
+        let (mut offer, presented) = presented_offer("text/plain", &[("text/plain", b"hi")]);
+        offer.operation = DndOperation::None;
+        assert!(!drag_session_is_servable(&offer, &presented));
+    }
+
+    #[test]
+    fn uri_list_entries_derive_bounded_safe_file_names() {
+        let body = b"# comment\n\nfile:///tmp/hello%20world.txt\r\nhttps://example.com/x\r\nfile:///tmp/dir/\r\nfile:///tmp/%2E%2E/evil.txt\r\nFILE:///C:/a%20b.TXT\r\n".to_vec();
+        let entries = uri_list_file_entries(&body, MAX_SESSION_FILE_ENTRIES);
+        // Comment, blank, https:, and directory lines are skipped; the `..`
+        // segment decodes but never escapes (it is just a name here).
+        assert_eq!(entries.len(), 3);
+        assert_eq!(entries[0].file_name, "hello world.txt");
+        assert_eq!(entries[0].url, "file:///tmp/hello%20world.txt");
+        // Line numbers count every line (1-based), comments included.
+        assert_eq!(
+            entries[0].entry,
+            RemoteEntryRef {
+                entry: 3,
+                num: 0,
+                parent: 0,
+            }
+        );
+        assert_eq!(entries[1].file_name, "evil.txt");
+        assert_eq!(entries[2].file_name, "a b.TXT");
+
+        // Dot-only and empty leaves fall back; separators are neutralized.
+        let body = b"file:///tmp/...\r\nfile:///tmp/a/b\\c:d.txt\r\nfile:\r\n".to_vec();
+        let entries = uri_list_file_entries(&body, MAX_SESSION_FILE_ENTRIES);
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].file_name, "dropped-file");
+        assert_eq!(entries[1].file_name, "b_c_d.txt");
+
+        // The entry cap bounds Finder promises / staged temp files.
+        let mut body = Vec::new();
+        for index in 0..MAX_SESSION_FILE_ENTRIES + 10 {
+            body.extend_from_slice(format!("file:///tmp/f{index}.txt\r\n").as_bytes());
+        }
+        assert_eq!(
+            uri_list_file_entries(&body, MAX_SESSION_FILE_ENTRIES).len(),
+            MAX_SESSION_FILE_ENTRIES
+        );
+
+        assert!(uri_list_file_entries(b"", MAX_SESSION_FILE_ENTRIES).is_empty());
+        assert!(uri_list_file_entries(b"# only a comment\n", MAX_SESSION_FILE_ENTRIES).is_empty());
     }
 }

@@ -10,6 +10,7 @@ pub mod clipboard;
 mod desktop_notification;
 pub mod dialog_utils;
 pub mod dialogs;
+pub mod dnd_source;
 pub mod docker_dialog;
 pub mod dpi;
 mod drop_target;

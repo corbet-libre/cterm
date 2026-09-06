@@ -28,6 +28,7 @@ pub mod cg_renderer;
 pub mod clipboard;
 mod desktop_notification;
 pub mod dialogs;
+pub mod dnd_source;
 pub mod file_transfer;
 pub mod log_capture;
 pub mod log_viewer;
