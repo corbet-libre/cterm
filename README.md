@@ -439,6 +439,7 @@ native window state to the daemon, which remains the single PTY reply authority.
 |----------|-------------|
 | DECCARA | Change any SGR attributes, including fg/bg/underline colors, in a rectangle (Kitty all-SGR semantics) |
 | DECRARA | Toggle boolean SGR attributes in a rectangle (colors have no reversal and are left untouched) |
+| DECSACE | Select whether DECCARA/DECRARA use the exact rectangle (`CSI 2 * x`) or the scan-order stream (`CSI 0/1 * x`, the power-on default) |
 | DECCRA | Copy a rectangle, including overlap-safe copies |
 | DECFRA | Fill a rectangle using the current SGR style |
 | DECERA | Erase a rectangle using the current background color |

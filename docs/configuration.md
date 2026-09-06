@@ -77,11 +77,15 @@ tab_bar_position = "top"
 # allows everything (today's behavior). Deny wins over allow; a non-empty
 # allow-list requires a positive match (exact, case-sensitive). Untagged
 # notifications (e.g. legacy OSC 9/777) never match deny entries but also
-# never satisfy an allow-list. Enforced on GTK before delivery.
+# never satisfy an allow-list. `filter_rules` adds Kitty-grammar deny rules
+# (`field:regexp` over title/body/app/type with and/or/not/parens/quotes,
+# or `all`); invalid rules are logged and ignored. Enforced on GTK before
+# delivery.
 # allow_apps = ["myapp"]
 # deny_apps = ["spammy"]
 # allow_types = ["email"]
 # deny_types = ["marketing"]
+# filter_rules = ["app:spammy or body:\"(?i)promo\""]
 ```
 
 ### Keyboard Shortcuts

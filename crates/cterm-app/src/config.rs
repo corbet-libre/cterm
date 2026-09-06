@@ -174,14 +174,17 @@ impl TransferConfig {
 }
 
 /// User-configured desktop-notification filtering over the Kitty OSC 99
-/// `f=` (application name) and `t=` (notification types) filter identity.
+/// `f=` (application name) and `t=` (notification types) filter identity,
+/// plus Kitty-style `filter_notification` deny rules.
 ///
 /// Every list defaults to empty, which allows everything — today's
 /// behavior. Otherwise deny wins over allow, and a non-empty allow-list
 /// requires a positive match (untagged notifications, e.g. legacy OSC
 /// 9/777 with no `f=`/`t=`, never match a deny entry but also never satisfy
 /// an allow-list). Matching is exact and case-sensitive after trimming;
-/// blank entries are ignored. See
+/// blank entries are ignored. `filter_rules` holds Kitty-grammar deny rules
+/// (`field:regexp` over title/body/app/type with and/or/not/parens/quotes,
+/// or `all`); invalid rules are logged and ignored. See
 /// `cterm_core::notifications::NotificationFilter` for the enforced rule.
 ///
 /// ```toml
@@ -190,13 +193,8 @@ impl TransferConfig {
 /// # deny_apps = ["spammy"]  # these f= names never deliver (wins over allow)
 /// # allow_types = ["email"] # a listed t= is required when non-empty
 /// # deny_types = ["marketing"]
+/// # filter_rules = ["app:spammy or body:\"(?i)promo\""]  # matching rules deny
 /// ```
-///
-/// Deliberately simpler than Kitty's `filter_notification`
-/// `field:regexp` boolean grammar (which also matches title/body):
-/// TOML-native allow/deny lists cover the common cases, and unknown future
-/// keys stay ignored via `#[serde(default)]`. Title/body/regex filtering
-/// stays future work.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(default)]
 pub struct NotificationConfig {
@@ -212,6 +210,10 @@ pub struct NotificationConfig {
     /// `t=` types that never deliver (wins over `allow_types`).
     #[serde(default)]
     pub deny_types: Vec<String>,
+    /// Kitty-grammar deny rules over title/body/app/type (invalid rules are
+    /// logged and ignored).
+    #[serde(default)]
+    pub filter_rules: Vec<String>,
 }
 
 impl NotificationConfig {
@@ -228,6 +230,7 @@ impl NotificationConfig {
             deny_apps: clean(&self.deny_apps),
             allow_types: clean(&self.allow_types),
             deny_types: clean(&self.deny_types),
+            filter_rules: cterm_core::notifications::compile_filter_rules(&self.filter_rules),
         }
     }
 
@@ -1915,12 +1918,35 @@ mod tests {
     }
 
     #[test]
+    fn test_notification_config_compiles_filter_rules() {
+        let toml_str = r#"
+            [notifications]
+            filter_rules = ["body:secret", "hello", "", "   "]
+        "#;
+        let config: Config = toml::from_str(toml_str).unwrap();
+        // The invalid rule is logged and ignored; blanks are skipped.
+        let filter = config.notifications.to_filter();
+        assert_eq!(
+            filter
+                .filter_rules
+                .iter()
+                .map(|rule| rule.source.as_str())
+                .collect::<Vec<_>>(),
+            ["body:secret"]
+        );
+        assert!(!filter.is_allow_all());
+        assert!(!filter.allows_full(Some("ci"), &[], "build", "a secret note"));
+        assert!(filter.allows_full(Some("ci"), &[], "build", "all green"));
+    }
+
+    #[test]
     fn test_notification_config_round_trip() {
         let config = NotificationConfig {
             allow_apps: vec!["myapp".into()],
             deny_apps: vec![],
             allow_types: vec!["email".into()],
             deny_types: vec![],
+            filter_rules: vec!["body:secret".into()],
         };
         let serialized = toml::to_string_pretty(&config).unwrap();
         assert!(serialized.contains("allow_apps"));

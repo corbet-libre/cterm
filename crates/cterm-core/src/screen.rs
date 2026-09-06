@@ -916,6 +916,20 @@ pub(crate) struct DecodedRgbaImage {
 /// Used in `SelectionPoint::col` to indicate the selection extends to the end of the line.
 const COL_END_OF_ROW: usize = usize::MAX;
 
+/// DECSACE attribute-change extent: which cells DECCARA/DECRARA affect.
+/// DEC VT420 powers on in stream mode, and Kitty matches that; `CSI 2 * x`
+/// selects the exact rectangle instead.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum AttributeChangeExtent {
+    /// `CSI 0/1 * x` (power-on default): the corners are scan-order
+    /// endpoints — tail of the first row, full rows between, head of the
+    /// last row. A single-row range matches the rectangle.
+    #[default]
+    Stream,
+    /// `CSI 2 * x`: the exact column range on every row.
+    Rectangle,
+}
+
 /// Terminal screen state
 #[derive(Debug)]
 pub struct Screen {
@@ -941,6 +955,9 @@ pub struct Screen {
     pub style: CellStyle,
     /// Terminal modes
     pub modes: TerminalModes,
+    /// DECSACE attribute-change extent for DECCARA/DECRARA (DEC default:
+    /// stream). Single setting like Kitty; reset by RIS and DECSTR.
+    attribute_change_extent: AttributeChangeExtent,
     /// Window title
     pub title: String,
     /// Icon name
@@ -1382,6 +1399,7 @@ impl Screen {
             keyboard_alt_stack: Vec::new(),
             pointer_main_stack: Vec::new(),
             pointer_alt_stack: Vec::new(),
+            attribute_change_extent: AttributeChangeExtent::Stream,
             drcs_fonts: HashMap::new(),
             sync_update_generation: 0,
         }
@@ -1610,6 +1628,58 @@ impl Screen {
         self.pointer_main_stack.clear();
         self.pointer_alt_stack.clear();
         self.dirty = true;
+    }
+
+    /// Current DECSACE attribute-change extent for DECCARA/DECRARA.
+    pub fn attribute_change_extent(&self) -> AttributeChangeExtent {
+        self.attribute_change_extent
+    }
+
+    /// Select the DECSACE extent (`CSI Ps * x`: 2 is the exact rectangle,
+    /// anything else is the scan-order stream, matching DEC and Kitty).
+    /// Public so daemon snapshots round-trip it like the pointer stacks.
+    pub fn set_attribute_change_extent(&mut self, extent: AttributeChangeExtent) {
+        self.attribute_change_extent = extent;
+    }
+
+    /// Row spans a DECCARA/DECRARA operation affects under the current
+    /// DECSACE extent, as `(row, first_col, last_col)` with unclipped
+    /// columns. Rectangle covers the exact column range on every row.
+    /// Stream covers the tail of the first row, full rows between, and the
+    /// head of the last row; a single-row range matches the rectangle,
+    /// mirroring Kitty's `select_graphic_rendition`.
+    fn attribute_change_spans(
+        &self,
+        top: usize,
+        left: usize,
+        bottom: usize,
+        right: usize,
+    ) -> Vec<(usize, usize, usize)> {
+        let height = self.height();
+        let width = self.width();
+        if height == 0 || width == 0 {
+            return Vec::new();
+        }
+        let bottom = bottom.min(height - 1);
+        if top > bottom {
+            return Vec::new();
+        }
+        let last_col = width - 1;
+        match self.attribute_change_extent {
+            AttributeChangeExtent::Rectangle => {
+                (top..=bottom).map(|row| (row, left, right)).collect()
+            }
+            AttributeChangeExtent::Stream if top == bottom => vec![(top, left, right)],
+            AttributeChangeExtent::Stream => {
+                let mut spans = Vec::with_capacity(bottom - top + 1);
+                spans.push((top, left, last_col));
+                for row in (top + 1)..bottom {
+                    spans.push((row, 0, last_col));
+                }
+                spans.push((bottom, 0, right));
+                spans
+            }
+        }
     }
 
     /// Authoritatively replace both stacks from a daemon snapshot.
@@ -3432,6 +3502,7 @@ impl Screen {
     /// styles; only the listed attributes change. An empty attribute list
     /// resets the rectangle, and `0` resets every SGR field of each cell while
     /// preserving character content, hyperlinks, and wide-cell structure.
+    /// The affected cells follow the DECSACE extent (stream by default).
     pub(crate) fn change_rectangular_attributes(
         &mut self,
         top: usize,
@@ -3447,11 +3518,11 @@ impl Screen {
         // DEC treats an empty attribute list as `0` (clear).
         let reset_all = params.iter().nth(4).is_none();
         self.clear_selection_if_rows_selected(top, bottom);
-        for row_index in top..=bottom.min(self.height().saturating_sub(1)) {
+        for (row_index, first, last) in self.attribute_change_spans(top, left, bottom, right) {
             let Some(row) = self.grid.row_mut(row_index) else {
                 continue;
             };
-            for col in left..=right.min(row.len().saturating_sub(1)) {
+            for col in first..=last.min(row.len().saturating_sub(1)) {
                 if reset_all {
                     row[col].reset_sgr();
                 } else {
@@ -3472,9 +3543,9 @@ impl Screen {
     /// their semicolon-form payload parameters — are skipped rather than
     /// misread as boolean toggles. "Off" codes (`22`, `23`, `24`, `25`,
     /// `27`, `28`, `29`, `55`, `221`, `222`) are likewise ignored under
-    /// reversal semantics. Kitty documents the all-SGR extension for DECCARA;
-    /// its DECRARA coverage is partial, so colors staying untouched here is
-    /// the documented best-effort behavior.
+    /// reversal semantics. Kitty implements no DECRARA; skipping colors
+    /// matches xterm, which documents only `0, 1, 4, 5, 7, 8` for DECRARA.
+    /// Like DECCARA, the affected cells follow the DECSACE extent.
     pub(crate) fn reverse_rectangular_attributes(
         &mut self,
         top: usize,
@@ -3488,11 +3559,11 @@ impl Screen {
         }
 
         self.clear_selection_if_rows_selected(top, bottom);
-        for row_index in top..=bottom.min(self.height().saturating_sub(1)) {
+        for (row_index, first, last) in self.attribute_change_spans(top, left, bottom, right) {
             let Some(row) = self.grid.row_mut(row_index) else {
                 continue;
             };
-            for col in left..=right.min(row.len().saturating_sub(1)) {
+            for col in first..=last.min(row.len().saturating_sub(1)) {
                 let attrs = &mut row[col].attrs;
                 let mut sgr = params.iter().skip(4).peekable();
                 while let Some(group) = sgr.next() {
@@ -3876,6 +3947,7 @@ impl Screen {
         self.keyboard_main_stack.clear();
         self.keyboard_alt_stack.clear();
         self.reset_pointer_shapes();
+        self.attribute_change_extent = AttributeChangeExtent::Stream;
     }
 
     /// Search for text in scrollback and visible buffer

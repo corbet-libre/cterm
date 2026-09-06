@@ -35,9 +35,10 @@ use crate::pointer_shape::{PointerShape, DEFAULT_POINTER_CSS, GRABBED_POINTER_CS
 #[cfg(test)]
 use crate::screen::DesktopNotificationAction;
 use crate::screen::{
-    ClearMode, ClipboardOperation, ClipboardSelection, ColorQuery, CursorStyle,
-    DesktopNotification, KittyColorKey, KittyColorSetting, KittyQueryField, LineClearMode,
-    MouseEncoding, MouseMode, NotificationUrgency, Screen, MAX_OSC21_FIELDS, MAX_OSC21_KEY_LEN,
+    AttributeChangeExtent, ClearMode, ClipboardOperation, ClipboardSelection, ColorQuery,
+    CursorStyle, DesktopNotification, KittyColorKey, KittyColorSetting, KittyQueryField,
+    LineClearMode, MouseEncoding, MouseMode, NotificationUrgency, Screen, MAX_OSC21_FIELDS,
+    MAX_OSC21_KEY_LEN,
 };
 use crate::sixel::{
     SixelDecoder, SixelDecoderConfig, SixelImage, DEFAULT_SIXEL_MAX_BYTES, MAX_SIXEL_COLORS,
@@ -1312,6 +1313,19 @@ impl vte::Perform for ScreenPerformer<'_> {
                     self.screen.erase_rectangular_area(top, left, bottom, right);
                 }
             }
+            // Select Attribute Change Extent (DECSACE): which cells
+            // DECCARA/DECRARA affect. `2` is the exact rectangle; `0`, `1`
+            // and a missing parameter are the scan-order stream (the DEC
+            // power-on default), matching Kitty (`kitty/screen.c`,
+            // `screen_decsace`). Controls DECCARA/DECRARA only, like DEC
+            // and xterm; DECCRA/DECERA/DECFRA stay rectangular.
+            ('x', [b'*']) => {
+                let extent = match first_param(&params_vec, 0) {
+                    2 => AttributeChangeExtent::Rectangle,
+                    _ => AttributeChangeExtent::Stream,
+                };
+                self.screen.set_attribute_change_extent(extent);
+            }
             // Save Cursor (DECSC)
             ('s', []) => {
                 self.screen.save_cursor();
@@ -1486,6 +1500,8 @@ impl vte::Perform for ScreenPerformer<'_> {
                 self.screen.style.reset();
                 self.screen.modes.insert_mode = false;
                 self.screen.modes.origin_mode = false;
+                self.screen
+                    .set_attribute_change_extent(AttributeChangeExtent::Stream);
                 self.screen.reset_scroll_region();
                 self.screen.reset_extra_cursors();
             }
@@ -1661,6 +1677,13 @@ fn decrqss_response(query: &[u8], screen: &Screen) -> Vec<u8> {
             };
             format!("{mode} q")
         }
+        // DECSACE extent. Values are Kitty-faithful, precursor-verified
+        // against `kitty/screen.c` (`1$r%d*x` with `mDECSACE ? 1 : 0`):
+        // `1` reports the exact rectangle, `0` the scan-order stream.
+        b"*x" => match screen.attribute_change_extent() {
+            AttributeChangeExtent::Rectangle => "1*x".to_string(),
+            AttributeChangeExtent::Stream => "0*x".to_string(),
+        },
         _ => return b"\x1bP0$r\x1b\\".to_vec(),
     };
 
@@ -5476,6 +5499,246 @@ mod tests {
             assert_eq!(cell.bg, Color::Ansi(AnsiColor::Blue));
             assert!(cell.attrs.is_empty());
         }
+    }
+
+    #[test]
+    fn test_decrara_color_payload_matrix_stays_untouched() {
+        // xterm documents only `0, 1, 4, 5, 7, 8` for DECRARA: every color
+        // form — basic, bright, reset, indexed, truecolor, underline color,
+        // colon and truncated payloads — must leave cells exactly alone.
+        let mut screen = make_screen();
+        let mut parser = Parser::new();
+
+        parser.parse(&mut screen, b"ABCD");
+        parser.parse(&mut screen, b"\x1b[1;1;1;4;31;44$r");
+        let matrix = [
+            // Basic and bright colors plus the default-color resets.
+            &b"\x1b[1;1;1;4;30;37;40;47;90;97;100;107;39;49;59$t"[..],
+            // Semicolon indexed/truecolor payloads.
+            b"\x1b[1;1;1;4;38;5;7;48;2;7;7;7;58;5;9$t",
+            // Colon payloads, including an empty-field truecolor form.
+            b"\x1b[1;1;1;4;38:5:7;48:2::7:7:7;58:2:9:9:9$t",
+            // Truncated payloads must not consume the next group either.
+            b"\x1b[1;1;1;4;38$t",
+            b"\x1b[1;1;1;4;38;5$t",
+            b"\x1b[1;1;1;4;48;2;7;7$t",
+        ];
+        for sequence in matrix {
+            parser.parse(&mut screen, sequence);
+        }
+        for col in 0..4 {
+            let cell = screen.get_cell(0, col).unwrap();
+            assert_eq!(cell.text(), &"ABCD"[col..col + 1]);
+            assert_eq!(cell.fg, Color::Ansi(AnsiColor::Red));
+            assert_eq!(cell.bg, Color::Ansi(AnsiColor::Blue));
+            assert_eq!(cell.underline_color, None);
+            assert!(cell.attrs.is_empty());
+        }
+
+        // Underline *styles* are still boolean toggles; only the `58`
+        // underline *color* is skipped.
+        parser.parse(&mut screen, b"\x1b[1;1;1;4;4:3$t");
+        for col in 0..4 {
+            assert!(screen
+                .get_cell(0, col)
+                .unwrap()
+                .attrs
+                .contains(CellAttrs::UNDERLINE));
+        }
+    }
+
+    #[test]
+    fn test_decsace_stream_is_default_and_selectable() {
+        // DEC VT420 powers on in stream mode; Kitty matches that default.
+        let mut screen = make_screen();
+        assert_eq!(
+            screen.attribute_change_extent(),
+            AttributeChangeExtent::Stream
+        );
+        let mut parser = Parser::new();
+
+        parser.parse(&mut screen, b"\x1b[2*x");
+        assert_eq!(
+            screen.attribute_change_extent(),
+            AttributeChangeExtent::Rectangle
+        );
+        // `0`, `1` and a missing parameter are all the stream, like Kitty's
+        // `val == 2` test in `screen_decsace`.
+        for sequence in [b"\x1b[0*x".as_slice(), b"\x1b[1*x", b"\x1b[*x"] {
+            parser.parse(&mut screen, sequence);
+            assert_eq!(
+                screen.attribute_change_extent(),
+                AttributeChangeExtent::Stream
+            );
+        }
+        // Out-of-range values fail closed to stream.
+        parser.parse(&mut screen, b"\x1b[2*x");
+        parser.parse(&mut screen, b"\x1b[9*x");
+        assert_eq!(
+            screen.attribute_change_extent(),
+            AttributeChangeExtent::Stream
+        );
+    }
+
+    #[test]
+    fn test_decsace_stream_geometry_for_deccara() {
+        let mut screen = make_screen();
+        let mut parser = Parser::new();
+        for row in 1..=3 {
+            parser.parse(
+                &mut screen,
+                format!("\x1b[{row};1H....................").as_bytes(),
+            );
+        }
+
+        // Stream (default): corners are scan-order endpoints, so rows 1-3
+        // cols 3-6 (1-based) bolds the tail of row 0, all of row 1, and the
+        // head of row 2.
+        parser.parse(&mut screen, b"\x1b[1;3;3;6;1$r");
+        let bold = |screen: &Screen, row: usize, col: usize| {
+            screen
+                .get_cell(row, col)
+                .unwrap()
+                .attrs
+                .contains(CellAttrs::BOLD)
+        };
+        for col in 0..2 {
+            assert!(!bold(&screen, 0, col));
+        }
+        for col in 2..80 {
+            assert!(bold(&screen, 0, col), "row 0 col {col}");
+        }
+        for col in 0..80 {
+            assert!(bold(&screen, 1, col), "row 1 col {col}");
+        }
+        for col in 0..6 {
+            assert!(bold(&screen, 2, col), "row 2 col {col}");
+        }
+        for col in 6..80 {
+            assert!(!bold(&screen, 2, col), "row 2 col {col}");
+        }
+        assert!(!bold(&screen, 3, 0));
+    }
+
+    #[test]
+    fn test_decsace_rectangle_geometry_for_deccara() {
+        let mut screen = make_screen();
+        let mut parser = Parser::new();
+        for row in 1..=3 {
+            parser.parse(
+                &mut screen,
+                format!("\x1b[{row};1H....................").as_bytes(),
+            );
+        }
+
+        parser.parse(&mut screen, b"\x1b[2*x\x1b[1;3;3;6;1$r");
+        for row in 0..3 {
+            for col in 0..80 {
+                let bold = screen
+                    .get_cell(row, col)
+                    .unwrap()
+                    .attrs
+                    .contains(CellAttrs::BOLD);
+                assert_eq!(bold, (2..6).contains(&col), "row {row} col {col}");
+            }
+        }
+        assert!(!screen
+            .get_cell(3, 0)
+            .unwrap()
+            .attrs
+            .contains(CellAttrs::BOLD));
+    }
+
+    #[test]
+    fn test_decsace_single_row_matches_rectangle() {
+        // A single-row range is identical under both extents, like Kitty.
+        for extent in [b"\x1b[1*x".as_slice(), b"\x1b[2*x"] {
+            let mut screen = make_screen();
+            let mut parser = Parser::new();
+            parser.parse(&mut screen, b"....................");
+            parser.parse(&mut screen, extent);
+            parser.parse(&mut screen, b"\x1b[1;3;1;6;1$r");
+            for col in 0..80 {
+                let bold = screen
+                    .get_cell(0, col)
+                    .unwrap()
+                    .attrs
+                    .contains(CellAttrs::BOLD);
+                assert_eq!(bold, (2..6).contains(&col), "col {col}");
+            }
+        }
+    }
+
+    #[test]
+    fn test_decsace_stream_geometry_for_decrara() {
+        let mut screen = make_screen();
+        let mut parser = Parser::new();
+        for row in 1..=3 {
+            parser.parse(
+                &mut screen,
+                format!("\x1b[{row};1H....................").as_bytes(),
+            );
+        }
+
+        // Bold the stream span, then reverse the same span back off: every
+        // stream cell must clear while nothing outside ever toggles on.
+        parser.parse(&mut screen, b"\x1b[1;3;3;6;1$r");
+        parser.parse(&mut screen, b"\x1b[1;3;3;6;1$t");
+        for row in 0..4 {
+            for col in 0..80 {
+                assert!(
+                    !screen
+                        .get_cell(row, col)
+                        .unwrap()
+                        .attrs
+                        .contains(CellAttrs::BOLD),
+                    "row {row} col {col}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_decsace_decrqss_matches_kitty() {
+        // Kitty-faithful values, precursor-verified against
+        // `kitty/screen.c` (`1$r%d*x` with `mDECSACE ? 1 : 0`): `1` reports
+        // the rectangle, `0` the stream.
+        let mut screen = make_screen();
+        let mut parser = Parser::new();
+
+        parser.parse(&mut screen, b"\x1bP$q*x\x1b\\");
+        assert_eq!(
+            screen.take_pending_responses(),
+            vec![b"\x1bP1$r0*x\x1b\\".to_vec()]
+        );
+        parser.parse(&mut screen, b"\x1b[2*x\x1bP$q*x\x1b\\");
+        assert_eq!(
+            screen.take_pending_responses(),
+            vec![b"\x1bP1$r1*x\x1b\\".to_vec()]
+        );
+    }
+
+    #[test]
+    fn test_decsace_reset_by_decstr_and_ris() {
+        let mut screen = make_screen();
+        let mut parser = Parser::new();
+
+        parser.parse(&mut screen, b"\x1b[2*x");
+        assert_eq!(
+            screen.attribute_change_extent(),
+            AttributeChangeExtent::Rectangle
+        );
+        parser.parse(&mut screen, b"\x1b[!p");
+        assert_eq!(
+            screen.attribute_change_extent(),
+            AttributeChangeExtent::Stream
+        );
+
+        parser.parse(&mut screen, b"\x1b[2*x\x1bc");
+        assert_eq!(
+            screen.attribute_change_extent(),
+            AttributeChangeExtent::Stream
+        );
     }
 
     #[test]

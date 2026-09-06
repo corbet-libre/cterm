@@ -8,9 +8,10 @@ use cterm_core::grid::Row as CoreRow;
 use cterm_core::pointer_shape::{stack_entry_from_snapshot, stack_entry_to_snapshot};
 use cterm_core::term::Terminal;
 use cterm_core::{
-    Cell, CellAttrs, Color, ColorQuery, CursorStyle, ExtraCursor, ExtraCursorColor,
-    ExtraCursorColors, ExtraCursorShape, KittyColorKey, KittyColorSetting, KittyColorSnapshot,
-    MouseEncoding, MouseMode, Multicell, Rgb, Screen, TerminalImage, TextSizeAlignment,
+    AttributeChangeExtent, Cell, CellAttrs, Color, ColorQuery, CursorStyle, ExtraCursor,
+    ExtraCursorColor, ExtraCursorColors, ExtraCursorShape, KittyColorKey, KittyColorSetting,
+    KittyColorSnapshot, MouseEncoding, MouseMode, Multicell, Rgb, Screen, TerminalImage,
+    TextSizeAlignment,
 };
 use std::sync::Arc;
 
@@ -620,6 +621,10 @@ pub fn modes_to_proto(screen: &Screen) -> proto::TerminalModes {
             .iter()
             .map(stack_entry_to_snapshot)
             .collect(),
+        attribute_change_stream: matches!(
+            screen.attribute_change_extent(),
+            AttributeChangeExtent::Stream
+        ),
     }
 }
 
@@ -856,6 +861,11 @@ pub fn apply_screen_snapshot(terminal: &mut Terminal, screen_data: &proto::GetSc
             decode_pointer_stack(&modes.pointer_main_stack),
             decode_pointer_stack(&modes.pointer_alt_stack),
         );
+        screen.set_attribute_change_extent(if modes.attribute_change_stream {
+            AttributeChangeExtent::Stream
+        } else {
+            AttributeChangeExtent::Rectangle
+        });
     }
 
     // Restore DRCS soft fonts
@@ -1413,5 +1423,35 @@ mod tests {
         assert!(!empty.modes.as_ref().unwrap().rich_clipboard_paste_events);
         apply_screen_snapshot(&mut restored, &empty);
         assert!(!restored.screen().rich_paste_events_enabled());
+    }
+
+    #[test]
+    fn attribute_change_extent_roundtrips_through_screen_snapshot() {
+        use cterm_core::AttributeChangeExtent;
+
+        let mut source = Terminal::new(8, 2, ScreenConfig::default());
+        assert_eq!(
+            source.screen().attribute_change_extent(),
+            AttributeChangeExtent::Stream
+        );
+        source.process(b"\x1b[2*x");
+        assert_eq!(
+            source.screen().attribute_change_extent(),
+            AttributeChangeExtent::Rectangle
+        );
+
+        let snapshot = screen_to_proto(source.screen(), false);
+        assert!(!snapshot.modes.as_ref().unwrap().attribute_change_stream);
+
+        let mut restored = Terminal::new(8, 2, ScreenConfig::default());
+        apply_screen_snapshot(&mut restored, &snapshot);
+        assert_eq!(
+            restored.screen().attribute_change_extent(),
+            AttributeChangeExtent::Rectangle
+        );
+
+        // The power-on default (stream) round-trips as `true`.
+        let fresh = screen_to_proto(Terminal::new(8, 2, ScreenConfig::default()).screen(), false);
+        assert!(fresh.modes.as_ref().unwrap().attribute_change_stream);
     }
 }
