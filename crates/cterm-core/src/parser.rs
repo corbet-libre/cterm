@@ -55,9 +55,17 @@ enum DcsState {
     Xtgettcap { buffer: Vec<u8>, overflowed: bool },
     /// DECRQSS request-status-string query in progress
     Decrqss { query: Vec<u8> },
+    /// Kitty private DCS (`ESC P @ kitty-... ST`) payload in progress
+    KittyPrivate { buffer: Vec<u8>, overflowed: bool },
 }
 
 const XTGETTCAP_MAX_REQUEST_SIZE: usize = 64 * 1024;
+/// Defensive bound for one Kitty private DCS payload (`@kitty-...`).
+/// Matches the XTGETTCAP bound; individual commands apply tighter limits.
+const KITTY_PRIVATE_DCS_MAX_BYTES: usize = 64 * 1024;
+/// Maximum decoded bytes accepted for `@kitty-echo` (a tty-drain flush is
+/// small; anything larger is treated as abuse and ignored).
+const KITTY_ECHO_MAX_DECODED_BYTES: usize = 4096;
 const MAX_NOTIFICATION_TITLE_BYTES: usize = 1024;
 const MAX_NOTIFICATION_BODY_BYTES: usize = 4096;
 // OSC 66 and OSC 72 permit 4096-byte payloads in addition to command
@@ -141,6 +149,50 @@ enum KittyPayloadType {
     Capabilities,
 }
 
+/// Kitty-compatible snapshot of side-effect-free modes for no-argument
+/// `CSI ? s` / `CSI ? r` (XTSAVE/XTRESTORE).
+///
+/// Mirrors the mode list in Kitty's `copy_specific_modes` (`kitty/screen.c`),
+/// restricted to modes cterm implements: ANSI 4 (IRM) and 20 (LNM), DEC 1, 5,
+/// 7, 25, the 1000 mouse-tracking group, the 1005 mouse-encoding group, 1004,
+/// 2004, 2031, and 2033. Modes with side effects on other terminal state
+/// (notably DECOM 6 and DECCOLM 3) and modes cterm does not implement
+/// (DECARM 8, inband-resize 2048, paste-event 5522) are never captured.
+#[derive(Debug, Clone, Copy, Default)]
+struct SafeModeSnapshot {
+    insert_mode: bool,
+    line_feed_mode: bool,
+    application_cursor: bool,
+    reverse_video: bool,
+    auto_wrap: bool,
+    show_cursor: bool,
+    mouse_mode: MouseMode,
+    focus_events: bool,
+    mouse_encoding: MouseEncoding,
+    bracketed_paste: bool,
+    theme_change_reports: bool,
+    visibility_change_reports: bool,
+}
+
+impl SafeModeSnapshot {
+    fn capture(screen: &Screen) -> Self {
+        Self {
+            insert_mode: screen.modes.insert_mode,
+            line_feed_mode: screen.modes.line_feed_mode,
+            application_cursor: screen.modes.application_cursor,
+            reverse_video: screen.modes.reverse_video,
+            auto_wrap: screen.modes.auto_wrap,
+            show_cursor: screen.modes.show_cursor,
+            mouse_mode: screen.modes.mouse_mode,
+            focus_events: screen.modes.focus_events,
+            mouse_encoding: screen.modes.mouse_encoding,
+            bracketed_paste: screen.modes.bracketed_paste,
+            theme_change_reports: screen.modes.theme_change_reports,
+            visibility_change_reports: screen.modes.visibility_change_reports,
+        }
+    }
+}
+
 /// Parser wraps the vte parser and applies actions to a Screen
 pub struct Parser {
     state_machine: vte::Parser<VTE_OSC_BUFFER_BYTES>,
@@ -149,6 +201,10 @@ pub struct Parser {
     last_printed: Option<char>,
     /// Saved DEC private modes for xterm XTSAVE/XTRESTORE.
     saved_dec_modes: HashMap<usize, bool>,
+    /// Snapshot for no-argument Kitty `CSI ? s` / `CSI ? r`. `None` means no
+    /// bare save has been seen; a bare restore then does nothing, matching
+    /// the explicit path's fail-closed treatment of never-saved modes.
+    saved_safe_modes: Option<SafeModeSnapshot>,
     /// Bounded, all-or-none interceptor for streaming OSC 1337 File sequences.
     osc_1337: Osc1337Interceptor,
     /// In-progress chunked Kitty OSC 99 notification.
@@ -176,6 +232,7 @@ impl Parser {
             dcs_state: DcsState::None,
             last_printed: None,
             saved_dec_modes: HashMap::new(),
+            saved_safe_modes: None,
             osc_1337: Osc1337Interceptor::new(),
             kitty_notification: KittyNotificationBuilder::default(),
             kitty_dnd: DndProtocolState::default(),
@@ -249,6 +306,7 @@ impl Parser {
             dcs_state: &mut self.dcs_state,
             last_printed: &mut self.last_printed,
             saved_dec_modes: &mut self.saved_dec_modes,
+            saved_safe_modes: &mut self.saved_safe_modes,
             kitty_notification: &mut self.kitty_notification,
             kitty_dnd: &mut self.kitty_dnd,
             active_notification_ids: &mut self.active_notification_ids,
@@ -340,6 +398,7 @@ struct ScreenPerformer<'a> {
     dcs_state: &'a mut DcsState,
     last_printed: &'a mut Option<char>,
     saved_dec_modes: &'a mut HashMap<usize, bool>,
+    saved_safe_modes: &'a mut Option<SafeModeSnapshot>,
     kitty_notification: &'a mut KittyNotificationBuilder,
     kitty_dnd: &'a mut DndProtocolState,
     active_notification_ids: &'a mut HashSet<String>,
@@ -450,6 +509,17 @@ impl vte::Perform for ScreenPerformer<'_> {
                     query: Vec::with_capacity(2),
                 };
             }
+            // Kitty private DCS (`ESC P @ kitty-... ST`). The `@` byte is a
+            // DCS final byte, so vte delivers it as the hook action with the
+            // `kitty-<command>|<payload>` body arriving via `put`. vte
+            // reports a missing parameter as a single zero, hence the
+            // all-zero check.
+            '@' if intermediates.is_empty() && params_vec.iter().all(|&param| param == 0) => {
+                *self.dcs_state = DcsState::KittyPrivate {
+                    buffer: Vec::new(),
+                    overflowed: false,
+                };
+            }
             // DECDLD (soft font download): DCS Pfn;Pcn;Pe;Pcmw;Pss;Pt;Pcmh;Pcss {
             '{' if intermediates.is_empty() => {
                 log::debug!("Starting DECDLD sequence, params: {:?}", params_vec);
@@ -488,6 +558,16 @@ impl vte::Perform for ScreenPerformer<'_> {
             DcsState::Decrqss { ref mut query } => {
                 if query.len() < 2 {
                     query.push(byte);
+                }
+            }
+            DcsState::KittyPrivate {
+                ref mut buffer,
+                ref mut overflowed,
+            } => {
+                if buffer.len() < KITTY_PRIVATE_DCS_MAX_BYTES {
+                    buffer.push(byte);
+                } else {
+                    *overflowed = true;
                 }
             }
             DcsState::None => {}
@@ -599,6 +679,13 @@ impl vte::Perform for ScreenPerformer<'_> {
             DcsState::Decrqss { query } => {
                 self.screen
                     .queue_response(decrqss_response(&query, self.screen));
+            }
+            DcsState::KittyPrivate { buffer, overflowed } => {
+                if overflowed {
+                    log::warn!("Ignoring oversized Kitty private DCS command");
+                } else {
+                    Self::handle_kitty_private_dcs(self.screen, &buffer);
+                }
             }
             DcsState::None => {}
         }
@@ -1239,31 +1326,44 @@ impl vte::Perform for ScreenPerformer<'_> {
                 self.screen
                     .queue_response(format!("\x1b[?{current};{size}#Q").into_bytes());
             }
-            // Save DEC private modes (XTSAVE).
+            // Save DEC private modes (XTSAVE). With no mode arguments, save
+            // Kitty's side-effect-free safe-mode set instead. vte reports a
+            // missing parameter as a single zero, so `CSI ? s` and the
+            // no-op `CSI ? 0 s` are indistinguishable; both take this path.
             ('s', [b'?']) => {
-                for &mode in &params_vec {
-                    if mode == 1048 {
-                        self.screen.save_cursor();
-                        continue;
-                    }
-                    match self.dec_private_mode_status(mode) {
-                        1 => {
-                            self.saved_dec_modes.insert(mode, true);
+                if params_vec.iter().all(|&param| param == 0) {
+                    self.save_safe_modes();
+                } else {
+                    for &mode in &params_vec {
+                        if mode == 1048 {
+                            self.screen.save_cursor();
+                            continue;
                         }
-                        2 => {
-                            self.saved_dec_modes.insert(mode, false);
+                        match self.dec_private_mode_status(mode) {
+                            1 => {
+                                self.saved_dec_modes.insert(mode, true);
+                            }
+                            2 => {
+                                self.saved_dec_modes.insert(mode, false);
+                            }
+                            _ => {}
                         }
-                        _ => {}
                     }
                 }
             }
-            // Restore DEC private modes (XTRESTORE).
+            // Restore DEC private modes (XTRESTORE). With no mode arguments,
+            // restore Kitty's side-effect-free safe-mode set instead (same
+            // vte zero-param note as the save arm above).
             ('r', [b'?']) => {
-                for &mode in &params_vec {
-                    if mode == 1048 {
-                        self.screen.restore_cursor();
-                    } else if let Some(enabled) = self.saved_dec_modes.get(&mode).copied() {
-                        self.handle_dec_mode(mode, enabled);
+                if params_vec.iter().all(|&param| param == 0) {
+                    self.restore_safe_modes();
+                } else {
+                    for &mode in &params_vec {
+                        if mode == 1048 {
+                            self.screen.restore_cursor();
+                        } else if let Some(enabled) = self.saved_dec_modes.get(&mode).copied() {
+                            self.handle_dec_mode(mode, enabled);
+                        }
                     }
                 }
             }
@@ -2705,6 +2805,126 @@ impl ScreenPerformer<'_> {
         }
     }
 
+    /// Save the Kitty safe-mode set for no-argument `CSI ? s`.
+    fn save_safe_modes(&mut self) {
+        let snapshot = SafeModeSnapshot::capture(self.screen);
+        *self.saved_safe_modes = Some(snapshot);
+        // Mirror the snapshot into the explicit-save map so a later explicit
+        // `CSI ? <mode> r` observes the bare save, matching Kitty's shared
+        // saved-mode store in that direction.
+        for mode in [1, 5, 7, 25, 1004, 2004, 2031, 2033] {
+            match self.dec_private_mode_status(mode) {
+                1 => {
+                    self.saved_dec_modes.insert(mode, true);
+                }
+                2 => {
+                    self.saved_dec_modes.insert(mode, false);
+                }
+                _ => {}
+            }
+        }
+        for mode in [1000, 1002, 1003, 1005, 1006, 1015, 1016] {
+            match self.dec_private_mode_status(mode) {
+                1 => {
+                    self.saved_dec_modes.insert(mode, true);
+                }
+                2 => {
+                    self.saved_dec_modes.insert(mode, false);
+                }
+                _ => {}
+            }
+        }
+        // ANSI modes 4/20 live only in the snapshot: explicit XTRESTORE
+        // addresses DEC private modes, so there is no map entry to mirror.
+    }
+
+    /// Restore the Kitty safe-mode set for no-argument `CSI ? r`. A restore
+    /// with no preceding bare save is a no-op.
+    fn restore_safe_modes(&mut self) {
+        let Some(snapshot) = *self.saved_safe_modes else {
+            return;
+        };
+        self.handle_ansi_mode(4, snapshot.insert_mode);
+        self.handle_ansi_mode(20, snapshot.line_feed_mode);
+        self.handle_dec_mode(1, snapshot.application_cursor);
+        self.handle_dec_mode(5, snapshot.reverse_video);
+        self.handle_dec_mode(7, snapshot.auto_wrap);
+        self.handle_dec_mode(25, snapshot.show_cursor);
+        self.screen.modes.mouse_mode = snapshot.mouse_mode;
+        self.handle_dec_mode(1004, snapshot.focus_events);
+        self.screen.modes.mouse_encoding = snapshot.mouse_encoding;
+        self.handle_dec_mode(2004, snapshot.bracketed_paste);
+        self.handle_dec_mode(2031, snapshot.theme_change_reports);
+        self.handle_dec_mode(2033, snapshot.visibility_change_reports);
+    }
+
+    /// Dispatch one complete Kitty private DCS payload (`kitty-<command>` plus
+    /// its trailing bytes). Unknown commands and malformed payloads are
+    /// silently ignored so a hostile or newer peer cannot disturb the
+    /// terminal.
+    fn handle_kitty_private_dcs(screen: &mut Screen, payload: &[u8]) {
+        const PREFIX: &[u8] = b"kitty-";
+        if payload.len() < PREFIX.len() || &payload[..PREFIX.len()] != PREFIX {
+            return;
+        }
+        let body = &payload[PREFIX.len()..];
+        // Remote control (`@kitty-cmd{...}`): cterm exposes no remote-control
+        // surface, so commands are fail-closed and never executed.
+        if body.first() == Some(&b'c') && body.starts_with(b"cmd{") {
+            log::trace!("Ignoring Kitty remote-control DCS command");
+            return;
+        }
+        let Some(separator) = body.iter().position(|&byte| byte == b'|') else {
+            return;
+        };
+        let (command, argument) = (&body[..separator], &body[separator + 1..]);
+        match command {
+            // Debug print from shell integration: strict base64, valid UTF-8,
+            // C0-sanitized like Kitty, emitted to the daemon log. Core owns
+            // no stderr channel, so the log is the faithful sink.
+            b"print" => {
+                let Some(text) = decode_kitty_print(argument) else {
+                    return;
+                };
+                if !text.is_empty() {
+                    log::info!("kitty-print: {text}");
+                }
+            }
+            // TTY-drain flush from the ssh kitten: base64 ASCII digits are
+            // echoed back to the child, exactly as Kitty writes them to its
+            // child. Anything else is ignored.
+            b"echo" => {
+                use base64::Engine;
+                let Ok(decoded) = base64::engine::general_purpose::STANDARD.decode(argument) else {
+                    return;
+                };
+                if decoded.is_empty()
+                    || decoded.len() > KITTY_ECHO_MAX_DECODED_BYTES
+                    || !decoded.iter().all(|byte| byte.is_ascii_digit())
+                {
+                    return;
+                }
+                screen.queue_response(decoded);
+            }
+            // Restore the configured cursor appearance, mirroring Kitty's
+            // reset of blink source, shape, visibility, and cursor color.
+            // The payload carries no arguments; any trailing bytes are
+            // accepted and ignored for forward compatibility.
+            b"restore-cursor-appearance" => {
+                screen.cursor.reset_style_to_config();
+                screen.cursor.blink.set_dec_mode_12(false);
+                screen.modes.show_cursor = true;
+                screen.set_dynamic_color(ColorQuery::Cursor, None);
+            }
+            // Deferred by design (see docs/parity.md): overlay coordination,
+            // kitten results, ssh bootstrap, shared-memory askpass, window
+            // cloning, and editor launching have no core counterpart and the
+            // security-sensitive ones must stay fail-closed.
+            b"overlay-ready" | b"kitten-result" | b"ssh" | b"ask" | b"clone" | b"edit" => {}
+            _ => {}
+        }
+    }
+
     /// Return a DECRPM status value for an ECMA-48/ANSI mode.
     fn ansi_mode_status(&self, mode: usize) -> u8 {
         let enabled = match mode {
@@ -2779,6 +2999,29 @@ fn parse_simple_notification(
         focus: true,
         ..Default::default()
     })
+}
+
+/// Strictly decode a `@kitty-print` payload: standard base64, valid UTF-8
+/// (Kitty decodes lossily; cterm rejects instead, fail-closed), and C0
+/// controls replaced except TAB, LF, and space, mirroring Kitty's
+/// `replace_c0_codes_except_nl_space_tab`.
+fn decode_kitty_print(argument: &[u8]) -> Option<String> {
+    use base64::Engine;
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(argument)
+        .ok()?;
+    let text = std::str::from_utf8(&decoded).ok()?;
+    Some(
+        text.chars()
+            .map(|c| {
+                if c.is_control() && !matches!(c, '\t' | '\n' | ' ') {
+                    '\u{FFFD}'
+                } else {
+                    c
+                }
+            })
+            .collect(),
+    )
 }
 
 fn kitty_notification_id_is_valid(id: &str) -> bool {
@@ -4544,6 +4787,265 @@ mod tests {
 
         parser.parse(&mut screen, b"\x1b[8;12H\x1b[?1048s\x1b[1;1H\x1b[?1048r");
         assert_eq!((screen.cursor.row, screen.cursor.col), (7, 11));
+    }
+
+    #[test]
+    fn test_kitty_bare_save_restore_round_trips_safe_modes() {
+        let mut screen = make_screen();
+        let mut parser = Parser::new();
+
+        // Establish a distinctive safe-mode state.
+        parser.parse(
+            &mut screen,
+            b"\x1b[?1h\x1b[?5h\x1b[?7l\x1b[?25l\x1b[4h\x1b[20h\
+              \x1b[?1003h\x1b[?1016h\x1b[?1004h\x1b[?2004h\x1b[?2031h\x1b[?2033h",
+        );
+        // Enabling visibility reports queues an immediate report; drain setup
+        // side effects before asserting the bare save is response-free.
+        screen.take_pending_responses();
+        parser.parse(&mut screen, b"\x1b[?s");
+        assert!(screen.take_pending_responses().is_empty());
+
+        // Flip every saved mode and confirm the new state via DECRQM.
+        parser.parse(
+            &mut screen,
+            b"\x1b[?1l\x1b[?5l\x1b[?7h\x1b[?25h\x1b[4l\x1b[20l\
+              \x1b[?1000h\x1b[?1006h\x1b[?1004l\x1b[?2004l\x1b[?2031l\x1b[?2033l",
+        );
+        parser.parse(&mut screen, b"\x1b[?1$p\x1b[4$p\x1b[20$p");
+        assert_eq!(
+            screen.take_pending_responses(),
+            vec![
+                b"\x1b[?1;2$y".to_vec(),
+                b"\x1b[4;2$y".to_vec(),
+                b"\x1b[20;2$y".to_vec(),
+            ]
+        );
+
+        parser.parse(&mut screen, b"\x1b[?r");
+
+        // Restoring visibility reports re-enables them, which queues foot's
+        // immediate visibility report before any DECRQM replies below.
+        assert_eq!(
+            screen.take_pending_responses(),
+            vec![b"\x1b[?999;1n".to_vec()]
+        );
+
+        assert!(screen.modes.application_cursor);
+        assert!(screen.modes.reverse_video);
+        assert!(!screen.modes.auto_wrap);
+        assert!(!screen.modes.show_cursor);
+        assert!(screen.modes.insert_mode);
+        assert!(screen.modes.line_feed_mode);
+        assert_eq!(screen.modes.mouse_mode, MouseMode::AnyEvent);
+        assert_eq!(screen.modes.mouse_encoding, MouseEncoding::SgrPixels);
+        assert!(screen.modes.focus_events);
+        assert!(screen.modes.bracketed_paste);
+        assert!(screen.modes.theme_change_reports);
+        assert!(screen.modes.visibility_change_reports);
+
+        // DECRQM round trip after restore.
+        parser.parse(
+            &mut screen,
+            b"\x1b[?1$p\x1b[?1003$p\x1b[?1016$p\x1b[4$p\x1b[20$p",
+        );
+        assert_eq!(
+            screen.take_pending_responses(),
+            vec![
+                b"\x1b[?1;1$y".to_vec(),
+                b"\x1b[?1003;1$y".to_vec(),
+                b"\x1b[?1016;1$y".to_vec(),
+                b"\x1b[4;1$y".to_vec(),
+                b"\x1b[20;1$y".to_vec(),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_kitty_bare_restore_without_save_is_noop() {
+        let mut screen = make_screen();
+        let mut parser = Parser::new();
+
+        parser.parse(&mut screen, b"\x1b[?1h\x1b[4h");
+        parser.parse(&mut screen, b"\x1b[?r");
+
+        assert!(screen.modes.application_cursor);
+        assert!(screen.modes.insert_mode);
+        assert!(screen.take_pending_responses().is_empty());
+    }
+
+    #[test]
+    fn test_kitty_bare_save_restore_excludes_side_effect_modes() {
+        let mut screen = make_screen();
+        let mut parser = Parser::new();
+
+        // Side-effect modes (origin, keypad) and cursor position must not be
+        // captured or restored by the bare sequences.
+        parser.parse(&mut screen, b"\x1b[?6h\x1b[?66h\x1b[5;10H\x1b[?s");
+        parser.parse(&mut screen, b"\x1b[?6l\x1b[?66l\x1b[1;1H\x1b[?r");
+
+        assert!(!screen.modes.origin_mode);
+        assert!(!screen.modes.application_keypad);
+        assert_eq!((screen.cursor.row, screen.cursor.col), (0, 0));
+
+        // And in the other direction: enabling them after the save must
+        // survive the restore.
+        parser.parse(&mut screen, b"\x1b[?s");
+        parser.parse(&mut screen, b"\x1b[?6h\x1b[?r");
+        assert!(screen.modes.origin_mode);
+    }
+
+    #[test]
+    fn test_kitty_private_dcs_echo_round_trip() {
+        use base64::Engine;
+
+        let mut screen = make_screen();
+        let mut parser = Parser::new();
+        let encode = |bytes: &[u8]| base64::engine::general_purpose::STANDARD.encode(bytes);
+
+        // Valid digit payloads echo back to the child.
+        let payload = encode(b"12345");
+        parser.parse(
+            &mut screen,
+            format!("\x1bP@kitty-echo|{payload}\x1b\\").as_bytes(),
+        );
+        assert_eq!(screen.take_pending_responses(), vec![b"12345".to_vec()]);
+
+        // Non-digit, invalid base64, and empty payloads are ignored.
+        for argument in [
+            encode(b"12a45"),
+            "!!!not-base64!!!".to_string(),
+            String::new(),
+        ] {
+            parser.parse(
+                &mut screen,
+                format!("\x1bP@kitty-echo|{argument}\x1b\\").as_bytes(),
+            );
+            assert!(screen.take_pending_responses().is_empty());
+        }
+
+        // Oversized decoded payloads are rejected.
+        let big = encode(&vec![b'7'; KITTY_ECHO_MAX_DECODED_BYTES + 1]);
+        parser.parse(
+            &mut screen,
+            format!("\x1bP@kitty-echo|{big}\x1b\\").as_bytes(),
+        );
+        assert!(screen.take_pending_responses().is_empty());
+
+        // The parser remains usable after every variant.
+        parser.parse(&mut screen, b"Z");
+        assert_eq!(screen.get_cell(0, 0).unwrap().text(), "Z");
+    }
+
+    #[test]
+    fn test_kitty_private_dcs_print_is_validated() {
+        use base64::Engine;
+
+        let mut screen = make_screen();
+        let mut parser = Parser::new();
+        let encode = |bytes: &[u8]| base64::engine::general_purpose::STANDARD.encode(bytes);
+
+        // Valid payloads are accepted without disturbing terminal state.
+        let payload = encode("hello".as_bytes());
+        parser.parse(
+            &mut screen,
+            format!("\x1bP@kitty-print|{payload}\x1b\\").as_bytes(),
+        );
+        assert!(screen.take_pending_responses().is_empty());
+
+        // Invalid base64 and invalid UTF-8 are rejected.
+        let bad_utf8 = encode(&[0xff, 0xfe]);
+        for argument in ["!!!not-base64!!!".to_string(), bad_utf8] {
+            parser.parse(
+                &mut screen,
+                format!("\x1bP@kitty-print|{argument}\x1b\\").as_bytes(),
+            );
+            assert!(screen.take_pending_responses().is_empty());
+        }
+
+        // Oversized payloads are rejected and the parser recovers.
+        let big = "A".repeat(KITTY_PRIVATE_DCS_MAX_BYTES + 1);
+        parser.parse(
+            &mut screen,
+            format!("\x1bP@kitty-print|{big}\x1b\\").as_bytes(),
+        );
+        assert!(screen.take_pending_responses().is_empty());
+        parser.parse(&mut screen, b"Y");
+        assert_eq!(screen.get_cell(0, 0).unwrap().text(), "Y");
+    }
+
+    #[test]
+    fn test_kitty_print_sanitizes_controls_but_keeps_whitespace() {
+        use base64::Engine;
+
+        let decoded = decode_kitty_print(
+            base64::engine::general_purpose::STANDARD
+                .encode("a\x01b\tc\nd e\x7ff".as_bytes())
+                .as_bytes(),
+        )
+        .expect("valid payload decodes");
+        assert_eq!(decoded, "a\u{FFFD}b\tc\nd e\u{FFFD}f");
+
+        assert!(decode_kitty_print(b"!!!not-base64!!!").is_none());
+        assert!(decode_kitty_print(b"//8=").is_none());
+    }
+
+    #[test]
+    fn test_kitty_private_dcs_restore_cursor_appearance() {
+        let mut screen = make_screen();
+        let mut parser = Parser::new();
+
+        parser.parse(&mut screen, b"\x1b[5 q\x1b[?25l\x1b[?12h");
+        screen.set_dynamic_color(ColorQuery::Cursor, Some(Rgb::new(1, 2, 3)));
+        assert_eq!(screen.cursor.style, CursorStyle::Bar);
+        assert!(!screen.modes.show_cursor);
+
+        parser.parse(&mut screen, b"\x1bP@kitty-restore-cursor-appearance|\x1b\\");
+
+        assert_eq!(screen.cursor.style, screen.cursor.configured_style());
+        assert_eq!(screen.cursor.blink.decscusr(), None);
+        assert!(!screen.cursor.blink.dec_mode_12());
+        assert!(screen.modes.show_cursor);
+        assert_eq!(screen.dynamic_color(ColorQuery::Cursor), None);
+        assert!(screen.take_pending_responses().is_empty());
+
+        // A missing `|` separator is malformed and must not restore.
+        parser.parse(&mut screen, b"\x1b[5 q\x1b[?25l");
+        parser.parse(&mut screen, b"\x1bP@kitty-restore-cursor-appearance\x1b\\");
+        assert_eq!(screen.cursor.style, CursorStyle::Bar);
+        assert!(!screen.modes.show_cursor);
+    }
+
+    #[test]
+    fn test_kitty_private_dcs_unknown_and_remote_cmd_are_ignored() {
+        let mut screen = make_screen();
+        let mut parser = Parser::new();
+
+        for sequence in [
+            // Remote control stays fail-closed: never executed, never answered.
+            "\x1bP@kitty-cmd{\"cmd\":\"ls\",\"version\":[0,14,2]}\x1b\\".to_string(),
+            "\x1bP@kitty-cmdnot-json\x1b\\".to_string(),
+            // Deferred commands with no core counterpart.
+            "\x1bP@kitty-clone|3:abcd\x1b\\".to_string(),
+            "\x1bP@kitty-ask|shm-name\x1b\\".to_string(),
+            "\x1bP@kitty-ssh|e30=\x1b\\".to_string(),
+            "\x1bP@kitty-edit|0:abcd\x1b\\".to_string(),
+            "\x1bP@kitty-kitten-result|e30=\x1b\\".to_string(),
+            "\x1bP@kitty-overlay-ready|\x1b\\".to_string(),
+            // Unknown present/future commands and non-Kitty `@` DCS.
+            "\x1bP@kitty-time-travel|now\x1b\\".to_string(),
+            "\x1bP@kitty-print".to_string() + "\x1b\\",
+            "\x1bP@vte-direct-future\x1b\\".to_string(),
+        ] {
+            parser.parse(&mut screen, sequence.as_bytes());
+            assert!(screen.take_pending_responses().is_empty());
+        }
+
+        // Terminal state is untouched and the parser is not stuck in DCS.
+        assert!(!screen.modes.application_cursor);
+        parser.parse(&mut screen, b"\x1b[?1hQ");
+        assert!(screen.modes.application_cursor);
+        assert_eq!(screen.get_cell(0, 0).unwrap().text(), "Q");
     }
 
     #[test]

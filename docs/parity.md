@@ -32,7 +32,7 @@ The authoritative catalog is Kitty's current
 | Color control | Partial | Xterm palette stack plus OSC 4/10-12 dynamic colors, with Kitty OSC 21 query/set/reset for selection, cursor-text, visual-bell, and transparency keys, shared OSC 30001/30101 palette-stack push/pop, daemon-owned replies, snapshot persistence, and strict value validation (core behavioral tests) | Native renderer hooks consuming the new slots, named-color values, OSC 17/19 selection aliasing, and pixel-level native visual assertions |
 | Arbitrary-region styles/colors | Partial | DEC rectangle operations support a bounded attribute subset | Kitty all-SGR DECCARA semantics, including colors |
 | Rich clipboard | Missing | Text-oriented OSC 52 and native text clipboards | OSC 5522 typed MIME data, reads/writes, paste events, consent reuse, queries, and native adapters |
-| Miscellaneous extensions | Partial | Independent bold/faint reset, mouse-leave report, and viewport-to-scrollback | No-argument save/restore of safe modes and Kitty private DCS commands |
+| Miscellaneous extensions | Partial | Independent bold/faint reset, mouse-leave report, viewport-to-scrollback, no-argument save/restore of safe modes (ANSI 4/20 plus DEC 1/5/7/25, the 1000 tracking and 1005 encoding groups, 1004/2004/2031/2033; DECOM/DECCOLM and unimplemented modes excluded), and Kitty private DCS echo/print/restore-cursor-appearance with strict validation and fail-closed remote control; 8 new core behavior tests | Remote-control execution and overlay/kitten-result/ssh/ask/clone/edit handlers (no core counterpart; security-sensitive commands stay fail-closed) |
 
 ## foot and terminal-core parity
 

@@ -49,6 +49,11 @@ is omitted for readability.
   transparency keys with query/set/reset and strict value validation) plus
   OSC 30001/30101 palette-stack push/pop on the shared xterm stack, with
   daemon-owned replies and snapshot persistence.
+- Kitty no-argument save/restore of safe terminal modes (bare `CSI ? s` /
+  `CSI ? r` over ANSI 4/20 and the side-effect-free DEC set, excluding
+  DECOM/DECCOLM), plus Kitty private DCS `echo`, `print`, and
+  `restore-cursor-appearance` with strict validation. Remote control and
+  the kitten/overlay/ssh/ask/clone/edit commands stay fail-closed.
 
 ### Fixed
 - Streamed OSC 1337 interception now replays incomplete, cancelled, and
