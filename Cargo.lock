@@ -644,6 +644,7 @@ dependencies = [
  "flate2",
  "fs_at",
  "futures",
+ "hmac",
  "libc",
  "log",
  "nix 0.31.3",

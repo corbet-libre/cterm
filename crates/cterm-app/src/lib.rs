@@ -13,6 +13,7 @@ pub mod file_drop;
 pub mod file_transfer;
 pub mod git_sync;
 pub mod kitty_dnd;
+pub mod kitty_dnd_source;
 pub mod kitty_file_transfer;
 pub mod kitty_file_transfer_fs;
 mod kitty_file_transfer_receive;

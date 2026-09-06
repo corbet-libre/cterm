@@ -17,6 +17,7 @@ use cterm_app::config::Config;
 use cterm_app::kitty_dnd::{
     DndAdapterAction, DndDestination, DndLocation, DndOperation, DropData, URI_LIST_MIME,
 };
+use cterm_app::kitty_dnd_source::{DndSource, DndSourceAction, OsDragOffer};
 use cterm_core::cell::CellAttrs;
 use cterm_core::color::{Color, ColorPalette, Rgb};
 use cterm_core::mouse::{
@@ -26,7 +27,8 @@ use cterm_core::screen::{ClipboardOperation, CursorStyle, MouseEncoding, MouseMo
 use cterm_core::term::{Key, Modifiers, Terminal, TerminalEvent};
 use cterm_core::KeyEventKind;
 use cterm_core::{
-    RichClipboardItem, RichClipboardLocation, RichClipboardOperation, RichClipboardStatus,
+    DndCommandType, RichClipboardItem, RichClipboardLocation, RichClipboardOperation,
+    RichClipboardStatus,
 };
 use cterm_ui::blink::{
     cell_foreground_visible, cursor_visible, BlinkClock, BlinkNeeds, BlinkPhase,
@@ -119,6 +121,11 @@ pub struct TerminalWidget {
     on_file_transfer: FileTransferCallback,
     /// Shared Kitty OSC 72 state used by PTY and GTK drop callbacks.
     dnd_destination: Rc<RefCell<DndDestination>>,
+    /// Shared Kitty OSC 72 source-side state for outbound drags. Command
+    /// routing lives here; the native `GtkDragSource` session that consumes
+    /// `BeginOsDrag` is still open (gesture arbitration with text selection
+    /// is unresolved — see `notify_source_gesture`).
+    dnd_source: Rc<RefCell<DndSource>>,
     /// Command channel for daemon I/O — None for local PTY sessions
     daemon_cmd_tx: Option<tokio::sync::mpsc::UnboundedSender<DaemonCommand>>,
 }
@@ -1590,6 +1597,23 @@ impl TerminalWidget {
         self.drawing_area.add_controller(scroll_controller);
     }
 
+    /// Report a user drag-start gesture to the source-side negotiation.
+    ///
+    /// This is the entry point for a future drag-gesture controller: it emits
+    /// the `t=o` location event the application needs before offering MIME
+    /// types. It is intentionally not connected yet — left-button drags own
+    /// text selection today, so arbitrating a drag-start gesture (modifier,
+    /// empty-selection threshold, or app-driven region) needs a product
+    /// decision first. Gestures while no application is armed are ignored.
+    #[allow(dead_code)]
+    fn notify_source_gesture(&self, x: f64, y: f64) {
+        let location = gtk_dnd_location(x, y, *self.cell_dims.borrow());
+        let actions = self.dnd_source.borrow_mut().user_gesture(location);
+        let source = Rc::clone(&self.dnd_source);
+        let mut terminal = self.terminal.lock();
+        apply_dnd_source_actions(&mut terminal, &source, actions);
+    }
+
     /// Set up file drag-and-drop
     fn setup_drop(&self) {
         let drop_target = gtk4::DropTarget::new(
@@ -1834,6 +1858,7 @@ impl TerminalWidget {
             preedit: Rc::new(RefCell::new(PreeditState::default())),
             on_file_transfer: Rc::new(RefCell::new(None)),
             dnd_destination: Rc::new(RefCell::new(DndDestination::default())),
+            dnd_source: Rc::new(RefCell::new(DndSource::default())),
             daemon_cmd_tx: Some(cmd_tx.clone()),
         };
 
@@ -1931,6 +1956,7 @@ impl TerminalWidget {
             preedit: Rc::new(RefCell::new(PreeditState::default())),
             on_file_transfer: Rc::new(RefCell::new(None)),
             dnd_destination: Rc::new(RefCell::new(DndDestination::default())),
+            dnd_source: Rc::new(RefCell::new(DndSource::default())),
             daemon_cmd_tx: Some(cmd_tx.clone()),
         };
 
@@ -2336,6 +2362,7 @@ impl TerminalWidget {
         let on_title_change = Rc::clone(&self.on_title_change);
         let on_file_transfer = Rc::clone(&self.on_file_transfer);
         let dnd_destination = Rc::clone(&self.dnd_destination);
+        let dnd_source = Rc::clone(&self.dnd_source);
         let blink_clock = Rc::clone(&self.blink_clock);
         let blink_started = self.blink_started;
         glib::timeout_add_local(Duration::from_millis(10), move || {
@@ -2401,9 +2428,31 @@ impl TerminalWidget {
                                 }
                                 TerminalEvent::ContentChanged => content_changed = true,
                                 TerminalEvent::DndCommand(command) => {
-                                    let actions =
-                                        dnd_destination.borrow_mut().handle_command(command);
-                                    apply_dnd_actions(&mut term, actions);
+                                    // Capability queries are answered by the
+                                    // destination side only; the source state
+                                    // deliberately emits no `t=q` response.
+                                    match command.command_type {
+                                        DndCommandType::OfferDrag
+                                        | DndCommandType::PresentData
+                                        | DndCommandType::ChangeDragImage
+                                        | DndCommandType::DragOfferEvent
+                                        | DndCommandType::DragOfferError
+                                        | DndCommandType::UriListData => {
+                                            let actions =
+                                                dnd_source.borrow_mut().handle_command(command);
+                                            apply_dnd_source_actions(
+                                                &mut term,
+                                                &dnd_source,
+                                                actions,
+                                            );
+                                        }
+                                        _ => {
+                                            let actions = dnd_destination
+                                                .borrow_mut()
+                                                .handle_command(command);
+                                            apply_dnd_actions(&mut term, actions);
+                                        }
+                                    }
                                 }
                                 TerminalEvent::ProcessExited(_) => {}
                             }
@@ -2535,6 +2584,78 @@ fn apply_dnd_actions(terminal: &mut Terminal, actions: Vec<DndAdapterAction>) {
             DndAdapterAction::RegistrationChanged { .. } | DndAdapterAction::DropFinished(_) => {}
         }
     }
+}
+
+fn apply_dnd_source_actions(
+    terminal: &mut Terminal,
+    source: &Rc<RefCell<DndSource>>,
+    actions: Vec<DndSourceAction>,
+) {
+    for action in actions {
+        match action {
+            DndSourceAction::Write(frame) => {
+                if let Err(error) = terminal.write(&frame) {
+                    log::error!("Failed to write Kitty DND source response to PTY: {error}");
+                    break;
+                }
+            }
+            DndSourceAction::BeginOsDrag(offer) => {
+                // No native `GtkDragSource` session exists yet (see
+                // `notify_source_gesture`), so claiming `OK` would lie to the
+                // application. Validate that the offer is servable, then fail
+                // closed; the application keeps its registration and may
+                // retry once a session lands.
+                let servable = build_source_content(&offer, &source.borrow()).is_some();
+                log::info!(
+                    "Kitty DND source drag not started (no native session; servable={servable})"
+                );
+                let failed = source.borrow_mut().os_drag_failed("ENOSYS");
+                apply_dnd_source_actions(terminal, source, failed);
+            }
+            DndSourceAction::CancelOsDrag => {
+                log::debug!("Kitty DND source drag cancelled; no native session to tear down");
+            }
+            DndSourceAction::OsDataReady { .. } | DndSourceAction::OsDataFailed { .. } => {
+                log::debug!("Kitty DND source data update dropped (no native session)");
+            }
+            DndSourceAction::RequestApproval(request) => {
+                // Fail closed: without a native consent prompt the terminal
+                // must not pull remote entry bytes over the PTY. Denying
+                // aborts the drag with `t=E;EPERM`.
+                log::info!(
+                    "Denying Kitty DND remote read (no consent prompt): entry={:?}",
+                    request.entry
+                );
+                let denied = source.borrow_mut().deny(request.request_id);
+                apply_dnd_source_actions(terminal, source, denied);
+            }
+        }
+    }
+}
+
+/// Build native clipboard/drag content for the pre-sent source offer.
+///
+/// Each fully received MIME value becomes a `for_bytes` provider so a future
+/// `GtkDragSource::connect_prepare` can serve OS drop targets without
+/// another PTY round trip. Returns `None` when nothing is servable yet.
+fn build_source_content(offer: &OsDragOffer, source: &DndSource) -> Option<gdk::ContentProvider> {
+    let presented = source.presented_snapshot();
+    let mut providers = Vec::new();
+    for mime in &offer.mime_types {
+        if let Some(item) = presented.iter().find(|item| &item.mime_type == mime) {
+            providers.push(gdk::ContentProvider::for_bytes(
+                mime,
+                &glib::Bytes::from(&item.data),
+            ));
+        }
+    }
+    if providers.is_empty() {
+        return None;
+    }
+    if providers.len() == 1 {
+        return providers.into_iter().next();
+    }
+    Some(gdk::ContentProvider::new_union(&providers))
 }
 
 fn gtk_dnd_motion(
@@ -3510,5 +3631,64 @@ mod tests {
             gdk::DragAction::MOVE
         );
         assert!(gtk_accepted_operation(DndOperation::None).is_empty());
+    }
+
+    #[test]
+    fn kitty_dnd_source_content_serves_only_presented_offer_mimes() {
+        use cterm_app::kitty_dnd_source::DndSourceAction;
+        use cterm_core::{DndCommand, DndCommandType};
+
+        fn source_command(command_type: DndCommandType) -> DndCommand {
+            DndCommand {
+                command_type,
+                more: false,
+                client_id: 0,
+                operation: 0,
+                cell_x: 0,
+                cell_y: 0,
+                pixel_x: 0,
+                pixel_y: 0,
+                payload: Vec::new(),
+            }
+        }
+
+        let mut source = DndSource::default();
+        let mut enable = source_command(DndCommandType::OfferDrag);
+        enable.cell_x = 1;
+        assert!(source.handle_command(enable).is_empty());
+        assert!(source
+            .user_gesture(DndLocation {
+                cell_x: 1,
+                cell_y: 1,
+                pixel_x: 8,
+                pixel_y: 16,
+            })
+            .iter()
+            .any(|action| matches!(action, DndSourceAction::Write(_))));
+        let mut offer = source_command(DndCommandType::OfferDrag);
+        offer.operation = 3;
+        offer.payload = b"text/plain text/uri-list".to_vec();
+        assert!(source.handle_command(offer).is_empty());
+
+        // Nothing pre-sent yet: no native provider can be built.
+        let pending = OsDragOffer {
+            mime_types: source.offered_mimes().to_vec(),
+            operation: source.offered_operation(),
+            location: DndLocation::default(),
+            has_image: false,
+        };
+        assert!(build_source_content(&pending, &source).is_none());
+
+        let mut present = source_command(DndCommandType::PresentData);
+        present.cell_x = 0;
+        present.payload = b"aGk=".to_vec();
+        assert!(source.handle_command(present).is_empty());
+
+        // Only the presented MIME is servable; the missing uri-list entry is
+        // skipped rather than served empty.
+        let provider =
+            build_source_content(&pending, &source).expect("presented text/plain is servable");
+        assert!(provider.formats().contain_mime_type("text/plain"));
+        assert!(!provider.formats().contain_mime_type("text/uri-list"));
     }
 }
