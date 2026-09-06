@@ -14,6 +14,9 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use tokio::sync::broadcast;
 
+#[cfg(test)]
+use super::transfer_policy::DaemonTransferContext;
+use super::transfer_policy::SharedTransferContext;
 use super::tty_transfer::TtyTransferController;
 
 /// Output chunk with timestamp
@@ -104,6 +107,12 @@ pub struct SessionState {
     /// Per-session OSC 5113 authorization/filesystem actor. `None` records a
     /// fail-closed initialization failure.
     tty_transfer: OnceLock<Option<TtyTransferController>>,
+
+    /// Daemon-wide transfer consent context (operator config plus the daemon
+    /// keypair). Installed by the [`SessionManager`](super::SessionManager)
+    /// before the reader starts; sessions built directly in tests keep the
+    /// stock always-prompt default.
+    transfer_context: RwLock<SharedTransferContext>,
 
     /// Whether new transfer commands may enter the non-serializable actor.
     tty_transfer_accepting: AtomicBool,
@@ -197,6 +206,7 @@ impl SessionState {
             prompt_registry: parking_lot::Mutex::new(HashMap::new()),
             prompt_counter: AtomicU64::new(0),
             tty_transfer: OnceLock::new(),
+            transfer_context: RwLock::new(SharedTransferContext::default()),
             tty_transfer_accepting: AtomicBool::new(true),
             tty_transfer_prompt_tx: broadcast::channel(32).0,
             tty_transfer_prompt_registry: parking_lot::Mutex::new(HashMap::new()),
@@ -242,6 +252,7 @@ impl SessionState {
             prompt_registry: parking_lot::Mutex::new(HashMap::new()),
             prompt_counter: AtomicU64::new(0),
             tty_transfer: OnceLock::new(),
+            transfer_context: RwLock::new(SharedTransferContext::default()),
             tty_transfer_accepting: AtomicBool::new(true),
             tty_transfer_prompt_tx: broadcast::channel(32).0,
             tty_transfer_prompt_registry: parking_lot::Mutex::new(HashMap::new()),
@@ -332,6 +343,18 @@ impl SessionState {
         } else {
             false
         }
+    }
+
+    /// Install the daemon-wide transfer consent context. Called by the session
+    /// manager after construction and before the reader (and its transfer
+    /// worker) starts, so the worker consults the operator config and keypair.
+    pub fn set_transfer_context(&self, context: SharedTransferContext) {
+        *self.transfer_context.write() = context;
+    }
+
+    /// The transfer consent context this session's worker evaluates under.
+    pub fn transfer_context(&self) -> SharedTransferContext {
+        self.transfer_context.read().clone()
     }
 
     /// Subscribe to current and future OSC 5113 consent requests.
@@ -539,6 +562,7 @@ impl SessionState {
             prompt_registry: parking_lot::Mutex::new(HashMap::new()),
             prompt_counter: AtomicU64::new(0),
             tty_transfer: OnceLock::new(),
+            transfer_context: RwLock::new(SharedTransferContext::default()),
             tty_transfer_accepting: AtomicBool::new(true),
             tty_transfer_prompt_tx: broadcast::channel(32).0,
             tty_transfer_prompt_registry: parking_lot::Mutex::new(HashMap::new()),
@@ -934,6 +958,192 @@ impl SessionState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    /// Drive one session-start command through a session whose worker evaluates
+    /// under `context`, capturing PTY response bytes. Returns the session, the
+    /// captured writes, and the approval subscription (created before the
+    /// command was submitted, so a published prompt cannot be missed).
+    #[cfg(unix)]
+    async fn drive_transfer_start(
+        session_name: &str,
+        context: DaemonTransferContext,
+        command: FileTransferCommand,
+    ) -> (
+        Arc<SessionState>,
+        Arc<Mutex<Vec<u8>>>,
+        tokio::sync::broadcast::Receiver<crate::proto::TtyFileTransferApprovalEvent>,
+    ) {
+        let session =
+            SessionState::new_ssh_connecting(session_name.to_string(), PtySize::default(), 0);
+        let writes = Arc::new(Mutex::new(Vec::new()));
+        let observed = Arc::clone(&writes);
+        session.with_terminal_mut(|terminal| {
+            terminal.set_write_fn(Box::new(move |data| {
+                observed.lock().unwrap().extend_from_slice(data);
+                Ok(())
+            }));
+        });
+        session.set_transfer_context(Arc::new(context));
+        let controller = TtyTransferController::spawn(&session).unwrap();
+        assert!(session.tty_transfer.set(Some(controller)).is_ok());
+        let (_, approvals) = session.subscribe_tty_transfer_prompts();
+        session.process_output(&command.encode().unwrap()).await;
+        (session, writes, approvals)
+    }
+
+    /// Wait until the captured PTY bytes decode to at least `count` transfer
+    /// responses, or fail the test on timeout.
+    #[cfg(unix)]
+    async fn wait_for_transfer_responses(
+        writes: &Arc<Mutex<Vec<u8>>>,
+        count: usize,
+    ) -> Vec<FileTransferCommand> {
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let responses = decode_transfer_responses(&writes.lock().unwrap());
+                if responses.len() >= count {
+                    break responses;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("timed out waiting for daemon transfer responses")
+    }
+
+    fn send_start(id: &str, bypass: Option<String>) -> FileTransferCommand {
+        FileTransferCommand {
+            action: FileTransferAction::Send,
+            id: id.into(),
+            file_id: None,
+            bypass,
+            quiet: 0,
+            mtime: None,
+            permissions: None,
+            size: None,
+            name: None,
+            status: None,
+            parent: None,
+            data: Vec::new(),
+            compression: None,
+            file_type: None,
+            transmission_type: None,
+        }
+    }
+
+    /// The daemon consults the consent seam: an explicitly allowed direction
+    /// plus a verifying credential auto-approves with an `OK` and never
+    /// publishes a prompt.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn allow_policy_auto_approves_without_prompting() {
+        let context = DaemonTransferContext::with_keypair(
+            cterm_app::TransferConfig {
+                bypass_password: Some("s3cret".into()),
+                send: Some(cterm_app::TransferConsentMode::Allow),
+                receive: None,
+            },
+            cterm_app::TransferBypassKeypair::from_private_bytes([7u8; 32]),
+        );
+        let credential = cterm_app::encode_bypass_credential("daemon-allow", "s3cret");
+        let (session, writes, mut approvals) = drive_transfer_start(
+            "daemon-allow",
+            context,
+            send_start("daemon-allow", Some(credential)),
+        )
+        .await;
+
+        let responses = wait_for_transfer_responses(&writes, 1).await;
+        assert_eq!(responses[0].status.as_deref(), Some("OK"));
+        // Let a wrongly published prompt arrive if one was emitted, then prove
+        // none was: the approval set stays empty and the session is approved.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(matches!(
+            approvals.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+        ));
+        assert!(session.subscribe_tty_transfer_prompts().0.is_empty());
+        // The session was approved, not refused: transfer work is live.
+        assert!(session.has_active_tty_transfers());
+        session.shutdown_tty_transfers().await;
+    }
+
+    /// An explicit direction deny hard-refuses with `EPERM` and never
+    /// publishes a prompt, even for a verifying credential.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn deny_policy_refuses_without_prompting() {
+        let context = DaemonTransferContext::with_keypair(
+            cterm_app::TransferConfig {
+                bypass_password: Some("s3cret".into()),
+                send: Some(cterm_app::TransferConsentMode::Deny),
+                receive: None,
+            },
+            cterm_app::TransferBypassKeypair::from_private_bytes([7u8; 32]),
+        );
+        let credential = cterm_app::encode_bypass_credential("daemon-deny", "s3cret");
+        let (session, writes, mut approvals) = drive_transfer_start(
+            "daemon-deny",
+            context,
+            send_start("daemon-deny", Some(credential)),
+        )
+        .await;
+
+        let responses = wait_for_transfer_responses(&writes, 1).await;
+        assert_eq!(
+            responses[0].status.as_deref(),
+            Some("EPERM:User refused the transfer")
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(matches!(
+            approvals.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+        ));
+        assert!(session.subscribe_tty_transfer_prompts().0.is_empty());
+        assert!(!session.has_active_tty_transfers());
+        session.shutdown_tty_transfers().await;
+    }
+
+    /// A wrong password keeps the consent prompt even with `allow` configured:
+    /// the worker publishes exactly one approval request and honors its denial.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn wrong_password_still_prompts_despite_allow() {
+        let context = DaemonTransferContext::with_keypair(
+            cterm_app::TransferConfig {
+                bypass_password: Some("s3cret".into()),
+                send: Some(cterm_app::TransferConsentMode::Allow),
+                receive: None,
+            },
+            cterm_app::TransferBypassKeypair::from_private_bytes([7u8; 32]),
+        );
+        let credential = cterm_app::encode_bypass_credential("daemon-wrong", "wrong-guess");
+        let (session, writes, mut approvals) = drive_transfer_start(
+            "daemon-wrong",
+            context,
+            send_start("daemon-wrong", Some(credential)),
+        )
+        .await;
+
+        let event = tokio::time::timeout(std::time::Duration::from_secs(1), approvals.recv())
+            .await
+            .expect("wrong-password transfer must still prompt")
+            .expect("approval channel closed");
+        assert_eq!(event.transfer_id, "daemon-wrong");
+        assert!(writes.lock().unwrap().is_empty());
+        assert!(
+            session
+                .respond_tty_transfer_approval(event.request_id, false)
+                .await
+        );
+        let responses = wait_for_transfer_responses(&writes, 1).await;
+        assert_eq!(
+            responses[0].status.as_deref(),
+            Some("EPERM:User refused the transfer")
+        );
+        session.shutdown_tty_transfers().await;
+    }
 
     #[cfg(unix)]
     fn decode_transfer_responses(bytes: &[u8]) -> Vec<FileTransferCommand> {

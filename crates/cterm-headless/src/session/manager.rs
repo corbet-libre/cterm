@@ -8,6 +8,8 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
+use super::transfer_policy::SharedTransferContext;
+
 #[cfg(any(unix, test))]
 fn apply_relaunch_terminal_state(
     terminal: &mut cterm_core::Terminal,
@@ -37,6 +39,10 @@ pub struct SessionManager {
     /// Sessions removed from the public map whose non-serializable transfer
     /// actors are still draining. Relaunch treats every entry as active.
     draining_tty_transfers: Arc<Mutex<HashSet<String>>>,
+    /// Daemon-wide transfer consent context (operator `[transfer]` config plus
+    /// the process-lifetime bypass keypair). Installed once at startup; every
+    /// session snapshots it before its transfer worker starts.
+    transfer_context: RwLock<SharedTransferContext>,
 }
 
 /// Keeps new OSC 5113 work and session-map mutations quiesced until relaunch
@@ -69,7 +75,20 @@ impl SessionManager {
             had_sessions: AtomicBool::new(false),
             lifecycle_gate: Mutex::new(()),
             draining_tty_transfers: Arc::new(Mutex::new(HashSet::new())),
+            transfer_context: RwLock::new(SharedTransferContext::default()),
         }
+    }
+
+    /// Install the daemon-wide transfer consent context (operator config plus
+    /// keypair). Called once at daemon startup; sessions created afterwards
+    /// snapshot it. The stock default (always prompt) applies until then.
+    pub fn set_transfer_context(&self, context: SharedTransferContext) {
+        *self.transfer_context.write() = context;
+    }
+
+    /// The current daemon-wide transfer consent context.
+    pub fn transfer_context(&self) -> SharedTransferContext {
+        self.transfer_context.read().clone()
     }
 
     /// Create a new terminal session
@@ -150,6 +169,12 @@ impl SessionManager {
             return Err(HeadlessError::SessionAlreadyExists(id));
         }
 
+        // Advertise the daemon bypass public key to the child, exactly as
+        // Kitty does for every child (`kitty/child.py:385`). A client-supplied
+        // value is overwritten so a child cannot spoof the terminal identity.
+        let transfer_context = self.transfer_context();
+        let mut env = env;
+        transfer_context.inject_child_env(&mut env);
         let state = SessionState::new(
             id.clone(),
             size,
@@ -160,6 +185,7 @@ impl SessionManager {
             term,
             self.scrollback_lines,
         )?;
+        state.set_transfer_context(transfer_context);
 
         if let Some(palette) = base_palette {
             state.set_base_palette(palette);
@@ -238,6 +264,9 @@ impl SessionManager {
 
         let host = ssh_config.host.clone();
         let state = SessionState::new_ssh_connecting(id.clone(), size, self.scrollback_lines);
+        // Remote children get no local environment, but their transfer worker
+        // still evaluates under the operator config and daemon keypair.
+        state.set_transfer_context(self.transfer_context());
         if let Some(palette) = base_palette {
             state.set_base_palette(palette);
         }
@@ -361,6 +390,10 @@ impl SessionManager {
         state.with_terminal_mut(|term| {
             apply_relaunch_terminal_state(term, cursor_style, cursor_blink, screen_snapshot);
         });
+        // The relaunched child keeps its pre-exec environment (including the
+        // previous keypair's advertisement, which now fails closed to prompt);
+        // its worker still evaluates under the current operator config.
+        state.set_transfer_context(self.transfer_context());
 
         // The saved screen must be authoritative before the reader can consume
         // bytes written while ctermd was exec'ing; otherwise applying it later

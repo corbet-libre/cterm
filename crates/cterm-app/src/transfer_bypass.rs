@@ -51,6 +51,20 @@ pub const MAX_BYPASS_WIRE_BYTES: usize = 512;
 /// `RC_ENCRYPTION_PROTOCOL_VERSION = '1'`.
 pub const KITTY_PUBLIC_KEY_VERSION: &str = "1";
 
+/// Environment variable through which the terminal advertises its transfer
+/// bypass public key to child processes.
+///
+/// Kitty sets this for every child (`kitty/child.py:385`,
+/// `env['KITTY_PUBLIC_KEY'] = boss.encryption_public_key`, where the value is
+/// computed once per GUI process in `kitty/boss.py:425` as
+/// `f'{RC_ENCRYPTION_PROTOCOL_VERSION}:{base85(public)}'`). The daemon mirrors
+/// that contract: one process-lifetime [`TransferBypassKeypair`], advertised
+/// verbatim to every local PTY child (see
+/// [`TransferBypassKeypair::kitty_public_key_env`]). Children hand the value
+/// to transfer kittens, which encrypt `kitty-1:` credentials against it; the
+/// private half never leaves the daemon.
+pub const KITTY_PUBLIC_KEY_ENV: &str = "KITTY_PUBLIC_KEY";
+
 /// What went wrong while *creating* bypass material (keygen/encryption).
 /// Verification itself returns `bool`, exactly like Kitty's `check_bypass`.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]

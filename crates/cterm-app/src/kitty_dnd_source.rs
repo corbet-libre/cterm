@@ -280,6 +280,24 @@ impl DndSource {
         !matches!(self.phase, SourcePhase::Idle)
     }
 
+    /// Whether remote (`t=k`) entry reads on this surface currently skip
+    /// per-entry approval. `false` (default) is fail-closed.
+    pub fn allow_remote_reads(&self) -> bool {
+        self.policy.allow_remote_reads
+    }
+
+    /// Record an explicit user opt-in ("Always allow" in the native remote-read
+    /// prompt) for this surface. Scoped to this `DndSource` only — it survives
+    /// individual drags (like the clipboard adapter's remembered exact token)
+    /// and clears when the surface goes away — and gated to remote reads:
+    /// same-machine drags never consult this flag because they never prompt.
+    /// While set, different-machine and unknown-locality entry reads stop
+    /// surfacing [`DndSourceAction::RequestApproval`] and proceed directly to
+    /// `t=k`. Frontends must state that scope in the prompt body.
+    pub fn set_allow_remote_reads(&mut self, allow: bool) {
+        self.policy.allow_remote_reads = allow;
+    }
+
     /// Whether an OS drag session is currently live.
     pub fn is_dragging(&self) -> bool {
         self.phase == SourcePhase::Dragging
@@ -1868,6 +1886,48 @@ mod tests {
             actions.as_slice(),
             [DndSourceAction::Write(frame)] if frame.starts_with(b"\x1b]72;t=k:x=1;")
         ));
+    }
+
+    #[test]
+    fn always_allow_opt_in_skips_later_remote_approvals() {
+        let mut source = DndSource::default();
+        assert!(!source.allow_remote_reads());
+        // Unknown-locality peer (no machine id): reads are approval-gated.
+        arm(&mut source);
+        gesture(&mut source);
+        offer(&mut source, 1, "text/uri-list");
+        start_drag(&mut source);
+        let first = RemoteEntryRef {
+            entry: 1,
+            num: 0,
+            parent: 0,
+        };
+        let request_id = match source.os_request_remote_entry(first).as_slice() {
+            [DndSourceAction::RequestApproval(request)] => {
+                assert_eq!(request.entry, first);
+                request.request_id
+            }
+            other => panic!("unknown-locality t=k must prompt, got {other:?}"),
+        };
+        // The user picks "Always allow": later entries skip approval...
+        source.set_allow_remote_reads(true);
+        assert!(source.allow_remote_reads());
+        let second = source.os_request_remote_entry(RemoteEntryRef {
+            entry: 2,
+            num: 0,
+            parent: 0,
+        });
+        assert!(matches!(
+            second.as_slice(),
+            [DndSourceAction::Write(frame)] if frame.starts_with(b"\x1b]72;t=k:x=2;")
+        ));
+        // ...while the earlier exact token still approves exactly once.
+        let approved = source.approve(request_id);
+        assert!(matches!(
+            approved.as_slice(),
+            [DndSourceAction::Write(frame)] if frame.starts_with(b"\x1b]72;t=k:x=1;")
+        ));
+        assert!(source.deny(request_id).is_empty());
     }
 
     #[test]

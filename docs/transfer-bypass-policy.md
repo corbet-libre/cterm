@@ -40,16 +40,25 @@ evaluation to `Prompt` for every bypass kind, direction, and wire credential.
   info, `prompt` at debug) and every dialog outcome (info) logs one line with
   request id, transfer id, direction, decision, bypass kind evaluated, and the
   authorizing token hash — never the token or password.
-- NOT yet wired: the daemon worker (`cterm-headless/src/session/tty_transfer.rs`)
-  does not consult the new seam, holds no `TransferBypassKeypair`, and
-  advertises no `KITTY_PUBLIC_KEY` — live transfers still always prompt
-  through the manager/dialog path regardless of config.
+- Daemon wiring (live, defaults unchanged): the daemon worker
+  (`cterm-headless/src/session/tty_transfer.rs`) consults the seam at session
+  start via `DaemonTransferContext` (`cterm-headless/src/session/transfer_policy.rs`,
+  loaded from `[transfer]` at startup in `server.rs`, snapshotted per session
+  in `manager.rs`/`state.rs`), holds one process-lifetime
+  `TransferBypassKeypair` (generated at startup like Kitty's per-`Boss` key in
+  `kitty/boss.py:425`; private half in daemon memory only, never written to
+  disk, rotating each restart), and advertises `KITTY_PUBLIC_KEY` to every
+  local PTY child exactly as Kitty does (`kitty/child.py:385`, overwriting any
+  client-supplied value). Stock config still always prompts, byte-identical;
+  only an explicit opt-in config plus a verifying wire credential can ever
+  skip a prompt.
 
 What flipping any default needs (all require Julian): setting
-`bypass_password` and/or per-direction `allow` in config, daemon integration
-(keypair lifetime, consulting the seam in the worker, `KITTY_PUBLIC_KEY`
-advertisement to PTY children for kitten interop), and a decision on each of
-the 5 open policy questions below — this mechanism decides none of them.
+`bypass_password` and/or per-direction `allow` in config and a decision on
+each of the 5 open policy questions below — this mechanism decides none of
+them. Daemon integration (keypair lifetime, consulting the seam in the
+worker, `KITTY_PUBLIC_KEY` advertisement to PTY children for kitten interop)
+is implemented as described above.
 
 ## Threat model
 
@@ -65,8 +74,9 @@ Kitty's OSC 5113 file transfer lets any process that can write to the PTY
   the TTY. Approval discloses file contents to whoever controls the
   PTY-writing process (possibly a remote SSH peer).
 - The `pw` (bypass) credential on the wire is **attacker-controlled input**:
-  decoding it must never authorize anything. Today it is parsed, bounded
-  (512 bytes), and ignored.
+  decoding it must never authorize anything. With stock config it is parsed,
+  bounded (512 bytes), and ignored; only an explicit opt-in config plus a
+  verifying credential can ever skip a prompt (see "Mechanism status").
 
 Attacker capabilities assumed: full control of PTY output bytes (malicious or
 compromised remote program, escape-sequence injection via `cat` of untrusted
