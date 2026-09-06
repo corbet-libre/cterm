@@ -20,6 +20,7 @@ mod kitty_graphics;
 mod kitty_placeholder;
 pub mod mouse;
 mod multiple_cursors;
+pub mod notifications;
 mod osc1337;
 pub mod parser;
 pub mod pointer_shape;
@@ -54,6 +55,14 @@ pub use kitty_file_transfer::{
 };
 pub use kitty_graphics::GraphicsAnimationTick;
 pub use multiple_cursors::{ExtraCursor, ExtraCursorColor, ExtraCursorColors, ExtraCursorShape};
+pub use notifications::{
+    ActiveNotificationSet, IconCache, NotificationOccasion, MAX_ACTIVE_NOTIFICATIONS,
+    MAX_APP_NAME_BYTES, MAX_ICON_CACHE_BYTES, MAX_ICON_CACHE_ENTRIES, MAX_ICON_NAMES,
+    MAX_ICON_NAME_BYTES, MAX_NOTIFICATION_BODY_BYTES, MAX_NOTIFICATION_BUTTONS,
+    MAX_NOTIFICATION_BUTTONS_BYTES, MAX_NOTIFICATION_BUTTON_BYTES, MAX_NOTIFICATION_ICON_BYTES,
+    MAX_NOTIFICATION_TITLE_BYTES, MAX_NOTIFICATION_TYPES, MAX_NOTIFICATION_TYPE_BYTES,
+    MAX_SOUND_NAME_BYTES,
+};
 pub use parser::Parser;
 pub use pointer_shape::{
     PointerShape, DEFAULT_POINTER_CSS, GRABBED_POINTER_CSS, MAX_POINTER_SHAPE_STACK_DEPTH,

@@ -401,16 +401,20 @@ also exposes the most recently completed command output delimited by C/D.
 
 OSC 9 and `OSC 777;notify` accept a UTF-8 title and optional body, matching
 Foot's first-semicolon split and its rejection of the unrelated numeric OSC 9
-Windows/ConEmu forms. Kitty OSC 99 supports bounded title/body chunking, UTF-8
-and base64 payloads, stable replacement and close IDs, urgency, and the default
-focus action. Its capability reply advertises exactly that common subset:
-`p=title,body,?,close`, `a=focus`, `o=always`, `u=0,1,2`, and `c=0`.
+Windows/ConEmu forms. Kitty OSC 99 supports bounded title/body/icon/buttons
+chunking (UTF-8 and base64, unpadded tolerated), stable replacement and close
+IDs, urgency, `a=focus,report` activation, `c=1` close reports (`untracked`
+where the OS gives no dismiss signal), `o=` occasion filtering, `f=`/`t=`
+filter identity, icon names/data/cache, named sounds, and `w=` expiry. Its
+capability reply advertises exactly that wired set (see
+`docs/notifications.md` for the per-platform matrix).
 
 Delivery uses GApplication notifications on Linux, UserNotifications.framework
 on macOS, and native shell notification balloons on Windows. Identified
-notifications can be replaced or closed on all three frontends, and activating
-a notification focuses cterm when requested. macOS asks for notification
-permission on first application startup.
+notifications can be replaced or closed on all three frontends through the
+shared `cterm-core::notifications` state machine, and activation/dismissal
+reports travel back through the issuing pane's PTY. macOS asks for
+notification permission on first application startup.
 
 ### Supported Xterm Palette Stack Sequences
 

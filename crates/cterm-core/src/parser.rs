@@ -6,7 +6,7 @@
 //! Special handling is provided for OSC 1337 (iTerm2) file transfers
 //! which are intercepted before VTE to enable streaming large files.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 use vte::Params;
@@ -23,6 +23,13 @@ use crate::kitty_graphics::{
     GraphicsAnimationTick, InterceptorResult as KittyInterceptorResult, KittyGraphics,
 };
 use crate::multiple_cursors::{ExtraCursorColor, ExtraCursorColorTarget, ExtraCursorShape};
+use crate::notifications::{
+    ActiveNotificationSet, IconCache, NotificationOccasion, MAX_ACTIVE_NOTIFICATIONS,
+    MAX_APP_NAME_BYTES, MAX_ICON_NAMES, MAX_ICON_NAME_BYTES, MAX_NOTIFICATION_BODY_BYTES,
+    MAX_NOTIFICATION_BUTTONS, MAX_NOTIFICATION_BUTTONS_BYTES, MAX_NOTIFICATION_ICON_BYTES,
+    MAX_NOTIFICATION_TITLE_BYTES, MAX_NOTIFICATION_TYPES, MAX_NOTIFICATION_TYPE_BYTES,
+    MAX_SOUND_NAME_BYTES,
+};
 use crate::osc1337::{InterceptorResult, Osc1337Interceptor};
 use crate::pointer_shape::{PointerShape, DEFAULT_POINTER_CSS, GRABBED_POINTER_CSS};
 #[cfg(test)]
@@ -66,8 +73,8 @@ const KITTY_PRIVATE_DCS_MAX_BYTES: usize = 64 * 1024;
 /// Maximum decoded bytes accepted for `@kitty-echo` (a tty-drain flush is
 /// small; anything larger is treated as abuse and ignored).
 const KITTY_ECHO_MAX_DECODED_BYTES: usize = 4096;
-const MAX_NOTIFICATION_TITLE_BYTES: usize = 1024;
-const MAX_NOTIFICATION_BODY_BYTES: usize = 4096;
+// Notification title/body/icon/buttons bounds live in `crate::notifications`
+// (single source of truth shared by the parser and the native frontends).
 // OSC 66 and OSC 72 permit 4096-byte payloads in addition to command
 // metadata. VTE's 1024-byte default would silently truncate valid commands.
 const VTE_OSC_BUFFER_BYTES: usize = 8192;
@@ -118,10 +125,21 @@ struct KittyNotificationBuilder {
     id: Option<String>,
     title: String,
     body: String,
+    buttons_raw: String,
+    icon_data: Vec<u8>,
+    icon_data_present: bool,
     urgency: NotificationUrgency,
     expire_time: Option<i32>,
     muted: bool,
     focus: bool,
+    report_activation: bool,
+    report_close: bool,
+    occasion: NotificationOccasion,
+    app_name: Option<String>,
+    notif_types: Vec<String>,
+    icon_names: Vec<String>,
+    icon_cache_id: Option<String>,
+    sound_name: Option<String>,
 }
 
 impl Default for KittyNotificationBuilder {
@@ -131,10 +149,21 @@ impl Default for KittyNotificationBuilder {
             id: None,
             title: String::new(),
             body: String::new(),
+            buttons_raw: String::new(),
+            icon_data: Vec::new(),
+            icon_data_present: false,
             urgency: NotificationUrgency::Normal,
             expire_time: None,
             muted: false,
             focus: true,
+            report_activation: false,
+            report_close: false,
+            occasion: NotificationOccasion::Always,
+            app_name: None,
+            notif_types: Vec::new(),
+            icon_names: Vec::new(),
+            icon_cache_id: None,
+            sound_name: None,
         }
     }
 }
@@ -143,6 +172,8 @@ impl Default for KittyNotificationBuilder {
 enum KittyPayloadType {
     Title,
     Body,
+    Icon,
+    Buttons,
     Close,
     Alive,
     Ignored,
@@ -214,7 +245,9 @@ pub struct Parser {
     /// Bounded Kitty graphics APC parser and image store.
     kitty_graphics: KittyGraphics,
     /// Optimistically active Kitty notification identifiers for p=alive.
-    active_notification_ids: HashSet<String>,
+    active_notification_ids: ActiveNotificationSet,
+    /// Bounded `g=` icon-data cache shared by chunked `p=icon` payloads.
+    notification_icon_cache: IconCache,
     /// Palette and resource limits shared by Sixel protocol sequences.
     sixel: SixelSessionState,
 }
@@ -237,7 +270,8 @@ impl Parser {
             kitty_notification: KittyNotificationBuilder::default(),
             kitty_dnd: DndProtocolState::default(),
             kitty_graphics: KittyGraphics::default(),
-            active_notification_ids: HashSet::new(),
+            active_notification_ids: ActiveNotificationSet::default(),
+            notification_icon_cache: IconCache::default(),
             sixel: SixelSessionState::default(),
         }
     }
@@ -310,6 +344,7 @@ impl Parser {
             kitty_notification: &mut self.kitty_notification,
             kitty_dnd: &mut self.kitty_dnd,
             active_notification_ids: &mut self.active_notification_ids,
+            notification_icon_cache: &mut self.notification_icon_cache,
             sixel: &mut self.sixel,
         };
         for &byte in bytes {
@@ -401,7 +436,8 @@ struct ScreenPerformer<'a> {
     saved_safe_modes: &'a mut Option<SafeModeSnapshot>,
     kitty_notification: &'a mut KittyNotificationBuilder,
     kitty_dnd: &'a mut DndProtocolState,
-    active_notification_ids: &'a mut HashSet<String>,
+    active_notification_ids: &'a mut ActiveNotificationSet,
+    notification_icon_cache: &'a mut IconCache,
     sixel: &'a mut SixelSessionState,
 }
 
@@ -2013,8 +2049,6 @@ impl ScreenPerformer<'_> {
     }
 
     fn handle_osc99(&mut self, params: &[&[u8]], bell_terminated: bool) {
-        use base64::Engine as _;
-
         let Some(parameters) = params
             .get(1)
             .and_then(|value| std::str::from_utf8(value).ok())
@@ -2029,7 +2063,17 @@ impl ScreenPerformer<'_> {
         let mut urgency = None;
         let mut expire_time = None;
         let mut muted = None;
+        let mut sound_name = None;
+        let mut sound_present = false;
         let mut focus = None;
+        let mut report_activation = None;
+        let mut report_close = None;
+        let mut occasion = None;
+        let mut app_name = None;
+        let mut notif_types: Vec<String> = Vec::new();
+        let mut icon_names: Vec<String> = Vec::new();
+        let mut icon_cache_id = None;
+        let mut icon_cache_id_present = false;
 
         for parameter in parameters.split(':') {
             let Some((key, value)) = parameter.split_once('=') else {
@@ -2039,11 +2083,15 @@ impl ScreenPerformer<'_> {
                 continue;
             }
             match key.as_bytes()[0] {
-                b'i' if kitty_notification_id_is_valid(value) => id = Some(value.to_owned()),
+                b'i' if crate::notifications::notification_id_is_valid(value) => {
+                    id = Some(value.to_owned());
+                }
                 b'p' => {
                     payload_type = match value {
                         "title" => KittyPayloadType::Title,
                         "body" => KittyPayloadType::Body,
+                        "icon" => KittyPayloadType::Icon,
+                        "buttons" => KittyPayloadType::Buttons,
                         "close" => KittyPayloadType::Close,
                         "alive" => KittyPayloadType::Alive,
                         "?" => KittyPayloadType::Capabilities,
@@ -2068,19 +2116,112 @@ impl ScreenPerformer<'_> {
                 }
                 b'a' => {
                     for action in value.split(',') {
-                        if action == "focus" {
-                            focus = Some(true);
-                        } else if action == "-focus" {
-                            focus = Some(false);
+                        let (negative, action) = action
+                            .strip_prefix('-')
+                            .map_or((false, action), |rest| (true, rest));
+                        match action {
+                            "focus" => focus = Some(!negative),
+                            "report" => report_activation = Some(!negative),
+                            _ => {}
                         }
                     }
                 }
+                b'c' => {
+                    // Spec: non-zero requests close reports; be liberal.
+                    report_close = Some(!matches!(value, "0" | "" | "-0"));
+                }
+                b'o' => {
+                    if let Some(parsed) = NotificationOccasion::parse(value) {
+                        occasion = Some(parsed);
+                    }
+                }
+                b'f' => {
+                    if let Some(decoded) =
+                        crate::notifications::decode_notification_base64(value.as_bytes())
+                    {
+                        if let Ok(text) = std::str::from_utf8(&decoded) {
+                            let text = text.trim();
+                            if !text.is_empty() {
+                                app_name = Some(
+                                    crate::notifications::truncate_utf8(text, MAX_APP_NAME_BYTES)
+                                        .to_owned(),
+                                );
+                            }
+                        }
+                    }
+                }
+                b't' => {
+                    if notif_types.len() < MAX_NOTIFICATION_TYPES {
+                        if let Some(decoded) =
+                            crate::notifications::decode_notification_base64(value.as_bytes())
+                        {
+                            if let Ok(text) = std::str::from_utf8(&decoded) {
+                                let text = text.trim();
+                                if !text.is_empty() {
+                                    notif_types.push(
+                                        crate::notifications::truncate_utf8(
+                                            text,
+                                            MAX_NOTIFICATION_TYPE_BYTES,
+                                        )
+                                        .to_owned(),
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+                b'n' => {
+                    if icon_names.len() < MAX_ICON_NAMES {
+                        if let Some(decoded) =
+                            crate::notifications::decode_notification_base64(value.as_bytes())
+                        {
+                            if let Ok(text) = std::str::from_utf8(&decoded) {
+                                let text = text.trim();
+                                if !text.is_empty() {
+                                    icon_names.push(
+                                        crate::notifications::truncate_utf8(
+                                            text,
+                                            MAX_ICON_NAME_BYTES,
+                                        )
+                                        .to_owned(),
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+                b'g' => {
+                    icon_cache_id_present = true;
+                    if crate::notifications::notification_id_is_valid(value) {
+                        icon_cache_id = Some(value.to_owned());
+                    }
+                }
                 b's' => {
-                    if let Ok(value) = base64::engine::general_purpose::STANDARD.decode(value) {
-                        if value == b"silent" {
-                            muted = Some(true);
-                        } else if value == b"system" {
-                            muted = Some(false);
+                    if let Some(decoded) =
+                        crate::notifications::decode_notification_base64(value.as_bytes())
+                    {
+                        if let Ok(text) = std::str::from_utf8(&decoded) {
+                            let name = text.trim().to_ascii_lowercase();
+                            if name.is_empty() {
+                                continue;
+                            }
+                            sound_present = true;
+                            if name == "silent" {
+                                muted = Some(true);
+                                sound_name = None;
+                            } else if name == "system" {
+                                muted = Some(false);
+                                sound_name = None;
+                            } else {
+                                muted = Some(false);
+                                sound_name = Some(
+                                    crate::notifications::truncate_utf8(
+                                        &name,
+                                        MAX_SOUND_NAME_BYTES,
+                                    )
+                                    .to_owned(),
+                                );
+                            }
                         }
                     }
                 }
@@ -2088,44 +2229,51 @@ impl ScreenPerformer<'_> {
             }
         }
 
+        // Unknown `o`/`u`/`a` values must not kill the notification; unknown
+        // `p` payloads are ignored per the Kitty extensibility rule.
         if payload_type == KittyPayloadType::Capabilities {
-            let id = id.as_deref().unwrap_or("0");
-            let terminator = if bell_terminated { "\x07" } else { "\x1b\\" };
-            self.screen.queue_response(
-                format!("\x1b]99;i={id}:p=?;p=title,body,?,close:a=focus:o=always:u=0,1,2:c=0{terminator}")
-                    .into_bytes(),
-            );
+            let query_id = id.as_deref().unwrap_or("0");
+            self.screen
+                .queue_response(crate::notifications::capability_reply(
+                    query_id,
+                    bell_terminated,
+                ));
             return;
         }
 
         if payload_type == KittyPayloadType::Alive {
-            let mut active: Vec<_> = self.active_notification_ids.iter().cloned().collect();
-            active.sort_unstable();
-            let terminator = if bell_terminated { "\x07" } else { "\x1b\\" };
-            self.screen.queue_response(
-                format!(
-                    "\x1b]99;i={}:p=alive;{}{terminator}",
-                    id.as_deref().unwrap_or("0"),
-                    active.join(",")
-                )
-                .into_bytes(),
-            );
+            let query_id = id.as_deref().unwrap_or("0");
+            self.screen
+                .queue_response(crate::notifications::alive_reply(
+                    query_id,
+                    &self.active_notification_ids.sorted_ids(),
+                    bell_terminated,
+                ));
             return;
         }
 
         if payload_type == KittyPayloadType::Close {
             if let Some(id) = id {
-                self.active_notification_ids.remove(&id);
-                self.screen.queue_notification_close(id);
+                // Unknown IDs are a no-op per the Kitty spec (already
+                // closed, activated, or never shown): never emit Close.
+                if self.active_notification_ids.remove(&id) {
+                    self.screen.queue_notification_close(id);
+                }
             }
             *self.kitty_notification = KittyNotificationBuilder::default();
             return;
         }
 
+        if payload_type == KittyPayloadType::Ignored {
+            // Future payload types must not disturb the in-progress chunks.
+            return;
+        }
+
         if !self.kitty_notification.active || self.kitty_notification.id != id {
+            let preserved_id = id.clone();
             *self.kitty_notification = KittyNotificationBuilder {
                 active: true,
-                id,
+                id: preserved_id,
                 ..Default::default()
             };
         }
@@ -2138,8 +2286,42 @@ impl ScreenPerformer<'_> {
         if let Some(muted) = muted {
             self.kitty_notification.muted = muted;
         }
+        if sound_present {
+            self.kitty_notification.sound_name = sound_name;
+        }
         if let Some(focus) = focus {
             self.kitty_notification.focus = focus;
+        }
+        if let Some(report) = report_activation {
+            self.kitty_notification.report_activation = report;
+        }
+        if let Some(report) = report_close {
+            self.kitty_notification.report_close = report;
+        }
+        if let Some(occasion) = occasion {
+            self.kitty_notification.occasion = occasion;
+        }
+        if app_name.is_some() {
+            self.kitty_notification.app_name = app_name;
+        }
+        if !notif_types.is_empty() {
+            for notif_type in notif_types {
+                if self.kitty_notification.notif_types.len() < MAX_NOTIFICATION_TYPES
+                    && !self.kitty_notification.notif_types.contains(&notif_type)
+                {
+                    self.kitty_notification.notif_types.push(notif_type);
+                }
+            }
+        }
+        if !icon_names.is_empty() {
+            for name in icon_names {
+                if self.kitty_notification.icon_names.len() < MAX_ICON_NAMES {
+                    self.kitty_notification.icon_names.push(name);
+                }
+            }
+        }
+        if icon_cache_id_present {
+            self.kitty_notification.icon_cache_id = icon_cache_id;
         }
 
         let mut payload = Vec::new();
@@ -2150,31 +2332,57 @@ impl ScreenPerformer<'_> {
             payload.extend_from_slice(part);
         }
         let payload = if base64_encoded {
-            match base64::engine::general_purpose::STANDARD.decode(payload) {
-                Ok(payload) => payload,
-                Err(_) => return,
+            match crate::notifications::decode_notification_base64(&payload) {
+                Some(payload) => payload,
+                None => return,
             }
         } else {
             payload
         };
 
-        if let Ok(payload) = std::str::from_utf8(&payload) {
-            match payload_type {
-                KittyPayloadType::Title => append_bounded(
-                    &mut self.kitty_notification.title,
-                    payload,
-                    MAX_NOTIFICATION_TITLE_BYTES,
-                ),
-                KittyPayloadType::Body => append_bounded(
-                    &mut self.kitty_notification.body,
-                    payload,
-                    MAX_NOTIFICATION_BODY_BYTES,
-                ),
-                KittyPayloadType::Ignored
-                | KittyPayloadType::Close
-                | KittyPayloadType::Alive
-                | KittyPayloadType::Capabilities => {}
+        match payload_type {
+            KittyPayloadType::Title => {
+                if let Ok(payload) = std::str::from_utf8(&payload) {
+                    append_bounded(
+                        &mut self.kitty_notification.title,
+                        payload,
+                        MAX_NOTIFICATION_TITLE_BYTES,
+                    );
+                }
             }
+            KittyPayloadType::Body => {
+                if let Ok(payload) = std::str::from_utf8(&payload) {
+                    append_bounded(
+                        &mut self.kitty_notification.body,
+                        payload,
+                        MAX_NOTIFICATION_BODY_BYTES,
+                    );
+                }
+            }
+            KittyPayloadType::Buttons => {
+                if let Ok(payload) = std::str::from_utf8(&payload) {
+                    append_bounded(
+                        &mut self.kitty_notification.buttons_raw,
+                        payload,
+                        MAX_NOTIFICATION_BUTTONS_BYTES,
+                    );
+                }
+            }
+            KittyPayloadType::Icon => {
+                let remaining = MAX_NOTIFICATION_ICON_BYTES
+                    .saturating_sub(self.kitty_notification.icon_data.len());
+                if remaining > 0 {
+                    let take = remaining.min(payload.len());
+                    self.kitty_notification
+                        .icon_data
+                        .extend_from_slice(&payload[..take]);
+                    self.kitty_notification.icon_data_present = true;
+                }
+            }
+            KittyPayloadType::Ignored
+            | KittyPayloadType::Close
+            | KittyPayloadType::Alive
+            | KittyPayloadType::Capabilities => {}
         }
 
         if done {
@@ -2185,13 +2393,41 @@ impl ScreenPerformer<'_> {
             if completed.title.is_empty() {
                 completed.title = std::mem::take(&mut completed.body);
             }
-            if let Some(id) = completed.id.as_ref() {
-                if self.active_notification_ids.len() >= 64 {
-                    if let Some(oldest) = self.active_notification_ids.iter().next().cloned() {
-                        self.active_notification_ids.remove(&oldest);
-                    }
+            // Resolve the icon: freshly transmitted data wins and refreshes
+            // the `g=` cache; otherwise fall back to previously cached bytes.
+            let mut icon_data = if completed.icon_data_present && !completed.icon_data.is_empty() {
+                Some(std::mem::take(&mut completed.icon_data))
+            } else {
+                None
+            };
+            if let Some(cache_id) = completed.icon_cache_id.clone() {
+                if let Some(data) = icon_data.clone() {
+                    self.notification_icon_cache.insert(cache_id, data);
+                } else if let Some(cached) = self.notification_icon_cache.get(&cache_id) {
+                    icon_data = Some(cached.to_vec());
                 }
-                self.active_notification_ids.insert(id.clone());
+            }
+            let buttons = crate::notifications::split_buttons(&completed.buttons_raw);
+            // Hard-cap stored button labels even if the raw payload was small.
+            let buttons = buttons
+                .into_iter()
+                .take(MAX_NOTIFICATION_BUTTONS)
+                .collect::<Vec<_>>();
+            if let Some(id) = completed.id.as_ref() {
+                // Bounded live set: oldest-first eviction keeps `p=alive`
+                // truthful without unbounded daemon memory.
+                if let Some(evicted) = self
+                    .active_notification_ids
+                    .insert(id.clone())
+                    .filter(|evicted| evicted != id)
+                {
+                    let _ = evicted;
+                }
+                if self.active_notification_ids.len() > MAX_ACTIVE_NOTIFICATIONS {
+                    // Defensive: `insert` already enforces the cap.
+                    self.active_notification_ids.remove(id);
+                    self.active_notification_ids.insert(id.clone());
+                }
             }
             self.screen.queue_notification(DesktopNotification {
                 id: completed.id,
@@ -2201,6 +2437,16 @@ impl ScreenPerformer<'_> {
                 expire_time: completed.expire_time,
                 muted: completed.muted,
                 focus: completed.focus,
+                report_activation: completed.report_activation,
+                report_close: completed.report_close,
+                occasion: completed.occasion,
+                app_name: completed.app_name,
+                notif_types: completed.notif_types,
+                icon_names: completed.icon_names,
+                icon_data,
+                icon_cache_id: completed.icon_cache_id,
+                buttons,
+                sound_name: completed.sound_name,
             });
         }
     }
@@ -2860,8 +3106,8 @@ fn parse_simple_notification(
     }
 
     Some(DesktopNotification {
-        title: truncate_utf8(title, MAX_NOTIFICATION_TITLE_BYTES).to_owned(),
-        body: truncate_utf8(body, MAX_NOTIFICATION_BODY_BYTES).to_owned(),
+        title: crate::notifications::truncate_utf8(title, MAX_NOTIFICATION_TITLE_BYTES).to_owned(),
+        body: crate::notifications::truncate_utf8(body, MAX_NOTIFICATION_BODY_BYTES).to_owned(),
         focus: true,
         ..Default::default()
     })
@@ -2890,28 +3136,9 @@ fn decode_kitty_print(argument: &[u8]) -> Option<String> {
     )
 }
 
-fn kitty_notification_id_is_valid(id: &str) -> bool {
-    !id.is_empty()
-        && id.len() <= 64
-        && id
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'+' | b'.'))
-}
-
 fn append_bounded(destination: &mut String, payload: &str, max_bytes: usize) {
     let remaining = max_bytes.saturating_sub(destination.len());
-    destination.push_str(truncate_utf8(payload, remaining));
-}
-
-fn truncate_utf8(value: &str, max_bytes: usize) -> &str {
-    if value.len() <= max_bytes {
-        return value;
-    }
-    let mut end = max_bytes;
-    while !value.is_char_boundary(end) {
-        end -= 1;
-    }
-    &value[..end]
+    destination.push_str(crate::notifications::truncate_utf8(payload, remaining));
 }
 
 fn parse_osc7_working_directory(params: &[&[u8]]) -> Option<std::path::PathBuf> {
@@ -4138,9 +4365,14 @@ mod tests {
         let response = screen.take_pending_responses().pop().unwrap();
         let response = std::str::from_utf8(&response).unwrap();
         assert!(response.starts_with("\x1b]99;i=query:p=?;"));
-        assert!(response.contains("p=title,body,?,close"));
-        assert!(!response.contains("alive"));
-        assert!(response.contains("a=focus"));
+        assert!(response.contains("p=title,body,icon,buttons,?,alive,close"));
+        assert!(response.contains("a=focus,report"));
+        assert!(response.contains("o=always,unfocused,invisible"));
+        assert!(response.contains("u=0,1,2"));
+        assert!(response.contains("s=silent,system"));
+        assert!(response.contains("w=1"));
+        assert!(response.contains("c=1"));
+        assert!(!response.contains("c=0"));
         assert!(response.ends_with("\x1b\\"));
     }
 
@@ -4159,6 +4391,222 @@ mod tests {
                 ..Default::default()
             })]
         );
+    }
+
+    #[test]
+    fn test_osc99_activation_close_occasion_and_filter_identity() {
+        use crate::notifications::NotificationOccasion;
+
+        let mut screen = make_screen();
+        let mut parser = Parser::new();
+
+        // report + no-focus + close reports + unfocused occasion + app/type.
+        // `f`, `t` values are base64("myapp") / base64("email").
+        parser.parse(
+            &mut screen,
+            b"\x1b]99;i=job1:a=report,-focus:c=1:o=unfocused:f=bXlhcHA=:t=ZW1haWw=;Ready\x1b\\",
+        );
+        assert_eq!(
+            screen.take_notifications(),
+            vec![DesktopNotificationAction::Show(DesktopNotification {
+                id: Some("job1".into()),
+                title: "Ready".into(),
+                focus: false,
+                report_activation: true,
+                report_close: true,
+                occasion: NotificationOccasion::Unfocused,
+                app_name: Some("myapp".into()),
+                notif_types: vec!["email".into()],
+                ..Default::default()
+            })]
+        );
+
+        // Negative report / unknown occasion keep prior chunk state semantics:
+        // a fresh id starts from defaults, unknown `o` is ignored.
+        parser.parse(&mut screen, b"\x1b]99;i=job2:a=-report:o=bogus;Hi\x1b\\");
+        assert_eq!(
+            screen.take_notifications(),
+            vec![DesktopNotificationAction::Show(DesktopNotification {
+                id: Some("job2".into()),
+                title: "Hi".into(),
+                focus: true,
+                ..Default::default()
+            })]
+        );
+    }
+
+    #[test]
+    fn test_osc99_buttons_icon_sound_and_expiry() {
+        let mut screen = make_screen();
+        let mut parser = Parser::new();
+
+        // Buttons: base64("Yes\xe2\x80\xa8No"), chunked title + buttons.
+        parser.parse(
+            &mut screen,
+            b"\x1b]99;i=ask:d=0:p=title;Question\x1b\\\
+              \x1b]99;i=ask:d=0:e=1:p=buttons;WWVz4oCoTm8=\x1b\\\
+              \x1b]99;i=ask:d=1:p=body:w=5000;Pick one\x1b\\",
+        );
+        let shown = screen.take_notifications();
+        assert_eq!(shown.len(), 1);
+        match &shown[0] {
+            DesktopNotificationAction::Show(notification) => {
+                assert_eq!(notification.id.as_deref(), Some("ask"));
+                assert_eq!(notification.title, "Question");
+                assert_eq!(notification.body, "Pick one");
+                assert_eq!(notification.buttons, vec!["Yes", "No"]);
+                assert_eq!(notification.expire_time, Some(5000));
+            }
+            other => panic!("expected Show, got {other:?}"),
+        }
+
+        // Named sound (base64("info")) is accepted and stored; silent mutes.
+        parser.parse(&mut screen, b"\x1b]99;s=aW5mbw==;Ping\x1b\\");
+        match screen.take_notifications().pop().unwrap() {
+            DesktopNotificationAction::Show(notification) => {
+                assert!(!notification.muted);
+                assert_eq!(notification.sound_name.as_deref(), Some("info"));
+            }
+            other => panic!("expected Show, got {other:?}"),
+        }
+        parser.parse(&mut screen, b"\x1b]99;s=c2lsZW50;Quiet\x1b\\");
+        match screen.take_notifications().pop().unwrap() {
+            DesktopNotificationAction::Show(notification) => {
+                assert!(notification.muted);
+                assert_eq!(notification.sound_name, None);
+            }
+            other => panic!("expected Show, got {other:?}"),
+        }
+
+        // Icon names + transmitted icon data with a cache id; a later
+        // notification reuses the cached bytes via `g=` alone. Icon chunks
+        // ride with a title chunk under the same id (single-payload
+        // sequences), so stage the title first.
+        let icon = vec![0x89, b'P', b'N', b'G', 0, 1, 2, 3];
+        {
+            use base64::Engine as _;
+            let encoded = base64::engine::general_purpose::STANDARD.encode(&icon);
+            // base64("myapp-icon") for the `n=` name.
+            let title = b"\x1b]99;i=icon1:d=0:p=title;Icon demo\x1b\\";
+            parser.parse(&mut screen, title);
+            let sequence =
+                format!("\x1b]99;i=icon1:g=cache-1:n=bXlhcHAtaWNvbg==:e=1:p=icon;{encoded}\x1b\\");
+            parser.parse(&mut screen, sequence.as_bytes());
+        }
+        match screen.take_notifications().pop().unwrap() {
+            DesktopNotificationAction::Show(notification) => {
+                assert_eq!(notification.icon_names, vec!["myapp-icon"]);
+                assert_eq!(notification.icon_data.as_deref(), Some(icon.as_slice()));
+                assert_eq!(notification.icon_cache_id.as_deref(), Some("cache-1"));
+            }
+            other => panic!("expected Show, got {other:?}"),
+        }
+        parser.parse(&mut screen, b"\x1b]99;i=icon2:g=cache-1;Reused\x1b\\");
+        match screen.take_notifications().pop().unwrap() {
+            DesktopNotificationAction::Show(notification) => {
+                assert_eq!(notification.icon_data.as_deref(), Some(icon.as_slice()));
+            }
+            other => panic!("expected Show, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_osc99_hostile_input_is_fail_closed() {
+        let mut screen = make_screen();
+        let mut parser = Parser::new();
+
+        // Invalid ids are sanitized to unidentified (shown, never tracked),
+        // per the Kitty "reject or sanitize" rule — never echoed back.
+        parser.parse(&mut screen, b"\x1b]99;i=bad id!:p=body;nope\x1b\\");
+        match screen.take_notifications().pop().unwrap() {
+            DesktopNotificationAction::Show(notification) => {
+                assert_eq!(notification.id, None);
+                assert_eq!(notification.title, "nope");
+            }
+            other => panic!("expected Show, got {other:?}"),
+        }
+        parser.parse(&mut screen, b"\x1b]99;i=q:p=alive;\x1b\\");
+        let reply = String::from_utf8(screen.take_pending_responses().pop().unwrap()).unwrap();
+        assert!(!reply.contains("bad"));
+        // No id + empty title/body is ignored.
+        parser.parse(&mut screen, b"\x1b]99;p=title;\x1b\\");
+        // Unknown payload types must not disturb or emit.
+        parser.parse(&mut screen, b"\x1b]99;p=future-widget;hello\x1b\\");
+        // Invalid base64 with e=1 drops the sequence.
+        parser.parse(&mut screen, b"\x1b]99;e=1:p=title;!!!\x1b\\");
+        assert!(screen.take_notifications().is_empty());
+
+        // Oversize title is truncated, not rejected; oversize simple (OSC 9)
+        // notifications are dropped fail-closed.
+        let big_title = "t".repeat(3000);
+        let sequence = format!("\x1b]99;p=title;{big_title}\x1b\\");
+        parser.parse(&mut screen, sequence.as_bytes());
+        match screen.take_notifications().pop().unwrap() {
+            DesktopNotificationAction::Show(notification) => {
+                assert_eq!(notification.title.len(), 1024);
+            }
+            other => panic!("expected Show, got {other:?}"),
+        }
+        let huge = format!("\x1b]9;{};body\x07", "x".repeat(6000));
+        parser.parse(&mut screen, huge.as_bytes());
+        assert!(screen.take_notifications().is_empty());
+
+        // Chunked reassembly across ids: switching ids restarts the builder,
+        // and an interleaved close resets pending chunks.
+        parser.parse(&mut screen, b"\x1b]99;i=a:d=0:p=title;Par\x1b\\");
+        parser.parse(&mut screen, b"\x1b]99;i=b:d=1:p=title;Other\x1b\\");
+        assert_eq!(
+            screen.take_notifications(),
+            vec![DesktopNotificationAction::Show(DesktopNotification {
+                id: Some("b".into()),
+                title: "Other".into(),
+                focus: true,
+                ..Default::default()
+            })]
+        );
+        parser.parse(&mut screen, b"\x1b]99;i=c:d=0:p=title;Half\x1b\\");
+        parser.parse(&mut screen, b"\x1b]99;i=c:p=close;\x1b\\");
+        // `c` was never shown (only a pending chunk), so per the Kitty
+        // "unknown close is ignored" rule there is no Close event — but the
+        // pending chunk is still discarded by the close reset.
+        assert!(screen.take_notifications().is_empty());
+        // The pending "Half" chunk was discarded by the close reset.
+        parser.parse(&mut screen, b"\x1b]99;i=c:d=1:p=body;Body\x1b\\");
+        match screen.take_notifications().pop().unwrap() {
+            DesktopNotificationAction::Show(notification) => {
+                assert_eq!(notification.title, "Body");
+            }
+            other => panic!("expected Show, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_osc99_replace_close_and_alive_state_machine() {
+        let mut screen = make_screen();
+        let mut parser = Parser::new();
+
+        parser.parse(&mut screen, b"\x1b]99;i=job:p=title;One\x1b\\");
+        parser.parse(&mut screen, b"\x1b]99;i=job:p=title;Two\x1b\\");
+        let shown = screen.take_notifications();
+        assert_eq!(shown.len(), 2);
+
+        parser.parse(&mut screen, b"\x1b]99;i=q:p=alive;\x1b\\");
+        let reply = String::from_utf8(screen.take_pending_responses().pop().unwrap()).unwrap();
+        assert!(reply.contains(";job"));
+
+        // Closing an unknown id is a no-op for the app stream (no Close
+        // event), but never errors.
+        parser.parse(&mut screen, b"\x1b]99;i=ghost:p=close;\x1b\\");
+        assert!(screen.take_notifications().is_empty());
+
+        parser.parse(&mut screen, b"\x1b]99;i=job:p=close;\x1b\\");
+        assert_eq!(
+            screen.take_notifications(),
+            vec![DesktopNotificationAction::Close("job".into())]
+        );
+        parser.parse(&mut screen, b"\x1b]99;i=q:p=alive;\x1b\\");
+        let reply = String::from_utf8(screen.take_pending_responses().pop().unwrap()).unwrap();
+        assert!(!reply.contains("job"));
     }
 
     #[test]

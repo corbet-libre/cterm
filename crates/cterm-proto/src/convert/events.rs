@@ -141,6 +141,7 @@ mod tests {
                 expire_time: Some(5_000),
                 muted: true,
                 focus: true,
+                ..Default::default()
             },
         ));
         let proto = event_to_proto(&event).unwrap();

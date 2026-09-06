@@ -2532,9 +2532,20 @@ impl TerminalView {
                     .map(|mut pending| std::mem::take(&mut *pending))
                     .unwrap_or_default();
                 if !notifications.is_empty() {
+                    // Reports travel back through the mirror terminal write
+                    // path (daemon input channel → PTY).
+                    let report_terminal = terminal.clone();
                     dispatch2::Queue::main().exec_async(move || {
+                        let sink: crate::desktop_notification::ReportSink =
+                            std::sync::Arc::new(move |bytes: &[u8]| {
+                                if let Err(error) = report_terminal.lock().write(bytes) {
+                                    log::error!(
+                                        "Failed to send notification report to PTY: {error}"
+                                    );
+                                }
+                            });
                         for notification in notifications {
-                            crate::desktop_notification::handle(&notification);
+                            crate::desktop_notification::handle(&notification, sink.clone());
                         }
                     });
                 }

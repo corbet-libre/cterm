@@ -2374,8 +2374,11 @@ impl TerminalWidget {
                         let mut content_changed = false;
                         // Rich-clipboard ops need the terminal lock (consent
                         // + replies), which is held for this loop, so they
-                        // are handled after `drop(term)` below.
+                        // are handled after `drop(term)` below. Desktop
+                        // notifications join them: delivery re-locks the
+                        // terminal for occasion filtering and PTY reports.
                         let mut deferred_rich = Vec::new();
+                        let mut deferred_notifications = Vec::new();
 
                         for event in events {
                             match event {
@@ -2420,8 +2423,8 @@ impl TerminalWidget {
                                         callback(title);
                                     }
                                 }
-                                TerminalEvent::DesktopNotification(ref notification) => {
-                                    crate::desktop_notification::handle(notification);
+                                TerminalEvent::DesktopNotification(notification) => {
+                                    deferred_notifications.push(notification);
                                 }
                                 TerminalEvent::RichClipboardRequest(op) => {
                                     deferred_rich.push(op);
@@ -2470,6 +2473,10 @@ impl TerminalWidget {
 
                         for op in deferred_rich {
                             Self::handle_rich_clipboard_request(&terminal_main, &drawing_area, op);
+                        }
+
+                        for notification in &deferred_notifications {
+                            crate::desktop_notification::handle(notification, &terminal_main);
                         }
 
                         for transfer in transfers {
