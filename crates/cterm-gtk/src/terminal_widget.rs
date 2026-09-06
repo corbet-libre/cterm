@@ -3827,6 +3827,7 @@ mod tests {
                 operation: 0,
                 cell_x: 0,
                 cell_y: 0,
+                has_cell_y: false,
                 pixel_x: 0,
                 pixel_y: 0,
                 payload: Vec::new(),

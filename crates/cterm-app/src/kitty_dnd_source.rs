@@ -8,6 +8,13 @@
 //! images, and the frontend runs the resulting OS drag session while
 //! reporting progress (`t=e`) back to the application.
 //!
+//! Progress/finish split (spec dnd-protocol.rst:358-376, kitty/dnd.c:1861-1886):
+//! `t=e:x=1:y` (accepted), `t=e:x=2:o=` (action-changed hint),
+//! `t=e:x=3` (dropped, data requests may follow), `t=e:x=4:y` (finished,
+//! terminal — `y=1` canceled), `t=e:x=5:y` (request MIME data). Copy/move
+//! finality on the source side comes via `x=2` hints only; the final
+//! operation lives destination-side as `t=r:o=` (spec 137-145).
+//!
 //! Security posture (mirrors the OSC 5113 exact-token consent philosophy):
 //!
 //! * An OS drag is never started without a genuine user gesture observed by
@@ -15,11 +22,17 @@
 //!   refused with `t=E;EPERM` and change no state.
 //! * `move` is only ever *reported* (`t=e:x=2:o=2`); the terminal never
 //!   deletes local data on behalf of the application.
-//! * Remote-filesystem ingress (`t=k` entry reads, used when the drag source
-//!   lives on another machine) is fail-closed: entry requests are never sent
-//!   unless the [`DndSourcePolicy`] allows remote reads or the exact pending
-//!   approval token is approved via [`DndSource::approve`]. Frontends without
-//!   a consent prompt must call [`DndSource::deny`], which aborts the drag.
+//! * Kitty has no prompt anywhere on the drag-source path (zero
+//!   confirm/prompt calls in `kitty/dnd.c`): local-vs-remote only steers the
+//!   data path (`is_remote_client` at dnd.c:1538-1541, remote must pre-send
+//!   uri-list at 1839-1843, auto-request remote files at 2051-2056; spec
+//!   dnd-protocol.rst:202-206, 404-428). Gating different-machine `t=k`
+//!   entry reads behind exact-token approval is deliberate hardening beyond
+//!   Kitty: same-machine drags proceed without prompting, while
+//!   different-machine and unknown-locality peers (fail-closed as remote)
+//!   require [`DndSource::approve`] or [`DndSourcePolicy::allow_remote_reads`].
+//!   Frontends without a consent prompt must call [`DndSource::deny`], which
+//!   aborts the drag.
 //! * The terminal never opens application-supplied local paths directly; URI
 //!   entries are served only from application-supplied bytes (pre-sent
 //!   `t=p` data or consented `t=k` responses). Local-direct reads are an
@@ -378,7 +391,9 @@ impl DndSource {
     }
 
     /// The OS-reported action changed; forwarded only on change so the
-    /// application learns an accurate copy/move outcome.
+    /// application learns an accurate copy/move outcome. This `t=e:x=2:o=`
+    /// hint is the only source-side copy/move signal; finality lives
+    /// destination-side as `t=r:o=`.
     pub fn os_action_changed(&mut self, action: DndOperation) -> Vec<DndSourceAction> {
         if self.phase != SourcePhase::Dragging {
             return Vec::new();
@@ -459,8 +474,10 @@ impl DndSource {
         vec![DndSourceAction::Write(frame)]
     }
 
-    /// Request bytes for one `text/uri-list` entry (fail-closed unless the
-    /// policy allows remote reads or the returned token is approved).
+    /// Request bytes for one `text/uri-list` entry. Same-machine drags
+    /// proceed without prompting (Kitty has no drag-source prompt); only
+    /// different-machine and unknown-locality (fail-closed as remote) reads
+    /// are gated behind exact-token approval unless the policy allows them.
     pub fn os_request_remote_entry(&mut self, entry: RemoteEntryRef) -> Vec<DndSourceAction> {
         if self.phase != SourcePhase::Dragging {
             return Vec::new();
@@ -476,7 +493,7 @@ impl DndSource {
         if self.pending_remote.len() >= MAX_PENDING_REMOTE_REQUESTS {
             return self.abort_with("EMFILE");
         }
-        if self.policy.allow_remote_reads {
+        if self.policy.allow_remote_reads || self.is_same_machine() {
             self.pending_remote.insert(key, true);
             return vec![DndSourceAction::Write(remote_request_frame(
                 self.client_id,
@@ -526,7 +543,22 @@ impl DndSource {
         self.abort_with("EPERM")
     }
 
-    /// The OS drag finished. `canceled` mirrors `t=e:x=4:y=1`.
+    /// True only when the peer machine id proves same-machine locality.
+    /// Unknown peers (absent/unparseable id) and unknown local ids fail
+    /// closed toward remote, so those reads stay approval-gated.
+    fn is_same_machine(&self) -> bool {
+        let Some(peer) = self.peer_machine_id.as_deref() else {
+            return false;
+        };
+        let Some(local) = local_machine_id() else {
+            return false;
+        };
+        !is_remote_peer(Some(&local), peer)
+    }
+
+    /// The OS drag finished (`t=e:x=4:y`, terminal: `y=1` canceled, `y=0`
+    /// completed). The registration survives for the next gesture; no further
+    /// data requests are served after this point.
     pub fn os_finished(&mut self, canceled: bool) -> Vec<DndSourceAction> {
         if self.phase != SourcePhase::Dragging {
             return Vec::new();
@@ -560,11 +592,10 @@ impl DndSource {
         if command.operation != 0 {
             return self.handle_offer_list(command);
         }
-        if !command.payload.is_empty() {
-            return Vec::new();
-        }
         match command.cell_x {
             1 => {
+                // `t=o:x=1` carries the optional machine id as its payload
+                // (spec dnd-protocol.rst:268-272); it must not be rejected.
                 self.phase = SourcePhase::Armed;
                 self.client_id = command.client_id;
                 // The machine id is optional; an absent or malformed value
@@ -575,6 +606,9 @@ impl DndSource {
                 Vec::new()
             }
             2 => {
+                if !command.payload.is_empty() {
+                    return Vec::new();
+                }
                 self.reset();
                 Vec::new()
             }
@@ -848,6 +882,10 @@ impl DndSource {
     }
 
     fn handle_client_error(&mut self, command: DndCommand) -> Vec<DndSourceAction> {
+        // Split `t=E` semantics, matching Kitty exactly (kitty/screen.c
+        // `t=E` arm, kitty/dnd.c:2104-2122,1525-1528; spec dnd-protocol.rst:387-399):
+        // valid-index `t=E:y=idx` fails only that request (per-item error,
+        // offer kept); `y=-1`/missing/ambiguous index aborts the whole drag.
         if !matches!(
             self.phase,
             SourcePhase::GestureSent | SourcePhase::Offered | SourcePhase::Dragging
@@ -855,7 +893,7 @@ impl DndSource {
             return Vec::new();
         }
         if command.cell_y == -1 {
-            // The application cancels the whole drag.
+            // The application cancels the whole drag (`t=E:y=-1`).
             let had_drag = self.phase == SourcePhase::Dragging;
             self.abort_to_armed();
             return if had_drag {
@@ -864,26 +902,44 @@ impl DndSource {
                 Vec::new()
             };
         }
-        // NOTE: a bare terminal-side abort (`t=E;POSIX`, no keys) is
-        // indistinguishable from a per-MIME error for index 0 at the parser
-        // layer (absent `y` defaults to 0). A `y` naming an outstanding
-        // request fails just that request; anything else aborts the drag.
-        // See the open spec question in docs/parity.md.
+        if !command.has_cell_y {
+            // Missing `y` is ambiguous with index 0 at the wire layer, so it
+            // aborts fail-closed instead of failing index 0.
+            if self.phase == SourcePhase::Dragging {
+                return self.abort_with("EINVAL");
+            }
+            self.abort_to_armed();
+            return error_actions(self.client_id, None, "EINVAL");
+        }
         let Ok(index) = u32::try_from(command.cell_y) else {
-            return self.abort_with("EINVAL");
+            // Negative other than -1, or otherwise ambiguous.
+            if self.phase == SourcePhase::Dragging {
+                return self.abort_with("EINVAL");
+            }
+            self.abort_to_armed();
+            return error_actions(self.client_id, None, "EINVAL");
         };
-        if self.phase == SourcePhase::Dragging && self.pending_data.remove(&index) {
+        let valid = usize::try_from(index).is_ok_and(|idx| idx < self.offered_mimes.len());
+        if !valid {
+            // Out-of-bounds index aborts the whole drag (dnd.c:2104-2109).
+            if self.phase == SourcePhase::Dragging {
+                return self.abort_with("EINVAL");
+            }
+            self.abort_to_armed();
+            return error_actions(self.client_id, None, "EINVAL");
+        }
+        if self.phase == SourcePhase::Dragging {
+            // Valid index: fail only that request, keep the offer alive
+            // (dnd.c:2112-2122 per-item `-err`).
+            self.pending_data.remove(&index);
             self.data_buffers.remove(&index);
             return vec![DndSourceAction::OsDataFailed {
                 mime_index: usize::try_from(index).ok(),
                 entry: None,
             }];
         }
-        if self.phase == SourcePhase::Dragging {
-            return self.abort_with("ECANCELED");
-        }
         self.abort_to_armed();
-        Vec::new()
+        error_actions(self.client_id, None, "EINVAL")
     }
 
     fn handle_remote_data(&mut self, command: DndCommand) -> Vec<DndSourceAction> {
@@ -1354,6 +1410,7 @@ mod tests {
             operation: 0,
             cell_x: 0,
             cell_y: 0,
+            has_cell_y: false,
             pixel_x: 0,
             pixel_y: 0,
             payload: Vec::new(),
@@ -1361,8 +1418,15 @@ mod tests {
     }
 
     fn arm(source: &mut DndSource) {
+        arm_with_peer(source, None);
+    }
+
+    fn arm_with_peer(source: &mut DndSource, peer: Option<&str>) {
         let mut enable = command(DndCommandType::OfferDrag);
         enable.cell_x = 1;
+        if let Some(peer) = peer {
+            enable.payload = peer.as_bytes().to_vec();
+        }
         assert!(source.handle_command(enable).is_empty());
         assert!(source.is_armed());
     }
@@ -1713,6 +1777,9 @@ mod tests {
 
     #[test]
     fn remote_entry_request_is_fail_closed_until_approved() {
+        // Unknown locality (no machine id) fails closed as remote: approval
+        // required. Kitty itself has no drag-source prompt; gating remote
+        // reads is deliberate hardening beyond Kitty.
         let mut source = DndSource::default();
         arm(&mut source);
         gesture(&mut source);
@@ -1799,6 +1866,61 @@ mod tests {
         });
         assert!(matches!(
             actions.as_slice(),
+            [DndSourceAction::Write(frame)] if frame.starts_with(b"\x1b]72;t=k:x=1;")
+        ));
+    }
+
+    #[test]
+    fn same_machine_remote_reads_need_no_prompt() {
+        let local = local_machine_id().expect("test host provides /etc/machine-id");
+        let mut source = DndSource::default();
+        arm_with_peer(&mut source, Some(&local));
+        gesture(&mut source);
+        offer(&mut source, 1, "text/uri-list");
+        start_drag(&mut source);
+        // Exact-token approval is gated to different-machine reads only:
+        // same-machine drags proceed directly to `t=k`.
+        let actions = source.os_request_remote_entry(RemoteEntryRef {
+            entry: 1,
+            num: 0,
+            parent: 0,
+        });
+        assert!(
+            matches!(
+                actions.as_slice(),
+                [DndSourceAction::Write(frame)] if frame.starts_with(b"\x1b]72;t=k:x=1;")
+            ),
+            "same-machine t=k must not prompt, got {actions:?}"
+        );
+        assert!(source.approvals.is_empty());
+    }
+
+    #[test]
+    fn different_machine_remote_reads_need_approval() {
+        let local = local_machine_id().expect("test host provides /etc/machine-id");
+        let remote = hash_machine_id("different-machine-for-test");
+        assert_ne!(local, remote);
+        let mut source = DndSource::default();
+        arm_with_peer(&mut source, Some(&remote));
+        gesture(&mut source);
+        offer(&mut source, 1, "text/uri-list");
+        start_drag(&mut source);
+        let entry = RemoteEntryRef {
+            entry: 1,
+            num: 0,
+            parent: 0,
+        };
+        let actions = source.os_request_remote_entry(entry);
+        let request_id = match actions.as_slice() {
+            [DndSourceAction::RequestApproval(request)] => {
+                assert_eq!(request.entry, entry);
+                request.request_id
+            }
+            other => panic!("different-machine t=k must prompt, got {other:?}"),
+        };
+        let approved = source.approve(request_id);
+        assert!(matches!(
+            approved.as_slice(),
             [DndSourceAction::Write(frame)] if frame.starts_with(b"\x1b]72;t=k:x=1;")
         ));
     }
@@ -1900,11 +2022,112 @@ mod tests {
         start_drag(&mut source);
         let mut cancel = command(DndCommandType::DragOfferError);
         cancel.cell_y = -1;
+        cancel.has_cell_y = true;
         assert_eq!(
             source.handle_command(cancel),
             vec![DndSourceAction::CancelOsDrag]
         );
         assert_eq!(source.phase, SourcePhase::Armed);
+    }
+
+    #[test]
+    fn valid_index_error_fails_only_that_request() {
+        // Per-item `t=E:y=idx` (dnd.c:2112-2122): offer kept, drag alive.
+        let mut source = DndSource::default();
+        arm(&mut source);
+        gesture(&mut source);
+        offer(&mut source, 1, "text/plain text/html");
+        start_drag(&mut source);
+        // Pull MIME 1 so it is outstanding, then fail it.
+        assert!(matches!(
+            source.os_request_data(1).as_slice(),
+            [DndSourceAction::Write(_)]
+        ));
+        let mut error = command(DndCommandType::DragOfferError);
+        error.cell_y = 1;
+        error.has_cell_y = true;
+        error.payload = b"EIO".to_vec();
+        assert_eq!(
+            source.handle_command(error),
+            vec![DndSourceAction::OsDataFailed {
+                mime_index: Some(1),
+                entry: None,
+            }]
+        );
+        assert!(source.is_dragging());
+        // The other MIME is still servable: the drag survived.
+        assert!(matches!(
+            source.os_request_data(0).as_slice(),
+            [DndSourceAction::Write(_)]
+        ));
+
+        // Valid index without a prior pull still fails per-item, not the drag.
+        let mut source = DndSource::default();
+        arm(&mut source);
+        gesture(&mut source);
+        offer(&mut source, 1, "text/plain");
+        start_drag(&mut source);
+        let mut error = command(DndCommandType::DragOfferError);
+        error.cell_y = 0;
+        error.has_cell_y = true;
+        error.payload = b"ENOENT".to_vec();
+        assert_eq!(
+            source.handle_command(error),
+            vec![DndSourceAction::OsDataFailed {
+                mime_index: Some(0),
+                entry: None,
+            }]
+        );
+        assert!(source.is_dragging());
+    }
+
+    #[test]
+    fn missing_and_out_of_bounds_error_aborts_the_drag() {
+        for (cell_y, has_cell_y) in [(0, false), (99, true), (-2, true)] {
+            let mut source = DndSource::default();
+            arm(&mut source);
+            gesture(&mut source);
+            offer(&mut source, 1, "text/plain");
+            start_drag(&mut source);
+            let mut error = command(DndCommandType::DragOfferError);
+            error.cell_y = cell_y;
+            error.has_cell_y = has_cell_y;
+            error.payload = b"EIO".to_vec();
+            let actions = source.handle_command(error);
+            assert!(
+                matches!(
+                    actions.as_slice(),
+                    [DndSourceAction::Write(frame), DndSourceAction::CancelOsDrag]
+                        if frame.windows(6).any(|part| part == b"EINVAL")
+                ),
+                "y={cell_y} present={has_cell_y} must abort with EINVAL, got {actions:?}"
+            );
+            assert_eq!(source.phase, SourcePhase::Armed);
+        }
+    }
+
+    #[test]
+    fn finish_x4_is_terminal() {
+        // `t=e:x=4:y` ends the drag (dnd.c:1861-1886); no further data flows.
+        let mut source = DndSource::default();
+        arm(&mut source);
+        gesture(&mut source);
+        offer(&mut source, 1, "text/plain");
+        start_drag(&mut source);
+        let finished = source.os_finished(false);
+        assert!(matches!(
+            finished.as_slice(),
+            [DndSourceAction::Write(frame)] if frame.windows(7).any(|part| part == b"x=4:y=0")
+        ));
+        assert_eq!(source.phase, SourcePhase::Armed);
+        assert!(source.os_request_data(0).is_empty());
+        assert!(source
+            .os_request_remote_entry(RemoteEntryRef {
+                entry: 1,
+                num: 0,
+                parent: 0,
+            })
+            .is_empty());
     }
 
     #[test]

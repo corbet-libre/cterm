@@ -224,17 +224,33 @@ impl SafeModeSnapshot {
     }
 }
 
+/// DEC private modes in Kitty's `copy_specific_modes` that cterm implements
+/// and shares via the single `saved_safe_modes` store. Mode 1005 is excluded:
+/// cterm permanently resets it (DECRQM 4), so it is never saved. ANSI 4/20
+/// live only in the snapshot via the bare path.
+fn is_safe_dec_mode(mode: usize) -> bool {
+    matches!(
+        mode,
+        1 | 5 | 7 | 25 | 1000 | 1002 | 1003 | 1004 | 1006 | 1015 | 1016 | 2004 | 2031 | 2033
+    )
+}
+
 /// Parser wraps the vte parser and applies actions to a Screen
 pub struct Parser {
     state_machine: vte::Parser<VTE_OSC_BUFFER_BYTES>,
     dcs_state: DcsState,
     /// Most recent graphic character for ECMA-48 REP.
     last_printed: Option<char>,
-    /// Saved DEC private modes for xterm XTSAVE/XTRESTORE.
+    /// Saved DEC private modes for xterm XTSAVE/XTRESTORE outside the Kitty
+    /// safe set (e.g. reverse-wrap 45). Safe modes share
+    /// [`saved_safe_modes`](Self::saved_safe_modes) instead.
     saved_dec_modes: HashMap<usize, bool>,
-    /// Snapshot for no-argument Kitty `CSI ? s` / `CSI ? r`. `None` means no
-    /// bare save has been seen; a bare restore then does nothing, matching
-    /// the explicit path's fail-closed treatment of never-saved modes.
+    /// Single shared store for Kitty safe modes, used by both explicit
+    /// (`CSI ? Pm s/r` via `screen_save/restore_mode`, kitty/screen.c:2660-2666)
+    /// and bare (`CSI ? s/r` bulk `copy_specific_modes`, kitty/screen.c:2689-2715)
+    /// paths — fully bidirectional. `None` means no save has been seen; a
+    /// restore then does nothing, matching the explicit path's fail-closed
+    /// treatment of never-saved modes.
     saved_safe_modes: Option<SafeModeSnapshot>,
     /// Bounded, all-or-none interceptor for streaming OSC 1337 File sequences.
     osc_1337: Osc1337Interceptor,
@@ -1397,6 +1413,13 @@ impl vte::Perform for ScreenPerformer<'_> {
                             self.screen.save_cursor();
                             continue;
                         }
+                        if is_safe_dec_mode(mode) {
+                            // Shared store: visible to later bare restores.
+                            if matches!(self.dec_private_mode_status(mode), 1 | 2) {
+                                self.save_explicit_safe_mode(mode);
+                            }
+                            continue;
+                        }
                         match self.dec_private_mode_status(mode) {
                             1 => {
                                 self.saved_dec_modes.insert(mode, true);
@@ -1419,6 +1442,9 @@ impl vte::Perform for ScreenPerformer<'_> {
                     for &mode in &params_vec {
                         if mode == 1048 {
                             self.screen.restore_cursor();
+                        } else if is_safe_dec_mode(mode) {
+                            // Shared store: observes bare saves as well.
+                            self.restore_explicit_safe_mode(mode);
                         } else if let Some(enabled) = self.saved_dec_modes.get(&mode).copied() {
                             self.handle_dec_mode(mode, enabled);
                         }
@@ -2042,9 +2068,11 @@ impl ScreenPerformer<'_> {
             // Pop: the trailing name list is ignored; popping an empty
             // stack has no effect.
             '<' => self.screen.pop_pointer_shape(),
-            // Query: one comma-separated answer per question. Supported
-            // shape names answer `1`, anything else answers `0`, except the
-            // `__current__` / `__default__` / `__grabbed__` specials.
+            // Query: one comma-separated answer per question. Only canonical
+            // CSS names answer `1` (Kitty `is_css_pointer_name_valid`);
+            // set-only xterm aliases like `left_ptr` answer `0` while staying
+            // settable. `__current__` / `__default__` / `__grabbed__` are
+            // specials.
             '?' => {
                 let mut answers = Vec::new();
                 for question in value.split(',') {
@@ -2942,41 +2970,15 @@ impl ScreenPerformer<'_> {
         }
     }
 
-    /// Save the Kitty safe-mode set for no-argument `CSI ? s`.
+    /// Save the Kitty safe-mode set for no-argument `CSI ? s` into the single
+    /// shared store (kitty/screen.c:2689-2692 `screen_save_modes`).
     fn save_safe_modes(&mut self) {
         let snapshot = SafeModeSnapshot::capture(self.screen);
         *self.saved_safe_modes = Some(snapshot);
-        // Mirror the snapshot into the explicit-save map so a later explicit
-        // `CSI ? <mode> r` observes the bare save, matching Kitty's shared
-        // saved-mode store in that direction.
-        for mode in [1, 5, 7, 25, 1004, 2004, 2031, 2033] {
-            match self.dec_private_mode_status(mode) {
-                1 => {
-                    self.saved_dec_modes.insert(mode, true);
-                }
-                2 => {
-                    self.saved_dec_modes.insert(mode, false);
-                }
-                _ => {}
-            }
-        }
-        for mode in [1000, 1002, 1003, 1005, 1006, 1015, 1016] {
-            match self.dec_private_mode_status(mode) {
-                1 => {
-                    self.saved_dec_modes.insert(mode, true);
-                }
-                2 => {
-                    self.saved_dec_modes.insert(mode, false);
-                }
-                _ => {}
-            }
-        }
-        // ANSI modes 4/20 live only in the snapshot: explicit XTRESTORE
-        // addresses DEC private modes, so there is no map entry to mirror.
     }
 
     /// Restore the Kitty safe-mode set for no-argument `CSI ? r`. A restore
-    /// with no preceding bare save is a no-op.
+    /// with no preceding save (bare or explicit) is a no-op.
     fn restore_safe_modes(&mut self) {
         let Some(snapshot) = *self.saved_safe_modes else {
             return;
@@ -2993,6 +2995,57 @@ impl ScreenPerformer<'_> {
         self.handle_dec_mode(2004, snapshot.bracketed_paste);
         self.handle_dec_mode(2031, snapshot.theme_change_reports);
         self.handle_dec_mode(2033, snapshot.visibility_change_reports);
+    }
+
+    /// Save one explicit `CSI ? Pm s` mode into the shared store
+    /// (kitty/screen.c:2660-2662 `screen_save_mode`). Safe modes update the
+    /// snapshot so a later bare `CSI ? r` observes them; other modes use the
+    /// explicit-only map. A first explicit save creates a default snapshot so
+    /// only that mode is pinned (Kitty zero-inits `saved_modes` the same way).
+    fn save_explicit_safe_mode(&mut self, mode: usize) {
+        let snapshot = self.saved_safe_modes.get_or_insert_default();
+        match mode {
+            1 => snapshot.application_cursor = self.screen.modes.application_cursor,
+            5 => snapshot.reverse_video = self.screen.modes.reverse_video,
+            7 => snapshot.auto_wrap = self.screen.modes.auto_wrap,
+            25 => snapshot.show_cursor = self.screen.modes.show_cursor,
+            1000 | 1002 | 1003 => snapshot.mouse_mode = self.screen.modes.mouse_mode,
+            1004 => snapshot.focus_events = self.screen.modes.focus_events,
+            1006 | 1015 | 1016 => snapshot.mouse_encoding = self.screen.modes.mouse_encoding,
+            2004 => snapshot.bracketed_paste = self.screen.modes.bracketed_paste,
+            2031 => snapshot.theme_change_reports = self.screen.modes.theme_change_reports,
+            2033 => {
+                snapshot.visibility_change_reports = self.screen.modes.visibility_change_reports
+            }
+            _ => {}
+        }
+    }
+
+    /// Restore one explicit `CSI ? Pm r` mode from the shared store
+    /// (kitty/screen.c:2664-2666 `screen_restore_mode`). Returns true when a
+    /// saved value existed; never-saved modes are a fail-closed no-op.
+    fn restore_explicit_safe_mode(&mut self, mode: usize) -> bool {
+        let Some(snapshot) = *self.saved_safe_modes else {
+            return false;
+        };
+        match mode {
+            1 => self.handle_dec_mode(1, snapshot.application_cursor),
+            5 => self.handle_dec_mode(5, snapshot.reverse_video),
+            7 => self.handle_dec_mode(7, snapshot.auto_wrap),
+            25 => self.handle_dec_mode(25, snapshot.show_cursor),
+            1000 | 1002 | 1003 => {
+                self.screen.modes.mouse_mode = snapshot.mouse_mode;
+            }
+            1004 => self.handle_dec_mode(1004, snapshot.focus_events),
+            1006 | 1015 | 1016 => {
+                self.screen.modes.mouse_encoding = snapshot.mouse_encoding;
+            }
+            2004 => self.handle_dec_mode(2004, snapshot.bracketed_paste),
+            2031 => self.handle_dec_mode(2031, snapshot.theme_change_reports),
+            2033 => self.handle_dec_mode(2033, snapshot.visibility_change_reports),
+            _ => return false,
+        }
+        true
     }
 
     /// Dispatch one complete Kitty private DCS payload (`kitty-<command>` plus
@@ -5691,6 +5744,36 @@ mod tests {
     }
 
     #[test]
+    fn test_kitty_explicit_save_is_visible_to_bare_restore() {
+        // Single shared store (kitty/screen.c:2660-2666 vs 2689-2715):
+        // explicit `CSI ? Pm s` must be observed by bare `CSI ? r`.
+        let mut screen = make_screen();
+        let mut parser = Parser::new();
+
+        parser.parse(&mut screen, b"\x1b[?1h\x1b[?2004h\x1b[?1;2004s");
+        parser.parse(&mut screen, b"\x1b[?1l\x1b[?2004l");
+        assert!(!screen.modes.application_cursor);
+        assert!(!screen.modes.bracketed_paste);
+
+        parser.parse(&mut screen, b"\x1b[?r");
+        assert!(screen.modes.application_cursor);
+        assert!(screen.modes.bracketed_paste);
+    }
+
+    #[test]
+    fn test_kitty_bare_save_is_visible_to_explicit_restore() {
+        // The other direction: bare `CSI ? s` must feed explicit `CSI ? Pm r`.
+        let mut screen = make_screen();
+        let mut parser = Parser::new();
+
+        parser.parse(&mut screen, b"\x1b[?1h\x1b[?2004h\x1b[?s");
+        parser.parse(&mut screen, b"\x1b[?1l\x1b[?2004l");
+        parser.parse(&mut screen, b"\x1b[?1;2004r");
+        assert!(screen.modes.application_cursor);
+        assert!(screen.modes.bracketed_paste);
+    }
+
+    #[test]
     fn test_kitty_bare_save_restore_excludes_side_effect_modes() {
         let mut screen = make_screen();
         let mut parser = Parser::new();
@@ -6219,6 +6302,21 @@ mod tests {
             screen.take_pending_responses(),
             vec![b"\x1b]22;1,1,0,1\x1b\\".to_vec()]
         );
+
+        // Set-only xterm aliases probe as 0 (CSS-validity-only) while staying
+        // settable: `left_ptr` sets `default` but `?left_ptr` answers 0.
+        parser.parse(&mut screen, b"\x1b]22;?left_ptr,pointer\x1b\\");
+        assert_eq!(
+            screen.take_pending_responses(),
+            vec![b"\x1b]22;0,1\x1b\\".to_vec()]
+        );
+        parser.parse(&mut screen, b"\x1b]22;left_ptr\x1b\\");
+        assert_eq!(
+            screen.current_pointer_shape(),
+            Some(crate::PointerShape::Default)
+        );
+        // Restore `pointer` so the specials below observe the original shape.
+        parser.parse(&mut screen, b"\x1b]22;pointer\x1b\\");
 
         parser.parse(
             &mut screen,
