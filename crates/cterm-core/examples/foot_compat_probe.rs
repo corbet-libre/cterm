@@ -100,6 +100,57 @@ mod unix {
             // Foot added visibility query 998 and mode 2033 after the 1.27.0
             // release used by this gate. cterm tests those extensions directly
             // until they are available in a released reference binary.
+            //
+            // Differential corpus expansion (foot-compatible subset only):
+            // Kitty-only replies (OSC 21 color slots, OSC 22 pointer shapes,
+            // OSC 5522 rich clipboard, DA2/XTVERSION version strings, pixel
+            // geometry) are covered by host-side unit tests in
+            // `tests/foot_corpus.rs` because foot either diverges or reports
+            // font-dependent values there.
+            ("dsr-status", b"\x1b[5n", b"n", 1),
+            (
+                "dec-modes-standard",
+                b"\x1b[?1$p\x1b[?5$p\x1b[?6$p\x1b[?7$p\x1b[?25$p\x1b[?47$p",
+                b"y",
+                6,
+            ),
+            (
+                "dec-modes-mouse-focus",
+                b"\x1b[?1000$p\x1b[?1002$p\x1b[?1003$p\x1b[?1004$p\x1b[?1007$p\x1b[?2004$p",
+                b"y",
+                6,
+            ),
+            (
+                "dec-modes-sync-sixel",
+                b"\x1b[?2026$p\x1b[?1070$p\x1b[?8452$p",
+                b"y",
+                3,
+            ),
+            ("ansi-modes", b"\x1b[4$p\x1b[20$p", b"y", 2),
+            ("keyboard-query", b"\x1b[?u", b"u", 1),
+            ("xtgettcap-bool", b"\x1bP+q626365;5463\x1b\\", b"\x1b\\", 2),
+            ("window-char-ops", b"\x1b[11t\x1b[13t\x1b[18t", b"t", 3),
+            (
+                "editing-dch-dsr",
+                b"\x1b[2J\x1b[HABCDE\x1b[2D\x1b[2P\x1b[6n",
+                b"R",
+                1,
+            ),
+            (
+                "editing-il-dl-dsr",
+                b"\x1b[2J\x1b[Hline1\r\nline2\r\nline3\x1b[1;1H\x1b[2L\x1b[6n",
+                b"R",
+                1,
+            ),
+            (
+                "editing-ech-dsr",
+                b"\x1b[2J\x1b[Hhello\x1b[1;1H\x1b[2X\x1b[6n",
+                b"R",
+                1,
+            ),
+            ("malformed-recovery", b"\x1b[?9999$p\x1b[6n", b"R", 1),
+            ("sixel-colors", b"\x1b[?1;1S", b"S", 1),
+            ("decrqss-unknown", b"\x1bP$qz\x1b\\", b"\x1b\\", 1),
         ];
 
         let mut report = String::new();
