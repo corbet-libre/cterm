@@ -119,6 +119,10 @@ pub struct TerminalWidget {
     on_bell: EventCallback,
     on_title_change: TitleCallback,
     on_file_transfer: FileTransferCallback,
+    /// Active Kitty `visual_bell` flash (application color + arming time),
+    /// painted as a brief fullscreen tint by the draw function. Armed through
+    /// the bell path in `setup_daemon_reader`; `None` means no flash.
+    visual_bell_flash: Rc<RefCell<Option<VisualBellFlash>>>,
     /// Shared Kitty OSC 72 state used by PTY and GTK drop callbacks.
     dnd_destination: Rc<RefCell<DndDestination>>,
     /// Shared Kitty OSC 72 source-side state for outbound drags. Command
@@ -801,6 +805,7 @@ impl TerminalWidget {
         let preedit = Rc::clone(&self.preedit);
         let sprite_cache = Rc::clone(&self.sprite_cache);
         let blink_clock = Rc::clone(&self.blink_clock);
+        let visual_bell_flash = Rc::clone(&self.visual_bell_flash);
 
         self.drawing_area
             .set_draw_func(move |_area, cr, _width, _height| {
@@ -808,11 +813,24 @@ impl TerminalWidget {
                 let dims = *cell_dims.borrow();
                 let bg_override = *background_override.borrow();
                 let preedit_state = preedit.borrow().clone();
+                // Resolve the flash tint and reap it once expired so a stale
+                // entry never outlives its paint.
+                let flash = {
+                    let mut slot = visual_bell_flash.borrow_mut();
+                    let color = slot
+                        .as_ref()
+                        .and_then(|flash| flash.color_at(Instant::now()));
+                    if color.is_none() {
+                        *slot = None;
+                    }
+                    color
+                };
                 let render_config = RenderConfig {
                     font_family: &font_family,
                     font_size,
                     cell_dims: dims,
                     background_override: bg_override,
+                    visual_bell_flash: flash,
                 };
                 let mut sprites = sprite_cache.borrow_mut();
                 let blink_phase = blink_clock.borrow().phase();
@@ -1857,6 +1875,7 @@ impl TerminalWidget {
             on_title_change: Rc::new(RefCell::new(None)),
             preedit: Rc::new(RefCell::new(PreeditState::default())),
             on_file_transfer: Rc::new(RefCell::new(None)),
+            visual_bell_flash: Rc::new(RefCell::new(None)),
             dnd_destination: Rc::new(RefCell::new(DndDestination::default())),
             dnd_source: Rc::new(RefCell::new(DndSource::default())),
             daemon_cmd_tx: Some(cmd_tx.clone()),
@@ -1955,6 +1974,7 @@ impl TerminalWidget {
             on_title_change: Rc::new(RefCell::new(None)),
             preedit: Rc::new(RefCell::new(PreeditState::default())),
             on_file_transfer: Rc::new(RefCell::new(None)),
+            visual_bell_flash: Rc::new(RefCell::new(None)),
             dnd_destination: Rc::new(RefCell::new(DndDestination::default())),
             dnd_source: Rc::new(RefCell::new(DndSource::default())),
             daemon_cmd_tx: Some(cmd_tx.clone()),
@@ -2359,6 +2379,7 @@ impl TerminalWidget {
         let terminal_main = Arc::clone(&self.terminal);
         let on_exit = Rc::clone(&self.on_exit);
         let on_bell = Rc::clone(&self.on_bell);
+        let visual_bell_flash = Rc::clone(&self.visual_bell_flash);
         let on_title_change = Rc::clone(&self.on_title_change);
         let on_file_transfer = Rc::clone(&self.on_file_transfer);
         let dnd_destination = Rc::clone(&self.dnd_destination);
@@ -2414,6 +2435,11 @@ impl TerminalWidget {
                                     }
                                 }
                                 TerminalEvent::Bell => {
+                                    ring_visual_bell(
+                                        terminal_main.lock().screen(),
+                                        &visual_bell_flash,
+                                        &drawing_area,
+                                    );
                                     if let Some(ref callback) = *on_bell.borrow() {
                                         callback();
                                     }
@@ -2463,6 +2489,7 @@ impl TerminalWidget {
 
                         if term.screen().bell {
                             term.screen_mut().bell = false;
+                            ring_visual_bell(term.screen(), &visual_bell_flash, &drawing_area);
                             if let Some(ref callback) = *on_bell.borrow() {
                                 callback();
                             }
@@ -2494,6 +2521,11 @@ impl TerminalWidget {
                         }
                     }
                     PtyMessage::Bell => {
+                        ring_visual_bell(
+                            terminal_main.lock().screen(),
+                            &visual_bell_flash,
+                            &drawing_area,
+                        );
                         if let Some(ref callback) = *on_bell.borrow() {
                             callback();
                         }
@@ -2836,7 +2868,13 @@ struct RenderConfig<'a> {
     font_size: f64,
     cell_dims: CellDimensions,
     background_override: Option<cterm_core::color::Rgb>,
+    /// Active Kitty visual-bell tint, resolved (and expiry-checked) at draw
+    /// time. `None` means no tint.
+    visual_bell_flash: Option<cterm_core::color::Rgb>,
 }
+
+/// Alpha of the Kitty visual-bell fullscreen tint.
+const VISUAL_BELL_FLASH_ALPHA: f64 = 0.25;
 
 fn configure_terminal_cursor(terminal: &mut Terminal, config: &Config) {
     terminal.screen_mut().configure_cursor(
@@ -2860,6 +2898,9 @@ fn draw_terminal(
     let palette = frontend_palette(theme, config.background_override);
     let palette = screen.resolved_palette(&palette);
     let palette = &palette;
+    // Explicit Kitty selection paint colors; when unset the selection keeps
+    // rendering as reverse video (see the per-cell logic below).
+    let (kitty_selection_bg, kitty_selection_fg) = kitty_selection_paint(screen);
 
     // Dynamic OSC colors override the configured theme/template palette.
     let normal_background = &palette.background;
@@ -2987,6 +3028,14 @@ fn draw_terminal(
                 } else {
                     fg_color
                 };
+                // An explicit Kitty selection foreground wins on selected
+                // cells; otherwise (including INVERSE-selected cells with no
+                // explicit color) the resolved color above stands.
+                let fg_color = if is_selected {
+                    kitty_selection_fg.unwrap_or(fg_color)
+                } else {
+                    fg_color
+                };
 
                 // Draw background (always draw for selected cells to show highlight)
                 let needs_bg = cell.bg != Color::Default
@@ -2995,18 +3044,23 @@ fn draw_terminal(
                     || screen.modes.reverse_video;
 
                 if !render_foreground && needs_bg {
-                    let bg_color = if is_inverted {
-                        // Inverted: use foreground color as background
-                        if cell.fg == Color::Default {
-                            palette.foreground
+                    let bg_color =
+                        if let Some(sel) = is_selected.then_some(kitty_selection_bg).flatten() {
+                            // An explicit Kitty selection background replaces the
+                            // reverse-video selection highlight.
+                            sel
+                        } else if is_inverted {
+                            // Inverted: use foreground color as background
+                            if cell.fg == Color::Default {
+                                palette.foreground
+                            } else {
+                                screen.resolve_color(cell.fg, palette)
+                            }
+                        } else if cell.bg == Color::Default {
+                            *normal_background
                         } else {
-                            screen.resolve_color(cell.fg, palette)
-                        }
-                    } else if cell.bg == Color::Default {
-                        *normal_background
-                    } else {
-                        screen.resolve_color(cell.bg, palette)
-                    };
+                            screen.resolve_color(cell.bg, palette)
+                        };
 
                     let (r, g, b) = bg_color.to_f64();
                     cr.set_source_rgb(r, g, b);
@@ -3140,7 +3194,7 @@ fn draw_terminal(
             cursor.col,
             cursor.style,
             palette.cursor,
-            theme.cursor.text_color,
+            kitty_cursor_text(screen, theme.cursor.text_color),
             cell_width,
             cell_height,
             config.font_family,
@@ -3230,6 +3284,15 @@ fn draw_terminal(
         cr.close_path();
         cr.set_source_rgba(0.5, 0.5, 0.5, opacity);
         cr.fill().ok();
+    }
+
+    // Kitty visual-bell flash: brief fullscreen tint in the application
+    // color, armed through the bell path. Expiry is resolved in the draw
+    // closure, so only a live tint reaches this paint.
+    if let Some(tint) = config.visual_bell_flash {
+        let (r, g, b) = tint.to_f64();
+        cr.set_source_rgba(r, g, b, VISUAL_BELL_FLASH_ALPHA);
+        cr.paint().ok();
     }
 }
 
@@ -3329,6 +3392,117 @@ pub(crate) fn parse_rgb(hex: &str) -> Option<Rgb> {
         u8::from_str_radix(&hex[2..4], 16).ok()?,
         u8::from_str_radix(&hex[4..6], 16).ok()?,
     ))
+}
+
+/// Explicit Kitty selection paint colors as `(background, foreground)`.
+///
+/// Each side is `Some` only when the application set an explicit `OSC 21`
+/// (or aliased `OSC 17`/`19`) color; `Default`/`Dynamic` keep the theme
+/// behavior (reverse-video highlight). Consumed by `draw_terminal`.
+pub(crate) fn kitty_selection_paint(screen: &cterm_core::Screen) -> (Option<Rgb>, Option<Rgb>) {
+    (
+        screen.kitty_explicit_color(cterm_core::KittyColorKey::SelectionBackground),
+        screen.kitty_explicit_color(cterm_core::KittyColorKey::SelectionForeground),
+    )
+}
+
+/// Cursor text color honoring the Kitty `cursor_text` slot.
+///
+/// Falls back to the theme cursor text color when the slot is unset or
+/// dynamic (dynamic means the underlying background, which the theme value
+/// approximates). Consumed by the main-cursor draw in `draw_terminal`.
+pub(crate) fn kitty_cursor_text(screen: &cterm_core::Screen, fallback: Rgb) -> Rgb {
+    screen
+        .kitty_explicit_color(cterm_core::KittyColorKey::CursorText)
+        .unwrap_or(fallback)
+}
+
+/// Kitty `visual_bell` application color, if the slot holds an explicit one.
+///
+/// `None` (unset or dynamic) means the existing bell path (tab indicator +
+/// window title) runs without a flash. Consumed through the bell path in
+/// `setup_daemon_reader`, which arms a [`VisualBellFlash`].
+pub(crate) fn kitty_visual_bell(screen: &cterm_core::Screen) -> Option<Rgb> {
+    screen.kitty_explicit_color(cterm_core::KittyColorKey::VisualBell)
+}
+
+/// Active Kitty visual-bell flash: the application `visual_bell` color plus
+/// its arming time, painted as a brief fullscreen tint.
+///
+/// Transparency (`transparent_background_color1..7`) is deliberately *not*
+/// consumed here: GTK has no applied window-opacity mechanism today
+/// (`config.appearance.opacity` is stored but never applied to a window), so
+/// those slots stay stored-and-queried state until a compositor-backed
+/// opacity path exists.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct VisualBellFlash {
+    color: Rgb,
+    armed_at: Instant,
+}
+
+impl VisualBellFlash {
+    /// How long the tint stays visible (matches the tab bell CSS transition).
+    pub(crate) const DURATION: Duration = Duration::from_millis(150);
+
+    pub(crate) fn arm(color: Rgb) -> Self {
+        Self::arm_at(color, Instant::now())
+    }
+
+    pub(crate) fn arm_at(color: Rgb, armed_at: Instant) -> Self {
+        Self { color, armed_at }
+    }
+
+    /// The flash color while the tint is still visible, `None` once expired.
+    pub(crate) fn color_at(&self, now: Instant) -> Option<Rgb> {
+        if now.saturating_duration_since(self.armed_at) <= Self::DURATION {
+            Some(self.color)
+        } else {
+            None
+        }
+    }
+}
+
+/// Arm (or clear) the visual-bell flash from one bell event.
+///
+/// Returns true when a flash was armed so the caller can invalidate the draw
+/// area. Pure enough to unit test through [`kitty_visual_bell`] plus
+/// [`VisualBellFlash`]; kept as a free function so every bell site shares it.
+fn arm_visual_bell_flash(
+    screen: &cterm_core::Screen,
+    flash: &Rc<RefCell<Option<VisualBellFlash>>>,
+) -> bool {
+    let armed = kitty_visual_bell(screen).map(VisualBellFlash::arm);
+    let active = armed.is_some();
+    *flash.borrow_mut() = armed;
+    active
+}
+
+/// Run one bell through the Kitty visual-bell path.
+///
+/// Arms a fullscreen tint when the `visual_bell` slot holds an explicit
+/// color, invalidates the draw area at once, and schedules a second
+/// invalidation after the flash expires so the tint clears even with no
+/// further PTY output. The existing audible/tab-indicator path (the `on_bell`
+/// callback) is untouched and always runs alongside.
+fn ring_visual_bell(
+    screen: &cterm_core::Screen,
+    flash: &Rc<RefCell<Option<VisualBellFlash>>>,
+    drawing_area: &DrawingArea,
+) {
+    if !arm_visual_bell_flash(screen, flash) {
+        return;
+    }
+    drawing_area.queue_draw();
+    let redraw = drawing_area.downgrade();
+    glib::timeout_add_local(
+        VisualBellFlash::DURATION + Duration::from_millis(50),
+        move || {
+            if let Some(area) = redraw.upgrade() {
+                area.queue_draw();
+            }
+            glib::ControlFlow::Break
+        },
+    );
 }
 
 fn draw_cell_decorations(
@@ -3697,5 +3871,114 @@ mod tests {
             build_source_content(&pending, &source).expect("presented text/plain is servable");
         assert!(provider.formats().contain_mime_type("text/plain"));
         assert!(!provider.formats().contain_mime_type("text/uri-list"));
+    }
+}
+
+/// Headless (compositor-free) tests for the Kitty color-slot renderer hooks.
+///
+/// These cover state plumbing only: slot resolution, cursor-text fallback,
+/// flash arming/expiry. Pixel-level visual assertions need a compositor and
+/// stay open (see `docs/parity.md`).
+#[cfg(test)]
+mod kitty_color_tests {
+    use super::*;
+    use cterm_core::screen::{KittyColorKey, KittyColorSetting, Screen, ScreenConfig};
+
+    fn test_screen() -> Screen {
+        Screen::new(80, 24, ScreenConfig::default())
+    }
+
+    #[test]
+    fn unset_slots_keep_theme_behavior() {
+        let screen = test_screen();
+        assert_eq!(kitty_selection_paint(&screen), (None, None));
+        let fallback = Rgb::new(1, 2, 3);
+        assert_eq!(kitty_cursor_text(&screen, fallback), fallback);
+        assert_eq!(kitty_visual_bell(&screen), None);
+    }
+
+    #[test]
+    fn explicit_slots_resolve_for_paint() {
+        let mut screen = test_screen();
+        screen.set_kitty_setting(
+            KittyColorKey::SelectionBackground,
+            KittyColorSetting::Color(Rgb::new(0x11, 0x22, 0x33)),
+        );
+        screen.set_kitty_setting(
+            KittyColorKey::SelectionForeground,
+            KittyColorSetting::Color(Rgb::new(0x44, 0x55, 0x66)),
+        );
+        screen.set_kitty_setting(
+            KittyColorKey::CursorText,
+            KittyColorSetting::Color(Rgb::new(0x77, 0x88, 0x99)),
+        );
+        screen.set_kitty_setting(
+            KittyColorKey::VisualBell,
+            KittyColorSetting::Color(Rgb::new(0xaa, 0xbb, 0xcc)),
+        );
+        assert_eq!(
+            kitty_selection_paint(&screen),
+            (
+                Some(Rgb::new(0x11, 0x22, 0x33)),
+                Some(Rgb::new(0x44, 0x55, 0x66))
+            )
+        );
+        assert_eq!(
+            kitty_cursor_text(&screen, Rgb::new(0, 0, 0)),
+            Rgb::new(0x77, 0x88, 0x99)
+        );
+        assert_eq!(kitty_visual_bell(&screen), Some(Rgb::new(0xaa, 0xbb, 0xcc)));
+        // Dynamic keeps theme behavior, like Default.
+        screen.set_kitty_setting(
+            KittyColorKey::SelectionBackground,
+            KittyColorSetting::Dynamic,
+        );
+        screen.set_kitty_setting(KittyColorKey::CursorText, KittyColorSetting::Dynamic);
+        assert_eq!(kitty_selection_paint(&screen).0, None);
+        assert_eq!(
+            kitty_cursor_text(&screen, Rgb::new(0, 0, 0)),
+            Rgb::new(0, 0, 0)
+        );
+    }
+
+    #[test]
+    fn visual_bell_flash_expires() {
+        let color = Rgb::new(255, 0, 0);
+        let armed_at = Instant::now();
+        let flash = VisualBellFlash::arm_at(color, armed_at);
+        assert_eq!(flash.color_at(armed_at), Some(color));
+        assert_eq!(
+            flash.color_at(armed_at + VisualBellFlash::DURATION),
+            Some(color)
+        );
+        assert_eq!(
+            flash.color_at(armed_at + VisualBellFlash::DURATION + Duration::from_millis(1)),
+            None
+        );
+    }
+
+    #[test]
+    fn bell_arming_tracks_the_visual_bell_slot() {
+        let mut screen = test_screen();
+        let slot: Rc<RefCell<Option<VisualBellFlash>>> = Rc::new(RefCell::new(None));
+        // No explicit color: no flash armed.
+        assert!(!arm_visual_bell_flash(&screen, &slot));
+        assert!(slot.borrow().is_none());
+        // Explicit color: flash armed with that color.
+        screen.set_kitty_setting(
+            KittyColorKey::VisualBell,
+            KittyColorSetting::Color(Rgb::new(1, 2, 3)),
+        );
+        assert!(arm_visual_bell_flash(&screen, &slot));
+        assert_eq!(
+            slot.borrow()
+                .as_ref()
+                .and_then(|flash| flash.color_at(Instant::now())),
+            Some(Rgb::new(1, 2, 3))
+        );
+        // A later bell after the slot resets clears the flash.
+        screen.set_kitty_setting(KittyColorKey::VisualBell, KittyColorSetting::Default);
+        assert!(!arm_visual_bell_flash(&screen, &slot));
+        assert!(slot.borrow().is_none());
     }
 }

@@ -68,6 +68,20 @@ is omitted for readability.
   transparency keys with query/set/reset and strict value validation) plus
   OSC 30001/30101 palette-stack push/pop on the shared xterm stack, with
   daemon-owned replies and snapshot persistence.
+- Kitty/X11 named colors for dynamic color specs: the 753-entry table from
+  Kitty's color-control spec (X11 `rgb.txt` values as an independent static
+  table, recorded in `THIRD_PARTY_LICENSES.md`) resolves case-insensitively
+  in `OSC 21`, `OSC 10-12`, and `OSC 17/19` values, with an optional
+  `@alpha` suffix on the Kitty spelling. Unknown names are still rejected.
+- xterm highlight colors (`OSC 17`/`19` set/query, `OSC 117`/`119` reset,
+  matching foot) aliased to the Kitty selection slots, so both spellings
+  share state, snapshots, and the palette stack with cross-spelling
+  round-trips.
+- GTK rendering of the Kitty color slots: explicit selection
+  background/foreground paint, cursor-text color, and a brief visual-bell
+  flash tint through the existing bell path. Transparency slots remain
+  stored-and-queried (GTK has no applied window-opacity mechanism);
+  Cocoa/Win32 renderer mappings are still open.
 - Kitty OSC 5522 rich clipboard: typed MIME reads/writes with strict
   validation, write sessions with alias resolution, MIME-list and DECRQM
   queries, paste-event mode with single-use tokens, exact-token consent

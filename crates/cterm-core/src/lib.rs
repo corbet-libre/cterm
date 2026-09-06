@@ -31,6 +31,7 @@ pub mod ssh;
 pub mod streaming_file;
 pub mod term;
 mod text_sizing;
+pub mod x11_colors;
 
 pub use cell::{Cell, CellAttrs};
 pub use color::{AnsiColor, Color, ColorPalette, Rgb};

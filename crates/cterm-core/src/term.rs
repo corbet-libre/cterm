@@ -1849,6 +1849,58 @@ mod tests {
     }
 
     #[test]
+    fn xterm_highlight_queries_report_aliased_selection_slots() {
+        use crate::color::Rgb;
+
+        let mut term = Terminal::new(80, 24, ScreenConfig::default());
+        let base = ColorPalette::default();
+
+        // Unset slots report the theme fallbacks in xterm shape (unlike the
+        // Kitty shape, which reports empty for the same state).
+        let (_, responses) = term.process_collecting(b"\x1b]17;?\x1b\\\x1b]19;?\x1b\\");
+        assert_eq!(
+            responses,
+            [
+                format!("\x1b]17;{}\x1b\\", base.selection.to_osc_spec()).into_bytes(),
+                format!("\x1b]19;{}\x1b\\", base.foreground.to_osc_spec()).into_bytes(),
+            ]
+        );
+
+        // Set through the Kitty spelling, query through the xterm spelling.
+        let (_, responses) = term.process_collecting(
+            b"\x1b]21;selection_background=#112233;selection_foreground=gold\x1b\\\
+              \x1b]17;?\x1b\\\x1b]19;?\x1b\\",
+        );
+        let bg = Rgb::new(0x11, 0x22, 0x33).to_osc_spec();
+        let fg = Rgb::new(0xff, 0xd7, 0x00).to_osc_spec();
+        assert_eq!(
+            responses,
+            [
+                format!("\x1b]17;{bg}\x1b\\").into_bytes(),
+                format!("\x1b]19;{fg}\x1b\\").into_bytes(),
+            ]
+        );
+
+        // Set through the xterm spelling, query through the Kitty spelling,
+        // then reset through the xterm spelling. Separate writes keep each
+        // reply pair deterministic: like the legacy OSC 10-12 replies, the
+        // xterm-shaped highlight replies drain as a group ahead of the
+        // Kitty-shaped ones.
+        let (_, responses) =
+            term.process_collecting(b"\x1b]19;#445566\x1b\\\x1b]21;selection_foreground=?\x1b\\");
+        let set = Rgb::new(0x44, 0x55, 0x66).to_osc_spec();
+        assert_eq!(
+            responses,
+            [format!("\x1b]21;selection_foreground={set}\x1b\\").into_bytes()]
+        );
+        let (_, responses) = term.process_collecting(b"\x1b]119\x1b\\\x1b]19;?\x1b\\");
+        assert_eq!(
+            responses,
+            [format!("\x1b]19;{}\x1b\\", base.foreground.to_osc_spec()).into_bytes(),]
+        );
+    }
+
+    #[test]
     fn foot_theme_and_visibility_queries_report_frontend_state() {
         use crate::{FrontendState, ThemeAppearance, WindowVisibility};
 

@@ -842,15 +842,40 @@ impl vte::Perform for ScreenPerformer<'_> {
                     }
                 }
             }
-            // Other color OSCs (13-19) - less common
-            13..=19 => {
+            // Other color OSCs (13-16, 18) - less common
+            13..=16 | 18 => {
                 log::trace!("Unhandled color OSC: {}", command);
+            }
+            // xterm highlight (selection) colors, aliased to the Kitty
+            // selection slots (see ColorQuery): 17 sets/queries the
+            // selection background, 19 the selection foreground. Successive
+            // values chain to the next code like OSC 10-12; unmapped codes
+            // (18) end the chain.
+            17 | 19 => {
+                for (offset, value) in params.iter().skip(1).enumerate() {
+                    let Some(target) = ColorQuery::from_osc_code(command + offset as u32) else {
+                        break;
+                    };
+                    let value = std::str::from_utf8(value).unwrap_or("");
+                    if value == "?" {
+                        self.screen.queue_color_query(target.osc_code());
+                    } else if let Some(color) = Rgb::from_xparse_color(value) {
+                        self.screen.set_dynamic_color(target, Some(color));
+                    }
+                }
             }
             // Kitty mouse pointer shapes (OSC 22): CSS names with
             // set/push/pop/query semantics and per-screen stacks.
             22 => self.handle_osc22(params),
             // Reset dynamic default foreground/background/cursor colors.
             110..=112 => {
+                if let Some(target) = ColorQuery::from_osc_code(command - 100) {
+                    self.screen.set_dynamic_color(target, None);
+                }
+            }
+            // Reset xterm highlight colors (aliases of the Kitty selection
+            // slots, matching foot's OSC 117/119).
+            117 | 119 => {
                 if let Some(target) = ColorQuery::from_osc_code(command - 100) {
                     self.screen.set_dynamic_color(target, None);
                 }
@@ -1880,9 +1905,9 @@ impl ScreenPerformer<'_> {
     ///
     /// Unknown keys are answered with `unknown=<base64>` only for queries
     /// (the Kitty spec's unknown rule lives in its query section); unknown
-    /// sets and resets are ignored. Malformed values — including named colors
-    /// such as `green`, which need Kitty's full X11 table — leave state
-    /// untouched, matching how bogus OSC 10-12 specs are ignored.
+    /// sets and resets are ignored. Malformed values — including unknown
+    /// color names — leave state untouched, matching how bogus OSC 10-12
+    /// specs are ignored.
     fn handle_osc21(&mut self, fields: &[&[u8]]) {
         let mut reply: Vec<KittyQueryField> = Vec::new();
         for field in fields.iter().take(MAX_OSC21_FIELDS) {
@@ -4129,9 +4154,13 @@ mod tests {
               \x1b]21;transparent_background_color0=#ffffff;\
               transparent_background_color8=#ffffff;FOREGROUND=#ffffff\x1b\\",
         );
-        // Named colors, bogus specs, bad slots, and wrong-case keys change
-        // nothing and queue no replies.
-        assert_eq!(screen.kitty_setting(Key::Foreground), Setting::Default);
+        // Named colors now resolve through the vendored Kitty/X11 table, so
+        // `foreground=green` applies; bogus specs, bad slots, and
+        // wrong-case keys still change nothing and queue no replies.
+        assert_eq!(
+            screen.kitty_setting(Key::Foreground),
+            Setting::Color(Rgb::new(0, 255, 0))
+        );
         assert_eq!(screen.kitty_setting(Key::CursorText), Setting::Default);
         assert_eq!(screen.kitty_setting(Key::Palette(5)), Setting::Default);
         assert!(screen.take_kitty_queries().is_empty());
@@ -4154,6 +4183,98 @@ mod tests {
         let queued = screen.take_kitty_queries();
         assert_eq!(queued.len(), 1);
         assert_eq!(queued[0].len(), 15);
+    }
+
+    #[test]
+    fn test_osc17_19_alias_kitty_selection_slots() {
+        use crate::screen::{KittyColorKey as Key, KittyColorSetting as Setting};
+
+        let mut screen = make_screen();
+        let mut parser = Parser::new();
+
+        // xterm highlight sets land in the Kitty selection slots, with named
+        // colors accepted like every other dynamic-color spelling.
+        parser.parse(&mut screen, b"\x1b]17;#112233\x1b\\\x1b]19;gold\x1b\\");
+        assert_eq!(
+            screen.kitty_setting(Key::SelectionBackground),
+            Setting::Color(Rgb::new(0x11, 0x22, 0x33))
+        );
+        assert_eq!(
+            screen.kitty_setting(Key::SelectionForeground),
+            Setting::Color(Rgb::new(0xff, 0xd7, 0x00))
+        );
+        // Both spellings read the same store.
+        assert_eq!(
+            screen.dynamic_color(ColorQuery::SelectionBackground),
+            Some(Rgb::new(0x11, 0x22, 0x33))
+        );
+        assert_eq!(
+            screen.dynamic_color(ColorQuery::SelectionForeground),
+            Some(Rgb::new(0xff, 0xd7, 0x00))
+        );
+
+        // Kitty sets are visible through the xterm spelling, including the
+        // Dynamic state the xterm spelling cannot produce itself.
+        parser.parse(
+            &mut screen,
+            b"\x1b]21;selection_background=#445566;selection_foreground=\x1b\\",
+        );
+        assert_eq!(
+            screen.dynamic_color(ColorQuery::SelectionBackground),
+            Some(Rgb::new(0x44, 0x55, 0x66))
+        );
+        assert_eq!(screen.dynamic_color(ColorQuery::SelectionForeground), None);
+
+        // Bogus values change nothing and queue no xterm reply.
+        parser.parse(&mut screen, b"\x1b]17;not-a-color\x1b\\");
+        assert_eq!(
+            screen.kitty_setting(Key::SelectionBackground),
+            Setting::Color(Rgb::new(0x44, 0x55, 0x66))
+        );
+        assert!(screen.take_color_queries().is_empty());
+
+        // Queries queue xterm-shaped replies.
+        parser.parse(&mut screen, b"\x1b]17;?\x1b\\\x1b]19;?\x1b\\");
+        assert_eq!(
+            screen.take_color_queries(),
+            vec![
+                (
+                    ColorQuery::SelectionBackground,
+                    Some(Rgb::new(0x44, 0x55, 0x66))
+                ),
+                (ColorQuery::SelectionForeground, None),
+            ]
+        );
+
+        // OSC 18 (Tektronix cursor) stays ignored and terminates a chained
+        // value list, matching the OSC 10-12 offset behavior.
+        parser.parse(&mut screen, b"\x1b]17;#778899;#aabbcc\x1b\\");
+        assert_eq!(
+            screen.kitty_setting(Key::SelectionBackground),
+            Setting::Color(Rgb::new(0x77, 0x88, 0x99))
+        );
+
+        // Resets restore Default through either spelling.
+        parser.parse(&mut screen, b"\x1b]117\x1b\\\x1b]119\x1b\\");
+        assert_eq!(
+            screen.kitty_setting(Key::SelectionBackground),
+            Setting::Default
+        );
+        assert_eq!(
+            screen.kitty_setting(Key::SelectionForeground),
+            Setting::Default
+        );
+
+        // Aliased slots ride the shared palette stack like other Kitty slots.
+        parser.parse(
+            &mut screen,
+            b"\x1b]17;#112233\x1b\\\x1b]30001\x1b\\\
+              \x1b]117\x1b\\\x1b]30101\x1b\\",
+        );
+        assert_eq!(
+            screen.kitty_setting(Key::SelectionBackground),
+            Setting::Color(Rgb::new(0x11, 0x22, 0x33))
+        );
     }
 
     #[test]
