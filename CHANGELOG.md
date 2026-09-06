@@ -45,6 +45,10 @@ is omitted for readability.
 - Kitty OSC 22 mouse pointer shapes: application set/push/pop/query with
   per-screen stacks, daemon snapshot persistence, and GTK cursor mapping
   (Cocoa/Win32 native mappings pending).
+- Kitty OSC 21 color control (selection, cursor-text, visual-bell, and
+  transparency keys with query/set/reset and strict value validation) plus
+  OSC 30001/30101 palette-stack push/pop on the shared xterm stack, with
+  daemon-owned replies and snapshot persistence.
 
 ### Fixed
 - Streamed OSC 1337 interception now replays incomplete, cancelled, and

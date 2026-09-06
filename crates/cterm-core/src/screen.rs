@@ -401,6 +401,158 @@ impl ColorQuery {
     }
 }
 
+/// Maximum Kitty OSC 21 fields accepted from one escape sequence.
+///
+/// A single sequence may legally combine many set/query operations; the cap
+/// keeps a hostile payload from queueing unbounded PTY replies. In practice
+/// the vte layer caps OSC sequences at 16 `;`-separated parameters first, so
+/// at most 15 fields ever arrive here; this bound only matters if that
+/// underlying limit is ever raised.
+pub const MAX_OSC21_FIELDS: usize = 128;
+
+/// Maximum accepted Kitty OSC 21 key length, in bytes.
+///
+/// The longest legitimate key (`transparent_background_color7`) is well under
+/// this; anything longer cannot name a known color and is skipped outright so
+/// huge keys cannot amplify into huge `unknown=` replies.
+pub const MAX_OSC21_KEY_LEN: usize = 64;
+
+/// A Kitty OSC 21 color slot (Kitty color-control spec, "Setting and
+/// querying colors").
+///
+/// Named keys use Kitty's string names; numeric keys (`0`-`255`) alias the
+/// same 256-color palette entries addressed by OSC 4, and the
+/// foreground/background/cursor keys alias the OSC 10-12 overrides.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KittyColorKey {
+    Foreground,
+    Background,
+    SelectionBackground,
+    SelectionForeground,
+    Cursor,
+    CursorText,
+    VisualBell,
+    TransparentBackground(u8),
+    Palette(u8),
+}
+
+impl KittyColorKey {
+    /// Match an exact OSC 21 key name.
+    ///
+    /// Matching is case-sensitive with no whitespace trimming: anything else
+    /// is an unknown key, never a near-miss. Transparency slots are the
+    /// single digits `1`-`7`; numeric palette keys are one to three ASCII
+    /// digits in `0`-`255`.
+    pub fn from_key_name(name: &str) -> Option<Self> {
+        match name {
+            "foreground" => Some(Self::Foreground),
+            "background" => Some(Self::Background),
+            "selection_background" => Some(Self::SelectionBackground),
+            "selection_foreground" => Some(Self::SelectionForeground),
+            "cursor" => Some(Self::Cursor),
+            "cursor_text" => Some(Self::CursorText),
+            "visual_bell" => Some(Self::VisualBell),
+            _ => {
+                if let Some(slot) = name.strip_prefix("transparent_background_color") {
+                    return match slot {
+                        "1" => Some(Self::TransparentBackground(1)),
+                        "2" => Some(Self::TransparentBackground(2)),
+                        "3" => Some(Self::TransparentBackground(3)),
+                        "4" => Some(Self::TransparentBackground(4)),
+                        "5" => Some(Self::TransparentBackground(5)),
+                        "6" => Some(Self::TransparentBackground(6)),
+                        "7" => Some(Self::TransparentBackground(7)),
+                        _ => None,
+                    };
+                }
+                if !name.is_empty()
+                    && name.len() <= 3
+                    && name.bytes().all(|byte| byte.is_ascii_digit())
+                {
+                    if let Ok(index) = name.parse::<u8>() {
+                        return Some(Self::Palette(index));
+                    }
+                }
+                None
+            }
+        }
+    }
+
+    /// Canonical key name used in OSC 21 query replies and snapshots.
+    pub fn key_name(self) -> String {
+        match self {
+            Self::Foreground => "foreground".to_string(),
+            Self::Background => "background".to_string(),
+            Self::SelectionBackground => "selection_background".to_string(),
+            Self::SelectionForeground => "selection_foreground".to_string(),
+            Self::Cursor => "cursor".to_string(),
+            Self::CursorText => "cursor_text".to_string(),
+            Self::VisualBell => "visual_bell".to_string(),
+            Self::TransparentBackground(slot) => {
+                format!("transparent_background_color{slot}")
+            }
+            Self::Palette(index) => format!("{index}"),
+        }
+    }
+
+    /// Whether this slot stores an explicit dynamic state.
+    ///
+    /// Only the newer Kitty slots do. The legacy foreground/background/cursor
+    /// slots alias the OSC 10-12 overrides (where an empty OSC 21 value resets
+    /// instead, since "dynamic" is not applicable there), and numeric palette
+    /// slots alias the OSC 4 overrides (where the Kitty spec forbids dynamic).
+    pub const fn stores_dynamic(self) -> bool {
+        match self {
+            Self::SelectionBackground
+            | Self::SelectionForeground
+            | Self::CursorText
+            | Self::VisualBell
+            | Self::TransparentBackground(_) => true,
+            Self::Foreground | Self::Background | Self::Cursor | Self::Palette(_) => false,
+        }
+    }
+}
+
+/// Application-provided state for one Kitty OSC 21 color slot.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum KittyColorSetting {
+    /// No application override. Queries report the frontend theme color when
+    /// the slot has one, and empty otherwise.
+    #[default]
+    Default,
+    /// Application-requested dynamic rendering (reverse video, automatic
+    /// colors, unset transparency). Queries always report empty.
+    Dynamic,
+    /// Application-provided color. Queries report it.
+    Color(Rgb),
+}
+
+/// One ordered field of a pending OSC 21 query reply.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum KittyQueryField {
+    /// A known key with the setting snapshot taken when it was queried.
+    Known {
+        key: KittyColorKey,
+        setting: KittyColorSetting,
+    },
+    /// An unknown key, stored as its padding-free base64 name so replies
+    /// cannot be abused to echo arbitrary text (per the Kitty spec).
+    Unknown { encoded: String },
+}
+
+/// Daemon-persisted snapshot of the dedicated Kitty OSC 21 slots.
+///
+/// The legacy foreground/background/cursor/palette slots alias the existing
+/// OSC 10-12/OSC 4 overrides and travel with those fields instead.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct KittyColorSnapshot {
+    pub selection_background: KittyColorSetting,
+    pub selection_foreground: KittyColorSetting,
+    pub cursor_text: KittyColorSetting,
+    pub visual_bell: KittyColorSetting,
+    pub transparent_background: [KittyColorSetting; 7],
+}
+
 /// Native urgency requested by Kitty OSC 99.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum NotificationUrgency {
@@ -744,6 +896,17 @@ pub struct Screen {
     dynamic_cursor: Option<Rgb>,
     /// Application-provided overrides from OSC 4, indexed by palette entry.
     dynamic_palette: [Option<Rgb>; 256],
+    /// Dedicated Kitty OSC 21 selection slots. The legacy foreground,
+    /// background, cursor, and palette keys alias the OSC 10-12/OSC 4 fields
+    /// above instead of living here.
+    kitty_selection_background: KittyColorSetting,
+    kitty_selection_foreground: KittyColorSetting,
+    kitty_cursor_text: KittyColorSetting,
+    kitty_visual_bell: KittyColorSetting,
+    /// Dedicated Kitty OSC 21 transparency slots 1-7 (index 0 holds key 1).
+    kitty_transparent_background: [KittyColorSetting; 7],
+    /// Ordered Kitty OSC 21 query replies awaiting daemon PTY responses.
+    pending_kitty_queries: Vec<Vec<KittyQueryField>>,
     /// xterm color-palette stack. The index is one-based, matching the wire
     /// protocol; zero means no current entry.
     color_stack: Vec<DynamicColorState>,
@@ -791,6 +954,11 @@ struct DynamicColorState {
     background: Option<Rgb>,
     cursor: Option<Rgb>,
     palette: Box<[Option<Rgb>; 256]>,
+    selection_background: KittyColorSetting,
+    selection_foreground: KittyColorSetting,
+    cursor_text: KittyColorSetting,
+    visual_bell: KittyColorSetting,
+    transparent_background: [KittyColorSetting; 7],
 }
 
 /// Reflowed physical rows plus a mapping from old cell coordinates to their
@@ -1098,6 +1266,12 @@ impl Screen {
             dynamic_background: None,
             dynamic_cursor: None,
             dynamic_palette: [None; 256],
+            kitty_selection_background: KittyColorSetting::Default,
+            kitty_selection_foreground: KittyColorSetting::Default,
+            kitty_cursor_text: KittyColorSetting::Default,
+            kitty_visual_bell: KittyColorSetting::Default,
+            kitty_transparent_background: [KittyColorSetting::Default; 7],
+            pending_kitty_queries: Vec::new(),
             color_stack: Vec::new(),
             color_stack_index: 0,
             current_working_directory: None,
@@ -1585,12 +1759,158 @@ impl Screen {
             background: self.dynamic_background,
             cursor: self.dynamic_cursor,
             palette: Box::new(self.dynamic_palette),
+            selection_background: self.kitty_selection_background,
+            selection_foreground: self.kitty_selection_foreground,
+            cursor_text: self.kitty_cursor_text,
+            visual_bell: self.kitty_visual_bell,
+            transparent_background: self.kitty_transparent_background,
         }
+    }
+
+    /// Snapshot the dedicated Kitty OSC 21 slots for daemon persistence.
+    ///
+    /// Legacy foreground/background/cursor/palette slots alias the OSC
+    /// 10-12/OSC 4 overrides and travel with those fields instead.
+    pub fn kitty_color_snapshot(&self) -> KittyColorSnapshot {
+        KittyColorSnapshot {
+            selection_background: self.kitty_selection_background,
+            selection_foreground: self.kitty_selection_foreground,
+            cursor_text: self.kitty_cursor_text,
+            visual_bell: self.kitty_visual_bell,
+            transparent_background: self.kitty_transparent_background,
+        }
+    }
+
+    /// Restore the dedicated Kitty OSC 21 slots from a daemon snapshot.
+    ///
+    /// The snapshot is authoritative: every slot is replaced.
+    pub fn restore_kitty_color_snapshot(&mut self, snapshot: KittyColorSnapshot) {
+        self.kitty_selection_background = snapshot.selection_background;
+        self.kitty_selection_foreground = snapshot.selection_foreground;
+        self.kitty_cursor_text = snapshot.cursor_text;
+        self.kitty_visual_bell = snapshot.visual_bell;
+        self.kitty_transparent_background = snapshot.transparent_background;
+        self.dirty = true;
+    }
+
+    /// Index into the transparency array for a `TransparentBackground` slot.
+    fn transparent_slot_index(slot: u8) -> Option<usize> {
+        (1..=7).contains(&slot).then(|| usize::from(slot - 1))
+    }
+
+    /// Snapshot the application setting for one Kitty OSC 21 slot.
+    ///
+    /// Numeric palette keys and the legacy foreground/background/cursor keys
+    /// alias the OSC 4/OSC 10-12 overrides; only the newer Kitty slots have
+    /// dedicated tri-state storage.
+    pub fn kitty_setting(&self, key: KittyColorKey) -> KittyColorSetting {
+        let legacy = |color: Option<Rgb>| {
+            color
+                .map(KittyColorSetting::Color)
+                .unwrap_or(KittyColorSetting::Default)
+        };
+        match key {
+            KittyColorKey::Foreground => legacy(self.dynamic_foreground),
+            KittyColorKey::Background => legacy(self.dynamic_background),
+            KittyColorKey::Cursor => legacy(self.dynamic_cursor),
+            KittyColorKey::Palette(index) => legacy(self.dynamic_palette[index as usize]),
+            KittyColorKey::SelectionBackground => self.kitty_selection_background,
+            KittyColorKey::SelectionForeground => self.kitty_selection_foreground,
+            KittyColorKey::CursorText => self.kitty_cursor_text,
+            KittyColorKey::VisualBell => self.kitty_visual_bell,
+            KittyColorKey::TransparentBackground(slot) => Self::transparent_slot_index(slot)
+                .map(|index| self.kitty_transparent_background[index])
+                .unwrap_or(KittyColorSetting::Default),
+        }
+    }
+
+    /// Apply an application-provided Kitty OSC 21 setting.
+    ///
+    /// `Dynamic` on a slot that does not store it resets the override instead
+    /// (matching the OSC 21 parser, which maps empty values on legacy slots
+    /// to resets). Out-of-range transparency slots are ignored.
+    pub fn set_kitty_setting(&mut self, key: KittyColorKey, setting: KittyColorSetting) {
+        let setting = if !key.stores_dynamic() && setting == KittyColorSetting::Dynamic {
+            KittyColorSetting::Default
+        } else {
+            setting
+        };
+        let legacy = |slot: &mut Option<Rgb>| {
+            *slot = match setting {
+                KittyColorSetting::Color(color) => Some(color),
+                KittyColorSetting::Default | KittyColorSetting::Dynamic => None,
+            };
+        };
+        match key {
+            KittyColorKey::Foreground => legacy(&mut self.dynamic_foreground),
+            KittyColorKey::Background => legacy(&mut self.dynamic_background),
+            KittyColorKey::Cursor => legacy(&mut self.dynamic_cursor),
+            KittyColorKey::Palette(index) => legacy(&mut self.dynamic_palette[index as usize]),
+            KittyColorKey::SelectionBackground => self.kitty_selection_background = setting,
+            KittyColorKey::SelectionForeground => self.kitty_selection_foreground = setting,
+            KittyColorKey::CursorText => self.kitty_cursor_text = setting,
+            KittyColorKey::VisualBell => self.kitty_visual_bell = setting,
+            KittyColorKey::TransparentBackground(slot) => {
+                if let Some(index) = Self::transparent_slot_index(slot) {
+                    self.kitty_transparent_background[index] = setting;
+                }
+            }
+        }
+        self.dirty = true;
+    }
+
+    /// Resolve the effective query value for one Kitty slot.
+    ///
+    /// `Some` colors are reported as `key=rgb:...`; `None` (dynamic, or unset
+    /// with no theme color) is reported as a bare `key=`.
+    pub fn kitty_effective_color(
+        &self,
+        key: KittyColorKey,
+        setting: KittyColorSetting,
+    ) -> Option<Rgb> {
+        match setting {
+            KittyColorSetting::Color(color) => Some(color),
+            KittyColorSetting::Dynamic => None,
+            KittyColorSetting::Default => match key {
+                KittyColorKey::Foreground => Some(self.base_palette.foreground),
+                KittyColorKey::Background => Some(self.base_palette.background),
+                KittyColorKey::SelectionBackground => Some(self.base_palette.selection),
+                KittyColorKey::Cursor => Some(self.base_palette.cursor),
+                KittyColorKey::Palette(index) => {
+                    Some(Color::Indexed(index).to_rgb(&self.base_palette))
+                }
+                KittyColorKey::SelectionForeground
+                | KittyColorKey::CursorText
+                | KittyColorKey::VisualBell
+                | KittyColorKey::TransparentBackground(_) => None,
+            },
+        }
+    }
+
+    /// Queue one OSC 21 query reply (ordered fields, one PTY response).
+    pub fn queue_kitty_query(&mut self, fields: Vec<KittyQueryField>) {
+        if !fields.is_empty() {
+            self.pending_kitty_queries.push(fields);
+        }
+    }
+
+    /// Take all pending OSC 21 query replies (drains the queue).
+    pub fn take_kitty_queries(&mut self) -> Vec<Vec<KittyQueryField>> {
+        std::mem::take(&mut self.pending_kitty_queries)
+    }
+
+    /// Check for pending OSC 21 query replies.
+    pub fn has_kitty_queries(&self) -> bool {
+        !self.pending_kitty_queries.is_empty()
     }
 
     /// Save the active application palette in an xterm color-stack slot.
     /// Slot zero means the entry after the current one; explicit slots are
     /// one-based and capped at xterm/foot's 128-entry limit.
+    ///
+    /// Kitty OSC 30001 shares this stack with XTPUSHCOLORS: both save the OSC
+    /// 4/10-12 overrides and every dedicated Kitty OSC 21 slot, matching
+    /// Kitty's converged save set (dynamic colors plus the full ANSI table).
     pub(crate) fn push_color_palette(&mut self, slot: usize) {
         const MAX_COLOR_STACK_DEPTH: usize = 128;
 
@@ -1610,6 +1930,8 @@ impl Screen {
     }
 
     /// Restore an xterm color-stack slot. Slot zero pops the current entry.
+    ///
+    /// Kitty OSC 30101 shares this stack with XTPOPCOLORS.
     pub(crate) fn pop_color_palette(&mut self, slot: usize) {
         let slot = if slot == 0 {
             self.color_stack_index
@@ -1629,6 +1951,11 @@ impl Screen {
         self.dynamic_background = state.background;
         self.dynamic_cursor = state.cursor;
         self.dynamic_palette = *state.palette;
+        self.kitty_selection_background = state.selection_background;
+        self.kitty_selection_foreground = state.selection_foreground;
+        self.kitty_cursor_text = state.cursor_text;
+        self.kitty_visual_bell = state.visual_bell;
+        self.kitty_transparent_background = state.transparent_background;
         self.dirty = true;
     }
 
@@ -2995,6 +3322,12 @@ impl Screen {
         self.dynamic_background = None;
         self.dynamic_cursor = None;
         self.dynamic_palette.fill(None);
+        self.kitty_selection_background = KittyColorSetting::Default;
+        self.kitty_selection_foreground = KittyColorSetting::Default;
+        self.kitty_cursor_text = KittyColorSetting::Default;
+        self.kitty_visual_bell = KittyColorSetting::Default;
+        self.kitty_transparent_background
+            .fill(KittyColorSetting::Default);
         self.color_stack.clear();
         self.color_stack_index = 0;
         self.drcs_fonts.clear();
@@ -4338,6 +4671,233 @@ mod tests {
         assert_ne!(
             screen.resolve_color(Color::Indexed(200), &resolved),
             extended
+        );
+    }
+
+    #[test]
+    fn kitty_color_key_names_match_the_spec() {
+        use KittyColorKey as Key;
+
+        assert_eq!(Key::from_key_name("foreground"), Some(Key::Foreground));
+        assert_eq!(Key::from_key_name("background"), Some(Key::Background));
+        assert_eq!(
+            Key::from_key_name("selection_background"),
+            Some(Key::SelectionBackground)
+        );
+        assert_eq!(
+            Key::from_key_name("selection_foreground"),
+            Some(Key::SelectionForeground)
+        );
+        assert_eq!(Key::from_key_name("cursor"), Some(Key::Cursor));
+        assert_eq!(Key::from_key_name("cursor_text"), Some(Key::CursorText));
+        assert_eq!(Key::from_key_name("visual_bell"), Some(Key::VisualBell));
+        assert_eq!(
+            Key::from_key_name("transparent_background_color1"),
+            Some(Key::TransparentBackground(1))
+        );
+        assert_eq!(
+            Key::from_key_name("transparent_background_color7"),
+            Some(Key::TransparentBackground(7))
+        );
+        assert_eq!(Key::from_key_name("0"), Some(Key::Palette(0)));
+        assert_eq!(Key::from_key_name("255"), Some(Key::Palette(255)));
+        assert_eq!(Key::from_key_name("007"), Some(Key::Palette(7)));
+
+        // Malformed or out-of-range keys never match.
+        for bad in [
+            "",
+            "256",
+            "999",
+            "1000",
+            "-1",
+            "+1",
+            " 1",
+            "1 ",
+            "0x1",
+            "FOREGROUND",
+            "Foreground",
+            " foreground",
+            "foreground ",
+            "selection_background ",
+            "transparent_background_color0",
+            "transparent_background_color8",
+            "transparent_background_color10",
+            "transparent_background_color",
+            "transparent_background_color1 ",
+            "cursor__text",
+        ] {
+            assert_eq!(Key::from_key_name(bad), None, "key {bad:?}");
+        }
+
+        // Canonical reply names round-trip.
+        for key in [
+            Key::Foreground,
+            Key::Background,
+            Key::SelectionBackground,
+            Key::SelectionForeground,
+            Key::Cursor,
+            Key::CursorText,
+            Key::VisualBell,
+            Key::TransparentBackground(3),
+            Key::Palette(200),
+        ] {
+            assert_eq!(Key::from_key_name(&key.key_name()), Some(key));
+        }
+        assert_eq!(
+            Key::TransparentBackground(4).key_name(),
+            "transparent_background_color4"
+        );
+        assert_eq!(Key::Palette(9).key_name(), "9");
+    }
+
+    #[test]
+    fn kitty_settings_alias_legacy_slots_and_store_new_ones() {
+        use KittyColorKey as Key;
+        use KittyColorSetting as Setting;
+
+        let mut screen = Screen::new(80, 24, ScreenConfig::default());
+        let color = Rgb::new(1, 2, 3);
+
+        // Legacy slots alias the OSC 10-12 / OSC 4 overrides.
+        screen.set_kitty_setting(Key::Foreground, Setting::Color(color));
+        screen.set_kitty_setting(Key::Palette(200), Setting::Color(color));
+        assert_eq!(screen.dynamic_color(ColorQuery::Foreground), Some(color));
+        assert_eq!(screen.dynamic_color(ColorQuery::Palette(200)), Some(color));
+        assert_eq!(screen.kitty_setting(Key::Foreground), Setting::Color(color));
+
+        // Dynamic on a legacy slot resets the override instead.
+        screen.set_kitty_setting(Key::Foreground, Setting::Dynamic);
+        screen.set_kitty_setting(Key::Palette(200), Setting::Dynamic);
+        assert_eq!(screen.dynamic_color(ColorQuery::Foreground), None);
+        assert_eq!(screen.dynamic_color(ColorQuery::Palette(200)), None);
+        assert_eq!(screen.kitty_setting(Key::Foreground), Setting::Default);
+
+        // Newer slots keep the full tri-state.
+        screen.set_kitty_setting(Key::CursorText, Setting::Dynamic);
+        screen.set_kitty_setting(Key::TransparentBackground(7), Setting::Color(color));
+        assert_eq!(screen.kitty_setting(Key::CursorText), Setting::Dynamic);
+        assert_eq!(
+            screen.kitty_setting(Key::TransparentBackground(7)),
+            Setting::Color(color)
+        );
+        assert_eq!(
+            screen.kitty_setting(Key::TransparentBackground(1)),
+            Setting::Default
+        );
+        // Out-of-range transparency slots are ignored, never panic.
+        screen.set_kitty_setting(Key::TransparentBackground(0), Setting::Color(color));
+        screen.set_kitty_setting(Key::TransparentBackground(8), Setting::Color(color));
+        let expected = [
+            Setting::Default,
+            Setting::Default,
+            Setting::Default,
+            Setting::Default,
+            Setting::Default,
+            Setting::Default,
+            Setting::Color(color),
+        ];
+        assert_eq!(
+            screen.kitty_color_snapshot().transparent_background,
+            expected
+        );
+    }
+
+    #[test]
+    fn kitty_effective_colors_fall_back_to_theme_or_empty() {
+        use KittyColorKey as Key;
+        use KittyColorSetting as Setting;
+
+        let mut screen = Screen::new(80, 24, ScreenConfig::default());
+        let base = ColorPalette::default_dark();
+        screen.set_base_palette(base.clone());
+        let set = Rgb::new(9, 9, 9);
+
+        // Unset slots with a theme color report the theme.
+        assert_eq!(
+            screen.kitty_effective_color(Key::Foreground, Setting::Default),
+            Some(base.foreground)
+        );
+        assert_eq!(
+            screen.kitty_effective_color(Key::SelectionBackground, Setting::Default),
+            Some(base.selection)
+        );
+        assert_eq!(
+            screen.kitty_effective_color(Key::Palette(200), Setting::Default),
+            Some(Color::Indexed(200).to_rgb(&base))
+        );
+        // Unset slots without a theme color report empty.
+        assert_eq!(
+            screen.kitty_effective_color(Key::CursorText, Setting::Default),
+            None
+        );
+        assert_eq!(
+            screen.kitty_effective_color(Key::TransparentBackground(1), Setting::Default),
+            None
+        );
+        // Explicit colors win; dynamic always reports empty.
+        assert_eq!(
+            screen.kitty_effective_color(Key::Foreground, Setting::Color(set)),
+            Some(set)
+        );
+        assert_eq!(
+            screen.kitty_effective_color(Key::Foreground, Setting::Dynamic),
+            None
+        );
+        assert_eq!(
+            screen.kitty_effective_color(Key::SelectionBackground, Setting::Dynamic),
+            None
+        );
+    }
+
+    #[test]
+    fn kitty_slots_ride_the_shared_color_stack() {
+        use KittyColorKey as Key;
+        use KittyColorSetting as Setting;
+
+        let mut screen = Screen::new(80, 24, ScreenConfig::default());
+        let first = Rgb::new(1, 2, 3);
+        let second = Rgb::new(4, 5, 6);
+
+        screen.set_kitty_setting(Key::CursorText, Setting::Color(first));
+        screen.set_kitty_setting(Key::Foreground, Setting::Color(first));
+        screen.push_color_palette(0);
+        screen.set_kitty_setting(Key::CursorText, Setting::Color(second));
+        screen.set_kitty_setting(Key::CursorText, Setting::Dynamic);
+        screen.set_kitty_setting(Key::Foreground, Setting::Color(second));
+        screen.pop_color_palette(0);
+
+        assert_eq!(screen.kitty_setting(Key::CursorText), Setting::Color(first));
+        assert_eq!(screen.dynamic_color(ColorQuery::Foreground), Some(first));
+
+        // Full resets clear the Kitty slots too.
+        screen.reset();
+        assert_eq!(screen.kitty_setting(Key::CursorText), Setting::Default);
+        assert_eq!(screen.kitty_color_snapshot(), KittyColorSnapshot::default());
+    }
+
+    #[test]
+    fn kitty_snapshot_round_trips_through_restore() {
+        use KittyColorKey as Key;
+        use KittyColorSetting as Setting;
+
+        let mut screen = Screen::new(80, 24, ScreenConfig::default());
+        let color = Rgb::new(7, 8, 9);
+        screen.set_kitty_setting(Key::SelectionBackground, Setting::Dynamic);
+        screen.set_kitty_setting(Key::CursorText, Setting::Color(color));
+        screen.set_kitty_setting(Key::TransparentBackground(2), Setting::Color(color));
+
+        let snapshot = screen.kitty_color_snapshot();
+        let mut restored = Screen::new(80, 24, ScreenConfig::default());
+        restored.restore_kitty_color_snapshot(snapshot);
+        assert_eq!(restored.kitty_color_snapshot(), snapshot);
+        assert_eq!(
+            restored.kitty_setting(Key::SelectionBackground),
+            Setting::Dynamic
+        );
+        // Absent restores stay default.
+        assert_eq!(
+            restored.kitty_setting(Key::SelectionForeground),
+            Setting::Default
         );
     }
 

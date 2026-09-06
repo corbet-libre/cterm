@@ -9,8 +9,8 @@ use crate::kitty_graphics::GraphicsAnimationTick;
 use crate::parser::Parser;
 use crate::pty::{Pty, PtyConfig, PtyError, PtySize};
 use crate::screen::{
-    ClipboardOperation, ColorQuery, DesktopNotificationAction, FrontendState, Screen, ScreenConfig,
-    SearchResult,
+    ClipboardOperation, ColorQuery, DesktopNotificationAction, FrontendState, KittyQueryField,
+    Screen, ScreenConfig, SearchResult,
 };
 use crate::{KeyEventKind, KeyEventMetadata, KeyboardEnhancementFlags};
 use std::time::{Duration, Instant};
@@ -264,6 +264,15 @@ impl Terminal {
             }
         }
 
+        // Kitty OSC 21 queries keep stream order with the legacy OSC 4/10-12
+        // replies: each sequence becomes one `OSC 21` response resolved
+        // against the active frontend palette.
+        if self.screen.has_kitty_queries() {
+            for fields in self.screen.take_kitty_queries() {
+                responses.push(Self::kitty_color_query_response(&self.screen, &fields));
+            }
+        }
+
         // Check for bell
         if self.screen.bell {
             self.screen.bell = false;
@@ -300,6 +309,35 @@ impl Terminal {
             }
             _ => format!("\x1b]{};{}\x1b\\", target.osc_code(), color.to_osc_spec()).into_bytes(),
         }
+    }
+
+    /// Format one Kitty OSC 21 query reply.
+    ///
+    /// Set colors report as `key=rgb:...`; dynamic slots and unset slots
+    /// without a theme color report as a bare `key=`; unknown keys report as
+    /// `unknown=<padding-free base64>`, per the Kitty color-control spec.
+    fn kitty_color_query_response(screen: &Screen, fields: &[KittyQueryField]) -> Vec<u8> {
+        let mut reply = String::from("\x1b]21;");
+        for (index, field) in fields.iter().enumerate() {
+            if index > 0 {
+                reply.push(';');
+            }
+            match field {
+                KittyQueryField::Known { key, setting } => {
+                    reply.push_str(&key.key_name());
+                    reply.push('=');
+                    if let Some(color) = screen.kitty_effective_color(*key, *setting) {
+                        reply.push_str(&color.to_osc_spec());
+                    }
+                }
+                KittyQueryField::Unknown { encoded } => {
+                    reply.push_str("unknown=");
+                    reply.push_str(encoded);
+                }
+            }
+        }
+        reply.push_str("\x1b\\");
+        reply.into_bytes()
     }
 
     /// Set the frontend theme used to answer OSC 10-12 color queries.
@@ -1659,6 +1697,59 @@ mod tests {
         assert!(events
             .iter()
             .all(|event| matches!(event, TerminalEvent::ContentChanged)));
+    }
+
+    #[test]
+    fn daemon_osc21_replies_resolve_against_frontend_theme() {
+        use crate::color::Rgb;
+
+        let mut term = Terminal::new(80, 24, ScreenConfig::default());
+        let base = ColorPalette::default();
+
+        // Unset slots with a theme color report it; slots without one (here
+        // cursor_text) report empty.
+        let (_, responses) = term
+            .process_collecting(b"\x1b]21;foreground=?;selection_background=?;cursor_text=?\x1b\\");
+        assert_eq!(
+            responses,
+            [format!(
+                "\x1b]21;foreground={};selection_background={};cursor_text=\x1b\\",
+                base.foreground.to_osc_spec(),
+                base.selection.to_osc_spec(),
+            )
+            .into_bytes()]
+        );
+
+        // Sets apply immediately, queries in the same sequence see the new
+        // value, unknown keys report base64, and dynamic slots report empty.
+        let (_, responses) = term.process_collecting(
+            b"\x1b]21;cursor_text=#a1b2c3;cursor_text=?;nonsense=?;selection_background=\x1b\\\
+              \x1b]21;cursor_text=?;selection_background=?\x1b\\",
+        );
+        let set = Rgb::new(0xa1, 0xb2, 0xc3).to_osc_spec();
+        assert_eq!(
+            responses,
+            [
+                format!("\x1b]21;cursor_text={set};unknown=bm9uc2Vuc2U\x1b\\").into_bytes(),
+                format!("\x1b]21;cursor_text={set};selection_background=\x1b\\").into_bytes(),
+            ]
+        );
+
+        // Resetting foreground falls back to the theme color, and OSC 21
+        // replies keep stream order with legacy OSC 10 replies.
+        let (_, responses) = term.process_collecting(
+            b"\x1b]21;foreground=#112233\x1b\\\
+              \x1b]21;foreground\x1b\\\
+              \x1b]10;?\x1b\\\x1b]21;foreground=?\x1b\\",
+        );
+        let theme = base.foreground.to_osc_spec();
+        assert_eq!(
+            responses,
+            [
+                format!("\x1b]10;{theme}\x1b\\").into_bytes(),
+                format!("\x1b]21;foreground={theme}\x1b\\").into_bytes(),
+            ]
+        );
     }
 
     #[test]

@@ -751,6 +751,17 @@ message DynamicColors {
   Color background = 2;
   Color cursor = 3;
   repeated DynamicPaletteColor palette = 4;
+  // Dedicated Kitty OSC 21 slots. An absent color means Default or Dynamic;
+  // Dynamic slots are named in kitty_dynamic_keys so the tri-state survives.
+  Color selection_background = 5;
+  Color selection_foreground = 6;
+  Color cursor_text = 7;
+  Color visual_bell = 8;
+  // Kitty OSC 21 transparency colors; index is the 1-based key number.
+  repeated DynamicPaletteColor transparent_background = 9;
+  // Canonical OSC 21 key names (KittyColorKey::key_name) whose setting is
+  // Dynamic rather than Default. Unknown names are ignored on restore.
+  repeated string kitty_dynamic_keys = 10;
 }
 
 message DynamicPaletteColor {
