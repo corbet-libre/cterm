@@ -1,13 +1,55 @@
-# Transfer consent-bypass policy (PROPOSAL — not implemented)
+# Transfer consent-bypass policy (PROPOSAL — policy undecided, mechanism implemented)
 
-Status: **draft for Julian's decision. No bypass exists in the code.**
+Status: **draft for Julian's decision. The consent *mechanism* is implemented
+with defaults unchanged (still always prompts out of the box); no bypass
+*policy* is decided — the 5 open questions below are all still open.**
 `TtyTransferBypassKind` (`crates/cterm-app/src/kitty_file_transfer.rs`) and
-`evaluate_transfer_bypass` resolve every request to `BypassDecision::Prompt`,
-and the regression tests `bypass_evaluation_is_default_deny_for_every_kind`
-and `wire_bypass_credential_never_skips_the_consent_prompt` lock that in. Any
-future bypass must extend that seam deliberately; nothing in the codec, the
-authorization state machine, or the daemon worker may be relaxed to "make a
-bypass work".
+the legacy `evaluate_transfer_bypass` still resolve every request to
+`BypassDecision::Prompt`, and the regression tests
+`bypass_evaluation_is_default_deny_for_every_kind` and
+`wire_bypass_credential_never_skips_the_consent_prompt` still lock that in,
+unmodified. The new `evaluate_transfer_bypass_with_policy` seam extends that
+hook deliberately; nothing in the codec, the authorization state machine, or
+the daemon worker was relaxed to "make a bypass work". A test
+(`policy_defaults_keep_todays_behavior_for_every_kind`) pins out-of-box
+evaluation to `Prompt` for every bypass kind, direction, and wire credential.
+
+## Mechanism status (implemented, defaults unchanged)
+
+- Credential verification (`crates/cterm-app/src/transfer_bypass.rs`),
+  checked against Kitty 0.48.2's `check_bypass`
+  (`kitty/file_transmission.py`): `sha256(request_id + ";" + password)` with
+  constant-time compare, plus the `kitty-1:` AES-256-GCM JSON envelope
+  (`pubkey`/`iv`/`tag`/`encrypted`, plaintext
+  `<timestamp_ns>:<request_id>;<password>`, timestamp within ±5 minutes).
+  Fail-closed deviations from Kitty (all stricter, documented in-module):
+  empty password refuses the `kitty-1` arm too, GCM tags must be 16 bytes,
+  timestamps must be plain ASCII digits, envelopes over 512 bytes refuse, and
+  degenerate peer keys refuse.
+- Config shape (`[transfer]` in `crates/cterm-app/src/config.rs`), stealing
+  Kitty's `clipboard_control` vocabulary: `bypass_password` (unset by
+  default), per-direction `send`/`receive` as `allow`|`ask`|`deny` (unset by
+  default, behaving as `ask`; invalid words parse to `ask`).
+- Evaluation (`evaluate_transfer_bypass_with_policy`): an explicit direction
+  `deny` hard-refuses without prompting for every kind; `allow` additionally
+  requires a configured non-empty password *and* a verifying credential, and
+  only for session-start commands under the `PasswordCredential` kind (kind
+  `None` keeps ignoring wire credentials exactly like today; the proposed
+  same-TTY/loopback kinds still prompt).
+- Audit rows (`TransferConsentAudit`): every evaluation (`allow`/`deny` at
+  info, `prompt` at debug) and every dialog outcome (info) logs one line with
+  request id, transfer id, direction, decision, bypass kind evaluated, and the
+  authorizing token hash — never the token or password.
+- NOT yet wired: the daemon worker (`cterm-headless/src/session/tty_transfer.rs`)
+  does not consult the new seam, holds no `TransferBypassKeypair`, and
+  advertises no `KITTY_PUBLIC_KEY` — live transfers still always prompt
+  through the manager/dialog path regardless of config.
+
+What flipping any default needs (all require Julian): setting
+`bypass_password` and/or per-direction `allow` in config, daemon integration
+(keypair lifetime, consulting the seam in the worker, `KITTY_PUBLIC_KEY`
+advertisement to PTY children for kitten interop), and a decision on each of
+the 5 open policy questions below — this mechanism decides none of them.
 
 ## Threat model
 
@@ -59,9 +101,12 @@ presenting a credential derived from the user-configured
 `pubkey`/`iv`/`tag`/`encrypted` AES-256-GCM fields whose decrypted payload
 must equal `request_id + ";" + password` with a timestamp inside ±5 minutes).
 A password-derived credential adds no security over prompting once any
-PTY-writing process can present it, while removing the human — so cterm
-deliberately has no equivalent yet (the wire field is parsed, bounded, and
-ignored).
+PTY-writing process can present it, while removing the human — so no password
+bypass is active by default. The verification primitive exists as inert
+mechanism only (`transfer_bypass::verify_bypass_credential`, unreachable
+without an explicit opt-in config plus daemon wiring; see "Mechanism status"
+above): with stock config the wire field is still parsed, bounded, and
+ignored.
 
 ## What stays always-prompt
 

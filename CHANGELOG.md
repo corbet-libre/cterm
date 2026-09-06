@@ -184,6 +184,22 @@ is omitted for readability.
   `--quick` smoke mode) plus a bench inventory, threshold scheme, and
   proposed-not-applied CI wiring in `crates/cterm-core/benches/README.md`.
   Plain `cargo bench -p cterm-core` behavior is unchanged.
+- Transfer consent-model mechanism with defaults unchanged (still
+  always-prompt out of the box; no policy decided): Kitty-compatible `pw`
+  bypass verification (`sha256(request_id + ";" + password)` with
+  constant-time compare plus the `kitty-1:` AES-256-GCM JSON envelope with
+  ±5-minute timestamps, checked against Kitty 0.48.2's `check_bypass`), an
+  opt-in `[transfer]` config table (`bypass_password` unset by default;
+  per-direction `send`/`receive` as `allow`|`ask`|`deny` in Kitty
+  `clipboard_control` vocabulary, unset/invalid resolving to `ask`), a
+  policy-gated evaluation seam (`deny` hard-refuses; `allow` additionally
+  needs a configured password plus a verifying credential on session-start
+  commands; everything else prompts, and the legacy always-`Prompt` entry
+  point is untouched), and one audit row per decision (request id, transfer
+  id, direction, decision, bypass kind, authorizing token hash only).
+  The daemon worker does not consult the new seam yet, so live transfers
+  still always prompt; flipping any default needs Julian (see
+  `docs/transfer-bypass-policy.md`, whose 5 open questions stay open).
 
 ### Fixed
 - Streamed OSC 1337 interception now replays incomplete, cancelled, and

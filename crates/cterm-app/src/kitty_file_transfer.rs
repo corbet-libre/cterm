@@ -8,6 +8,9 @@ use std::collections::HashMap;
 
 use cterm_core::{FileTransferAction, FileTransferCommand, MAX_FILE_TRANSFER_PATH_BYTES};
 
+use crate::config::{TransferConfig, TransferConsentMode};
+use crate::transfer_bypass::{hash_bypass_token, verify_bypass_credential};
+
 const MAX_ACTIVE_SESSIONS: usize = 16;
 const MAX_RECEIVE_PATHS: usize = 256;
 
@@ -62,30 +65,46 @@ impl AuthorizedTtyTransferCommand {
 
 /// Requested authorization-bypass condition for one transfer command.
 ///
-/// Design hook only: see `docs/transfer-bypass-policy.md`. No bypass is
-/// implemented — [`evaluate_transfer_bypass`] resolves every kind to
-/// [`BypassDecision::Prompt`] — so the `pw` bypass credential decoded from the
-/// wire today can never authorize a transfer. The variants name the conditions
-/// the policy proposal discusses, so call sites can already express intent
-/// while enforcement stays deny-by-default.
+/// The policy proposal lives in `docs/transfer-bypass-policy.md`. Only the
+/// `PasswordCredential` condition is implemented, and only behind an explicit
+/// operator opt-in (see [`evaluate_transfer_bypass_with_policy`]); every
+/// other combination still prompts. The wire `pw` bypass credential decoded
+/// from untrusted PTY bytes can never authorize a transfer on its own.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum TtyTransferBypassKind {
-    /// No bypass requested: always prompt. This is the default.
+    /// No bypass requested: always prompt, ignoring any wire credential.
+    /// This is the default.
     #[default]
     None,
+    /// Evaluate the wire `pw` credential against the configured password.
+    /// Still prompts unless the direction was explicitly allowed *and* a
+    /// password is configured *and* the credential verifies.
+    PasswordCredential,
     /// Proposed: a session the local user pre-authorized on the same TTY.
+    /// Undecided: always prompts (an explicit direction deny still refuses).
     SameTtyPreauthorized,
     /// Proposed: loopback automation where the peer is the local machine.
+    /// Undecided: always prompts (an explicit direction deny still refuses).
     LoopbackAutomation,
 }
 
-/// Outcome of evaluating a bypass request. The only stable outcome is
-/// `Prompt`; auto-approve arms do not exist until the bypass policy is
-/// approved and implemented.
+/// Outcome of evaluating a bypass request.
+///
+/// `Prompt` stays the default for every input. `Allow` additionally requires
+/// an explicit direction opt-in *and* a verified credential, and `Deny`
+/// requires an explicit direction deny (see
+/// [`evaluate_transfer_bypass_with_policy`]). Nothing is inferred from
+/// defaults: an unset config evaluates exactly like the legacy
+/// [`evaluate_transfer_bypass`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BypassDecision {
     /// Show the native deny-by-default consent dialog.
     Prompt,
+    /// Skip the dialog: the direction was explicitly allowed and the wire
+    /// bypass credential verified against the configured password.
+    Allow,
+    /// Refuse without prompting: the direction was explicitly denied.
+    Deny,
 }
 
 /// Evaluate a bypass request without weakening enforcement.
@@ -101,6 +120,217 @@ pub fn evaluate_transfer_bypass(
 ) -> BypassDecision {
     let _ = (command, kind);
     BypassDecision::Prompt
+}
+
+/// Resolved inputs for one bypass evaluation: operator config plus the
+/// terminal-side secrets needed for verification.
+///
+/// Build one per evaluation from the loaded [`TransferConfig`]; there is no
+/// global policy object, so every evaluation states what it ran under.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TransferBypassPolicy<'a> {
+    /// Operator config (password opt-in plus per-direction modes).
+    pub config: &'a TransferConfig,
+    /// This terminal's X25519 private key for the `kitty-1` envelope arm, if
+    /// the daemon holds one. `None` fails that arm closed while leaving the
+    /// `sha256` arm usable.
+    pub decryption_key: Option<&'a [u8; 32]>,
+    /// Current time in nanoseconds since the Unix epoch, for the envelope
+    /// freshness window (see `transfer_bypass::current_time_ns`).
+    pub now_ns: u64,
+}
+
+/// Consent decisions, shared by the bypass seam and the dialog outcomes so
+/// every transfer logs one audit row in one format (see
+/// [`TransferConsentAudit::line`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TransferConsentDecision {
+    /// Evaluation deferred to the human dialog.
+    Prompt,
+    /// Bypass auto-approved (explicit opt-in plus verified credential).
+    Allow,
+    /// Hard-refused by direction policy, no dialog shown.
+    Deny,
+    /// The user explicitly approved in the dialog.
+    Approved,
+    /// The user explicitly denied (or dismissed) the dialog.
+    Denied,
+    /// The daemon-advertised deadline passed before approval.
+    Expired,
+    /// The terminal session closed while prompting.
+    Cancelled,
+}
+
+impl TransferConsentDecision {
+    /// The stable log vocabulary for this decision.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Prompt => "prompt",
+            Self::Allow => "allow",
+            Self::Deny => "deny",
+            Self::Approved => "approved",
+            Self::Denied => "denied",
+            Self::Expired => "expired",
+            Self::Cancelled => "cancelled",
+        }
+    }
+}
+
+impl From<BypassDecision> for TransferConsentDecision {
+    fn from(decision: BypassDecision) -> Self {
+        match decision {
+            BypassDecision::Prompt => Self::Prompt,
+            BypassDecision::Allow => Self::Allow,
+            BypassDecision::Deny => Self::Deny,
+        }
+    }
+}
+
+/// One audit row for a transfer consent decision.
+///
+/// The authorizing token is recorded only as a hex hash (see
+/// `transfer_bypass::hash_bypass_token`); raw credentials and passwords never
+/// appear in logs. The wire session id is codec-bounded to safe characters,
+/// so it is safe to log.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TransferConsentAudit<'a> {
+    /// Terminal-minted approval token, if one was assigned yet (`None` while
+    /// evaluating, before the session starts).
+    pub request_id: Option<u64>,
+    /// Wire session id, if the session is (still) known.
+    pub transfer_id: Option<&'a str>,
+    /// Transfer direction, if known.
+    pub direction: Option<TtyTransferDirection>,
+    /// The decision this row records.
+    pub decision: TransferConsentDecision,
+    /// The bypass condition that was evaluated (dialog outcomes report the
+    /// kind the request was evaluated under, usually `None`).
+    pub bypass_kind: TtyTransferBypassKind,
+    /// Hex hash of the wire credential that authorized this decision, if any.
+    /// `None` whenever no credential authorized anything — including failed
+    /// verification attempts.
+    pub token_hash: Option<&'a str>,
+}
+
+impl TransferConsentAudit<'_> {
+    /// Render the row as a single greppable log line.
+    pub fn line(&self) -> String {
+        format!(
+            "OSC 5113 transfer decision={} request_id={} transfer_id={} direction={} bypass={:?} token_hash={}",
+            self.decision.as_str(),
+            self.request_id
+                .map_or_else(|| "-".to_string(), |id| id.to_string()),
+            self.transfer_id.unwrap_or("-"),
+            self.direction.map_or("-", |direction| match direction {
+                TtyTransferDirection::Send => "send",
+                TtyTransferDirection::Receive => "receive",
+            }),
+            self.bypass_kind,
+            self.token_hash.unwrap_or("-"),
+        )
+    }
+}
+
+/// Evaluate a bypass request against an explicit operator policy.
+///
+/// This is the only seam where verification can authorize anything, and it
+/// stays deny-by-default:
+///
+/// - An explicit direction deny hard-refuses (`Deny`) without prompting, for
+///   every bypass kind including the proposed (undecided) ones.
+/// - `SameTtyPreauthorized` and `LoopbackAutomation` always prompt: those
+///   policy conditions are undecided (see `docs/transfer-bypass-policy.md`).
+/// - `None` always prompts and ignores any wire credential, exactly like the
+///   legacy [`evaluate_transfer_bypass`].
+/// - `PasswordCredential` prompts unless the direction was *explicitly* set
+///   to `allow` in the config **and** a non-empty `bypass_password` is
+///   configured **and** the wire credential verifies against it (bound to the
+///   session id via `transfer_bypass::verify_bypass_credential`).
+/// - Bypass is only evaluated for session-start (`send`/`receive`) commands;
+///   anything else prompts (the state machine rejects pre-approval commands
+///   regardless).
+///
+/// Every `Allow`/`Deny` decision is audit-logged with the authorizing token
+/// hash; `Prompt` evaluations log at debug level so the later dialog outcome
+/// stays the single info-level row for that transfer.
+pub fn evaluate_transfer_bypass_with_policy(
+    command: &FileTransferCommand,
+    kind: TtyTransferBypassKind,
+    policy: &TransferBypassPolicy<'_>,
+) -> BypassDecision {
+    let direction = match command.action {
+        FileTransferAction::Send => TtyTransferDirection::Send,
+        FileTransferAction::Receive => TtyTransferDirection::Receive,
+        _ => return BypassDecision::Prompt,
+    };
+    let audit = |decision: TransferConsentDecision, token_hash: Option<&str>| {
+        TransferConsentAudit {
+            request_id: None,
+            transfer_id: Some(command.id.as_str()),
+            direction: Some(direction),
+            decision,
+            bypass_kind: kind,
+            token_hash,
+        }
+        .line()
+    };
+    if policy.config.resolve(direction) == TransferConsentMode::Deny {
+        log::info!("{}", audit(TransferConsentDecision::Deny, None));
+        return BypassDecision::Deny;
+    }
+    match kind {
+        TtyTransferBypassKind::SameTtyPreauthorized | TtyTransferBypassKind::LoopbackAutomation => {
+            log::debug!("{}", audit(TransferConsentDecision::Prompt, None));
+            BypassDecision::Prompt
+        }
+        TtyTransferBypassKind::None => {
+            // No bypass requested: any wire credential stays ignored, exactly
+            // like the legacy seam.
+            log::debug!("{}", audit(TransferConsentDecision::Prompt, None));
+            BypassDecision::Prompt
+        }
+        TtyTransferBypassKind::PasswordCredential => {
+            let password = policy.config.effective_password();
+            let credential = command.bypass.as_deref();
+            match (
+                policy.config.is_explicit_allow(direction),
+                password,
+                credential,
+            ) {
+                (true, Some(password), Some(credential))
+                    if verify_bypass_credential(
+                        &command.id,
+                        credential,
+                        password,
+                        policy.decryption_key,
+                        policy.now_ns,
+                    ) =>
+                {
+                    let token_hash = hash_bypass_token(credential);
+                    log::info!(
+                        "{}",
+                        audit(TransferConsentDecision::Allow, Some(&token_hash))
+                    );
+                    BypassDecision::Allow
+                }
+                (true, Some(_), Some(_)) => {
+                    // Explicitly opted in, but the credential is wrong: a
+                    // tamper/replay signal worth a warning. The session id is
+                    // codec-bounded to safe characters, so it is safe to log.
+                    log::warn!(
+                        "OSC 5113 bypass credential for transfer '{}' failed verification; keeping the consent prompt",
+                        command.id
+                    );
+                    log::debug!("{}", audit(TransferConsentDecision::Prompt, None));
+                    BypassDecision::Prompt
+                }
+                _ => {
+                    log::debug!("{}", audit(TransferConsentDecision::Prompt, None));
+                    BypassDecision::Prompt
+                }
+            }
+        }
+    }
 }
 
 /// Work emitted by the UI-neutral authorization state machine.
@@ -275,6 +505,18 @@ impl TtyTransferManager {
     /// otherwise rejected commands cannot accidentally dismiss a live prompt.
     pub fn is_approval_pending(&self, request_id: u64) -> bool {
         self.session_id_for_request(request_id).is_some()
+    }
+
+    /// Session context for a still-pending approval token, for audit logging.
+    ///
+    /// Returns the wire session id and direction without touching
+    /// authorization state. `None` once the token lapsed (approved, denied,
+    /// expired, cancelled, or never issued).
+    pub fn pending_request_info(&self, request_id: u64) -> Option<(String, TtyTransferDirection)> {
+        self.sessions.iter().find_map(|(session_id, session)| {
+            (session.request_id == request_id && session.phase == SessionPhase::AwaitApproval)
+                .then(|| (session_id.clone(), session.direction))
+        })
     }
 
     fn start(
@@ -881,5 +1123,380 @@ mod tests {
             manager.approve(request_id).as_slice(),
             [TtyTransferAction::Write(_)]
         ));
+    }
+
+    // --- Consent-model mechanism tests (defaults unchanged) ---
+
+    use crate::config::{TransferConfig, TransferConsentMode};
+    use crate::transfer_bypass::{
+        encode_bypass_credential, encrypt_bypass_credential, hash_bypass_token,
+        TransferBypassKeypair,
+    };
+
+    const POLICY_PASSWORD: &str = "s3cret";
+    const POLICY_NOW_NS: u64 = 1_750_000_000_000_000_000;
+
+    fn policy<'a>(
+        config: &'a TransferConfig,
+        key: Option<&'a [u8; 32]>,
+    ) -> TransferBypassPolicy<'a> {
+        TransferBypassPolicy {
+            config,
+            decryption_key: key,
+            now_ns: POLICY_NOW_NS,
+        }
+    }
+
+    fn start_command(action: FileTransferAction, id: &str) -> FileTransferCommand {
+        command(action, id)
+    }
+
+    fn credentialed(action: FileTransferAction, id: &str, bypass: &str) -> FileTransferCommand {
+        let mut credentialed = command(action, id);
+        credentialed.bypass = Some(bypass.into());
+        credentialed
+    }
+
+    /// Out-of-box evaluation is `Prompt` for every kind, direction, and wire
+    /// credential: the mechanism changes nothing unless explicitly opted in.
+    /// This also pins the legacy seam to the new policy seam under defaults.
+    #[test]
+    fn policy_defaults_keep_todays_behavior_for_every_kind() {
+        let config = TransferConfig::default();
+        let policy = policy(&config, None);
+        let attacker_credential = encode_bypass_credential("any-session", "attacker-guess");
+        for kind in [
+            TtyTransferBypassKind::None,
+            TtyTransferBypassKind::PasswordCredential,
+            TtyTransferBypassKind::SameTtyPreauthorized,
+            TtyTransferBypassKind::LoopbackAutomation,
+        ] {
+            for action in [FileTransferAction::Send, FileTransferAction::Receive] {
+                for command in [
+                    start_command(action, "plain"),
+                    credentialed(action, "any-session", &attacker_credential),
+                ] {
+                    assert_eq!(
+                        evaluate_transfer_bypass_with_policy(&command, kind, &policy),
+                        BypassDecision::Prompt,
+                        "default policy must prompt for {kind:?} {action:?}"
+                    );
+                }
+            }
+        }
+        // The legacy seam agrees with the default policy on its kinds.
+        for kind in [
+            TtyTransferBypassKind::None,
+            TtyTransferBypassKind::SameTtyPreauthorized,
+            TtyTransferBypassKind::LoopbackAutomation,
+        ] {
+            assert_eq!(
+                evaluate_transfer_bypass(&command(FileTransferAction::Send, "x"), kind),
+                BypassDecision::Prompt
+            );
+        }
+    }
+
+    #[test]
+    fn direction_deny_hard_refuses_without_prompting() {
+        let config = TransferConfig {
+            bypass_password: Some(POLICY_PASSWORD.into()),
+            send: Some(TransferConsentMode::Deny),
+            receive: None,
+        };
+        let policy = policy(&config, None);
+        // Even a *valid* credential cannot escape an explicit deny.
+        let valid = encode_bypass_credential("denied-send", POLICY_PASSWORD);
+        for kind in [
+            TtyTransferBypassKind::None,
+            TtyTransferBypassKind::PasswordCredential,
+            TtyTransferBypassKind::SameTtyPreauthorized,
+            TtyTransferBypassKind::LoopbackAutomation,
+        ] {
+            assert_eq!(
+                evaluate_transfer_bypass_with_policy(
+                    &credentialed(FileTransferAction::Send, "denied-send", &valid),
+                    kind,
+                    &policy
+                ),
+                BypassDecision::Deny,
+                "deny must win for {kind:?}"
+            );
+            assert_eq!(
+                evaluate_transfer_bypass_with_policy(
+                    &start_command(FileTransferAction::Send, "denied-send"),
+                    kind,
+                    &policy
+                ),
+                BypassDecision::Deny,
+                "deny needs no credential for {kind:?}"
+            );
+        }
+        // The unset direction still prompts.
+        assert_eq!(
+            evaluate_transfer_bypass_with_policy(
+                &credentialed(FileTransferAction::Receive, "r", &valid),
+                TtyTransferBypassKind::PasswordCredential,
+                &policy
+            ),
+            BypassDecision::Prompt
+        );
+    }
+
+    #[test]
+    fn explicit_allow_with_verified_credential_auto_approves() {
+        let terminal = TransferBypassKeypair::from_private_bytes([7u8; 32]);
+        let config = TransferConfig {
+            bypass_password: Some(POLICY_PASSWORD.into()),
+            send: Some(TransferConsentMode::Allow),
+            receive: None,
+        };
+        let policy = policy(&config, Some(terminal.private_bytes()));
+        // sha256 arm.
+        let sha_credential = encode_bypass_credential("allow-sha", POLICY_PASSWORD);
+        assert_eq!(
+            evaluate_transfer_bypass_with_policy(
+                &credentialed(FileTransferAction::Send, "allow-sha", &sha_credential),
+                TtyTransferBypassKind::PasswordCredential,
+                &policy
+            ),
+            BypassDecision::Allow
+        );
+        // kitty-1 arm.
+        let public = terminal.public_bytes();
+        let envelope =
+            encrypt_bypass_credential("allow-1", POLICY_PASSWORD, &public, POLICY_NOW_NS).unwrap();
+        assert_eq!(
+            evaluate_transfer_bypass_with_policy(
+                &credentialed(FileTransferAction::Send, "allow-1", &envelope),
+                TtyTransferBypassKind::PasswordCredential,
+                &policy
+            ),
+            BypassDecision::Allow
+        );
+        // Same credential under kind None stays ignored (today's behavior).
+        assert_eq!(
+            evaluate_transfer_bypass_with_policy(
+                &credentialed(FileTransferAction::Send, "allow-sha", &sha_credential),
+                TtyTransferBypassKind::None,
+                &policy
+            ),
+            BypassDecision::Prompt
+        );
+        // The allow does not leak across directions.
+        assert_eq!(
+            evaluate_transfer_bypass_with_policy(
+                &credentialed(FileTransferAction::Receive, "allow-sha", &sha_credential),
+                TtyTransferBypassKind::PasswordCredential,
+                &policy
+            ),
+            BypassDecision::Prompt
+        );
+    }
+
+    #[test]
+    fn allow_requires_every_opt_in_element() {
+        let terminal = TransferBypassKeypair::from_private_bytes([7u8; 32]);
+        let public = terminal.public_bytes();
+        let valid = encode_bypass_credential("allow-x", POLICY_PASSWORD);
+        let envelope =
+            encrypt_bypass_credential("allow-x", POLICY_PASSWORD, &public, POLICY_NOW_NS).unwrap();
+        let allow_no_password = TransferConfig {
+            bypass_password: None,
+            send: Some(TransferConsentMode::Allow),
+            receive: None,
+        };
+        let allow_empty_password = TransferConfig {
+            bypass_password: Some(String::new()),
+            send: Some(TransferConsentMode::Allow),
+            receive: None,
+        };
+        let allow_with_password = TransferConfig {
+            bypass_password: Some(POLICY_PASSWORD.into()),
+            send: Some(TransferConsentMode::Allow),
+            receive: None,
+        };
+        let unset_with_password = TransferConfig {
+            bypass_password: Some(POLICY_PASSWORD.into()),
+            send: None,
+            receive: None,
+        };
+        let ask_with_password = TransferConfig {
+            bypass_password: Some(POLICY_PASSWORD.into()),
+            send: Some(TransferConsentMode::Ask),
+            receive: None,
+        };
+        // (config, key, credential): every row must prompt.
+        type OptInRow<'a> = (TransferConfig, Option<&'a [u8; 32]>, Option<String>);
+        let rows: Vec<OptInRow<'_>> = vec![
+            (allow_no_password.clone(), None, Some(valid.clone())),
+            (allow_empty_password.clone(), None, Some(valid.clone())),
+            // No key fails the kitty-1 arm closed (the sha256 arm needs no
+            // key, so this row uses the envelope).
+            (allow_with_password.clone(), None, Some(envelope.clone())),
+            (
+                allow_with_password.clone(),
+                Some(terminal.private_bytes()),
+                None,
+            ),
+            (
+                allow_with_password.clone(),
+                Some(terminal.private_bytes()),
+                Some(encode_bypass_credential("allow-x", "wrong")),
+            ),
+            (unset_with_password.clone(), None, Some(valid.clone())),
+            (ask_with_password.clone(), None, Some(valid.clone())),
+        ];
+        for (config, key, credential) in &rows {
+            let mut candidate = start_command(FileTransferAction::Send, "allow-x");
+            candidate.bypass = credential.clone();
+            assert_eq!(
+                evaluate_transfer_bypass_with_policy(
+                    &candidate,
+                    TtyTransferBypassKind::PasswordCredential,
+                    &policy(config, *key)
+                ),
+                BypassDecision::Prompt,
+                "must prompt for config {config:?}"
+            );
+        }
+        // The kitty-1 envelope without its decryption key prompts too.
+        assert_eq!(
+            evaluate_transfer_bypass_with_policy(
+                &credentialed(FileTransferAction::Send, "allow-x", &envelope),
+                TtyTransferBypassKind::PasswordCredential,
+                &policy(&allow_with_password, None)
+            ),
+            BypassDecision::Prompt
+        );
+    }
+
+    #[test]
+    fn non_start_commands_never_bypass() {
+        let terminal = TransferBypassKeypair::from_private_bytes([7u8; 32]);
+        let config = TransferConfig {
+            bypass_password: Some(POLICY_PASSWORD.into()),
+            send: Some(TransferConsentMode::Allow),
+            receive: Some(TransferConsentMode::Allow),
+        };
+        let policy = policy(&config, Some(terminal.private_bytes()));
+        for action in [
+            FileTransferAction::File,
+            FileTransferAction::Data,
+            FileTransferAction::EndData,
+            FileTransferAction::Finish,
+            FileTransferAction::Finished,
+            FileTransferAction::Cancel,
+            FileTransferAction::Status,
+        ] {
+            let mut candidate = command(action, "allow-x");
+            candidate.bypass = Some(encode_bypass_credential("allow-x", POLICY_PASSWORD));
+            // Direction allow plus a valid credential still prompts: bypass is
+            // only evaluated for session starts.
+            assert_eq!(
+                evaluate_transfer_bypass_with_policy(
+                    &candidate,
+                    TtyTransferBypassKind::PasswordCredential,
+                    &policy
+                ),
+                BypassDecision::Prompt,
+                "must prompt for {action:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn stale_kitty1_envelope_prompts() {
+        let terminal = TransferBypassKeypair::from_private_bytes([7u8; 32]);
+        let public = terminal.public_bytes();
+        let config = TransferConfig {
+            bypass_password: Some(POLICY_PASSWORD.into()),
+            send: Some(TransferConsentMode::Allow),
+            receive: None,
+        };
+        let stale = encrypt_bypass_credential("allow-x", POLICY_PASSWORD, &public, 0).unwrap();
+        assert_eq!(
+            evaluate_transfer_bypass_with_policy(
+                &credentialed(FileTransferAction::Send, "allow-x", &stale),
+                TtyTransferBypassKind::PasswordCredential,
+                &policy(&config, Some(terminal.private_bytes()))
+            ),
+            BypassDecision::Prompt
+        );
+    }
+
+    #[test]
+    fn transfer_consent_audit_line_carries_every_field_and_no_secrets() {
+        let token_hash = hash_bypass_token("kitty-1:sensitive-envelope");
+        let row = TransferConsentAudit {
+            request_id: Some(41),
+            transfer_id: Some("allow-1"),
+            direction: Some(TtyTransferDirection::Send),
+            decision: TransferConsentDecision::Allow,
+            bypass_kind: TtyTransferBypassKind::PasswordCredential,
+            token_hash: Some(&token_hash),
+        }
+        .line();
+        for expected in [
+            "decision=allow",
+            "request_id=41",
+            "transfer_id=allow-1",
+            "direction=send",
+            "bypass=PasswordCredential",
+            &format!("token_hash={token_hash}"),
+        ] {
+            assert!(
+                row.contains(expected),
+                "audit row {row:?} misses {expected}"
+            );
+        }
+        assert!(
+            !row.contains("sensitive-envelope"),
+            "audit row leaks the token: {row:?}"
+        );
+        assert!(
+            !row.contains(POLICY_PASSWORD),
+            "audit row leaks the password: {row:?}"
+        );
+        // Dialog-style rows format with the human outcome and no token hash.
+        let dialog = TransferConsentAudit {
+            request_id: Some(7),
+            transfer_id: Some("plain"),
+            direction: Some(TtyTransferDirection::Receive),
+            decision: TransferConsentDecision::Approved,
+            bypass_kind: TtyTransferBypassKind::None,
+            token_hash: None,
+        }
+        .line();
+        assert!(dialog.contains("decision=approved"), "{dialog:?}");
+        assert!(dialog.contains("direction=receive"), "{dialog:?}");
+        assert!(dialog.contains("token_hash=-"), "{dialog:?}");
+        // Unknown sessions degrade to dashes instead of panicking.
+        let unknown = TransferConsentAudit {
+            request_id: Some(9),
+            transfer_id: None,
+            direction: None,
+            decision: TransferConsentDecision::Expired,
+            bypass_kind: TtyTransferBypassKind::None,
+            token_hash: None,
+        }
+        .line();
+        assert!(unknown.contains("transfer_id=-"), "{unknown:?}");
+        assert!(unknown.contains("direction=-"), "{unknown:?}");
+    }
+
+    #[test]
+    fn pending_request_info_supports_audit_without_touching_auth() {
+        let mut manager = TtyTransferManager::new();
+        let request_id =
+            approval(&manager.handle(command(FileTransferAction::Send, "audit"))).request_id;
+        assert_eq!(
+            manager.pending_request_info(request_id),
+            Some(("audit".to_string(), TtyTransferDirection::Send))
+        );
+        assert_eq!(manager.pending_request_info(0xDEAD), None);
+        // Resolving the request spends the token for audit too.
+        manager.deny(request_id);
+        assert_eq!(manager.pending_request_info(request_id), None);
     }
 }

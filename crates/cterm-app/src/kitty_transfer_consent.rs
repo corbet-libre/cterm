@@ -23,7 +23,10 @@
 //! `test_tty_file_transfer_consent_replay_and_relaunch_refusal` in
 //! `crates/cterm-headless/tests/grpc_integration.rs`.
 
-use crate::kitty_file_transfer::{TtyTransferAction, TtyTransferManager};
+use crate::kitty_file_transfer::{
+    TransferConsentAudit, TransferConsentDecision, TtyTransferAction, TtyTransferBypassKind,
+    TtyTransferManager,
+};
 
 /// Status reported when the daemon-side expiry fires before a dialog resolves.
 /// Matches the worker literal in `cterm-headless/src/session/tty_transfer.rs`.
@@ -78,11 +81,35 @@ impl DialogOutcome {
 /// already-consumed tokens resolve to no actions: the manager only honors the
 /// exact still-pending `request_id`, so a late click after expiry, cancel, a
 /// peer `cancel` command, or session-id reuse can never authorize a transfer.
+///
+/// Every resolved outcome logs one [`TransferConsentAudit`] row carrying the
+/// request id, transfer id, direction, decision, and evaluated bypass kind.
+/// Dialog outcomes never carry an authorizing token hash: no credential
+/// authorized anything on this path (bypass approvals log their hash where
+/// they are granted, in the bypass evaluation seam).
 pub fn apply_dialog_outcome(
     manager: &mut TtyTransferManager,
     request_id: u64,
     outcome: DialogOutcome,
 ) -> Vec<TtyTransferAction> {
+    // Capture session context before acting: denial removes the session, so a
+    // post-hoc lookup would lose the transfer id and direction for the audit
+    // row. The lookup is read-only and cannot affect authorization.
+    let (transfer_id, direction) = manager
+        .pending_request_info(request_id)
+        .map(|(session_id, direction)| (Some(session_id), Some(direction)))
+        .unwrap_or((None, None));
+    let audit = |decision: TransferConsentDecision| {
+        TransferConsentAudit {
+            request_id: Some(request_id),
+            transfer_id: transfer_id.as_deref(),
+            direction,
+            decision,
+            bypass_kind: TtyTransferBypassKind::None,
+            token_hash: None,
+        }
+        .line()
+    };
     match outcome {
         DialogOutcome::Approved => {
             let actions = manager.approve(request_id);
@@ -91,7 +118,7 @@ pub fn apply_dialog_outcome(
                     "OSC 5113 approval for request {request_id} arrived after its token lapsed; staying denied"
                 );
             } else {
-                log::info!("OSC 5113 transfer request {request_id} approved by user consent");
+                log::info!("{}", audit(TransferConsentDecision::Approved));
             }
             actions
         }
@@ -102,20 +129,18 @@ pub fn apply_dialog_outcome(
                     "OSC 5113 denial for request {request_id} arrived after its token lapsed"
                 );
             } else {
-                log::info!("OSC 5113 transfer request {request_id} denied by user consent");
+                log::info!("{}", audit(TransferConsentDecision::Denied));
             }
             actions
         }
         DialogOutcome::Expired => {
             let actions = manager.reject(request_id, CONSENT_EXPIRED_STATUS);
-            log::info!("OSC 5113 transfer request {request_id} expired before consent");
+            log::info!("{}", audit(TransferConsentDecision::Expired));
             actions
         }
         DialogOutcome::Cancelled => {
             let actions = manager.reject(request_id, CONSENT_CANCELLED_STATUS);
-            log::info!(
-                "OSC 5113 transfer request {request_id} cancelled with its terminal session"
-            );
+            log::info!("{}", audit(TransferConsentDecision::Cancelled));
             actions
         }
     }

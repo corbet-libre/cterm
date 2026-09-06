@@ -39,6 +39,8 @@ pub struct Config {
     pub appearance: AppearanceConfig,
     /// Tab settings
     pub tabs: TabsConfig,
+    /// Kitty OSC 5113 transfer consent overrides (all default to prompting).
+    pub transfer: TransferConfig,
     /// Shortcut bindings
     pub shortcuts: ShortcutsConfig,
     /// Named remote hosts (for daemon-backed remote sessions)
@@ -46,6 +48,127 @@ pub struct Config {
     pub remotes: Vec<RemoteConfig>,
     /// Sticky tabs configuration
     pub sticky_tabs: Vec<StickyTabConfig>,
+}
+
+/// Per-direction transfer consent mode, stealing Kitty's
+/// `clipboard_control` vocabulary shape (`allow`|`ask`|`deny` as bare words).
+///
+/// `Ask` is the default and the fail-closed value: unknown strings parse to
+/// `Ask`, and an unset direction behaves as `Ask`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TransferConsentMode {
+    /// Show the native consent dialog (today's behavior).
+    #[default]
+    Ask,
+    /// Skip the dialog when the transfer presents a verified bypass
+    /// credential (requires an explicitly set `allow` *and* a configured
+    /// `bypass_password`; see the bypass evaluation seam).
+    Allow,
+    /// Hard-refuse the transfer without prompting.
+    Deny,
+}
+
+impl<'de> Deserialize<'de> for TransferConsentMode {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let raw = String::deserialize(deserializer)?;
+        Ok(Self::parse(&raw))
+    }
+}
+
+impl TransferConsentMode {
+    /// Parse one mode word case-insensitively. Anything but `allow`/`deny`
+    /// — including `ask`, empty, and invalid values — resolves to `Ask` so a
+    /// typo can never silently permit or refuse transfers.
+    pub fn parse(raw: &str) -> Self {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "allow" => Self::Allow,
+            "deny" => Self::Deny,
+            _ => Self::Ask,
+        }
+    }
+
+    /// The canonical config-file spelling.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Ask => "ask",
+            Self::Allow => "allow",
+            Self::Deny => "deny",
+        }
+    }
+}
+
+/// Opt-in Kitty OSC 5113 transfer consent overrides.
+///
+/// Every field defaults to today's always-prompt behavior: no password is
+/// configured and no direction is set, so the bypass evaluation seam keeps
+/// resolving to `Prompt`. See `docs/transfer-bypass-policy.md`; flipping any
+/// default is a policy decision for Julian, not a config tweak.
+///
+/// ```toml
+/// [transfer]
+/// # bypass_password = "s3cret"  # unset by default: password bypass disabled
+/// # send = "ask"                # ask (default) | allow | deny
+/// # receive = "ask"             # ask (default) | allow | deny
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct TransferConfig {
+    /// Shared secret for the Kitty `pw` bypass credential. Unset (or empty)
+    /// disables password bypass entirely — the default. Stored in the same
+    /// file as the rest of the config; restrict the config directory to the
+    /// owner if a password is set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bypass_password: Option<String>,
+    /// Consent mode for send sessions (the peer writes files here).
+    /// `None` (unset) behaves as `ask`; only an explicit `allow` can ever
+    /// yield `Allow`, never a defaulted value.
+    #[serde(default)]
+    pub send: Option<TransferConsentMode>,
+    /// Consent mode for receive sessions (the peer reads files from here).
+    #[serde(default)]
+    pub receive: Option<TransferConsentMode>,
+}
+
+impl TransferConfig {
+    /// Resolve one direction to its consent mode. Unset means `Ask`.
+    pub fn resolve(
+        &self,
+        direction: crate::kitty_file_transfer::TtyTransferDirection,
+    ) -> TransferConsentMode {
+        match direction {
+            crate::kitty_file_transfer::TtyTransferDirection::Send => self.send,
+            crate::kitty_file_transfer::TtyTransferDirection::Receive => self.receive,
+        }
+        .unwrap_or_default()
+    }
+
+    /// Whether this direction was explicitly set to `allow` in the config.
+    /// `Allow` is never inferred from defaults: only `Some(Allow)` counts.
+    pub fn is_explicit_allow(
+        &self,
+        direction: crate::kitty_file_transfer::TtyTransferDirection,
+    ) -> bool {
+        matches!(
+            match direction {
+                crate::kitty_file_transfer::TtyTransferDirection::Send => self.send,
+                crate::kitty_file_transfer::TtyTransferDirection::Receive => self.receive,
+            },
+            Some(TransferConsentMode::Allow)
+        )
+    }
+
+    /// The configured bypass password, if one is actually set. An explicitly
+    /// empty string counts as unset: like Kitty (`if password else False`),
+    /// an empty secret never verifies.
+    pub fn effective_password(&self) -> Option<&str> {
+        self.bypass_password
+            .as_deref()
+            .filter(|secret| !secret.is_empty())
+    }
 }
 
 /// A named remote host for daemon-backed sessions.
@@ -1554,5 +1677,122 @@ mod tests {
         assert_eq!(entry.name, "Test");
         assert_eq!(entry.command, "ls");
         assert!(entry.args.is_empty());
+    }
+
+    #[test]
+    fn test_transfer_config_defaults_to_todays_behavior() {
+        let config = TransferConfig::default();
+        assert_eq!(config.bypass_password, None);
+        assert_eq!(config.effective_password(), None);
+        assert_eq!(config.send, None);
+        assert_eq!(config.receive, None);
+        let direction = crate::kitty_file_transfer::TtyTransferDirection::Send;
+        assert_eq!(config.resolve(direction), TransferConsentMode::Ask);
+        assert!(!config.is_explicit_allow(direction));
+        let direction = crate::kitty_file_transfer::TtyTransferDirection::Receive;
+        assert_eq!(config.resolve(direction), TransferConsentMode::Ask);
+        assert!(!config.is_explicit_allow(direction));
+        // A fresh top-level config carries the same defaults.
+        let top = Config::default();
+        assert_eq!(top.transfer.effective_password(), None);
+        assert_eq!(
+            top.transfer
+                .resolve(crate::kitty_file_transfer::TtyTransferDirection::Send),
+            TransferConsentMode::Ask
+        );
+    }
+
+    #[test]
+    fn test_transfer_config_parses_explicit_values() {
+        let toml_str = r#"
+            [transfer]
+            bypass_password = "s3cret"
+            send = "allow"
+            receive = "deny"
+        "#;
+        let config: Config = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.transfer.effective_password(), Some("s3cret"));
+        assert!(config
+            .transfer
+            .is_explicit_allow(crate::kitty_file_transfer::TtyTransferDirection::Send));
+        assert_eq!(
+            config
+                .transfer
+                .resolve(crate::kitty_file_transfer::TtyTransferDirection::Receive),
+            TransferConsentMode::Deny
+        );
+    }
+
+    #[test]
+    fn test_transfer_config_invalid_values_fail_closed_to_ask() {
+        for invalid in [
+            "",
+            "Ask ",
+            "ALLOW",
+            "Allow",
+            "DENY",
+            "sometimes",
+            "yes",
+            "123",
+        ] {
+            let parsed = TransferConsentMode::parse(invalid);
+            let expected = match invalid.trim().to_ascii_lowercase().as_str() {
+                "allow" => TransferConsentMode::Allow,
+                "deny" => TransferConsentMode::Deny,
+                _ => TransferConsentMode::Ask,
+            };
+            assert_eq!(parsed, expected, "input {invalid:?}");
+        }
+        // Invalid words in a real file resolve to ask instead of erroring.
+        let toml_str = r#"
+            [transfer]
+            send = "sometimes"
+            receive = "yes please"
+        "#;
+        let config: Config = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.transfer.send, Some(TransferConsentMode::Ask));
+        assert_eq!(config.transfer.receive, Some(TransferConsentMode::Ask));
+        assert!(!config
+            .transfer
+            .is_explicit_allow(crate::kitty_file_transfer::TtyTransferDirection::Send));
+        // A file without a [transfer] table behaves like the default.
+        let config: Config = toml::from_str("[general]\n").unwrap();
+        assert_eq!(config.transfer.effective_password(), None);
+        assert_eq!(config.transfer.send, None);
+    }
+
+    #[test]
+    fn test_transfer_config_empty_password_counts_as_unset() {
+        let toml_str = r#"
+            [transfer]
+            bypass_password = ""
+            send = "allow"
+        "#;
+        let config: Config = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.transfer.effective_password(), None);
+        // Explicit allow is still recorded (the evaluation seam additionally
+        // requires a password before it can auto-approve).
+        assert!(config
+            .transfer
+            .is_explicit_allow(crate::kitty_file_transfer::TtyTransferDirection::Send));
+    }
+
+    #[test]
+    fn test_transfer_config_round_trip_preserves_modes() {
+        let config = TransferConfig {
+            bypass_password: Some("s3cret".into()),
+            send: Some(TransferConsentMode::Allow),
+            receive: Some(TransferConsentMode::Deny),
+        };
+        let serialized = toml::to_string_pretty(&config).unwrap();
+        assert!(serialized.contains("send = \"allow\""));
+        assert!(serialized.contains("receive = \"deny\""));
+        let parsed: TransferConfig = toml::from_str(&serialized).unwrap();
+        assert_eq!(parsed.send, Some(TransferConsentMode::Allow));
+        assert_eq!(parsed.receive, Some(TransferConsentMode::Deny));
+        assert_eq!(parsed.effective_password(), Some("s3cret"));
+        // No password serializes without a password key.
+        let serialized = toml::to_string_pretty(&TransferConfig::default()).unwrap();
+        assert!(!serialized.contains("bypass_password"));
     }
 }
