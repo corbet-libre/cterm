@@ -22,6 +22,20 @@ is omitted for readability.
   (targeted actions, icons, expiry, reports via the mirror PTY path);
   Cocoa/Win32 reuse the same core seams (not compiled on Linux — see
   `docs/notifications.md` for the per-platform matrix and open questions).
+- Foot differential corpus expansion (tests and fixtures only): a 27-vector
+  host-side parser/screen corpus (`tests/foot_corpus.rs`) across editing,
+  DECSET/DECRST incl. Kitty 5522/2026/2031/2033/1070/8452 plus keyboard and
+  safe save/restore, DA/DSR/DECRQM/DECRQSS/XTGETTCAP plus OSC 21/22/5522,
+  grapheme-safe/wide/multicell resize/reflow, combining/ZWJ/flags/variation
+  selectors, and truncated/hostile/mixed malformed input; a bounded
+  5000-iteration parser fuzzer (`tests/parser_fuzz.rs`, fixed seed, response
+  and scrollback bounds, 30 s hang guard); a 31-case foot probe
+  (`examples/foot_compat_probe.rs`, same CI script/harness) adding
+  editing-via-DSR, standard/sync/sixel modes, keyboard query, boolean
+  XTGETTCAP, char-cell window ops, Sixel colors, and malformed recovery;
+  vim and less real-session TUI fixtures (`tests/tui_e2e.rs --ignored`).
+  Version/pixel-dependent replies (DA2/XTVERSION, pixel geometry) stay
+  host-side only; screen/emacs/htop remain documented skips.
 - Kitty screen unscrolling (`CSI Ps + T`): scroll down within the scroll
   region, refilling the new top lines from scrollback instead of blanking
   them. Falls back to blank lines on the alternate screen or with empty

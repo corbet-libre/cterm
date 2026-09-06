@@ -1,4 +1,14 @@
 #![cfg(unix)]
+//! Real-program TUI fixtures through the cterm PTY layer.
+//!
+//! Host availability (checked 2026-09-06, also gated per-test at runtime):
+//! - nvim, vim, tmux, less, man, fzf, lazygit: present (vim/less added here;
+//!   man exercises less as its pager; fzf/lazygit are present but too
+//!   interactive/flaky for deterministic fixtures, so they stay documented
+//!   rather than asserted).
+//! - screen, emacs-nox, htop: absent here — skipped by design. CI installs
+//!   only foot/neovim/tmux for the hard gate, so vim/less run wherever the
+//!   binaries exist and skip otherwise via `require_program`.
 
 use cterm_core::screen::ScreenConfig;
 use cterm_core::{PtyConfig, Terminal};
@@ -159,6 +169,62 @@ fn neovim_edits_and_saves_through_cterm_pty() {
 
     let saved = fs::read_to_string(file).expect("read edited fixture");
     assert_eq!(saved, "CTERM_NVIM_OK\n");
+}
+
+#[test]
+#[ignore = "run by the hard Linux TUI compatibility GHA gate"]
+fn vim_edits_and_saves_through_cterm_pty() {
+    require_program("vim", "--version");
+    let directory = TestDirectory::new("vim");
+    let file = directory.path().join("document.txt");
+    fs::write(&file, "initial\n").expect("write fixture");
+    let args = vec![
+        "-u".to_string(),
+        "NONE".to_string(),
+        "-i".to_string(),
+        "NONE".to_string(),
+        "-n".to_string(),
+        file.to_string_lossy().into_owned(),
+    ];
+    let mut tui = TuiHarness::spawn("vim", &args, Vec::new());
+
+    tui.wait_until("Vim alternate screen", |terminal| {
+        terminal.screen().modes.alternate_screen
+    });
+    tui.send(b"gg0ciwCTERM_VIM_OK\x1b:wq\r");
+    tui.wait_for_exit();
+
+    let saved = fs::read_to_string(file).expect("read edited fixture");
+    assert_eq!(saved, "CTERM_VIM_OK\n");
+}
+
+#[test]
+#[ignore = "run by the hard Linux TUI compatibility GHA gate"]
+fn less_renders_file_and_quits_through_cterm_pty() {
+    require_program("less", "--version");
+    let directory = TestDirectory::new("less");
+    let file = directory.path().join("pager.txt");
+    // More lines than the 24-row viewport so less stays open in the
+    // alternate screen instead of quitting immediately (`F` would exit).
+    let mut contents = String::from("CTERM_LESS_LINE_ONE\n");
+    for line in 2..=60 {
+        contents.push_str(&format!("filler line {line}\n"));
+    }
+    fs::write(&file, contents).expect("write fixture");
+    let args = vec![file.to_string_lossy().into_owned()];
+    // Pager-friendly env: raw control chars, but keep init (alternate
+    // screen) so the fixture observes the fullscreen pager path.
+    let env = vec![("LESS".to_string(), "R".to_string())];
+    let mut tui = TuiHarness::spawn("less", &args, env);
+
+    tui.wait_until("less alternate screen", |terminal| {
+        terminal.screen().modes.alternate_screen
+    });
+    tui.wait_until("less file content", |terminal| {
+        screen_text(terminal).contains("CTERM_LESS_LINE_ONE")
+    });
+    tui.send(b"q");
+    tui.wait_for_exit();
 }
 
 #[test]
