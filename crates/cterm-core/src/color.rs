@@ -79,6 +79,53 @@ impl Rgb {
         ))
     }
 
+    /// Parse a Kitty OSC 21 color value.
+    ///
+    /// Accepted forms are the strict XParseColor subset from
+    /// [`Rgb::from_xparse_color`] (`rgb:r/g/b`, `#rgb`), the Kitty
+    /// `rgbi:red/green/blue` float form (components clipped to `0.0..=1.0`),
+    /// and an optional `@alpha` suffix on any of those forms. The alpha
+    /// component is validated (finite float, clipped to `0.0..=1.0`) but not
+    /// stored: [`Rgb`] has no alpha channel, so query replies never
+    /// round-trip it. Named colors (for example `green`) are rejected; they
+    /// require Kitty's multi-hundred-entry X11 table, which is tracked as a
+    /// follow-up rather than guessed here.
+    ///
+    /// Overlong specs are rejected without allocation so hostile OSC payloads
+    /// cannot amplify memory use.
+    pub fn from_kitty_color_spec(spec: &str) -> Option<Self> {
+        if spec.is_empty() || spec.len() > MAX_KITTY_COLOR_SPEC_LEN {
+            return None;
+        }
+        let color_part = match spec.split_once('@') {
+            None => spec,
+            Some((color, alpha)) => {
+                if alpha.is_empty() || alpha.contains('@') {
+                    return None;
+                }
+                // Validated and clipped per the Kitty spec; not stored because
+                // Rgb has no alpha channel (see the method docs).
+                let _alpha = parse_kitty_float(alpha)?.clamp(0.0, 1.0);
+                color
+            }
+        };
+
+        if let Some(channels) = color_part.strip_prefix("rgbi:") {
+            let mut parts = channels.split('/');
+            let result = [parts.next()?, parts.next()?, parts.next()?];
+            if parts.next().is_some() {
+                return None;
+            }
+            return Some(Self::new(
+                kitty_float_channel(result[0])?,
+                kitty_float_channel(result[1])?,
+                kitty_float_channel(result[2])?,
+            ));
+        }
+
+        Self::from_xparse_color(color_part)
+    }
+
     /// Convert to hex string
     pub fn to_hex(&self) -> String {
         format!("#{:02x}{:02x}{:02x}", self.r, self.g, self.b)
@@ -100,6 +147,67 @@ impl Rgb {
             self.b as f64 / 255.0,
         )
     }
+}
+
+/// Longest accepted Kitty OSC 21 color value, in bytes.
+///
+/// The longest legitimate spec is far shorter (`rgbi:` with exponents plus an
+/// `@alpha` suffix); anything beyond this is hostile or corrupt input.
+pub const MAX_KITTY_COLOR_SPEC_LEN: usize = 128;
+
+/// Parse one Kitty float (`rgbi:` channel or `@alpha`).
+///
+/// Accepts an optional sign, decimal digits with an optional point, and an
+/// optional `e`/`E` exponent. The value must be finite; callers clip it to
+/// `0.0..=1.0` per the Kitty color-control spec.
+fn parse_kitty_float(text: &str) -> Option<f64> {
+    if text.is_empty() || text.len() > 32 {
+        return None;
+    }
+    let bytes = text.as_bytes();
+    let mut index = 0;
+    if bytes[index] == b'+' || bytes[index] == b'-' {
+        index += 1;
+    }
+    let mut seen_digit = false;
+    let mut seen_point = false;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'0'..=b'9' => {
+                seen_digit = true;
+                index += 1;
+            }
+            b'.' if !seen_point => {
+                seen_point = true;
+                index += 1;
+            }
+            b'e' | b'E' if seen_digit => {
+                index += 1;
+                if index < bytes.len() && (bytes[index] == b'+' || bytes[index] == b'-') {
+                    index += 1;
+                }
+                let exponent_start = index;
+                while index < bytes.len() && bytes[index].is_ascii_digit() {
+                    index += 1;
+                }
+                if index == exponent_start || index != bytes.len() {
+                    return None;
+                }
+                return text.parse().ok().filter(|value: &f64| value.is_finite());
+            }
+            _ => return None,
+        }
+    }
+    if !seen_digit {
+        return None;
+    }
+    text.parse().ok().filter(|value: &f64| value.is_finite())
+}
+
+/// Scale one `rgbi:` channel to a byte, clipping out-of-range input.
+fn kitty_float_channel(text: &str) -> Option<u8> {
+    let value = parse_kitty_float(text)?.clamp(0.0, 1.0);
+    Some((value * 255.0).round() as u8)
 }
 
 /// Standard ANSI colors (0-15)
@@ -348,6 +456,57 @@ mod tests {
         assert_eq!(Rgb::from_xparse_color("rgb:ff/00"), None);
         assert_eq!(Rgb::from_xparse_color("#12345"), None);
         assert_eq!(Rgb::from_xparse_color("red"), None);
+    }
+
+    #[test]
+    fn test_rgb_from_kitty_color_spec() {
+        // Strict XParseColor subset is shared with OSC 4/10-12.
+        assert_eq!(
+            Rgb::from_kitty_color_spec("rgb:ff/00/00"),
+            Some(Rgb::new(255, 0, 0))
+        );
+        assert_eq!(
+            Rgb::from_kitty_color_spec("#00ff00"),
+            Some(Rgb::new(0, 255, 0))
+        );
+        // Kitty float channels scale and clip.
+        assert_eq!(
+            Rgb::from_kitty_color_spec("rgbi:1.0/0.0/0.5"),
+            Some(Rgb::new(255, 0, 128))
+        );
+        assert_eq!(
+            Rgb::from_kitty_color_spec("rgbi:2.0/-1.0/0.0"),
+            Some(Rgb::new(255, 0, 0))
+        );
+        assert_eq!(
+            Rgb::from_kitty_color_spec("rgbi:1e0/0.0/0.0"),
+            Some(Rgb::new(255, 0, 0))
+        );
+        // Alpha is validated but not stored.
+        assert_eq!(
+            Rgb::from_kitty_color_spec("#ff0000@0.5"),
+            Some(Rgb::new(255, 0, 0))
+        );
+        assert_eq!(
+            Rgb::from_kitty_color_spec("rgb:ff/00/00@2.0"),
+            Some(Rgb::new(255, 0, 0))
+        );
+        // Malformed input is rejected.
+        assert_eq!(Rgb::from_kitty_color_spec(""), None);
+        assert_eq!(Rgb::from_kitty_color_spec("green"), None);
+        assert_eq!(Rgb::from_kitty_color_spec("red"), None);
+        assert_eq!(Rgb::from_kitty_color_spec("rgbi:1.0/0.0"), None);
+        assert_eq!(Rgb::from_kitty_color_spec("rgbi:1.0/0.0/0.0/0.0"), None);
+        assert_eq!(Rgb::from_kitty_color_spec("rgbi:nan/0.0/0.0"), None);
+        assert_eq!(Rgb::from_kitty_color_spec("rgbi:inf/0.0/0.0"), None);
+        assert_eq!(Rgb::from_kitty_color_spec("rgbi:1e/0.0/0.0"), None);
+        assert_eq!(Rgb::from_kitty_color_spec("#ff0000@"), None);
+        assert_eq!(Rgb::from_kitty_color_spec("#ff0000@abc"), None);
+        assert_eq!(Rgb::from_kitty_color_spec("#ff0000@0.5@0.5"), None);
+        assert_eq!(Rgb::from_kitty_color_spec("#ff0000@nan"), None);
+        assert_eq!(Rgb::from_kitty_color_spec("rgb:ff/00/00@"), None);
+        let overlong = format!("#{}", "0".repeat(256));
+        assert_eq!(Rgb::from_kitty_color_spec(&overlong), None);
     }
 
     #[test]

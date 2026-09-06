@@ -28,7 +28,8 @@ use crate::osc1337::{InterceptorResult, Osc1337Interceptor};
 use crate::screen::DesktopNotificationAction;
 use crate::screen::{
     ClearMode, ClipboardOperation, ClipboardSelection, ColorQuery, CursorStyle,
-    DesktopNotification, LineClearMode, MouseEncoding, MouseMode, NotificationUrgency, Screen,
+    DesktopNotification, KittyColorKey, KittyColorSetting, KittyQueryField, LineClearMode,
+    MouseEncoding, MouseMode, NotificationUrgency, Screen, MAX_OSC21_FIELDS, MAX_OSC21_KEY_LEN,
 };
 use crate::sixel::{
     SixelDecoder, SixelDecoderConfig, SixelImage, DEFAULT_SIXEL_MAX_BYTES, MAX_SIXEL_COLORS,
@@ -739,6 +740,18 @@ impl vte::Perform for ScreenPerformer<'_> {
                         }
                     }
                 }
+            }
+            // Kitty color control: set, query, and reset named color slots.
+            21 => {
+                self.handle_osc21(&params[1..]);
+            }
+            // Kitty color-stack push/pop share the xterm palette stack (see
+            // Screen::push_color_palette). Trailing parameters are ignored.
+            30001 => {
+                self.screen.push_color_palette(0);
+            }
+            30101 => {
+                self.screen.pop_color_palette(0);
             }
             // FinalTerm/iTerm2 shell integration. Foot deliberately treats B
             // as informational and records A/C/D on the current physical row.
@@ -1711,6 +1724,97 @@ impl ScreenPerformer<'_> {
                 _ => {}
             }
         }
+    }
+
+    /// Kitty OSC 21 color control: set, query, and reset named color slots.
+    ///
+    /// Each `;`-separated field is `key` (reset the override), `key=`
+    /// (request dynamic rendering, or reset where dynamic has no meaning),
+    /// `key=?` (query), or `key=value` (set). Queries accumulate into one
+    /// ordered reply per sequence, drained into PTY responses by the daemon
+    /// terminal layer; sets and resets mutate screen state immediately.
+    ///
+    /// Unknown keys are answered with `unknown=<base64>` only for queries
+    /// (the Kitty spec's unknown rule lives in its query section); unknown
+    /// sets and resets are ignored. Malformed values — including named colors
+    /// such as `green`, which need Kitty's full X11 table — leave state
+    /// untouched, matching how bogus OSC 10-12 specs are ignored.
+    fn handle_osc21(&mut self, fields: &[&[u8]]) {
+        let mut reply: Vec<KittyQueryField> = Vec::new();
+        for field in fields.iter().take(MAX_OSC21_FIELDS) {
+            let (raw_key, raw_value) = match field.iter().position(|byte| *byte == b'=') {
+                None => (*field, None),
+                Some(index) => {
+                    let (key, value) = field.split_at(index);
+                    (key, Some(&value[1..]))
+                }
+            };
+            let Some(key_name) = Self::osc21_key_name(raw_key) else {
+                continue;
+            };
+            let key = KittyColorKey::from_key_name(key_name);
+            match raw_value {
+                // Bare key: reset a known override, ignore unknown keys.
+                None => {
+                    if let Some(key) = key {
+                        self.screen
+                            .set_kitty_setting(key, KittyColorSetting::Default);
+                    }
+                }
+                // Empty value: dynamic where the slot stores it, reset where
+                // the Kitty spec marks dynamic not-applicable, and ignored
+                // for palette entries where the spec forbids dynamic.
+                Some([]) => {
+                    if let Some(key) = key {
+                        if matches!(key, KittyColorKey::Palette(_)) {
+                            continue;
+                        }
+                        let setting = if key.stores_dynamic() {
+                            KittyColorSetting::Dynamic
+                        } else {
+                            KittyColorSetting::Default
+                        };
+                        self.screen.set_kitty_setting(key, setting);
+                    }
+                }
+                // Query: snapshot known settings, base64 unknown names.
+                Some(value) if value == b"?" => match key {
+                    Some(key) => {
+                        let setting = self.screen.kitty_setting(key);
+                        reply.push(KittyQueryField::Known { key, setting });
+                    }
+                    None => {
+                        use base64::Engine;
+                        let encoded =
+                            base64::engine::general_purpose::STANDARD_NO_PAD.encode(key_name);
+                        reply.push(KittyQueryField::Unknown { encoded });
+                    }
+                },
+                // Set: strict values only; malformed input changes nothing.
+                Some(value) => {
+                    if let Some(key) = key {
+                        if let Ok(value) = std::str::from_utf8(value) {
+                            if let Some(color) = Rgb::from_kitty_color_spec(value) {
+                                self.screen
+                                    .set_kitty_setting(key, KittyColorSetting::Color(color));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        self.screen.queue_kitty_query(reply);
+    }
+
+    /// Validate one OSC 21 key: non-empty UTF-8 within the length bound.
+    ///
+    /// Anything else is skipped outright (no reply), so hostile keys cannot
+    /// amplify into large `unknown=` responses.
+    fn osc21_key_name(raw_key: &[u8]) -> Option<&str> {
+        if raw_key.is_empty() || raw_key.len() > MAX_OSC21_KEY_LEN {
+            return None;
+        }
+        std::str::from_utf8(raw_key).ok()
     }
 
     fn handle_osc99(&mut self, params: &[&[u8]], bell_terminated: bool) {
@@ -3493,6 +3597,232 @@ mod tests {
             screen.take_pending_responses(),
             vec![b"\x1b[?128;128#Q".to_vec(), b"\x1b[?0;0#Q".to_vec()]
         );
+    }
+
+    #[test]
+    fn test_osc21_sets_every_key_kind() {
+        use crate::screen::{KittyColorKey as Key, KittyColorSetting as Setting};
+
+        let mut screen = make_screen();
+        let mut parser = Parser::new();
+
+        parser.parse(
+            &mut screen,
+            b"\x1b]21;foreground=#112233;background=rgb:44/55/66;cursor=#778899\x1b\\\
+              \x1b]21;selection_background=#aabbcc;selection_foreground=#ddeeff\x1b\\\
+              \x1b]21;cursor_text=#123456;visual_bell=rgbi:1.0/0.0/0.0\x1b\\\
+              \x1b]21;transparent_background_color1=#010203;transparent_background_color7=#040506\x1b\\\
+              \x1b]21;5=#654321;nonsense=value\x1b\\",
+        );
+
+        assert_eq!(
+            screen.dynamic_color(ColorQuery::Foreground),
+            Some(Rgb::new(0x11, 0x22, 0x33))
+        );
+        assert_eq!(
+            screen.dynamic_color(ColorQuery::Background),
+            Some(Rgb::new(0x44, 0x55, 0x66))
+        );
+        assert_eq!(
+            screen.dynamic_color(ColorQuery::Cursor),
+            Some(Rgb::new(0x77, 0x88, 0x99))
+        );
+        assert_eq!(
+            screen.kitty_setting(Key::SelectionBackground),
+            Setting::Color(Rgb::new(0xaa, 0xbb, 0xcc))
+        );
+        assert_eq!(
+            screen.kitty_setting(Key::SelectionForeground),
+            Setting::Color(Rgb::new(0xdd, 0xee, 0xff))
+        );
+        assert_eq!(
+            screen.kitty_setting(Key::CursorText),
+            Setting::Color(Rgb::new(0x12, 0x34, 0x56))
+        );
+        assert_eq!(
+            screen.kitty_setting(Key::VisualBell),
+            Setting::Color(Rgb::new(255, 0, 0))
+        );
+        assert_eq!(
+            screen.kitty_setting(Key::TransparentBackground(1)),
+            Setting::Color(Rgb::new(0x01, 0x02, 0x03))
+        );
+        assert_eq!(
+            screen.kitty_setting(Key::TransparentBackground(7)),
+            Setting::Color(Rgb::new(0x04, 0x05, 0x06))
+        );
+        // Numeric keys alias the OSC 4 palette.
+        assert_eq!(
+            screen.dynamic_color(ColorQuery::Palette(5)),
+            Some(Rgb::new(0x65, 0x43, 0x21))
+        );
+        // Unknown sets are ignored and queue no reply.
+        assert!(screen.take_kitty_queries().is_empty());
+    }
+
+    #[test]
+    fn test_osc21_reset_and_dynamic_semantics() {
+        use crate::screen::{KittyColorKey as Key, KittyColorSetting as Setting};
+
+        let mut screen = make_screen();
+        let mut parser = Parser::new();
+        let color = Rgb::new(0x11, 0x22, 0x33);
+
+        parser.parse(
+            &mut screen,
+            b"\x1b]21;foreground=#112233;cursor_text=#112233;5=#112233\x1b\\",
+        );
+        assert_eq!(screen.kitty_setting(Key::Foreground), Setting::Color(color));
+
+        // Bare keys reset overrides.
+        parser.parse(&mut screen, b"\x1b]21;foreground;cursor_text;5\x1b\\");
+        assert_eq!(screen.kitty_setting(Key::Foreground), Setting::Default);
+        assert_eq!(screen.kitty_setting(Key::CursorText), Setting::Default);
+        assert_eq!(screen.kitty_setting(Key::Palette(5)), Setting::Default);
+
+        parser.parse(
+            &mut screen,
+            b"\x1b]21;foreground=#112233;selection_background=#112233;5=#112233\x1b\\",
+        );
+        // Empty values request dynamic where stored, reset where the Kitty
+        // spec marks dynamic not-applicable, and are ignored for palette
+        // entries where the spec forbids dynamic.
+        parser.parse(
+            &mut screen,
+            b"\x1b]21;foreground=;selection_background=;5=\x1b\\",
+        );
+        assert_eq!(screen.kitty_setting(Key::Foreground), Setting::Default);
+        assert_eq!(
+            screen.kitty_setting(Key::SelectionBackground),
+            Setting::Dynamic
+        );
+        assert_eq!(screen.kitty_setting(Key::Palette(5)), Setting::Color(color));
+        // Unknown resets queue no reply.
+        parser.parse(&mut screen, b"\x1b]21;nonsense;nonsense=\x1b\\");
+        assert!(screen.take_kitty_queries().is_empty());
+    }
+
+    #[test]
+    fn test_osc21_rejects_malformed_input() {
+        use crate::screen::{KittyColorKey as Key, KittyColorSetting as Setting};
+
+        let mut screen = make_screen();
+        let mut parser = Parser::new();
+
+        parser.parse(
+            &mut screen,
+            b"\x1b]21;foreground=green;cursor_text=not-a-color;5=256;\
+              \x1b]21;transparent_background_color0=#ffffff;\
+              transparent_background_color8=#ffffff;FOREGROUND=#ffffff\x1b\\",
+        );
+        // Named colors, bogus specs, bad slots, and wrong-case keys change
+        // nothing and queue no replies.
+        assert_eq!(screen.kitty_setting(Key::Foreground), Setting::Default);
+        assert_eq!(screen.kitty_setting(Key::CursorText), Setting::Default);
+        assert_eq!(screen.kitty_setting(Key::Palette(5)), Setting::Default);
+        assert!(screen.take_kitty_queries().is_empty());
+
+        // Empty, overlong, and non-UTF8 keys are skipped outright.
+        let mut hostile = b"\x1b]21;?=;".to_vec();
+        hostile.extend_from_slice(&[b'k'; 65]);
+        hostile.extend_from_slice(b"=?;\xff=?\x1b\\");
+        parser.parse(&mut screen, hostile.as_slice());
+        assert!(screen.take_kitty_queries().is_empty());
+
+        // Field counts are bounded: vte caps OSC sequences at 16 parameters,
+        // so at most 15 fields (after the `21` opcode) arrive here.
+        let mut many = b"\x1b]21".to_vec();
+        for _ in 0..129 {
+            many.extend_from_slice(b";foreground=?");
+        }
+        many.extend_from_slice(b"\x1b\\");
+        parser.parse(&mut screen, many.as_slice());
+        let queued = screen.take_kitty_queries();
+        assert_eq!(queued.len(), 1);
+        assert_eq!(queued[0].len(), 15);
+    }
+
+    #[test]
+    fn test_osc21_unknown_query_keys_use_base64() {
+        use crate::screen::{KittyColorKey as Key, KittyColorSetting as Setting};
+
+        let mut screen = make_screen();
+        let mut parser = Parser::new();
+
+        parser.parse(
+            &mut screen,
+            b"\x1b]21;foreground=?;nonsense=?;cursor_text=?\x1b\\",
+        );
+        let queued = screen.take_kitty_queries();
+        assert_eq!(queued.len(), 1);
+        assert_eq!(
+            queued[0],
+            vec![
+                KittyQueryField::Known {
+                    key: Key::Foreground,
+                    setting: Setting::Default,
+                },
+                KittyQueryField::Unknown {
+                    // Base64 (no padding) of "nonsense".
+                    encoded: "bm9uc2Vuc2U".to_string(),
+                },
+                KittyQueryField::Known {
+                    key: Key::CursorText,
+                    setting: Setting::Default,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn test_osc21_set_then_query_sees_new_value() {
+        use crate::screen::{KittyColorKey as Key, KittyColorSetting as Setting};
+
+        let mut screen = make_screen();
+        let mut parser = Parser::new();
+
+        parser.parse(
+            &mut screen,
+            b"\x1b]21;cursor_text=#a1b2c3;cursor_text=?\x1b\\",
+        );
+        let queued = screen.take_kitty_queries();
+        assert_eq!(queued.len(), 1);
+        assert_eq!(
+            queued[0],
+            vec![KittyQueryField::Known {
+                key: Key::CursorText,
+                setting: Setting::Color(Rgb::new(0xa1, 0xb2, 0xc3)),
+            }]
+        );
+    }
+
+    #[test]
+    fn test_kitty_color_stack_push_pop_shares_xterm_stack() {
+        use crate::screen::{KittyColorKey as Key, KittyColorSetting as Setting};
+
+        let mut screen = make_screen();
+        let mut parser = Parser::new();
+        let first = Rgb::new(0x11, 0x22, 0x33);
+        let second = Rgb::new(0x44, 0x55, 0x66);
+
+        // Kitty push saves OSC 21 state; xterm pop restores it.
+        parser.parse(
+            &mut screen,
+            b"\x1b]21;cursor_text=#112233\x1b\\\x1b]30001\x1b\\",
+        );
+        parser.parse(&mut screen, b"\x1b]21;cursor_text=#445566\x1b\\\x1b[#Q");
+        assert_eq!(screen.kitty_setting(Key::CursorText), Setting::Color(first));
+
+        // xterm push saves; Kitty pop restores, including legacy slots.
+        parser.parse(
+            &mut screen,
+            b"\x1b]10;#445566\x1b\\\x1b[#P\x1b]10;#778899\x1b\\\x1b]30101\x1b\\",
+        );
+        assert_eq!(screen.dynamic_color(ColorQuery::Foreground), Some(second));
+
+        // Popping an empty stack is a no-op, and BEL termination works.
+        parser.parse(&mut screen, b"\x1b[#Q\x1b]30101\x07");
+        assert_eq!(screen.kitty_setting(Key::CursorText), Setting::Color(first));
     }
 
     #[test]

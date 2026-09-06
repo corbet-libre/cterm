@@ -8,8 +8,8 @@ use cterm_core::grid::Row as CoreRow;
 use cterm_core::term::Terminal;
 use cterm_core::{
     Cell, CellAttrs, Color, ColorQuery, CursorStyle, ExtraCursor, ExtraCursorColor,
-    ExtraCursorColors, ExtraCursorShape, MouseEncoding, MouseMode, Multicell, Rgb, Screen,
-    TerminalImage, TextSizeAlignment,
+    ExtraCursorColors, ExtraCursorShape, KittyColorKey, KittyColorSetting, KittyColorSnapshot,
+    MouseEncoding, MouseMode, Multicell, Rgb, Screen, TerminalImage, TextSizeAlignment,
 };
 use std::sync::Arc;
 
@@ -482,6 +482,60 @@ pub fn extra_cursors_to_proto(screen: &Screen) -> proto::ExtraCursorsUpdate {
     }
 }
 
+/// Convert one dedicated Kitty OSC 21 slot to proto.
+///
+/// Only explicit colors travel as colors; `Default` and `Dynamic` are both
+/// absent here, with `Dynamic` slots named separately in
+/// `kitty_dynamic_keys` so the tri-state round-trips.
+fn kitty_setting_to_proto(setting: KittyColorSetting) -> Option<proto::Color> {
+    match setting {
+        KittyColorSetting::Color(color) => Some(color_to_proto(&Color::Rgb(color))),
+        KittyColorSetting::Default | KittyColorSetting::Dynamic => None,
+    }
+}
+
+/// Convert one proto color back to a Kitty slot setting.
+fn kitty_setting_from_proto(color: Option<&proto::Color>) -> KittyColorSetting {
+    color
+        .map(proto_to_color)
+        .and_then(|color| {
+            if let Color::Rgb(rgb) = color {
+                Some(rgb)
+            } else {
+                None
+            }
+        })
+        .map(KittyColorSetting::Color)
+        .unwrap_or(KittyColorSetting::Default)
+}
+
+/// Canonical OSC 21 key names of every dedicated Kitty slot in `Dynamic`.
+fn kitty_dynamic_keys(snapshot: &KittyColorSnapshot) -> Vec<String> {
+    let mut keys = Vec::new();
+    let mut push = |key: KittyColorKey, setting: KittyColorSetting| {
+        if setting == KittyColorSetting::Dynamic {
+            keys.push(key.key_name());
+        }
+    };
+    push(
+        KittyColorKey::SelectionBackground,
+        snapshot.selection_background,
+    );
+    push(
+        KittyColorKey::SelectionForeground,
+        snapshot.selection_foreground,
+    );
+    push(KittyColorKey::CursorText, snapshot.cursor_text);
+    push(KittyColorKey::VisualBell, snapshot.visual_bell);
+    for (index, setting) in snapshot.transparent_background.iter().enumerate() {
+        push(
+            KittyColorKey::TransparentBackground(index as u8 + 1),
+            *setting,
+        );
+    }
+    keys
+}
+
 /// Build terminal modes proto from the screen state
 pub fn modes_to_proto(screen: &Screen) -> proto::TerminalModes {
     proto::TerminalModes {
@@ -513,6 +567,28 @@ pub fn modes_to_proto(screen: &Screen) -> proto::TerminalModes {
                     color: Some(color_to_proto(&Color::Rgb(color))),
                 })
                 .collect(),
+            selection_background: kitty_setting_to_proto(
+                screen.kitty_color_snapshot().selection_background,
+            ),
+            selection_foreground: kitty_setting_to_proto(
+                screen.kitty_color_snapshot().selection_foreground,
+            ),
+            cursor_text: kitty_setting_to_proto(screen.kitty_color_snapshot().cursor_text),
+            visual_bell: kitty_setting_to_proto(screen.kitty_color_snapshot().visual_bell),
+            transparent_background: screen
+                .kitty_color_snapshot()
+                .transparent_background
+                .iter()
+                .enumerate()
+                .filter_map(|(index, setting)| match setting {
+                    KittyColorSetting::Color(color) => Some(proto::DynamicPaletteColor {
+                        index: index as u32 + 1,
+                        color: Some(color_to_proto(&Color::Rgb(*color))),
+                    }),
+                    KittyColorSetting::Default | KittyColorSetting::Dynamic => None,
+                })
+                .collect(),
+            kitty_dynamic_keys: kitty_dynamic_keys(&screen.kitty_color_snapshot()),
         }),
         current_working_directory: screen
             .current_working_directory()
@@ -708,6 +784,7 @@ pub fn apply_screen_snapshot(terminal: &mut Terminal, screen_data: &proto::GetSc
             dynamic_rgb(dynamic_colors.and_then(|colors| colors.cursor.as_ref())),
         );
         screen.reset_dynamic_palette();
+        let mut kitty = KittyColorSnapshot::default();
         if let Some(colors) = dynamic_colors {
             for entry in &colors.palette {
                 let Ok(index) = u8::try_from(entry.index) else {
@@ -715,6 +792,36 @@ pub fn apply_screen_snapshot(terminal: &mut Terminal, screen_data: &proto::GetSc
                 };
                 if let Some(color) = dynamic_rgb(entry.color.as_ref()) {
                     screen.set_dynamic_color(ColorQuery::Palette(index), Some(color));
+                }
+            }
+            kitty.selection_background =
+                kitty_setting_from_proto(colors.selection_background.as_ref());
+            kitty.selection_foreground =
+                kitty_setting_from_proto(colors.selection_foreground.as_ref());
+            kitty.cursor_text = kitty_setting_from_proto(colors.cursor_text.as_ref());
+            kitty.visual_bell = kitty_setting_from_proto(colors.visual_bell.as_ref());
+            for entry in &colors.transparent_background {
+                if !(1..=7).contains(&entry.index) {
+                    continue;
+                }
+                if let Some(slot) = kitty
+                    .transparent_background
+                    .get_mut(entry.index as usize - 1)
+                {
+                    *slot = kitty_setting_from_proto(entry.color.as_ref());
+                }
+            }
+        }
+        screen.restore_kitty_color_snapshot(kitty);
+        if let Some(colors) = dynamic_colors {
+            // Dynamics win over colors on conflict. Only dedicated Kitty
+            // slots are accepted, so a hostile snapshot cannot reset the
+            // OSC 10-12 / OSC 4 overrides through these names.
+            for name in &colors.kitty_dynamic_keys {
+                if let Some(key) =
+                    KittyColorKey::from_key_name(name).filter(|key| key.stores_dynamic())
+                {
+                    screen.set_kitty_setting(key, KittyColorSetting::Dynamic);
                 }
             }
         }
@@ -1040,6 +1147,123 @@ mod tests {
         );
         assert_eq!(restored.screen().current_working_directory(), None);
         assert!(restored.screen().scrollback().is_empty());
+    }
+
+    #[test]
+    fn screen_snapshot_round_trips_kitty_color_slots() {
+        use cterm_core::{KittyColorKey, KittyColorSetting};
+
+        let mut source = Terminal::new(80, 24, ScreenConfig::default());
+        source.screen_mut().set_dynamic_color(
+            ColorQuery::Foreground,
+            Some(cterm_core::Rgb::new(20, 21, 22)),
+        );
+        let set = |screen: &mut Screen, key, setting| {
+            screen.set_kitty_setting(key, setting);
+        };
+        set(
+            source.screen_mut(),
+            KittyColorKey::SelectionBackground,
+            KittyColorSetting::Dynamic,
+        );
+        set(
+            source.screen_mut(),
+            KittyColorKey::SelectionForeground,
+            KittyColorSetting::Color(cterm_core::Rgb::new(1, 2, 3)),
+        );
+        set(
+            source.screen_mut(),
+            KittyColorKey::CursorText,
+            KittyColorSetting::Color(cterm_core::Rgb::new(4, 5, 6)),
+        );
+        set(
+            source.screen_mut(),
+            KittyColorKey::TransparentBackground(2),
+            KittyColorSetting::Color(cterm_core::Rgb::new(7, 8, 9)),
+        );
+        set(
+            source.screen_mut(),
+            KittyColorKey::TransparentBackground(5),
+            KittyColorSetting::Dynamic,
+        );
+
+        let snapshot = screen_to_proto(source.screen(), true);
+        let mut restored = Terminal::new(80, 24, ScreenConfig::default());
+        // Stale Kitty state is replaced, not merged.
+        set(
+            restored.screen_mut(),
+            KittyColorKey::VisualBell,
+            KittyColorSetting::Color(cterm_core::Rgb::new(9, 9, 9)),
+        );
+        apply_screen_snapshot(&mut restored, &snapshot);
+
+        assert_eq!(
+            restored.screen().kitty_color_snapshot(),
+            source.screen().kitty_color_snapshot()
+        );
+        // Dynamic survives as Dynamic (empty-reporting), not as theme
+        // fallback: selection_background has a theme color, so this is
+        // observable through the setting itself.
+        assert_eq!(
+            restored
+                .screen()
+                .kitty_setting(KittyColorKey::SelectionBackground),
+            KittyColorSetting::Dynamic
+        );
+        // Legacy OSC 10-12 slots aliased through OSC 21 travel with the
+        // existing dynamic-colors fields.
+        assert_eq!(
+            restored.screen().dynamic_color(ColorQuery::Foreground),
+            Some(cterm_core::Rgb::new(20, 21, 22))
+        );
+
+        // Hostile snapshots cannot smuggle resets into the legacy slots
+        // through dynamic names, and out-of-range transparency indices are
+        // ignored. A legitimate conflicting name still applies (dynamic
+        // wins), proving the allowlist — not the blocklist — decides.
+        let mut hostile = screen_to_proto(source.screen(), true);
+        if let Some(modes) = hostile.modes.as_mut() {
+            if let Some(colors) = modes.dynamic_colors.as_mut() {
+                colors.kitty_dynamic_keys = vec![
+                    "foreground".to_string(),
+                    "5".to_string(),
+                    "bogus".to_string(),
+                    "cursor_text".to_string(),
+                ];
+                colors
+                    .transparent_background
+                    .push(proto::DynamicPaletteColor {
+                        index: 0,
+                        color: Some(crate::convert::color::color_to_proto(
+                            &cterm_core::Color::Rgb(cterm_core::Rgb::new(9, 9, 9)),
+                        )),
+                    });
+                colors
+                    .transparent_background
+                    .push(proto::DynamicPaletteColor {
+                        index: 8,
+                        color: Some(crate::convert::color::color_to_proto(
+                            &cterm_core::Color::Rgb(cterm_core::Rgb::new(9, 9, 9)),
+                        )),
+                    });
+            }
+        }
+        let mut target = Terminal::new(80, 24, ScreenConfig::default());
+        apply_screen_snapshot(&mut target, &hostile);
+        assert_eq!(
+            target.screen().dynamic_color(ColorQuery::Foreground),
+            Some(cterm_core::Rgb::new(20, 21, 22))
+        );
+        assert_eq!(
+            target.screen().kitty_setting(KittyColorKey::CursorText),
+            KittyColorSetting::Dynamic
+        );
+        assert_eq!(
+            target
+                .screen()
+                .kitty_setting(KittyColorKey::TransparentBackground(1)),
+            KittyColorSetting::Default
+        );
     }
 
     #[test]

@@ -38,6 +38,10 @@ is omitted for readability.
 - Foot-compatible independent cursor blink sources and native cursor/text
   blink rendering across GTK/Wayland, Cocoa, and Win32, including distinct
   slow and rapid SGR phases and daemon snapshot persistence.
+- Kitty OSC 21 color control (selection, cursor-text, visual-bell, and
+  transparency keys with query/set/reset and strict value validation) plus
+  OSC 30001/30101 palette-stack push/pop on the shared xterm stack, with
+  daemon-owned replies and snapshot persistence.
 
 ### Fixed
 - Streamed OSC 1337 interception now replays incomplete, cancelled, and
