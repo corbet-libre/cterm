@@ -49,6 +49,14 @@ is omitted for readability.
   transparency keys with query/set/reset and strict value validation) plus
   OSC 30001/30101 palette-stack push/pop on the shared xterm stack, with
   daemon-owned replies and snapshot persistence.
+- Kitty all-SGR DECCARA: rectangular attribute changes now apply the full
+  SGR repertoire (every boolean attribute, styled underlines, and
+  fg/bg/underline colors in ANSI, indexed, and truecolor forms, including
+  colon subparameters and empty-list reset) while honoring origin mode,
+  scrolling margins, active-page clipping, and cursor preservation.
+  DECRARA toggles the full boolean set and deliberately leaves colors
+  untouched, since color reversal is undefined. No renderer change was
+  needed: rectangle-styled cells are identical to SGR-styled ones.
 
 ### Fixed
 - Streamed OSC 1337 interception now replays incomplete, cancelled, and

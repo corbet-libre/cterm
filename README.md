@@ -433,8 +433,8 @@ native window state to the daemon, which remains the single PTY reply authority.
 
 | Sequence | Description |
 |----------|-------------|
-| DECCARA | Change bold, underline, blink, and inverse attributes in a rectangle |
-| DECRARA | Invert those attributes in a rectangle |
+| DECCARA | Change any SGR attributes, including fg/bg/underline colors, in a rectangle (Kitty all-SGR semantics) |
+| DECRARA | Toggle boolean SGR attributes in a rectangle (colors have no reversal and are left untouched) |
 | DECCRA | Copy a rectangle, including overlap-safe copies |
 | DECFRA | Fill a rectangle using the current SGR style |
 | DECERA | Erase a rectangle using the current background color |
