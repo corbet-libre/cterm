@@ -31,6 +31,18 @@ is omitted for readability.
   unplaced data, deterministic victims, blend/overwrite order, zero/oversized
   raw dimensions, 3-chunk reassembly). Native/compositor pixel assertions on
   Cocoa, GTK, and Win32 remain open.
+- Kitty keyboard differential fixtures, compositor-free half (tests and
+  fixtures only, no encoder change): `crates/cterm-core/tests/keyboard_differential.rs`
+  pins the shared-Rust encoder with table-driven input → escape-sequence
+  vectors and a replay recipe for macOS/Windows contributors — the full
+  32-combination progressive-flag matrix for press/repeat/release, release
+  gating (releases require event-types even in all-keys mode), alternate-key
+  vectors with the MAC-ANSI vs PC-101 base-identity contract, modifier vectors
+  including CapsLock/NumLock, dead-key compose/cancel and IME commits at the
+  `handle_text_input` seam, focus-in/out vs release-drain semantics, flag-stack
+  pop-imbalance/overflow and per-screen isolation, and hostile associated-text
+  handling. Native dead-key/IME/alternate-key/release verification per platform
+  remains open (needs a compositor, macOS, and Windows hosts).
 - Kitty OSC 99 desktop-notification completion over one shared
   `cterm-core::notifications` model: `a=report` activation reports (whole
   notification plus 1-based button numbers) and `c=1` close reports
