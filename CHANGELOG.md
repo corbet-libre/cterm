@@ -10,6 +10,13 @@ is omitted for readability.
 ## [Unreleased]
 
 ### Added
+- Notification hardening: pinned `w=0` never-expire semantics (no terminal
+  timer; persists until replaced, closed, evicted, or frontend exit; daemon
+  `p=alive` survives UI reconnects) with activation/close ordering guarantees,
+  plus `[notifications]` user filtering (`allow_apps`/`deny_apps` over `f=`,
+  `allow_types`/`deny_types` over `t=`; default allow-all; deny wins),
+  enforced in the shared model before delivery. Cocoa/Win32 filtering and
+  the Win32 `w=0` timer gap remain open.
 - Deferred Cocoa/Win32 native mappings, foreign-target type-checked
   (`aarch64`/`x86_64-apple-darwin`, `x86_64-pc-windows-msvc`) but still
   awaiting macOS/Windows runtime verification: OSC 22 pointer-shape tables
