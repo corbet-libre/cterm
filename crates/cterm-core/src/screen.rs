@@ -1665,8 +1665,7 @@ impl Screen {
     /// are queued here, at parse time.
     pub fn handle_rich_clipboard(&mut self, params: &[&[u8]]) {
         use crate::kitty_clipboard::{
-            encode_read_error, encode_write_status, parse_metadata, RichClipboardStatus,
-            RichWriteSession,
+            encode_write_status, parse_metadata, RichClipboardStatus, RichWriteSession,
         };
 
         let Some(metadata_bytes) = params.get(1) else {
@@ -1684,8 +1683,22 @@ impl Screen {
             .map(|bytes| bytes.to_vec())
             .unwrap_or_default();
         let Ok(payload_str) = std::str::from_utf8(&payload).map(str::to_string) else {
-            // Non-UTF-8 payloads cannot be valid base64.
-            self.queue_response(encode_read_error(&id, RichClipboardStatus::Inval));
+            // Non-UTF-8 payloads cannot be valid base64. Kitty has no error
+            // status for read requests (docs/clipboard.rst:32-39,
+            // kitty/clipboard.py:410-415 returns with no reply on
+            // read-decode failure), so malformed reads are ignored with a
+            // log; write-side failures keep EINVAL (407-409,434-448,464-470).
+            if metadata.packet_type.as_deref() == Some("read") {
+                log::debug!("Ignoring malformed OSC 5522 read with non-UTF-8 payload");
+                return;
+            }
+            if matches!(
+                metadata.packet_type.as_deref(),
+                Some("write" | "wdata" | "walias")
+            ) {
+                self.queue_response(encode_write_status(&id, Some(RichClipboardStatus::Inval)));
+                return;
+            }
             return;
         };
 
@@ -1707,24 +1720,28 @@ impl Screen {
 
     /// Handle one validated `type=read` packet: resolve consent at parse time
     /// and queue a [`RichClipboardOperation::Read`] for the native frontend.
+    ///
+    /// Malformed reads are silently ignored with a log and no reply, matching
+    /// Kitty (spec docs/clipboard.rst:32-39 "no error status for read
+    /// requests, must simply ignore"; kitty/clipboard.py:410-415 returns with
+    /// no reply on read-decode failure). EINVAL stays write-side only
+    /// (407-409,434-448,464-470).
     fn handle_rich_read(
         &mut self,
         id: &str,
         metadata: &crate::kitty_clipboard::RichMetadata,
         payload: &str,
     ) {
-        use crate::kitty_clipboard::{
-            encode_read_error, parse_read_payload, resolve_read_consent, RichClipboardStatus,
-        };
+        use crate::kitty_clipboard::{parse_read_payload, resolve_read_consent};
 
         if metadata.malformed_credential || payload.is_empty() {
-            self.queue_response(encode_read_error(id, RichClipboardStatus::Inval));
+            log::debug!("Ignoring malformed OSC 5522 read (bad metadata or empty payload)");
             return;
         }
         let mimes = match parse_read_payload(payload) {
             Ok(mimes) => mimes,
             Err(_) => {
-                self.queue_response(encode_read_error(id, RichClipboardStatus::Inval));
+                log::debug!("Ignoring malformed OSC 5522 read payload");
                 return;
             }
         };

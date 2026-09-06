@@ -50,7 +50,10 @@ impl DndCommandType {
 ///
 /// Coordinates use signed 32-bit values because `-1, -1` is the drop-leave
 /// sentinel. `operation` remains an integer because it is also used as image
-/// opacity by `t=p`, not only as copy/move flags.
+/// opacity by `t=p`, not only as copy/move flags. `has_cell_y` records whether
+/// the `y` key was present on the wire: a missing `y` defaults to `0` for
+/// parsing but must abort a source-side `t=E` (ambiguous with index 0) rather
+/// than fail index 0.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DndCommand {
     pub command_type: DndCommandType,
@@ -59,6 +62,7 @@ pub struct DndCommand {
     pub operation: u32,
     pub cell_x: i32,
     pub cell_y: i32,
+    pub has_cell_y: bool,
     pub pixel_x: i32,
     pub pixel_y: i32,
     pub payload: Vec<u8>,
@@ -86,6 +90,7 @@ impl DndMetadata {
             operation: self.operation.unwrap_or(0),
             cell_x: self.cell_x.unwrap_or(0),
             cell_y: self.cell_y.unwrap_or(0),
+            has_cell_y: self.cell_y.is_some(),
             pixel_x: self.pixel_x.unwrap_or(0),
             pixel_y: self.pixel_y.unwrap_or(0),
             payload,
@@ -384,5 +389,20 @@ mod tests {
     fn capability_response_echoes_optional_client_id() {
         assert_eq!(capability_response(0), b"\x1b]72;t=q;\x1b\\");
         assert_eq!(capability_response(42), b"\x1b]72;t=q:i=42;\x1b\\");
+    }
+
+    #[test]
+    fn missing_y_is_tracked_for_source_error_split() {
+        // `t=E` without `y` defaults to 0 but marks absence, so the
+        // source side can abort (ambiguous) instead of failing index 0.
+        let missing = parse(&[b"72", b"t=E", b"EIO"]).unwrap();
+        assert_eq!(missing.cell_y, 0);
+        assert!(!missing.has_cell_y);
+        let explicit = parse(&[b"72", b"t=E:y=0", b"EIO"]).unwrap();
+        assert_eq!(explicit.cell_y, 0);
+        assert!(explicit.has_cell_y);
+        let cancel = parse(&[b"72", b"t=E:y=-1"]).unwrap();
+        assert_eq!(cancel.cell_y, -1);
+        assert!(cancel.has_cell_y);
     }
 }

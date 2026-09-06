@@ -1203,36 +1203,39 @@ mod integration_tests {
         assert!(responses.is_empty());
         assert!(rich_ops(&events).is_empty());
 
-        // Read with bad base64 payload.
-        let (_, _, responses) = collect(b"\x1b]5522;type=read;!!!\x1b\\");
-        assert_eq!(responses.len(), 1);
-        assert!(responses[0].starts_with(b"\x1b]5522;type=read:status=EINVAL;"));
+        // Malformed reads are silently ignored with no reply and no op,
+        // matching Kitty (docs/clipboard.rst:32-39, kitty/clipboard.py:410-415).
+        // EINVAL stays write-side only.
+        let (_, events, responses) = collect(b"\x1b]5522;type=read;!!!\x1b\\");
+        assert!(responses.is_empty());
+        assert!(rich_ops(&events).is_empty());
 
         // Read with an invalid MIME type.
         let payload = b64(b"text/ok bad//mime");
-        let (_, _, responses) = collect(format!("\x1b]5522;type=read;{payload}\x1b\\").as_bytes());
-        assert_eq!(responses.len(), 1);
-        assert!(responses[0].starts_with(b"\x1b]5522;type=read:status=EINVAL;"));
+        let (_, events, responses) =
+            collect(format!("\x1b]5522;type=read;{payload}\x1b\\").as_bytes());
+        assert!(responses.is_empty());
+        assert!(rich_ops(&events).is_empty());
 
         // Read with an oversize credential.
         let big_pw = b64(&vec![b'p'; MAX_RICH_CREDENTIAL_BYTES + 1]);
         let name = b64(b"App");
         let payload = b64(b"text/plain");
-        let (_, _, responses) = collect(
+        let (_, events, responses) = collect(
             format!("\x1b]5522;type=read:pw={big_pw}:name={name};{payload}\x1b\\").as_bytes(),
         );
-        assert_eq!(responses.len(), 1);
-        assert!(responses[0].starts_with(b"\x1b]5522;type=read:status=EINVAL;"));
+        assert!(responses.is_empty());
+        assert!(rich_ops(&events).is_empty());
 
         // Read with too many MIME types.
         let many = (0..MAX_RICH_MIME_COUNT + 1)
             .map(|index| format!("type/x{index}"))
             .collect::<Vec<_>>()
             .join(" ");
-        let (_, _, responses) =
+        let (_, events, responses) =
             collect(format!("\x1b]5522;type=read;{}\x1b\\", b64(many.as_bytes())).as_bytes());
-        assert_eq!(responses.len(), 1);
-        assert!(responses[0].starts_with(b"\x1b]5522;type=read:status=EINVAL;"));
+        assert!(responses.is_empty());
+        assert!(rich_ops(&events).is_empty());
 
         // Data outside any write session is ignored (no reply, no op).
         let mime = b64(b"text/plain");
@@ -1242,16 +1245,37 @@ mod integration_tests {
         assert!(responses.is_empty());
         assert!(rich_ops(&events).is_empty());
 
-        // Unknown `loc` values never remap to the system clipboard.
-        let (_, _, responses) = collect(
+        // Unknown `loc` values never remap to the system clipboard; the
+        // malformed read is ignored with no reply.
+        let (_, events, responses) = collect(
             format!(
                 "\x1b]5522;type=read:loc=evilcorp;{payload}\x1b\\",
                 payload = b64(b".")
             )
             .as_bytes(),
         );
+        assert!(responses.is_empty());
+        assert!(rich_ops(&events).is_empty());
+    }
+
+    #[test]
+    fn malformed_reads_are_ignored_while_writes_keep_einval() {
+        // Empty-payload and non-UTF8 reads produce no reply and no op.
+        let (_, events, responses) = collect(b"\x1b]5522;type=read;\x1b\\");
+        assert!(responses.is_empty());
+        assert!(rich_ops(&events).is_empty());
+
+        // Write-side failures still answer EINVAL exactly once.
+        let mime = b64(b"text/plain");
+        let input = [
+            b"\x1b]5522;type=write\x1b\\".to_vec(),
+            format!("\x1b]5522;type=wdata:mime={mime};!!!not-base64!!!\x1b\\").into_bytes(),
+        ]
+        .concat();
+        let (_, events, responses) = collect(&input);
         assert_eq!(responses.len(), 1);
-        assert!(responses[0].starts_with(b"\x1b]5522;type=read:status=EINVAL;"));
+        assert!(responses[0].starts_with(b"\x1b]5522;type=write:status=EINVAL;"));
+        assert!(rich_ops(&events).is_empty());
     }
 
     #[test]

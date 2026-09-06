@@ -182,12 +182,13 @@ impl PointerShape {
 
     /// Whether a query name is answered with `1` (supported).
     ///
-    /// Every name accepted by [`PointerShape::from_name`] — CSS plus xterm
-    /// aliases — reports supported. This is a compatible superset of Kitty's
-    /// CSS-only check: all 30 canonical names answer identically, while
-    /// legacy aliases honestly report that setting them works.
+    /// Only the 30 canonical CSS names report supported, matching Kitty
+    /// (`kitty/window.py:2902-2916` via `is_css_pointer_name_valid`,
+    /// `kitty/glfw.c:3093-3102`). Set-only xterm aliases such as `left_ptr`
+    /// answer `0` even though setting them works (`kitty/screen.c:2251-2296`;
+    /// spec `pointer-shapes.rst:79-85,165-172`).
     pub fn is_supported_name(name: &str) -> bool {
-        Self::from_name(name).is_some()
+        Self::from_css_name(name).is_some()
     }
 
     /// All 30 canonical CSS shapes in sorted wire order.
@@ -288,7 +289,9 @@ mod tests {
                 css,
                 "alias {alias}"
             );
-            assert!(PointerShape::is_supported_name(alias));
+            // Aliases stay settable but probe as unsupported (CSS-only `?`,
+            // matching Kitty): setting works, `?alias` answers `0`.
+            assert!(!PointerShape::is_supported_name(alias), "alias {alias}");
         }
     }
 

@@ -10,6 +10,19 @@ is omitted for readability.
 ## [Unreleased]
 
 ### Added
+- Kitty-precursor alignment fixes, verified against Kitty 0.48.2 sources:
+  OSC 5522 malformed reads silently ignored with a log and no reply
+  (EINVAL stays write-side only); drag-source `t=k` exact-token approval
+  gated to different-machine/unknown-locality reads while same-machine drags
+  proceed without prompting (Kitty has no drag-source prompt; remote gating
+  is deliberate hardening); one shared saved-modes store for explicit
+  (`CSI ? Pm s/r`) and bare (`CSI ? s/r`) save/restore, fully bidirectional;
+  OSC 22 `?` probe answering 1 only for CSS-valid names (0 for set-only
+  xterm aliases like `left_ptr`, which stay settable); and source-side `t=E`
+  split semantics (valid index fails only that request, `y=-1`/missing/
+  out-of-bounds aborts the drag) with finish-only `t=e:x=4:y` and `x=2:o=`
+  as the action-changed hint (final copy/move lives destination-side
+  `t=r:o=`).
 - Compositor-free graphics-pipeline differential suite (tests and fixtures
   only): a 41-vector pipeline suite
   (`crates/cterm-core/tests/graphics_differential.rs`) pinning Sixel decode
