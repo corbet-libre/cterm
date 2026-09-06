@@ -36,7 +36,10 @@ impl Rgb {
     ///
     /// Supported forms are `rgb:r/g/b` and legacy `#rgb`, with one to four
     /// hexadecimal digits per component. Components wider than eight bits use
-    /// their most significant byte; a single nibble is duplicated.
+    /// their most significant byte; a single nibble is duplicated. Anything
+    /// else falls back to the vendored Kitty/X11 named-color table
+    /// ([`crate::x11_colors::x11_color`]), matched case-insensitively, so
+    /// `red` and `DarkSeaGreen` resolve while unknown names fail.
     pub fn from_xparse_color(spec: &str) -> Option<Self> {
         fn component_with_width(value: &str) -> Option<u8> {
             if !(1..=4).contains(&value.len())
@@ -61,7 +64,7 @@ impl Rgb {
                 return None;
             }
             result
-        } else {
+        } else if spec.starts_with('#') {
             let hex = spec.strip_prefix('#')?;
             if !matches!(hex.len(), 3 | 6 | 9 | 12)
                 || !hex.bytes().all(|byte| byte.is_ascii_hexdigit())
@@ -70,6 +73,10 @@ impl Rgb {
             }
             let width = hex.len() / 3;
             [&hex[..width], &hex[width..width * 2], &hex[width * 2..]]
+        } else {
+            // Named colors (`red`, `DarkSeaGreen`): the X11 database values
+            // Kitty accepts, matched case-insensitively. Unknown names fail.
+            return super::x11_colors::x11_color(spec);
         };
 
         Some(Self::new(
@@ -82,14 +89,14 @@ impl Rgb {
     /// Parse a Kitty OSC 21 color value.
     ///
     /// Accepted forms are the strict XParseColor subset from
-    /// [`Rgb::from_xparse_color`] (`rgb:r/g/b`, `#rgb`), the Kitty
-    /// `rgbi:red/green/blue` float form (components clipped to `0.0..=1.0`),
-    /// and an optional `@alpha` suffix on any of those forms. The alpha
-    /// component is validated (finite float, clipped to `0.0..=1.0`) but not
-    /// stored: [`Rgb`] has no alpha channel, so query replies never
-    /// round-trip it. Named colors (for example `green`) are rejected; they
-    /// require Kitty's multi-hundred-entry X11 table, which is tracked as a
-    /// follow-up rather than guessed here.
+    /// [`Rgb::from_xparse_color`] (`rgb:r/g/b`, `#rgb`, plus the vendored
+    /// Kitty/X11 named colors such as `green`, matched case-insensitively),
+    /// the Kitty `rgbi:red/green/blue` float form (components clipped to
+    /// `0.0..=1.0`), and an optional `@alpha` suffix on any of those forms
+    /// (including names, for example `green@0.5`). The alpha component is
+    /// validated (finite float, clipped to `0.0..=1.0`) but not stored:
+    /// [`Rgb`] has no alpha channel, so query replies never round-trip it.
+    /// Unknown names and malformed specs are rejected.
     ///
     /// Overlong specs are rejected without allocation so hostile OSC payloads
     /// cannot amplify memory use.
@@ -453,9 +460,20 @@ mod tests {
             Rgb::from_xparse_color("#ffff80001234"),
             Some(Rgb::new(255, 128, 18))
         );
+        // Vendored Kitty/X11 names resolve case-insensitively.
+        assert_eq!(Rgb::from_xparse_color("red"), Some(Rgb::new(255, 0, 0)));
+        assert_eq!(
+            Rgb::from_xparse_color("DarkSeaGreen"),
+            Some(Rgb::new(143, 188, 143))
+        );
+        assert_eq!(
+            Rgb::from_xparse_color("sea green"),
+            Some(Rgb::new(46, 139, 87))
+        );
         assert_eq!(Rgb::from_xparse_color("rgb:ff/00"), None);
         assert_eq!(Rgb::from_xparse_color("#12345"), None);
-        assert_eq!(Rgb::from_xparse_color("red"), None);
+        assert_eq!(Rgb::from_xparse_color("not-a-color"), None);
+        assert_eq!(Rgb::from_xparse_color(""), None);
     }
 
     #[test]
@@ -493,8 +511,30 @@ mod tests {
         );
         // Malformed input is rejected.
         assert_eq!(Rgb::from_kitty_color_spec(""), None);
-        assert_eq!(Rgb::from_kitty_color_spec("green"), None);
-        assert_eq!(Rgb::from_kitty_color_spec("red"), None);
+        // Vendored Kitty/X11 names resolve case-insensitively, with an
+        // optional validated `@alpha` suffix; unknown names still fail.
+        assert_eq!(
+            Rgb::from_kitty_color_spec("green"),
+            Some(Rgb::new(0, 255, 0))
+        );
+        assert_eq!(
+            Rgb::from_kitty_color_spec("GREEN"),
+            Some(Rgb::new(0, 255, 0))
+        );
+        assert_eq!(
+            Rgb::from_kitty_color_spec("DarkSeaGreen"),
+            Some(Rgb::new(143, 188, 143))
+        );
+        assert_eq!(
+            Rgb::from_kitty_color_spec("sea green"),
+            Some(Rgb::new(46, 139, 87))
+        );
+        assert_eq!(
+            Rgb::from_kitty_color_spec("red@0.5"),
+            Some(Rgb::new(255, 0, 0))
+        );
+        assert_eq!(Rgb::from_kitty_color_spec("not-a-color"), None);
+        assert_eq!(Rgb::from_kitty_color_spec("reddish"), None);
         assert_eq!(Rgb::from_kitty_color_spec("rgbi:1.0/0.0"), None);
         assert_eq!(Rgb::from_kitty_color_spec("rgbi:1.0/0.0/0.0/0.0"), None);
         assert_eq!(Rgb::from_kitty_color_spec("rgbi:nan/0.0/0.0"), None);

@@ -386,7 +386,22 @@ struct PendingRichRead {
     list_only: bool,
 }
 
-/// Color query type (OSC 4 and OSC 10-12)
+/// Color query type (OSC 4 and OSC 10-12, plus the xterm highlight aliases)
+///
+/// `SelectionBackground` (`OSC 17`) and `SelectionForeground` (`OSC 19`)
+/// are **aliases** of the Kitty `selection_background` / `selection_foreground`
+/// slots, not separate storage. Rationale: xterm (`ctlseqs`, dynamic colors)
+/// and foot (`OSC 17`/`19` + resets `117`/`119`) define these codes as the
+/// highlight (selection) colors — the same user-observable concept as Kitty's
+/// `OSC 21` selection keys. One store keeps both spellings consistent (a set
+/// through either spelling is visible through the other, and the shared
+/// palette stack snapshots it once) instead of risking split-brain state.
+///
+/// One deliberate reply-shape difference follows from the two specs: the
+/// xterm shape always carries a color, so an unset selection slot reports the
+/// theme fallback (selection background, or foreground for the selection
+/// foreground, which reverse-video renders as the underlying text), while the
+/// Kitty `OSC 21` shape reports the same state as an empty value.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ColorQuery {
     /// Query one entry in the 256-color palette (OSC 4)
@@ -397,6 +412,12 @@ pub enum ColorQuery {
     Background,
     /// Query cursor color (OSC 12)
     Cursor,
+    /// Query highlight background / selection background (OSC 17, aliased to
+    /// the Kitty `selection_background` slot)
+    SelectionBackground,
+    /// Query highlight foreground / selection foreground (OSC 19, aliased to
+    /// the Kitty `selection_foreground` slot)
+    SelectionForeground,
 }
 
 impl ColorQuery {
@@ -405,6 +426,8 @@ impl ColorQuery {
             10 => Some(Self::Foreground),
             11 => Some(Self::Background),
             12 => Some(Self::Cursor),
+            17 => Some(Self::SelectionBackground),
+            19 => Some(Self::SelectionForeground),
             _ => None,
         }
     }
@@ -415,6 +438,8 @@ impl ColorQuery {
             Self::Foreground => 10,
             Self::Background => 11,
             Self::Cursor => 12,
+            Self::SelectionBackground => 17,
+            Self::SelectionForeground => 19,
         }
     }
 }
@@ -1983,12 +2008,15 @@ impl Screen {
         !self.pending_dnd_commands.is_empty()
     }
 
-    /// Queue a default-color query (from OSC 10-12)
+    /// Queue a default-color query (from OSC 10-12 and the OSC 17/19
+    /// highlight aliases)
     pub fn queue_color_query(&mut self, osc_code: u8) {
         let query = match osc_code {
             10 => ColorQuery::Foreground,
             11 => ColorQuery::Background,
             12 => ColorQuery::Cursor,
+            17 => ColorQuery::SelectionBackground,
+            19 => ColorQuery::SelectionForeground,
             _ => return,
         };
         let dynamic_color = self.dynamic_color(query);
@@ -2069,23 +2097,50 @@ impl Screen {
     }
 
     /// Set or reset an application-provided default color.
+    ///
+    /// The `OSC 17`/`19` highlight spellings alias the Kitty selection slots
+    /// (see [`ColorQuery`): setting stores an explicit color and resetting
+    /// restores `Default`. The xterm spellings cannot express `Dynamic`; use
+    /// `OSC 21` with an empty value for that.
     pub fn set_dynamic_color(&mut self, target: ColorQuery, color: Option<Rgb>) {
         match target {
             ColorQuery::Palette(index) => self.dynamic_palette[index as usize] = color,
             ColorQuery::Foreground => self.dynamic_foreground = color,
             ColorQuery::Background => self.dynamic_background = color,
             ColorQuery::Cursor => self.dynamic_cursor = color,
+            ColorQuery::SelectionBackground => {
+                self.set_kitty_setting(
+                    KittyColorKey::SelectionBackground,
+                    color.map_or(KittyColorSetting::Default, KittyColorSetting::Color),
+                );
+            }
+            ColorQuery::SelectionForeground => {
+                self.set_kitty_setting(
+                    KittyColorKey::SelectionForeground,
+                    color.map_or(KittyColorSetting::Default, KittyColorSetting::Color),
+                );
+            }
         }
         self.dirty = true;
     }
 
     /// Return an application-provided default color override.
+    ///
+    /// Aliased highlight queries report the explicit selection color, or
+    /// `None` when the slot is `Default`/`Dynamic` so the xterm reply falls
+    /// back to the theme color from [`Screen::base_query_color`].
     pub fn dynamic_color(&self, target: ColorQuery) -> Option<Rgb> {
         match target {
             ColorQuery::Palette(index) => self.dynamic_palette[index as usize],
             ColorQuery::Foreground => self.dynamic_foreground,
             ColorQuery::Background => self.dynamic_background,
             ColorQuery::Cursor => self.dynamic_cursor,
+            ColorQuery::SelectionBackground => {
+                self.kitty_explicit_color(KittyColorKey::SelectionBackground)
+            }
+            ColorQuery::SelectionForeground => {
+                self.kitty_explicit_color(KittyColorKey::SelectionForeground)
+            }
         }
     }
 
@@ -2184,8 +2239,13 @@ impl Screen {
     /// Snapshot the application setting for one Kitty OSC 21 slot.
     ///
     /// Numeric palette keys and the legacy foreground/background/cursor keys
-    /// alias the OSC 4/OSC 10-12 overrides; only the newer Kitty slots have
-    /// dedicated tri-state storage.
+    /// alias the OSC 4/OSC 10-12 overrides; the selection keys additionally
+    /// alias the xterm `OSC 17`/`19` highlight spellings (see [`ColorQuery`]).
+    /// Only the newer Kitty slots have dedicated tri-state storage.
+    ///
+    /// This is stable API for the native renderers (GTK/Cocoa/Win32): read
+    /// slots here and resolve them with [`Screen::kitty_explicit_color`] or
+    /// [`Screen::kitty_effective_color`].
     pub fn kitty_setting(&self, key: KittyColorKey) -> KittyColorSetting {
         let legacy = |color: Option<Rgb>| {
             color
@@ -2240,6 +2300,22 @@ impl Screen {
             }
         }
         self.dirty = true;
+    }
+
+    /// Explicit application color for one Kitty OSC 21 slot, for native
+    /// renderers.
+    ///
+    /// Returns the `Color` setting, or `None` when the slot is `Default` or
+    /// `Dynamic` and the frontend should keep its theme behavior. Per the
+    /// Kitty color-control spec the dynamic fallbacks are advisory:
+    /// selections render as reverse video, cursor text takes the underlying
+    /// background, the visual bell picks an automatic contrasting color, and
+    /// unset transparency means opaque. Stable API for GTK/Cocoa/Win32.
+    pub fn kitty_explicit_color(&self, key: KittyColorKey) -> Option<Rgb> {
+        match self.kitty_setting(key) {
+            KittyColorSetting::Color(color) => Some(color),
+            KittyColorSetting::Default | KittyColorSetting::Dynamic => None,
+        }
     }
 
     /// Resolve the effective query value for one Kitty slot.
@@ -2348,12 +2424,19 @@ impl Screen {
     }
 
     /// Return one queried color from the frontend's configured palette.
+    ///
+    /// The highlight aliases fall back to the theme selection background;
+    /// the selection foreground falls back to the theme foreground, matching
+    /// the unset reverse-video rendering (selected text shows the underlying
+    /// cell's foreground).
     pub fn base_query_color(&self, target: ColorQuery) -> Rgb {
         match target {
             ColorQuery::Palette(index) => Color::Indexed(index).to_rgb(&self.base_palette),
             ColorQuery::Foreground => self.base_palette.foreground,
             ColorQuery::Background => self.base_palette.background,
             ColorQuery::Cursor => self.base_palette.cursor,
+            ColorQuery::SelectionBackground => self.base_palette.selection,
+            ColorQuery::SelectionForeground => self.base_palette.foreground,
         }
     }
 
