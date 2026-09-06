@@ -92,6 +92,9 @@ struct ViewState {
     title_locked: AtomicBool,
     /// Flag indicating bell was triggered and needs UI update
     bell_changed: AtomicBool,
+    /// Active Kitty `visual_bell` flash (application color + arming time),
+    /// resolved and expiry-checked at draw time. `None` means no tint.
+    visual_bell_flash: std::sync::Mutex<Option<crate::cg_renderer::VisualBellFlash>>,
     /// Notifications parsed on the daemon reader thread and awaiting the main thread.
     pending_notifications: std::sync::Mutex<Vec<cterm_core::DesktopNotificationAction>>,
     /// OSC 72 commands parsed off-main-thread and awaiting the AppKit adapter.
@@ -110,6 +113,7 @@ impl Default for ViewState {
             title_changed: AtomicBool::new(false),
             title_locked: AtomicBool::new(false),
             bell_changed: AtomicBool::new(false),
+            visual_bell_flash: std::sync::Mutex::new(None),
             pending_notifications: std::sync::Mutex::new(Vec::new()),
             pending_dnd_commands: std::sync::Mutex::new(Vec::new()),
         }
@@ -184,6 +188,20 @@ async fn request_tty_file_transfer_consent(
         });
     }
     resolution.approved
+}
+
+/// Arm (or clear) the Kitty visual-bell flash from one bell event.
+///
+/// Reads the application `visual_bell` slot at bell time, mirroring the GTK
+/// `arm_visual_bell_flash` hook. The existing tab-indicator/dock-attention
+/// path always runs alongside; a slot without an explicit color simply
+/// leaves no tint armed.
+fn arm_visual_bell_flash(term: &Terminal, state: &Arc<ViewState>) {
+    let armed = crate::cg_renderer::kitty_visual_bell(term.screen())
+        .map(crate::cg_renderer::VisualBellFlash::arm);
+    if let Ok(mut flash) = state.visual_bell_flash.lock() {
+        *flash = armed;
+    }
 }
 
 /// Commands sent to the daemon I/O thread
@@ -364,7 +382,23 @@ define_class!(
                 let blink_phase = BlinkPhase::from_bits(
                     self.ivars().state.blink_phase.load(Ordering::Relaxed),
                 );
-                renderer.render(&terminal, bounds, blink_phase);
+                // Resolve the Kitty visual-bell tint here so only a live
+                // flash reaches the paint; an expired slot is cleared so the
+                // redraw loop below goes quiet again.
+                let visual_bell_flash = self
+                    .ivars()
+                    .state
+                    .visual_bell_flash
+                    .lock()
+                    .map(|mut flash| {
+                        let live = flash.as_ref().and_then(|armed| armed.color_at(Instant::now()));
+                        if live.is_none() {
+                            *flash = None;
+                        }
+                        live
+                    })
+                    .unwrap_or_default();
+                renderer.render(&terminal, bounds, blink_phase, visual_bell_flash);
 
                 // Render IME marked text if present
                 let marked_text = self.ivars().marked_text.borrow();
@@ -979,33 +1013,38 @@ define_class!(
                 return;
             }
 
-            // Check if we're over a hyperlink
-            let terminal = self.ivars().terminal.lock();
-            let absolute_line = terminal.screen().visible_row_to_absolute_line(row);
-
-            if let Some(cell) = terminal.screen().get_cell_with_scrollback(absolute_line, col) {
-                if let Some(ref hyperlink) = cell.hyperlink {
-                    // Show tooltip with URL
-                    let uri = hyperlink.uri.clone();
-                    drop(terminal);
-                    self.set_tooltip(&uri);
-
-                    // Set cursor to pointing hand
-                    unsafe {
-                        let cursor: Retained<AnyObject> = msg_send![class!(NSCursor), pointingHandCursor];
-                        let _: () = msg_send![&*cursor, set];
-                    }
-                    return;
-                }
+            // Selection drags and mouse-tracking drags keep their own cursor
+            // (Kitty's drag exemption, same precedence the GTK frontend
+            // applies: drag paths return before any cursor override).
+            if self.ivars().is_selecting.get() {
+                return;
             }
+
+            // Kitty OSC 22 application shape wins over the local hyperlink
+            // cursor; the hyperlink cursor wins over the default I-beam.
+            let terminal = self.ivars().terminal.lock();
+            let osc_shape = terminal.screen().current_pointer_shape();
+            let absolute_line = terminal.screen().visible_row_to_absolute_line(row);
+            let uri = terminal
+                .screen()
+                .get_cell_with_scrollback(absolute_line, col)
+                .and_then(|cell| cell.hyperlink.as_ref().map(|link| link.uri.clone()));
             drop(terminal);
 
-            // Clear tooltip and reset cursor if not over a hyperlink
-            self.clear_tooltip();
-            unsafe {
-                let cursor: Retained<AnyObject> = msg_send![class!(NSCursor), IBeamCursor];
-                let _: () = msg_send![&*cursor, set];
+            if let Some(uri) = uri.as_deref() {
+                self.set_tooltip(uri);
+            } else {
+                self.clear_tooltip();
             }
+            let Some((cursor, exact)) =
+                crate::pointer_shape::hover_cursor(false, osc_shape, uri.is_some())
+            else {
+                return;
+            };
+            if let Some(shape) = osc_shape {
+                crate::pointer_shape::note_fallback(shape, exact);
+            }
+            crate::pointer_shape::push_cocoa_cursor(cursor);
         }
 
         /// Report Kitty's SGR-pixel leave event to mouse-tracking applications.
@@ -2335,6 +2374,12 @@ impl TerminalView {
                                         let mut term = terminal.lock();
                                         let events = term.process_mirror(&chunk.data);
                                         let mut content_changed = false;
+                                        // Rich-clipboard reads need a main-thread
+                                        // consent sheet, which cannot run under
+                                        // the terminal lock held here, so they
+                                        // are collected and routed after
+                                        // `drop(term)` below (mirroring GTK).
+                                        let mut deferred_rich = Vec::new();
 
                                         for event in events {
                                             match event {
@@ -2351,6 +2396,7 @@ impl TerminalView {
                                                     }
                                                 }
                                                 TerminalEvent::Bell => {
+                                                    arm_visual_bell_flash(&term, &state);
                                                     state.bell_changed.store(true, Ordering::Relaxed);
                                                 }
                                                 TerminalEvent::DesktopNotification(notification) => {
@@ -2367,16 +2413,32 @@ impl TerminalView {
                                                     content_changed = true;
                                                 }
                                                 TerminalEvent::RichClipboardRequest(op) => {
-                                                    Self::handle_rich_clipboard_request(
-                                                        &mut term,
-                                                        op,
-                                                    );
+                                                    deferred_rich.push(op);
                                                 }
                                                 _ => {}
                                             }
                                         }
 
+                                        // Core clears the flag when it emits
+                                        // the Bell event above; this covers
+                                        // any path that set the flag without
+                                        // one, mirroring the GTK bell check.
+                                        if term.screen().bell {
+                                            term.screen_mut().bell = false;
+                                            arm_visual_bell_flash(&term, &state);
+                                            state.bell_changed.store(true, Ordering::Relaxed);
+                                        }
+
                                         drop(term);
+                                        for op in deferred_rich {
+                                            Self::handle_rich_clipboard_request(
+                                                &terminal,
+                                                &state,
+                                                view_ptr,
+                                                event_cancel_tx.subscribe(),
+                                                op,
+                                            );
+                                        }
                                         if content_changed {
                                             state.cursor_rearm.store(true, Ordering::Relaxed);
                                             state.needs_redraw.store(true, Ordering::Relaxed);
@@ -2453,6 +2515,18 @@ impl TerminalView {
                     state
                         .blink_phase
                         .store(blink_clock.phase().bits(), Ordering::Relaxed);
+                    state.needs_redraw.store(true, Ordering::Relaxed);
+                }
+
+                // Keep repainting while a Kitty visual-bell tint is live so
+                // it visibly expires; `drawRect:` clears the slot once the
+                // flash is spent, which quiets this loop again.
+                if state
+                    .visual_bell_flash
+                    .lock()
+                    .map(|flash| flash.is_some())
+                    .unwrap_or(false)
+                {
                     state.needs_redraw.store(true, Ordering::Relaxed);
                 }
 
@@ -3123,11 +3197,19 @@ impl TerminalView {
     }
 
     /// Handle one Kitty OSC 5522 operation in the frontend mirror, which owns
-    /// the native pasteboard. The caller holds the terminal lock; replies go
-    /// back through the terminal's write path (daemon input channel or local
-    /// PTY). Reads without prior consent are denied fail-closed: consent
-    /// prompts need the main thread, which this daemon reader cannot assume.
-    fn handle_rich_clipboard_request(term: &mut Terminal, op: cterm_core::RichClipboardOperation) {
+    /// the native pasteboard. Writes apply immediately; reads are answered
+    /// directly when core pre-authorized them (MIME listings, exact-token
+    /// consents, live paste-event tokens) and go through a native
+    /// deny-by-default sheet otherwise. The caller must NOT hold the terminal
+    /// lock: consent sheets live on the main thread while the reader
+    /// continues, and answers travel back through the terminal write path.
+    fn handle_rich_clipboard_request(
+        terminal: &Arc<Mutex<Terminal>>,
+        state: &Arc<ViewState>,
+        view_ptr: usize,
+        lifecycle_cancel: tokio::sync::watch::Receiver<bool>,
+        op: cterm_core::RichClipboardOperation,
+    ) {
         use cterm_core::RichClipboardOperation as Op;
 
         match op {
@@ -3151,45 +3233,151 @@ impl TerminalView {
                 }
             }
             Op::Read { request } => {
-                if request.location == RichClipboardLocation::Primary {
+                if request.list_only || request.pre_authorized {
+                    Self::answer_rich_clipboard_read(&mut terminal.lock(), &request);
+                } else if request.location == RichClipboardLocation::Primary {
                     // No primary selection on macOS.
-                    let _ = term.fail_rich_clipboard_read(
+                    let _ = terminal.lock().fail_rich_clipboard_read(
                         &request.id,
                         request.location,
                         RichClipboardStatus::NoSys,
                     );
-                } else if !request.pre_authorized {
-                    let _ = term.fail_rich_clipboard_read(
-                        &request.id,
-                        request.location,
-                        RichClipboardStatus::Perm,
-                    );
-                } else if request.list_only {
-                    let types = clipboard::get_text()
-                        .map(|_| vec!["text/plain".to_string()])
-                        .unwrap_or_default();
-                    if term
-                        .complete_rich_clipboard_list(&request.id, request.location, &types)
-                        .is_err()
-                    {
-                        log::error!("Failed to answer OSC 5522 MIME-list read");
-                    }
                 } else {
-                    let wants_text = request.mimes.iter().any(|mime| mime == "text/plain");
-                    let items = match (clipboard::get_text(), wants_text) {
-                        (Some(text), true) => vec![RichClipboardItem {
-                            mime: "text/plain".to_string(),
-                            data: text.into_bytes(),
-                        }],
-                        _ => Vec::new(),
-                    };
-                    if term
-                        .complete_rich_clipboard_read(&request.id, request.location, &items)
-                        .is_err()
-                    {
-                        log::error!("Failed to answer OSC 5522 read");
-                    }
+                    tokio::spawn(Self::request_rich_clipboard_consent(
+                        Arc::clone(terminal),
+                        Arc::clone(state),
+                        view_ptr,
+                        request,
+                        lifecycle_cancel,
+                    ));
                 }
+            }
+        }
+    }
+
+    /// Answer a consented OSC 5522 read with native pasteboard data.
+    /// Requested types outside text/plain are unavailable here and skipped,
+    /// per the protocol (possibly yielding an empty DONE).
+    fn answer_rich_clipboard_read(term: &mut Terminal, request: &cterm_core::RichReadRequest) {
+        if request.list_only {
+            let types = clipboard::get_text()
+                .map(|_| vec!["text/plain".to_string()])
+                .unwrap_or_default();
+            if term
+                .complete_rich_clipboard_list(&request.id, request.location, &types)
+                .is_err()
+            {
+                log::error!("Failed to answer OSC 5522 MIME-list read");
+            }
+            return;
+        }
+        let wants_text = request.mimes.iter().any(|mime| mime == "text/plain");
+        let items = match (clipboard::get_text(), wants_text) {
+            (Some(text), true) => vec![RichClipboardItem {
+                mime: "text/plain".to_string(),
+                data: text.into_bytes(),
+            }],
+            _ => Vec::new(),
+        };
+        if term
+            .complete_rich_clipboard_read(&request.id, request.location, &items)
+            .is_err()
+        {
+            log::error!("Failed to answer OSC 5522 read");
+        }
+    }
+
+    /// Resolve one non-pre-authorized OSC 5522 read through a native
+    /// deny-by-default sheet. Never blocks the reader: the sheet lives on
+    /// the main thread while this task awaits expiry, lifecycle
+    /// cancellation, or the user's choice, then answers through the terminal
+    /// write path. Every non-click path denies with `EPERM`.
+    async fn request_rich_clipboard_consent(
+        terminal: Arc<Mutex<Terminal>>,
+        state: Arc<ViewState>,
+        view_ptr: usize,
+        request: cterm_core::RichReadRequest,
+        lifecycle_cancel: tokio::sync::watch::Receiver<bool>,
+    ) {
+        use crate::rich_clipboard_prompt::RichClipboardChoice as Choice;
+
+        // Anchor expiry when the event is received, before main-thread
+        // dispatch can delay the sheet.
+        let expires_at =
+            tokio::time::Instant::now() + crate::rich_clipboard_prompt::RICH_CLIPBOARD_PROMPT_TTL;
+        if expires_at <= tokio::time::Instant::now()
+            || *lifecycle_cancel.borrow()
+            || state.view_invalid.load(Ordering::Acquire)
+        {
+            let _ = terminal.lock().fail_rich_clipboard_read(
+                &request.id,
+                request.location,
+                RichClipboardStatus::Perm,
+            );
+            return;
+        }
+        let token = crate::rich_clipboard_prompt::next_rich_clipboard_prompt_token();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let cancelled_for_ui = Arc::clone(&cancelled);
+        let state_for_ui = Arc::clone(&state);
+        let request_for_ui = request.clone();
+        let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+
+        dispatch2::Queue::main().exec_async(move || {
+            if cancelled_for_ui.load(Ordering::Acquire)
+                || state_for_ui.view_invalid.load(Ordering::Acquire)
+            {
+                let _ = result_tx.send(Choice::Deny);
+                return;
+            }
+
+            let mtm = unsafe { MainThreadMarker::new_unchecked() };
+            // The view's deallocation and this closure are serialized on
+            // AppKit's main thread. `view_invalid` is set before
+            // removal/deallocation.
+            let view = unsafe { &*(view_ptr as *const TerminalView) };
+            let Some(parent) = view.window() else {
+                let _ = result_tx.send(Choice::Deny);
+                return;
+            };
+            crate::rich_clipboard_prompt::begin_rich_clipboard_prompt(
+                mtm,
+                token,
+                &request_for_ui,
+                &parent,
+                cancelled_for_ui,
+                result_tx,
+            );
+        });
+
+        let outcome = crate::rich_clipboard_prompt::await_rich_clipboard_prompt(
+            result_rx,
+            lifecycle_cancel,
+            expires_at,
+        )
+        .await;
+        if outcome.dismiss {
+            cancelled.store(true, Ordering::Release);
+            dispatch2::Queue::main().exec_async(move || {
+                let mtm = unsafe { MainThreadMarker::new_unchecked() };
+                crate::rich_clipboard_prompt::cancel_rich_clipboard_prompt(mtm, token);
+            });
+        }
+        let mut term = terminal.lock();
+        match outcome.choice {
+            Choice::AllowAlways => {
+                if let Some(credential) = &request.credential {
+                    term.authorize_rich_clipboard(&credential.password, &credential.name);
+                }
+                Self::answer_rich_clipboard_read(&mut term, &request);
+            }
+            Choice::AllowOnce => Self::answer_rich_clipboard_read(&mut term, &request),
+            Choice::Deny => {
+                let _ = term.fail_rich_clipboard_read(
+                    &request.id,
+                    request.location,
+                    RichClipboardStatus::Perm,
+                );
             }
         }
     }
