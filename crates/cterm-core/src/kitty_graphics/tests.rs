@@ -1424,3 +1424,213 @@ fn invalid_payload_returns_a_bounded_protocol_error() {
     assert!(String::from_utf8(reply).unwrap().contains("ENODATA"));
     assert!(screen.images().is_empty());
 }
+
+#[test]
+fn transient_priority_holds_regardless_of_insertion_order() {
+    // Reverse of the existing insertion order: transient first, regular
+    // second. The transient image must still lose under quota pressure,
+    // proving the N=1 hint outranks LRU age.
+    let mut graphics = KittyGraphics::default();
+    let mut screen = Screen::new(10, 5, ScreenConfig::default());
+    feed(
+        &mut graphics,
+        &mut screen,
+        &sequence("a=t,f=32,s=1,v=1,i=201,N=1", &[4, 5, 6, 255]),
+    );
+    feed(
+        &mut graphics,
+        &mut screen,
+        &sequence("a=t,f=32,s=1,v=1,i=202", &[1, 2, 3, 255]),
+    );
+
+    graphics.evict_to_fit(STORE_QUOTA_BYTES - 4, None, &mut screen);
+
+    assert!(graphics.images.contains_key(&202));
+    assert!(!graphics.images.contains_key(&201));
+}
+
+#[test]
+fn eviction_prefers_oldest_within_the_same_hint_class() {
+    let mut graphics = KittyGraphics::default();
+    let mut screen = Screen::new(10, 5, ScreenConfig::default());
+    for (id, transient) in [(211, true), (212, true)] {
+        let control = if transient {
+            format!("a=t,f=32,s=1,v=1,i={id},N=1")
+        } else {
+            format!("a=t,f=32,s=1,v=1,i={id}")
+        };
+        feed(
+            &mut graphics,
+            &mut screen,
+            &sequence(&control, &[1, 2, 3, 255]),
+        );
+    }
+
+    graphics.evict_to_fit(STORE_QUOTA_BYTES - 4, None, &mut screen);
+
+    assert!(
+        !graphics.images.contains_key(&211),
+        "oldest transient goes first"
+    );
+    assert!(graphics.images.contains_key(&212));
+}
+
+#[test]
+fn visible_transient_placements_are_never_evicted_for_unplaced_data() {
+    let mut graphics = KittyGraphics::default();
+    let mut screen = Screen::new(10, 5, ScreenConfig::default());
+    feed(
+        &mut graphics,
+        &mut screen,
+        &sequence("a=T,f=32,s=1,v=1,i=221,N=1,C=1", &[9, 9, 9, 255]),
+    );
+    feed(
+        &mut graphics,
+        &mut screen,
+        &sequence("a=t,f=32,s=1,v=1,i=222", &[1, 2, 3, 255]),
+    );
+
+    graphics.evict_to_fit(STORE_QUOTA_BYTES - 4, None, &mut screen);
+
+    assert!(graphics.images.contains_key(&221), "placed image survives");
+    assert!(!graphics.images.contains_key(&222));
+    assert_eq!(screen.images().len(), 1);
+}
+
+#[test]
+fn eviction_victim_is_deterministic_across_identical_stores() {
+    fn victim() -> Option<u32> {
+        let mut graphics = KittyGraphics::default();
+        let mut screen = Screen::new(10, 5, ScreenConfig::default());
+        for id in 231..=233 {
+            feed(
+                &mut graphics,
+                &mut screen,
+                &sequence(
+                    &format!("a=t,f=32,s=1,v=1,i={id},N=1"),
+                    &[id as u8, 2, 3, 255],
+                ),
+            );
+        }
+        graphics.evict_to_fit(STORE_QUOTA_BYTES - 4, None, &mut screen);
+        (231..=233).find(|id| !graphics.images.contains_key(id))
+    }
+
+    assert_eq!(victim(), Some(231));
+    assert_eq!(
+        victim(),
+        victim(),
+        "same pressure must pick the same victim"
+    );
+}
+
+#[test]
+fn blend_and_overwrite_order_is_deterministic_on_transparent_source() {
+    // Direct composition helper: order matters and each mode is exact.
+    // Transparent red over opaque blue preserves blue with AlphaBlend but
+    // wins outright with Overwrite.
+    let blue = [0, 0, 255, 255];
+    let transparent_red = [255, 0, 0, 0];
+
+    let mut blended = blue.to_vec();
+    composite_rgba_region(
+        &mut blended,
+        1,
+        &transparent_red,
+        1,
+        0,
+        0,
+        0,
+        0,
+        1,
+        1,
+        FrameComposition::AlphaBlend,
+    );
+    assert_eq!(blended, blue);
+
+    let mut overwritten = blue.to_vec();
+    composite_rgba_region(
+        &mut overwritten,
+        1,
+        &transparent_red,
+        1,
+        0,
+        0,
+        0,
+        0,
+        1,
+        1,
+        FrameComposition::Overwrite,
+    );
+    assert_eq!(overwritten, transparent_red);
+
+    // Opaque source wins under both modes (sanity: no hidden blending).
+    let opaque_red = [255, 0, 0, 255];
+    for mode in [FrameComposition::AlphaBlend, FrameComposition::Overwrite] {
+        let mut destination = blue.to_vec();
+        composite_rgba_region(&mut destination, 1, &opaque_red, 1, 0, 0, 0, 0, 1, 1, mode);
+        assert_eq!(destination, opaque_red);
+    }
+}
+
+#[test]
+fn decode_raw_rejects_zero_and_oversized_dimensions_without_allocating() {
+    for (width, height) in [(0, 1), (1, 0), (10_001, 1), (1, 10_001), (10_001, 10_001)] {
+        let command = Command {
+            format: Format::Rgba32,
+            pixel_width: Some(width),
+            pixel_height: Some(height),
+            ..Command::default()
+        };
+        let error = decode_raw(&command, Vec::new(), command.echo()).unwrap_err();
+        assert_eq!(error.code, ErrorCode::Invalid, "{width}x{height}");
+    }
+}
+
+#[test]
+fn three_chunk_reassembly_matches_single_shot_upload() {
+    let rgba = [7, 8, 9, 255, 10, 11, 12, 255];
+    let encoded = STANDARD.encode(rgba);
+    let third = encoded.len() / 3;
+    let (first, rest) = encoded.split_at(third);
+    let (second, last) = rest.split_at(third);
+
+    let mut chunked = KittyGraphics::default();
+    let mut chunked_screen = Screen::new(10, 5, ScreenConfig::default());
+    feed(
+        &mut chunked,
+        &mut chunked_screen,
+        format!("\x1b_Ga=t,f=32,s=2,v=1,i=241,m=1;{first}\x1b\\").as_bytes(),
+    );
+    // Middle chunks carry only the continuation marker.
+    feed(
+        &mut chunked,
+        &mut chunked_screen,
+        format!("\x1b_Gm=1;{second}\x1b\\").as_bytes(),
+    );
+    assert!(chunked_screen.images().is_empty());
+    feed(
+        &mut chunked,
+        &mut chunked_screen,
+        format!("\x1b_Gm=0;{last}\x1b\\").as_bytes(),
+    );
+    feed(
+        &mut chunked,
+        &mut chunked_screen,
+        b"\x1b_Ga=p,i=241,p=1,C=1\x1b\\",
+    );
+
+    let mut single = KittyGraphics::default();
+    let mut single_screen = Screen::new(10, 5, ScreenConfig::default());
+    feed(
+        &mut single,
+        &mut single_screen,
+        &sequence("a=T,f=32,s=2,v=1,i=241,C=1", &rgba),
+    );
+
+    assert_eq!(
+        chunked_screen.images()[0].data.as_slice(),
+        single_screen.images()[0].data.as_slice()
+    );
+    assert_eq!(chunked_screen.images()[0].data.as_slice(), &rgba);
+}
