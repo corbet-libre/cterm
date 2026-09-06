@@ -10,6 +10,10 @@ is omitted for readability.
 ## [Unreleased]
 
 ### Added
+- Kitty screen unscrolling (`CSI Ps + T`): scroll down within the scroll
+  region, refilling the new top lines from scrollback instead of blanking
+  them. Falls back to blank lines on the alternate screen or with empty
+  scrollback; ordinary `CSI Ps T` behavior is unchanged.
 - A living, evidence-backed foot and Kitty parity inventory that distinguishes
   implementation from user-observable verification.
 - Kitty OSC 5113 decoding and exact-token consent, plus bidirectional
