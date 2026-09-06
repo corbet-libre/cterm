@@ -28,12 +28,13 @@ pub mod session;
 pub mod shortcuts;
 pub mod ssh_history;
 pub mod template_launch;
+pub mod transfer_bypass;
 pub mod upgrade;
 
 pub use config::{
     background_sync, load_config, load_sticky_tabs, load_tool_shortcuts, save_config,
     save_config_with_sync, save_sticky_tabs, save_tool_shortcuts, set_config_dir_override, Config,
-    ToolShortcutEntry,
+    ToolShortcutEntry, TransferConfig, TransferConsentMode,
 };
 pub use daemon_reconnect::{
     check_daemon_sessions, reconnect_all_sessions, ReconnectCheck, ReconnectedSession,
@@ -45,8 +46,10 @@ pub use git_sync::{
     PullResult, SyncStatus,
 };
 pub use kitty_file_transfer::{
-    evaluate_transfer_bypass, AuthorizedTtyTransferCommand, BypassDecision, TtyTransferAction,
-    TtyTransferApprovalRequest, TtyTransferBypassKind, TtyTransferDirection, TtyTransferManager,
+    evaluate_transfer_bypass, evaluate_transfer_bypass_with_policy, AuthorizedTtyTransferCommand,
+    BypassDecision, TransferBypassPolicy, TransferConsentAudit, TransferConsentDecision,
+    TtyTransferAction, TtyTransferApprovalRequest, TtyTransferBypassKind, TtyTransferDirection,
+    TtyTransferManager,
 };
 pub use kitty_file_transfer_fs::{
     TtyTransferFilesystem, TtyTransferFilesystemConfigError, TtyTransferLimits,
@@ -70,6 +73,12 @@ pub use template_launch::{
     TemplateAppearance, TemplateDaemonTarget, TemplateInstancePolicy, TemplateLaunchPlan,
     TemplateLaunchPlanError, TemplateLaunchTarget, TemplateNamedRemote, TemplateWorkspace,
     TemplateWorkspaceLocation, TemplateWorkspaceSource,
+};
+pub use transfer_bypass::{
+    b85decode, b85encode, current_time_ns, encode_bypass_credential, encrypt_bypass_credential,
+    hash_bypass_token, parse_kitty_public_key_env, verify_bypass_credential, TransferBypassError,
+    TransferBypassKeypair, BYPASS_TIMESTAMP_WINDOW_NS, KITTY_PUBLIC_KEY_VERSION,
+    MAX_BYPASS_WIRE_BYTES,
 };
 pub use upgrade::{execute_upgrade, receive_upgrade, UpgradeError};
 pub use upgrade::{UpdateError, UpdateInfo, Updater, UpgradeState};
