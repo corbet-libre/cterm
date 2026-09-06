@@ -4,6 +4,7 @@
 
 use crate::color::ColorPalette;
 use crate::dnd::DndCommand;
+use crate::kitty_clipboard::{RichClipboardItem, RichClipboardLocation, RichClipboardStatus};
 use crate::kitty_file_transfer::FileTransferCommand;
 use crate::kitty_graphics::GraphicsAnimationTick;
 use crate::parser::Parser;
@@ -34,6 +35,10 @@ pub enum TerminalEvent {
     ContentChanged,
     /// Clipboard operation requested (OSC 52)
     ClipboardRequest(ClipboardOperation),
+    /// Rich-clipboard operation requested (OSC 5522). Reads carry consent
+    /// state: pre-authorized requests need native data only, others need a
+    /// deny-by-default native prompt first (denial answers `EPERM`).
+    RichClipboardRequest(crate::kitty_clipboard::RichClipboardOperation),
     /// Terminal application requested a native desktop notification.
     DesktopNotification(DesktopNotificationAction),
     /// Terminal application changed a native Kitty OSC 72 drag session.
@@ -245,6 +250,14 @@ impl Terminal {
             }
         }
 
+        // Emit rich-clipboard operations. Mirrors handle these (they own the
+        // native clipboard); the daemon core only tracks pending reads.
+        if self.screen.has_rich_clipboard_ops() {
+            for op in self.screen.take_rich_clipboard_ops() {
+                events.push(TerminalEvent::RichClipboardRequest(op));
+            }
+        }
+
         if self.screen.has_notifications() {
             for notification in self.screen.take_notifications() {
                 events.push(TerminalEvent::DesktopNotification(notification));
@@ -426,6 +439,89 @@ impl Terminal {
         let encoded = base64::engine::general_purpose::STANDARD.encode(data);
         let response = format!("\x1b]52;{};{}\x07", selection_char, encoded);
         self.write(response.as_bytes())
+    }
+
+    /// Answer a pending OSC 5522 data read with frontend-supplied native
+    /// items, writing the `OK`/`DATA`/`DONE` reply to the PTY. Returns
+    /// `Ok(false)` when no matching read is pending (stale answer dropped).
+    pub fn complete_rich_clipboard_read(
+        &mut self,
+        id: &str,
+        location: RichClipboardLocation,
+        items: &[RichClipboardItem],
+    ) -> Result<bool, PtyError> {
+        let replies = self
+            .screen
+            .complete_rich_clipboard_read(id, location, items);
+        if replies.is_empty() {
+            return Ok(false);
+        }
+        for reply in &replies {
+            self.write(reply)?;
+        }
+        Ok(true)
+    }
+
+    /// Answer a pending OSC 5522 MIME-list read with available native types.
+    pub fn complete_rich_clipboard_list(
+        &mut self,
+        id: &str,
+        location: RichClipboardLocation,
+        types: &[String],
+    ) -> Result<bool, PtyError> {
+        let replies = self
+            .screen
+            .complete_rich_clipboard_list(id, location, types);
+        if replies.is_empty() {
+            return Ok(false);
+        }
+        for reply in &replies {
+            self.write(reply)?;
+        }
+        Ok(true)
+    }
+
+    /// Fail a pending OSC 5522 read (`EPERM` after a denied consent prompt,
+    /// `ENOSYS` for primary on single-clipboard platforms).
+    pub fn fail_rich_clipboard_read(
+        &mut self,
+        id: &str,
+        location: RichClipboardLocation,
+        status: RichClipboardStatus,
+    ) -> Result<bool, PtyError> {
+        let replies = self.screen.fail_rich_clipboard_read(id, location, status);
+        if replies.is_empty() {
+            return Ok(false);
+        }
+        for reply in &replies {
+            self.write(reply)?;
+        }
+        Ok(true)
+    }
+
+    /// Remember an exact-token consent authorizing future OSC 5522 reads
+    /// that present the same `password`+`name` ("always allow" answers).
+    pub fn authorize_rich_clipboard(&mut self, password: &str, name: &str) -> bool {
+        self.screen.authorize_rich_clipboard(password, name)
+    }
+
+    /// Send an unsolicited 5522-mode paste notification listing `types`
+    /// available at `location`. Returns `Ok(false)` and sends nothing when
+    /// paste-event mode is disabled (callers then use the normal paste
+    /// path). While enabled, 5522 replaces bracketed paste for the event.
+    pub fn notify_rich_clipboard_paste(
+        &mut self,
+        location: RichClipboardLocation,
+        types: &[String],
+    ) -> Result<bool, PtyError> {
+        let replies = self.screen.mint_rich_paste_notification(location, types);
+        if replies.is_empty() {
+            return Ok(false);
+        }
+        for reply in &replies {
+            self.write(reply)?;
+        }
+        Ok(true)
     }
 
     /// Resize the terminal

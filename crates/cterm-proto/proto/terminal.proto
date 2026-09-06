@@ -727,6 +727,9 @@ message TerminalModes {
   // screen's own pointer state.
   repeated string pointer_main_stack = 18;
   repeated string pointer_alt_stack = 19;
+  // Kitty OSC 5522 paste-event mode for reconnecting frontends, so a
+  // relaunch keeps reporting user pastes as MIME listings (or not).
+  bool rich_clipboard_paste_events = 20;
 }
 
 enum MouseTrackingMode {

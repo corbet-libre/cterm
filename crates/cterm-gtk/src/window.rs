@@ -1493,6 +1493,20 @@ impl CtermWindow {
                     let clipboard = display.clipboard();
                     let tabs_paste = Rc::clone(&tabs);
                     let notebook_paste = notebook.clone();
+                    // Paste-event mode replaces the text paste with an
+                    // unsolicited MIME listing; the application then reads
+                    // whatever types it wants through OSC 5522.
+                    if let Some(page_idx) = notebook_paste.current_page() {
+                        let tabs = tabs_paste.borrow();
+                        if let Some(tab) = tabs.get(page_idx as usize) {
+                            if tab
+                                .terminal
+                                .notify_rich_paste(cterm_core::RichClipboardLocation::Clipboard)
+                            {
+                                return;
+                            }
+                        }
+                    }
                     clipboard.read_text_async(None::<&gio::Cancellable>, move |result| {
                         if let Ok(Some(text)) = result {
                             if let Some(page_idx) = notebook_paste.current_page() {

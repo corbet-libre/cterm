@@ -49,6 +49,13 @@ is omitted for readability.
   transparency keys with query/set/reset and strict value validation) plus
   OSC 30001/30101 palette-stack push/pop on the shared xterm stack, with
   daemon-owned replies and snapshot persistence.
+- Kitty OSC 5522 rich clipboard: typed MIME reads/writes with strict
+  validation, write sessions with alias resolution, MIME-list and DECRQM
+  queries, paste-event mode with single-use tokens, exact-token consent
+  reuse with deny-by-default prompts, and per-backend native adapters
+  (GTK consent prompt + text/plain, Cocoa text/HTML, Win32 text/plain),
+  with daemon snapshot persistence of the paste-event mode. Text OSC 52
+  behavior is unchanged.
 
 ### Fixed
 - Streamed OSC 1337 interception now replays incomplete, cancelled, and

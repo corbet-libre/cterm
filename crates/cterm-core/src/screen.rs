@@ -9,6 +9,11 @@ use crate::dnd::DndCommand;
 use crate::drcs::{DrcsFont, DrcsGlyph};
 use crate::grid::{Grid, Row};
 use crate::keyboard::KeyboardEnhancementFlags;
+use crate::kitty_clipboard::{
+    PastePassword, RichClipboardItem, RichClipboardLocation, RichClipboardOperation,
+    RichClipboardStatus, RichReadRequest, RichWriteSession, MAX_PENDING_RICH_CLIPBOARD_OPS,
+    MAX_PENDING_RICH_READS,
+};
 use crate::kitty_file_transfer::{FileTransferCommand, MAX_PENDING_FILE_TRANSFER_COMMANDS};
 use crate::multiple_cursors::{
     ExtraCursor, ExtraCursorColor, ExtraCursorColorTarget, ExtraCursorColors, ExtraCursorShape,
@@ -268,6 +273,11 @@ pub struct TerminalModes {
     pub alternate_scroll: bool,
     /// Bracketed paste mode
     pub bracketed_paste: bool,
+    /// Kitty rich-clipboard paste events (DEC private mode 5522). When set,
+    /// user paste actions are reported as unsolicited OSC 5522 MIME listings
+    /// instead of bracketed-paste text.
+    #[serde(default)]
+    pub rich_clipboard_paste_events: bool,
     /// xterm modifyOtherKeys level. foot supports level 1 (default) and 2.
     #[serde(default = "default_modify_other_keys")]
     pub modify_other_keys: u8,
@@ -366,6 +376,14 @@ pub enum ClipboardOperation {
     },
     /// Query clipboard content
     Query { selection: ClipboardSelection },
+}
+
+/// An OSC 5522 read awaiting frontend-supplied native data.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PendingRichRead {
+    id: String,
+    location: RichClipboardLocation,
+    list_only: bool,
 }
 
 /// Color query type (OSC 4 and OSC 10-12)
@@ -880,6 +898,17 @@ pub struct Screen {
     pending_responses: Vec<Vec<u8>>,
     /// Pending clipboard operations from OSC 52
     pending_clipboard_ops: Vec<ClipboardOperation>,
+    /// Active Kitty OSC 5522 write session, if the application started one.
+    rich_write: Option<RichWriteSession>,
+    /// Exact-token (`pw`+`name`) consents authorizing future OSC 5522 reads.
+    /// Session-scoped ("same tty"): never snapshotted, never persisted.
+    authorized_clipboard: Vec<(String, String)>,
+    /// Live one-time paste-event tokens (single-use, TTL-bounded).
+    paste_passwords: VecDeque<PastePassword>,
+    /// Pending rich-clipboard operations from OSC 5522.
+    pending_rich_clipboard_ops: Vec<RichClipboardOperation>,
+    /// Reads awaiting frontend data (bounded; oldest evicted past the cap).
+    pending_rich_reads: Vec<PendingRichRead>,
     /// Pending desktop notifications from OSC 9/777/99.
     pending_notifications: Vec<DesktopNotificationAction>,
     /// Validated Kitty OSC 72 commands for the native drag-and-drop adapter.
@@ -1257,6 +1286,11 @@ impl Screen {
             tab_stops: Self::default_tab_stops(width),
             pending_responses: Vec::new(),
             pending_clipboard_ops: Vec::new(),
+            rich_write: None,
+            authorized_clipboard: Vec::new(),
+            paste_passwords: VecDeque::new(),
+            pending_rich_clipboard_ops: Vec::new(),
+            pending_rich_reads: Vec::new(),
             pending_notifications: Vec::new(),
             pending_dnd_commands: Vec::new(),
             pending_color_queries: Vec::new(),
@@ -1561,6 +1595,355 @@ impl Screen {
     /// Check if there are pending clipboard operations
     pub fn has_clipboard_ops(&self) -> bool {
         !self.pending_clipboard_ops.is_empty()
+    }
+
+    /// Handle one Kitty OSC 5522 packet (`params[0]` is `5522`).
+    ///
+    /// Malformed packets are rejected with a terminal-side error reply (or
+    /// silently ignored when there is no request to answer); validated reads
+    /// and completed writes become [`RichClipboardOperation`]s for the
+    /// native frontend. Daemon-owned replies keep stream order because they
+    /// are queued here, at parse time.
+    pub fn handle_rich_clipboard(&mut self, params: &[&[u8]]) {
+        use crate::kitty_clipboard::{
+            encode_read_error, encode_write_status, parse_metadata, RichClipboardStatus,
+            RichWriteSession,
+        };
+
+        let Some(metadata_bytes) = params.get(1) else {
+            return;
+        };
+        let Ok(metadata_str) = std::str::from_utf8(metadata_bytes) else {
+            return;
+        };
+        let metadata = parse_metadata(metadata_str);
+        // Echo back the sanitized id even when the rest of the packet is
+        // unusable, so multiplexers can route the error.
+        let id = metadata.id.clone();
+        let payload = params
+            .get(2)
+            .map(|bytes| bytes.to_vec())
+            .unwrap_or_default();
+        let Ok(payload_str) = std::str::from_utf8(&payload).map(str::to_string) else {
+            // Non-UTF-8 payloads cannot be valid base64.
+            self.queue_response(encode_read_error(&id, RichClipboardStatus::Inval));
+            return;
+        };
+
+        match metadata.packet_type.as_deref() {
+            Some("read") => self.handle_rich_read(&id, &metadata, &payload_str),
+            Some("write") => {
+                if metadata.malformed_credential || !payload_str.is_empty() {
+                    self.queue_response(encode_write_status(&id, Some(RichClipboardStatus::Inval)));
+                    return;
+                }
+                self.rich_write = Some(RichWriteSession::new(metadata.location, id));
+            }
+            Some("wdata") => self.handle_rich_wdata(&metadata, &payload_str),
+            Some("walias") => self.handle_rich_walias(&metadata, &payload_str),
+            // Unknown packet types are ignored so newer senders keep working.
+            _ => {}
+        }
+    }
+
+    /// Handle one validated `type=read` packet: resolve consent at parse time
+    /// and queue a [`RichClipboardOperation::Read`] for the native frontend.
+    fn handle_rich_read(
+        &mut self,
+        id: &str,
+        metadata: &crate::kitty_clipboard::RichMetadata,
+        payload: &str,
+    ) {
+        use crate::kitty_clipboard::{
+            encode_read_error, parse_read_payload, resolve_read_consent, RichClipboardStatus,
+        };
+
+        if metadata.malformed_credential || payload.is_empty() {
+            self.queue_response(encode_read_error(id, RichClipboardStatus::Inval));
+            return;
+        }
+        let mimes = match parse_read_payload(payload) {
+            Ok(mimes) => mimes,
+            Err(_) => {
+                self.queue_response(encode_read_error(id, RichClipboardStatus::Inval));
+                return;
+            }
+        };
+        let list_only = mimes.is_none();
+        let credential = metadata.credential();
+        // MIME listings never prompt; data reads need an exact-token consent
+        // or a live paste-event token, otherwise the frontend must ask.
+        let pre_authorized = list_only
+            || resolve_read_consent(
+                credential.as_ref(),
+                metadata.location,
+                &self.authorized_clipboard,
+                &mut self.paste_passwords,
+            );
+        let request = RichReadRequest {
+            id: id.to_string(),
+            location: metadata.location,
+            mimes: mimes.unwrap_or_default(),
+            list_only,
+            app_name: credential
+                .as_ref()
+                .map(|credential| credential.name.clone()),
+            credential,
+            pre_authorized,
+        };
+        self.track_pending_rich_read(&request);
+        self.queue_rich_clipboard_op(RichClipboardOperation::Read { request });
+    }
+
+    /// Handle one `type=wdata` packet: append a chunk or finish the session.
+    fn handle_rich_wdata(
+        &mut self,
+        metadata: &crate::kitty_clipboard::RichMetadata,
+        payload: &str,
+    ) {
+        use crate::kitty_clipboard::{
+            decode_clipboard_base64, encode_write_status, RichClipboardStatus,
+        };
+
+        let Some(session) = self.rich_write.as_mut() else {
+            // Chunks outside a session (or after completion) are ignored.
+            return;
+        };
+        if session.failed {
+            // A failed session ignores everything until a new `type=write`.
+            return;
+        }
+        // The bare packet (no MIME, no payload) ends the transmission.
+        if metadata.mime.is_none() && payload.is_empty() {
+            let session = self.rich_write.take().expect("session checked above");
+            let session_id = session.id.clone();
+            let location = session.location;
+            let (items, aliases) = session.finish();
+            self.queue_response(encode_write_status(&session_id, None));
+            self.queue_rich_clipboard_op(RichClipboardOperation::Write {
+                id: session_id,
+                location,
+                items,
+                aliases,
+            });
+            return;
+        }
+        if metadata.malformed_credential {
+            self.fail_rich_write(RichClipboardStatus::Inval);
+            return;
+        }
+        let Some(mime) = metadata.mime.as_deref() else {
+            self.fail_rich_write(RichClipboardStatus::Inval);
+            return;
+        };
+        let Some(chunk) = decode_clipboard_base64(payload) else {
+            self.fail_rich_write(RichClipboardStatus::Inval);
+            return;
+        };
+        if let Err(status) = session.add_chunk(mime, chunk) {
+            self.fail_rich_write(status);
+        }
+    }
+
+    /// Handle one `type=walias` packet inside an active write session.
+    fn handle_rich_walias(
+        &mut self,
+        metadata: &crate::kitty_clipboard::RichMetadata,
+        payload: &str,
+    ) {
+        use crate::kitty_clipboard::{decode_clipboard_base64, RichClipboardStatus};
+
+        let Some(session) = self.rich_write.as_mut() else {
+            return;
+        };
+        if session.failed {
+            return;
+        }
+        if metadata.malformed_credential {
+            self.fail_rich_write(RichClipboardStatus::Inval);
+            return;
+        }
+        let Some(target) = metadata.mime.as_deref() else {
+            self.fail_rich_write(RichClipboardStatus::Inval);
+            return;
+        };
+        let aliases: Vec<String> = match decode_clipboard_base64(payload)
+            .and_then(|decoded| String::from_utf8(decoded).ok())
+        {
+            Some(text) => text.split_ascii_whitespace().map(str::to_string).collect(),
+            None => {
+                self.fail_rich_write(RichClipboardStatus::Inval);
+                return;
+            }
+        };
+        if aliases.is_empty() {
+            self.fail_rich_write(RichClipboardStatus::Inval);
+            return;
+        }
+        if let Err(status) = session.add_alias(target, aliases) {
+            self.fail_rich_write(status);
+        }
+    }
+
+    /// Fail the active write session: reply once, then ignore further
+    /// session packets until a new `type=write` starts.
+    fn fail_rich_write(&mut self, status: RichClipboardStatus) {
+        use crate::kitty_clipboard::encode_write_status;
+
+        if let Some(session) = self.rich_write.as_mut() {
+            session.failed = true;
+            let id = session.id.clone();
+            self.queue_response(encode_write_status(&id, Some(status)));
+        }
+    }
+
+    /// Queue a validated rich-clipboard operation, dropping (with a warning)
+    /// when the frontend has not drained the bounded queue.
+    pub fn queue_rich_clipboard_op(&mut self, op: RichClipboardOperation) {
+        if self.pending_rich_clipboard_ops.len() >= MAX_PENDING_RICH_CLIPBOARD_OPS {
+            log::warn!("Dropping Kitty OSC 5522 operation: frontend queue is full");
+            return;
+        }
+        self.pending_rich_clipboard_ops.push(op);
+    }
+
+    /// Drain all pending rich-clipboard operations.
+    pub fn take_rich_clipboard_ops(&mut self) -> Vec<RichClipboardOperation> {
+        std::mem::take(&mut self.pending_rich_clipboard_ops)
+    }
+
+    /// Whether rich-clipboard operations are waiting for the frontend.
+    pub fn has_rich_clipboard_ops(&self) -> bool {
+        !self.pending_rich_clipboard_ops.is_empty()
+    }
+
+    /// Remember one pending read for later completion, evicting the oldest
+    /// past the cap. Evicted reads never receive a reply; the bounded queue
+    /// keeps a hostile sender from growing memory without bound.
+    fn track_pending_rich_read(&mut self, request: &RichReadRequest) {
+        if self.pending_rich_reads.len() >= MAX_PENDING_RICH_READS {
+            self.pending_rich_reads.remove(0);
+        }
+        self.pending_rich_reads.push(PendingRichRead {
+            id: request.id.clone(),
+            location: request.location,
+            list_only: request.list_only,
+        });
+    }
+
+    /// Remove the oldest pending read matching `id` (empty matches any),
+    /// location, and kind. Returns false when nothing matched.
+    fn take_pending_rich_read(
+        &mut self,
+        id: &str,
+        location: RichClipboardLocation,
+        list_only: bool,
+    ) -> Option<PendingRichRead> {
+        let index = self.pending_rich_reads.iter().position(|pending| {
+            (id.is_empty() || pending.id == id)
+                && pending.location == location
+                && pending.list_only == list_only
+        })?;
+        Some(self.pending_rich_reads.remove(index))
+    }
+
+    /// Remember an exact-token consent authorizing future reads that present
+    /// the same `password`+`name`. Returns false for empty/oversize halves.
+    pub fn authorize_rich_clipboard(&mut self, password: &str, name: &str) -> bool {
+        use crate::kitty_clipboard::remember_consent;
+
+        remember_consent(&mut self.authorized_clipboard, password, name)
+    }
+
+    /// Whether an exact-token consent is currently remembered.
+    pub fn is_rich_clipboard_authorized(&self, password: &str, name: &str) -> bool {
+        self.authorized_clipboard
+            .iter()
+            .any(|(stored_pw, stored_name)| stored_pw == password && stored_name == name)
+    }
+
+    /// Build the reply for a data read from frontend-supplied native items.
+    /// Returns empty when no matching read is pending (stale/duplicate
+    /// answers are dropped, never misrouted to another request).
+    pub fn complete_rich_clipboard_read(
+        &mut self,
+        id: &str,
+        location: RichClipboardLocation,
+        items: &[RichClipboardItem],
+    ) -> Vec<Vec<u8>> {
+        use crate::kitty_clipboard::{encode_read_responses, validate_mime};
+
+        let Some(pending) = self.take_pending_rich_read(id, location, false) else {
+            log::warn!("Dropping OSC 5522 read answer: no matching pending read");
+            return Vec::new();
+        };
+        let clean: Vec<RichClipboardItem> = items
+            .iter()
+            .filter(|item| validate_mime(&item.mime).is_some())
+            .cloned()
+            .collect();
+        if clean.len() != items.len() {
+            log::warn!("Dropping OSC 5522 read items with invalid MIME types");
+        }
+        encode_read_responses(&pending.id, &clean)
+    }
+
+    /// Build the reply for a MIME-list read from available native types.
+    pub fn complete_rich_clipboard_list(
+        &mut self,
+        id: &str,
+        location: RichClipboardLocation,
+        types: &[String],
+    ) -> Vec<Vec<u8>> {
+        use crate::kitty_clipboard::encode_list_responses;
+
+        let Some(pending) = self.take_pending_rich_read(id, location, true) else {
+            log::warn!("Dropping OSC 5522 list answer: no matching pending read");
+            return Vec::new();
+        };
+        encode_list_responses(&pending.id, types)
+    }
+
+    /// Build an error reply for a pending read (e.g. `EPERM` after the user
+    /// denied a consent prompt, `ENOSYS` for primary on single-clipboard
+    /// platforms). Unknown/stale reads answer nothing.
+    pub fn fail_rich_clipboard_read(
+        &mut self,
+        id: &str,
+        location: RichClipboardLocation,
+        status: RichClipboardStatus,
+    ) -> Vec<Vec<u8>> {
+        use crate::kitty_clipboard::encode_read_error;
+
+        let pending_list = self.take_pending_rich_read(id, location, true);
+        let pending_data = self.take_pending_rich_read(id, location, false);
+        let Some(pending) = pending_list.or(pending_data) else {
+            log::warn!("Dropping OSC 5522 read error: no matching pending read");
+            return Vec::new();
+        };
+        vec![encode_read_error(&pending.id, status)]
+    }
+
+    /// Whether Kitty paste-event mode (5522) is currently enabled.
+    pub fn rich_paste_events_enabled(&self) -> bool {
+        self.modes.rich_clipboard_paste_events
+    }
+
+    /// Build an unsolicited 5522-mode paste notification for `types`
+    /// available at `location`, minting a single-use token the application
+    /// can redeem for the data. Returns empty when the mode is disabled.
+    pub fn mint_rich_paste_notification(
+        &mut self,
+        location: RichClipboardLocation,
+        types: &[String],
+    ) -> Vec<Vec<u8>> {
+        use crate::kitty_clipboard::{encode_paste_notification, remember_paste_password};
+
+        if !self.modes.rich_clipboard_paste_events {
+            return Vec::new();
+        }
+        let password = remember_paste_password(&mut self.paste_passwords, location);
+        encode_paste_notification(location, types, &password)
     }
 
     /// Queue a native desktop notification requested by terminal output.
