@@ -76,6 +76,21 @@ is omitted for readability.
   DECOM/DECCOLM), plus Kitty private DCS `echo`, `print`, and
   `restore-cursor-appearance` with strict validation. Remote control and
   the kitten/overlay/ssh/ask/clone/edit commands stay fail-closed.
+- Headless scripted consent driver for Kitty OSC 5113 transfers: a
+  compositor-free dialog-result seam (`DialogOutcome` with fail-closed
+  cancel/expiry precedence over simultaneous approval plus exact-token
+  approve/deny/expire/cancel/reconnect-replay coverage). The final native
+  dialog hop on GTK/Cocoa/Win32 still needs UI automation.
+- Default-deny transfer bypass hook (`TtyTransferBypassKind`,
+  `evaluate_transfer_bypass` always resolving to prompt, with regression
+  tests locking that in) plus a decision-pending bypass policy proposal in
+  `docs/transfer-bypass-policy.md`. No enforcement was weakened.
+- Kitty file-transfer differential vectors, verified against live Kitty
+  0.48.2: a serialized codec corpus parsed to identical fields, byte-exact
+  rsync signatures/deltas applied unmodified, Kitty-matched round(sqrt)
+  signature block sizing, padded/unpadded base64 agreement, chunk-split
+  invariance, and decompressed-byte session accounting
+  (`scripts/kitty_transfer_vectors.sh`).
 
 ### Fixed
 - Streamed OSC 1337 interception now replays incomplete, cancelled, and

@@ -16,7 +16,6 @@ const SIGNATURE_HEADER_BYTES: usize = 12;
 const BLOCK_HASH_BYTES: usize = 20;
 const MAX_BLOCK_BYTES: usize = 1024 * 1024;
 const DEFAULT_BLOCK_BYTES: usize = 6 * 1024;
-const HASH_BLOCK_BYTES: usize = 64;
 const MAX_LITERAL_BYTES: usize = 64 * 1024;
 const OUTPUT_HASH_BYTES: usize = 16;
 const DELTA_INPUT_SLACK_BYTES: u64 = 64 * 1024;
@@ -538,8 +537,17 @@ fn signature_block_size(size: u64) -> usize {
     if size == 0 {
         return DEFAULT_BLOCK_BYTES;
     }
-    let root = (size as f64).sqrt().round() as usize;
-    root.clamp(HASH_BLOCK_BYTES, MAX_BLOCK_BYTES) / HASH_BLOCK_BYTES * HASH_BLOCK_BYTES
+    // Match Kitty's sizing (verified against Kitty 0.48.2's Patcher block
+    // sizes for 0, 1, 8, 48, 1000, 4096, 100000, 1000000, 100000000, 10^14,
+    // 2^63 and 2^64-1 bytes): the 6 KiB default for empty input, otherwise
+    // round(sqrt(size)) with no upper clamp. Integer sizes never sit exactly
+    // on a .5 boundary, so float rounding mode cannot diverge. The caller
+    // sizes come from local file metadata bounded by the transfer limits, so
+    // the block buffer stays small. Note the deliberate receiving-side
+    // divergence: Signature::parse and DeltaPatcher::new still reject block
+    // sizes above 1 MiB fail-closed, so a peer asking us to match gigabyte
+    // blocks is refused instead of honored.
+    ((size as f64).sqrt().round() as usize).max(1)
 }
 
 fn operation_bytes_needed(pending: &[u8]) -> io::Result<usize> {
@@ -663,7 +671,8 @@ mod tests {
         assert_eq!(&serialized[..8], &[0; 8]);
         assert_eq!(
             u32::from_le_bytes(serialized[8..12].try_into().unwrap()),
-            64
+            3,
+            "Kitty 0.48.2 sizes 8-byte input to round(sqrt(8)) = 3"
         );
         assert_eq!(
             u64::from_le_bytes(serialized[12..20].try_into().unwrap()),
@@ -735,6 +744,209 @@ mod tests {
             patcher.write_all(&empty_data).unwrap_err().kind(),
             io::ErrorKind::FileTooLarge
         );
+    }
+
+    // Differential vectors against Kitty's documented rsync/XXH3 wire layout
+    // (little-endian records, XXH3-64 block hashes, XXH3-128 output
+    // verification). No live-Kitty comparison is possible in this
+    // environment, so these pin the documented serialization instead; rerun
+    // them against a live Kitty before claiming differential parity.
+    #[test]
+    fn kitty_documented_wire_signature_layout_is_little_endian() {
+        let mut serialized = Vec::new();
+        write_signature(Cursor::new(b"abcdefgh"), 8, &mut serialized).unwrap();
+        // Byte-exact against Kitty 0.48.2's Patcher(8) signing b"abcdefgh":
+        // 12-byte header plus three 20-byte records (block size 3 splits the
+        // input into abc/def/gh). Every byte below came off the live Kitty
+        // binary, so this also proves the weak rolling checksum and XXH3-64
+        // agree with Kitty's.
+        let kitty = hex_bytes("000000000000000003000000000000000000000026014a0250392f89945faf7801000000000000002f015c0288f19e693ee7e49b0200000000000000cf003601c558472a7ca2c72c");
+        assert_eq!(serialized, kitty);
+        // Three 3-byte blocks: 12-byte header plus three 20-byte records.
+        assert_eq!(
+            serialized.len(),
+            SIGNATURE_HEADER_BYTES + 3 * BLOCK_HASH_BYTES
+        );
+        // Version, checksum type, strong hash type, weak hash type are zero.
+        assert_eq!(&serialized[..8], &[0; 8]);
+        // round(sqrt(8)) = 3, matching Kitty's block sizing.
+        assert_eq!(u32::from_le_bytes(serialized[8..12].try_into().unwrap()), 3);
+        assert_eq!(&serialized[12..20], &[0; 8], "block index is u64 LE");
+        assert_eq!(
+            u32::from_le_bytes(serialized[20..24].try_into().unwrap()),
+            RollingChecksum::new(b"abc").digest(),
+            "weak checksum is u32 LE and agrees with Kitty's record"
+        );
+        assert_eq!(
+            u64::from_le_bytes(serialized[24..32].try_into().unwrap()),
+            XxHash3_64::oneshot(b"abc"),
+            "strong hash is u64 LE and agrees with Kitty's record"
+        );
+
+        let mut empty = Vec::new();
+        write_signature(Cursor::new(b""), 0, &mut empty).unwrap();
+        assert_eq!(empty.len(), SIGNATURE_HEADER_BYTES);
+    }
+
+    #[test]
+    fn kitty_live_block_sizes_match_kitty_0_48() {
+        // Probed from Kitty 0.48.2's Patcher(size).block_size. Rerun against
+        // the installed Kitty if it is upgraded.
+        for (size, expected) in [
+            (0, DEFAULT_BLOCK_BYTES),
+            (1, 1),
+            (8, 3),
+            (48, 7),
+            (1000, 32),
+            (4096, 64),
+            (100_000, 316),
+            (1_000_000, 1000),
+            (100_000_000, 10_000),
+        ] {
+            assert_eq!(signature_block_size(size), expected, "size {size}");
+        }
+    }
+
+    #[test]
+    fn kitty_documented_wire_signature_rejects_foreign_layouts() {
+        let mut serialized = Vec::new();
+        write_signature(Cursor::new(b"abcdefgh"), 8, &mut serialized).unwrap();
+        let limit = serialized.len();
+
+        let mut versioned = serialized.clone();
+        versioned[0] = 1;
+        assert!(Signature::parse(&versioned, limit).is_err());
+
+        let mut checksummed = serialized.clone();
+        checksummed[2] = 1;
+        assert!(Signature::parse(&checksummed, limit).is_err());
+
+        let mut zero_block = serialized.clone();
+        zero_block[8..12].copy_from_slice(&0_u32.to_le_bytes());
+        assert!(Signature::parse(&zero_block, limit).is_err());
+
+        let mut huge_block = serialized.clone();
+        huge_block[8..12].copy_from_slice(&(MAX_BLOCK_BYTES as u32 + 1).to_le_bytes());
+        assert!(Signature::parse(&huge_block, limit).is_err());
+
+        // 10 trailing body bytes are not a whole 20-byte record.
+        assert!(Signature::parse(&serialized[..serialized.len() - 10], limit).is_err());
+    }
+
+    #[test]
+    fn kitty_documented_wire_contiguous_blocks_coalesce_to_one_range() {
+        let block_size = 16;
+        let base: Vec<u8> = (0..48).map(|byte| byte as u8).collect();
+        let signature = signature(&base, block_size);
+        let mut delta = Vec::new();
+        write_delta(Cursor::new(&base), &signature, &mut delta).unwrap();
+
+        // One block-range op covering all three blocks, then the 16-byte
+        // XXH3-128 output checksum op. No literal ops for identical content.
+        assert_eq!(delta.len(), 13 + 3 + OUTPUT_HASH_BYTES);
+        assert_eq!(delta[0], OP_BLOCK_RANGE);
+        assert_eq!(
+            u64::from_le_bytes(delta[1..9].try_into().unwrap()),
+            0,
+            "range starts at block 0"
+        );
+        assert_eq!(
+            u32::from_le_bytes(delta[9..13].try_into().unwrap()),
+            2,
+            "range covers two additional blocks"
+        );
+        assert_eq!(delta[13], OP_HASH);
+        assert_eq!(
+            u16::from_le_bytes(delta[14..16].try_into().unwrap()) as usize,
+            OUTPUT_HASH_BYTES
+        );
+        assert_eq!(
+            &delta[16..],
+            &XxHash3_128::oneshot(&base).to_be_bytes(),
+            "output checksum is XXH3-128 big-endian"
+        );
+
+        let mut patcher = DeltaPatcher::new(
+            Cursor::new(&base),
+            Vec::new(),
+            base.len() as u64,
+            block_size,
+            base.len() as u64,
+        )
+        .unwrap();
+        patcher.write_all(&delta).unwrap();
+        assert_eq!(patcher.finish().unwrap(), base);
+    }
+
+    #[test]
+    fn kitty_live_delta_applies_through_cterm_unmodified() {
+        // Byte-exact delta emitted by Kitty 0.48.2's Differ for 48 identical
+        // bytes (block size 7): one block-range op for blocks 0-5, one
+        // literal for the 6-byte tail, one XXH3-128 checksum op. Applying it
+        // unmodified proves op codes, little-endian framing, the u16 hash
+        // length, and big-endian XXH3-128 verification all agree with Kitty.
+        let base: Vec<u8> = (0..48).map(|byte| byte as u8).collect();
+        let kitty_delta = hex_bytes(
+            "0300000000000000000500000001060000002a2b2c2d2e2f021000d750a7889a2e7adaf6b46e1097bd1836",
+        );
+        let mut patcher = DeltaPatcher::new(Cursor::new(&base), Vec::new(), 48, 7, 48).unwrap();
+        patcher.write_all(&kitty_delta).unwrap();
+        assert_eq!(patcher.finish().unwrap(), base);
+    }
+
+    #[test]
+    fn kitty_live_mixed_delta_applies_through_cterm_unmodified() {
+        // Byte-exact delta emitted by Kitty 0.48.2's Differ for base bytes
+        // 0..48 (block size 7) morphing into a patched, extended target:
+        // mixed literal, block-copy, and tail ops plus the XXH3-128 checksum.
+        // Applying it unmodified proves the patcher tracks Kitty's matcher
+        // across shifted content, not just identical files.
+        let base: Vec<u8> = (0..48).map(|byte| byte as u8).collect();
+        // Mirrors the Python fixture generator: target[3:9] = b"PATCH1"
+        // (same length), target[30:35] = b"XX" (shrinks by 3), plus a
+        // 9-byte trailer.
+        let mut target: Vec<u8> = Vec::with_capacity(54);
+        target.extend_from_slice(&base[..3]);
+        target.extend_from_slice(b"PATCH1");
+        target.extend_from_slice(&base[9..30]);
+        target.extend_from_slice(b"XX");
+        target.extend_from_slice(&base[35..]);
+        target.extend_from_slice(b"trailer!!");
+        assert_eq!(target.len(), 54);
+        let kitty_delta = hex_bytes(
+            "010e000000000102504154434831090a0b0c0d0302000000000000000100000001040000001c1d585800050000000000000001080000002a2b2c2d2e2f7472010700000061696c6572212102100057ce8b6a0e8e100d85527e814f198100",
+        );
+        let mut patcher =
+            DeltaPatcher::new(Cursor::new(&base), Vec::new(), 48, 7, target.len() as u64).unwrap();
+        for chunk in kitty_delta.chunks(11) {
+            patcher.write_all(chunk).unwrap();
+        }
+        assert_eq!(patcher.finish().unwrap(), target);
+    }
+
+    #[test]
+    fn kitty_documented_wire_delta_rejects_unknown_ops_and_trailers() {
+        let base = b"abcdefgh";
+        let valid_signature = signature(base, 4);
+        let mut delta = Vec::new();
+        write_delta(Cursor::new(b"abcdefgH"), &valid_signature, &mut delta).unwrap();
+
+        let mut unknown = DeltaPatcher::new(Cursor::new(base), Vec::new(), 8, 4, 8).unwrap();
+        assert!(unknown.write_all(&[0xFF]).is_err());
+
+        let mut trailed = delta.clone();
+        trailed.push(0x00);
+        let mut patcher = DeltaPatcher::new(Cursor::new(base), Vec::new(), 8, 4, 8).unwrap();
+        assert!(patcher.write_all(&trailed).is_err());
+    }
+
+    fn hex_bytes(value: &str) -> Vec<u8> {
+        let (pairs, remainder) = value.as_bytes().as_chunks::<2>();
+        assert!(remainder.is_empty());
+        pairs
+            .iter()
+            .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap())
+            .collect()
     }
 
     fn hex(value: &str) -> [u8; 16] {

@@ -4469,4 +4469,169 @@ mod tests {
             assert!(resolve_absolute_protocol_path(path).is_none(), "{path}");
         }
     }
+
+    // Differential vectors against Kitty's documented file-transfer wire
+    // behavior: ≤4096-byte plain/zlib chunks, per-file and cumulative
+    // decompressed-byte accounting. No live-Kitty comparison is possible in
+    // this environment, so these pin the documented chunking and accounting
+    // instead; rerun them against a live Kitty before claiming differential
+    // parity.
+    #[test]
+    fn kitty_documented_wire_chunk_splitting_is_invisible_to_the_destination() {
+        let payload: Vec<u8> = (0..5000).map(|index| (index % 251) as u8).collect();
+        let committed = |session_id: &str, splits: &[usize]| {
+            let home = tempfile::tempdir().unwrap();
+            let mut manager = TtyTransferManager::new();
+            let mut filesystem =
+                TtyTransferSendFilesystem::new(home.path().to_path_buf(), limits(16 * 1024))
+                    .unwrap();
+            approve_send(&mut manager, session_id);
+
+            let mut file = command(FileTransferAction::File, session_id);
+            file.file_id = Some("f1".into());
+            file.name = Some("~/split.bin".into());
+            file.size = Some(payload.len() as u64);
+            assert_eq!(
+                status(&run(&mut manager, &mut filesystem, file))
+                    .status
+                    .as_deref(),
+                Some("STARTED")
+            );
+
+            let mut offset = 0;
+            for (index, split) in splits.iter().enumerate() {
+                let end = (offset + split).min(payload.len());
+                let last = end == payload.len();
+                let mut chunk = command(
+                    if last {
+                        FileTransferAction::EndData
+                    } else {
+                        FileTransferAction::Data
+                    },
+                    session_id,
+                );
+                chunk.file_id = Some("f1".into());
+                chunk.data = payload[offset..end].to_vec();
+                let responded = run(&mut manager, &mut filesystem, chunk);
+                if last {
+                    assert_eq!(
+                        status(&responded).status.as_deref(),
+                        Some("OK"),
+                        "split plan {splits:?}"
+                    );
+                    assert_eq!(status(&responded).size, Some(end as u64));
+                } else {
+                    assert_eq!(
+                        status(&responded).status.as_deref(),
+                        Some("PROGRESS"),
+                        "split plan {splits:?} chunk {index}"
+                    );
+                    assert_eq!(status(&responded).size, Some(end as u64));
+                }
+                offset = end;
+            }
+            assert!(run(
+                &mut manager,
+                &mut filesystem,
+                command(FileTransferAction::Finish, session_id)
+            )
+            .is_empty());
+            fs::read(home.path().join("split.bin")).unwrap()
+        };
+
+        // Same bytes as one max-size wire chunk plus a tail, and as many
+        // small chunks: both are wire-legal (every command carries ≤4096
+        // bytes) and both must commit byte-identical files.
+        assert_eq!(
+            committed("wire-chunks", &[MAX_FILE_TRANSFER_CHUNK_BYTES, 904]),
+            payload
+        );
+        assert_eq!(
+            committed("small-chunks", &[1000, 1000, 1000, 1000, 1000]),
+            payload
+        );
+    }
+
+    #[test]
+    fn kitty_documented_wire_decompressed_bytes_consume_the_session_budget() {
+        let home = tempfile::tempdir().unwrap();
+        let mut manager = TtyTransferManager::new();
+        let budget = TtyTransferLimits::new(8, 600, 1000).unwrap();
+        let mut filesystem =
+            TtyTransferSendFilesystem::new(home.path().to_path_buf(), budget).unwrap();
+        approve_send(&mut manager, "budget");
+
+        // Kitty commonly omits `sz`: the 600 decompressed bytes still count.
+        let mut first = command(FileTransferAction::File, "budget");
+        first.file_id = Some("f1".into());
+        first.name = Some("~/one.bin".into());
+        first.compression = Some(FileTransferCompression::Zlib);
+        run(&mut manager, &mut filesystem, first);
+        let mut end = command(FileTransferAction::EndData, "budget");
+        end.file_id = Some("f1".into());
+        end.data = zlib_bytes(&[b'a'; 600]);
+        assert_eq!(
+            status(&run(&mut manager, &mut filesystem, end))
+                .status
+                .as_deref(),
+            Some("OK")
+        );
+
+        // Only 400 session bytes remain, so 600 more decompressed bytes fail.
+        let mut second = command(FileTransferAction::File, "budget");
+        second.file_id = Some("f2".into());
+        second.name = Some("~/two.bin".into());
+        second.compression = Some(FileTransferCompression::Zlib);
+        run(&mut manager, &mut filesystem, second);
+        let mut overflow = command(FileTransferAction::EndData, "budget");
+        overflow.file_id = Some("f2".into());
+        overflow.data = zlib_bytes(&[b'b'; 600]);
+        assert!(status(&run(&mut manager, &mut filesystem, overflow))
+            .status
+            .as_deref()
+            .is_some_and(|value| value.starts_with("EFBIG:")));
+
+        run(
+            &mut manager,
+            &mut filesystem,
+            command(FileTransferAction::Finish, "budget"),
+        );
+        assert_eq!(
+            fs::read(home.path().join("one.bin")).unwrap(),
+            vec![b'a'; 600]
+        );
+        assert!(!home.path().join("two.bin").exists());
+    }
+
+    #[test]
+    fn kitty_documented_wire_understated_size_fails_closed() {
+        let home = tempfile::tempdir().unwrap();
+        let destination = home.path().join("small.txt");
+        let mut manager = TtyTransferManager::new();
+        let mut filesystem =
+            TtyTransferSendFilesystem::new(home.path().to_path_buf(), limits(1024)).unwrap();
+        approve_send(&mut manager, "understated");
+
+        // The peer declares 4 bytes but sends 11: the writer limit follows
+        // the declaration, so the overrun fails instead of committing.
+        let mut file = command(FileTransferAction::File, "understated");
+        file.file_id = Some("f1".into());
+        file.name = Some("~/small.txt".into());
+        file.size = Some(4);
+        run(&mut manager, &mut filesystem, file);
+        let mut data = command(FileTransferAction::Data, "understated");
+        data.file_id = Some("f1".into());
+        data.data = b"hello world".to_vec();
+        assert!(status(&run(&mut manager, &mut filesystem, data))
+            .status
+            .as_deref()
+            .is_some_and(|value| value.starts_with("EFBIG:")));
+
+        run(
+            &mut manager,
+            &mut filesystem,
+            command(FileTransferAction::Finish, "understated"),
+        );
+        assert!(!destination.exists());
+    }
 }
