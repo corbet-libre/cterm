@@ -60,6 +60,49 @@ impl AuthorizedTtyTransferCommand {
     }
 }
 
+/// Requested authorization-bypass condition for one transfer command.
+///
+/// Design hook only: see `docs/transfer-bypass-policy.md`. No bypass is
+/// implemented — [`evaluate_transfer_bypass`] resolves every kind to
+/// [`BypassDecision::Prompt`] — so the `pw` bypass credential decoded from the
+/// wire today can never authorize a transfer. The variants name the conditions
+/// the policy proposal discusses, so call sites can already express intent
+/// while enforcement stays deny-by-default.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TtyTransferBypassKind {
+    /// No bypass requested: always prompt. This is the default.
+    #[default]
+    None,
+    /// Proposed: a session the local user pre-authorized on the same TTY.
+    SameTtyPreauthorized,
+    /// Proposed: loopback automation where the peer is the local machine.
+    LoopbackAutomation,
+}
+
+/// Outcome of evaluating a bypass request. The only stable outcome is
+/// `Prompt`; auto-approve arms do not exist until the bypass policy is
+/// approved and implemented.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BypassDecision {
+    /// Show the native deny-by-default consent dialog.
+    Prompt,
+}
+
+/// Evaluate a bypass request without weakening enforcement.
+///
+/// Always returns [`BypassDecision::Prompt`], including for commands that
+/// carry a wire `pw` bypass credential and for every proposed
+/// [`TtyTransferBypassKind`]. The regression tests below lock this in: any
+/// future policy landing must extend this function and its decision enum
+/// deliberately, never by relaxing the codec or the state machine.
+pub fn evaluate_transfer_bypass(
+    command: &FileTransferCommand,
+    kind: TtyTransferBypassKind,
+) -> BypassDecision {
+    let _ = (command, kind);
+    BypassDecision::Prompt
+}
+
 /// Work emitted by the UI-neutral authorization state machine.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TtyTransferAction {
@@ -774,6 +817,47 @@ mod tests {
             [TtyTransferAction::Abort { .. }, TtyTransferAction::Write(_)]
         ));
         assert_eq!(manager.active_sessions(), 0);
+    }
+
+    #[test]
+    fn bypass_evaluation_is_default_deny_for_every_kind() {
+        let mut credentialed = command(FileTransferAction::Send, "bypass");
+        credentialed.bypass = Some("sha256:attacker-supplied".into());
+        for kind in [
+            TtyTransferBypassKind::None,
+            TtyTransferBypassKind::SameTtyPreauthorized,
+            TtyTransferBypassKind::LoopbackAutomation,
+        ] {
+            assert_eq!(
+                evaluate_transfer_bypass(&credentialed, kind),
+                BypassDecision::Prompt,
+                "bypass kind {kind:?} must not authorize without an approved policy"
+            );
+            assert_eq!(
+                evaluate_transfer_bypass(&command(FileTransferAction::Send, "plain"), kind),
+                BypassDecision::Prompt
+            );
+        }
+        assert_eq!(
+            TtyTransferBypassKind::default(),
+            TtyTransferBypassKind::None
+        );
+    }
+
+    #[test]
+    fn wire_bypass_credential_never_skips_the_consent_prompt() {
+        let mut manager = TtyTransferManager::new();
+        let mut start = command(FileTransferAction::Send, "credentialed");
+        start.bypass = Some("sha256:attacker-supplied".into());
+        let actions = manager.handle(start);
+        // The credential is decoded by the codec but ignored by the state
+        // machine: exactly one approval request, no authorization.
+        let request_id = approval(&actions).request_id;
+        assert!(manager.is_approval_pending(request_id));
+        assert!(matches!(
+            manager.approve(request_id).as_slice(),
+            [TtyTransferAction::Write(_)]
+        ));
     }
 
     #[test]

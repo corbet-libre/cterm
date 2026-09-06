@@ -17,6 +17,7 @@ pub mod kitty_file_transfer;
 pub mod kitty_file_transfer_fs;
 mod kitty_file_transfer_receive;
 mod kitty_rsync;
+pub mod kitty_transfer_consent;
 pub mod log_capture;
 pub mod plugin_broker;
 pub mod plugin_runtime;
@@ -43,12 +44,15 @@ pub use git_sync::{
     PullResult, SyncStatus,
 };
 pub use kitty_file_transfer::{
-    AuthorizedTtyTransferCommand, TtyTransferAction, TtyTransferApprovalRequest,
-    TtyTransferDirection, TtyTransferManager,
+    evaluate_transfer_bypass, AuthorizedTtyTransferCommand, BypassDecision, TtyTransferAction,
+    TtyTransferApprovalRequest, TtyTransferBypassKind, TtyTransferDirection, TtyTransferManager,
 };
 pub use kitty_file_transfer_fs::{
     TtyTransferFilesystem, TtyTransferFilesystemConfigError, TtyTransferLimits,
     TtyTransferSendFilesystem,
+};
+pub use kitty_transfer_consent::{
+    apply_dialog_outcome, DialogOutcome, CONSENT_CANCELLED_STATUS, CONSENT_EXPIRED_STATUS,
 };
 pub use plugin_broker::{PluginBroker, PluginBrokerError, PluginBrokerOutput, PluginBrokerTimeout};
 pub use plugin_runtime::{

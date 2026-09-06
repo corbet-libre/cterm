@@ -505,7 +505,10 @@ mod tests {
 
     #[test]
     fn bypass_accepts_bounded_kitty_json_payloads() {
-        let bypass = r#"kitty-1:{"password":"a;b", "timestamp":42}"#;
+        // Opaque to the codec: Kitty 0.48.2's kitty-1 bypass carries
+        // pubkey/iv/tag/encrypted JSON (see check_bypass); the codec only
+        // bounds it and never interprets it.
+        let bypass = r#"kitty-1:{"pubkey":"a;b", "iv":"c", "tag":"d", "encrypted":"e"}"#;
         let encoded = KITTY_BASE64.encode(bypass);
         let command = parse(format!("ac=send;id=test;pw={encoded}").as_bytes()).unwrap();
         assert_eq!(command.bypass.as_deref(), Some(bypass));
@@ -592,5 +595,198 @@ mod tests {
     fn whitespace_in_the_documented_display_form_is_ignored() {
         let command = parse(b" ac=send ; id=test ; n=c29tZWZpbGU= ").unwrap();
         assert_eq!(command.name.as_deref(), Some("somefile"));
+    }
+
+    // Differential vectors against Kitty's documented OSC 5113 wire behavior
+    // (https://sw.kovidgoyal.net/kitty/file-transfer-protocol/). No live-Kitty
+    // comparison is possible in this environment, so these pin the documented
+    // encoding, limits, and alphabet instead; rerun them against a live Kitty
+    // before claiming differential parity.
+    // Live differential corpus: every wire string below was serialized by
+    // Kitty 0.48.2's own FileTransmissionCommand.serialize and round-tripped
+    // through its deserialize. cterm must parse each one to identical fields,
+    // regardless of Kitty's field order. Regenerate with the installed kitty
+    // if it is upgraded. Note Kitty 0.48.2 never emits `finished`; accepting
+    // it stays a harmless cterm-side tolerance for other peers.
+    #[test]
+    fn kitty_live_corpus_parses_to_identical_fields() {
+        let corpus: &[(&str, FileTransferAction)] = &[
+            ("ac=send;id=xfer-1", FileTransferAction::Send),
+            ("ac=send;id=xfer-2;q=2", FileTransferAction::Send),
+            (
+                "ac=file;zip=zlib;tt=rsync;id=xfer-1;fid=f1;mod=1725000000;prm=493;sz=12;n=L3RtcC9HcsO8w59lLnR4dA",
+                FileTransferAction::File,
+            ),
+            (
+                "ac=data;id=xfer-1;fid=f1;d=aGVsbG8gd29ybGQh",
+                FileTransferAction::Data,
+            ),
+            (
+                "ac=end_data;id=xfer-1;fid=f1;d=Ynll",
+                FileTransferAction::EndData,
+            ),
+            ("ac=receive;id=recv-1;sz=2", FileTransferAction::Receive),
+            ("ac=cancel;id=xfer-1", FileTransferAction::Cancel),
+            (
+                "ac=status;id=xfer-1;fid=f1;st=RVBFUk06VXNlciByZWZ1c2VkIHRoZSB0cmFuc2Zlcg",
+                FileTransferAction::Status,
+            ),
+            ("ac=finish;id=xfer-1", FileTransferAction::Finish),
+            (
+                "ac=file;ft=symlink;id=link-1;fid=f9;n=cmVsL2xpbms",
+                FileTransferAction::File,
+            ),
+        ];
+        for (wire, action) in corpus {
+            let command = parse(wire.as_bytes())
+                .unwrap_or_else(|error| panic!("live Kitty bytes rejected: {wire}: {error:?}"));
+            assert_eq!(command.action, *action, "{wire}");
+        }
+
+        let file = parse(
+            b"ac=file;zip=zlib;tt=rsync;id=xfer-1;fid=f1;mod=1725000000;prm=493;sz=12;n=L3RtcC9HcsO8w59lLnR4dA",
+        )
+        .unwrap();
+        assert_eq!(file.id, "xfer-1");
+        assert_eq!(file.file_id.as_deref(), Some("f1"));
+        assert_eq!(file.mtime, Some(1_725_000_000));
+        assert_eq!(file.permissions, Some(0o755));
+        assert_eq!(file.size, Some(12));
+        assert_eq!(file.name.as_deref(), Some("/tmp/Grüße.txt"));
+        assert_eq!(file.compression, Some(FileTransferCompression::Zlib));
+        assert_eq!(file.file_type, None);
+        assert_eq!(file.transmission_type, Some(FileTransmissionType::Rsync));
+
+        let data = parse(b"ac=data;id=xfer-1;fid=f1;d=aGVsbG8gd29ybGQh").unwrap();
+        assert_eq!(data.data, b"hello world!");
+
+        let status =
+            parse(b"ac=status;id=xfer-1;fid=f1;st=RVBFUk06VXNlciByZWZ1c2VkIHRoZSB0cmFuc2Zlcg")
+                .unwrap();
+        assert_eq!(
+            status.status.as_deref(),
+            Some("EPERM:User refused the transfer")
+        );
+
+        let link = parse(b"ac=file;ft=symlink;id=link-1;fid=f9;n=cmVsL2xpbms").unwrap();
+        assert_eq!(link.name.as_deref(), Some("rel/link"));
+        assert_eq!(link.file_type, Some(FileTransferType::Symlink));
+
+        // Kitty omits defaulted fields rather than zeroing them.
+        let send = parse(b"ac=send;id=xfer-1").unwrap();
+        assert_eq!(send.quiet, 0);
+        assert_eq!(send.compression, None);
+        assert_eq!(send.size, None);
+    }
+
+    #[test]
+    fn kitty_documented_wire_chunk_length_boundaries() {
+        let exact = vec![0xAB_u8; MAX_FILE_TRANSFER_CHUNK_BYTES];
+        let encoded = KITTY_BASE64.encode(&exact);
+        let wire = format!("ac=data;id=x;fid=f;d={encoded}");
+        assert_eq!(parse(wire.as_bytes()).unwrap().data, exact);
+
+        let oversized = vec![0xAB_u8; MAX_FILE_TRANSFER_CHUNK_BYTES + 1];
+        let encoded = KITTY_BASE64.encode(&oversized);
+        let wire = format!("ac=data;id=x;fid=f;d={encoded}");
+        assert_eq!(
+            parse(wire.as_bytes()),
+            Err(FileTransferCodecError::LimitExceeded("data"))
+        );
+    }
+
+    #[test]
+    fn kitty_documented_wire_padded_and_unpadded_base64_agree() {
+        let unpadded = parse(b"ac=file;id=x;pw=c2hhMjU2OmFiY2Q;st=U1RBUlRFRA").unwrap();
+        let padded = parse(b"ac=file;id=x;pw=c2hhMjU2OmFiY2Q=;st=U1RBUlRFRA==").unwrap();
+        assert_eq!(unpadded.bypass.as_deref(), Some("sha256:abcd"));
+        assert_eq!(unpadded.bypass, padded.bypass);
+        assert_eq!(unpadded.status.as_deref(), Some("STARTED"));
+        assert_eq!(unpadded.status, padded.status);
+    }
+
+    #[test]
+    fn kitty_documented_wire_quiet_and_completion_forms() {
+        assert_eq!(parse(b"ac=send;id=x;q=").unwrap().quiet, 0);
+        let silent = FileTransferCommand {
+            action: FileTransferAction::Send,
+            id: "x".into(),
+            file_id: None,
+            bypass: None,
+            quiet: 2,
+            mtime: None,
+            permissions: None,
+            size: None,
+            name: None,
+            status: None,
+            parent: None,
+            data: Vec::new(),
+            compression: None,
+            file_type: None,
+            transmission_type: None,
+        };
+        assert_eq!(parse(&silent.encode().unwrap()).unwrap(), silent);
+        // `finish` closes the send direction; `finished` closes receive.
+        assert_eq!(
+            parse(b"ac=finish;id=x").unwrap().action,
+            FileTransferAction::Finish
+        );
+        assert_eq!(
+            parse(b"ac=finished;id=x").unwrap().action,
+            FileTransferAction::Finished
+        );
+    }
+
+    #[test]
+    fn kitty_documented_wire_rejects_bad_shapes_and_sizes() {
+        assert_eq!(
+            parse(b"ac=teleport;id=x"),
+            Err(FileTransferCodecError::InvalidField("action"))
+        );
+        assert_eq!(
+            parse(b"ac=data;id=x;fid=f;d=AQ;d=Ag"),
+            Err(FileTransferCodecError::DuplicateField("data"))
+        );
+        // The Kitty base64 alphabet has no whitespace.
+        assert_eq!(
+            parse(b"ac=data;id=x;fid=f;d=AQ ID"),
+            Err(FileTransferCodecError::InvalidField("data"))
+        );
+        // Unsigned sizes reject negatives; the full u64 range parses.
+        assert_eq!(
+            parse(b"ac=file;id=x;sz=-1"),
+            Err(FileTransferCodecError::InvalidField("size"))
+        );
+        assert_eq!(
+            parse(b"ac=file;id=x;sz=18446744073709551615").unwrap().size,
+            Some(u64::MAX)
+        );
+        // Signed modification times keep their sign.
+        assert_eq!(parse(b"ac=file;id=x;mod=-5").unwrap().mtime, Some(-5));
+    }
+
+    #[test]
+    fn kitty_documented_wire_name_and_id_boundaries() {
+        let exact = "a".repeat(MAX_FILE_TRANSFER_PATH_BYTES);
+        let encoded = KITTY_BASE64.encode(&exact);
+        let wire = format!("ac=file;id=x;fid=f;n={encoded}");
+        assert_eq!(
+            parse(wire.as_bytes()).unwrap().name.as_deref(),
+            Some(exact.as_str())
+        );
+
+        let oversized = "a".repeat(MAX_FILE_TRANSFER_PATH_BYTES + 1);
+        let encoded = KITTY_BASE64.encode(&oversized);
+        let wire = format!("ac=file;id=x;fid=f;n={encoded}");
+        assert_eq!(
+            parse(wire.as_bytes()),
+            Err(FileTransferCodecError::LimitExceeded("name"))
+        );
+
+        assert!(parse(b"ac=send;id=aZ09:@./-_").is_ok());
+        assert_eq!(
+            parse(b"ac=send;id="),
+            Err(FileTransferCodecError::InvalidField("id"))
+        );
     }
 }
