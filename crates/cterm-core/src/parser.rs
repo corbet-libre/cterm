@@ -919,6 +919,13 @@ impl vte::Perform for ScreenPerformer<'_> {
                 let n = first_param(&params_vec, 1);
                 self.screen.scroll_down(n);
             }
+            // Kitty unscroll: SD with a `+` intermediate fills the new top
+            // lines from scrollback instead of blanking them. Dispatched
+            // separately so ordinary `CSI Ps T` behavior is untouched.
+            ('T', [b'+']) => {
+                let n = first_param(&params_vec, 1);
+                self.screen.unscroll(n);
+            }
             // Erase Characters (ECH)
             ('X', []) => {
                 let n = first_param(&params_vec, 1);
@@ -3697,6 +3704,129 @@ mod tests {
         assert_eq!(screen.images().len(), 1);
         assert_eq!(screen.images()[0].line, 0);
         assert!((0..screen.height()).all(|row| screen.grid().row(row).unwrap().is_all_empty()));
+    }
+
+    /// Build a 8x3 screen whose scrollback holds ["L0", "L1"] and whose grid
+    /// shows ["L2", "L3", "L4"] with the cursor at (2, 2).
+    fn unscroll_fixture() -> (Screen, Parser) {
+        let mut screen = Screen::new(
+            8,
+            3,
+            ScreenConfig {
+                scrollback_lines: 10,
+            },
+        );
+        let mut parser = Parser::new();
+        parser.parse(&mut screen, b"L0\r\nL1\r\nL2\r\nL3\r\nL4");
+        assert_eq!(screen.scrollback().len(), 2);
+        assert_eq!(screen.scrollback()[0].text(), "L0");
+        assert_eq!(screen.scrollback()[1].text(), "L1");
+        assert_eq!(screen.grid().row(0).unwrap().text(), "L2");
+        assert_eq!(screen.grid().row(1).unwrap().text(), "L3");
+        assert_eq!(screen.grid().row(2).unwrap().text(), "L4");
+        (screen, parser)
+    }
+
+    #[test]
+    fn test_kitty_unscroll_pulls_scrollback_onto_screen() {
+        let (mut screen, mut parser) = unscroll_fixture();
+
+        parser.parse(&mut screen, b"\x1b[2+T");
+
+        assert!(screen.scrollback().is_empty());
+        assert_eq!(screen.grid().row(0).unwrap().text(), "L0");
+        assert_eq!(screen.grid().row(1).unwrap().text(), "L1");
+        assert_eq!(screen.grid().row(2).unwrap().text(), "L2");
+        // Kitty leaves cursor placement to the application.
+        assert_eq!((screen.cursor.row, screen.cursor.col), (2, 2));
+    }
+
+    #[test]
+    fn test_kitty_unscroll_defaults_to_one_line() {
+        let (mut screen, mut parser) = unscroll_fixture();
+
+        parser.parse(&mut screen, b"\x1b[+T");
+
+        assert_eq!(screen.scrollback().len(), 1);
+        assert_eq!(screen.scrollback()[0].text(), "L0");
+        assert_eq!(screen.grid().row(0).unwrap().text(), "L1");
+        assert_eq!(screen.grid().row(1).unwrap().text(), "L2");
+        assert_eq!(screen.grid().row(2).unwrap().text(), "L3");
+    }
+
+    #[test]
+    fn test_kitty_unscroll_clamps_at_scrollback_top() {
+        let (mut screen, mut parser) = unscroll_fixture();
+
+        parser.parse(&mut screen, b"\x1b[99+T");
+
+        assert!(screen.scrollback().is_empty());
+        assert_eq!(screen.grid().row(0).unwrap().text(), "L0");
+        assert_eq!(screen.grid().row(1).unwrap().text(), "L1");
+        assert!(screen.grid().row(2).unwrap().is_all_empty());
+    }
+
+    #[test]
+    fn test_kitty_unscroll_on_alternate_screen_inserts_blanks() {
+        let (mut screen, mut parser) = unscroll_fixture();
+        screen.enter_alternate_screen();
+        parser.parse(&mut screen, b"AA\r\nBB");
+
+        parser.parse(&mut screen, b"\x1b[2+T");
+
+        assert!(screen.grid().row(0).unwrap().is_all_empty());
+        assert!(screen.grid().row(1).unwrap().is_all_empty());
+        assert_eq!(screen.grid().row(2).unwrap().text(), "AA");
+        // Primary scrollback is untouched by alternate-screen unscrolls.
+        assert_eq!(screen.scrollback().len(), 2);
+    }
+
+    #[test]
+    fn test_plain_scroll_down_ignores_scrollback() {
+        let (mut screen, mut parser) = unscroll_fixture();
+
+        parser.parse(&mut screen, b"\x1b[2T");
+
+        assert_eq!(screen.scrollback().len(), 2);
+        assert!(screen.grid().row(0).unwrap().is_all_empty());
+        assert!(screen.grid().row(1).unwrap().is_all_empty());
+        assert_eq!(screen.grid().row(2).unwrap().text(), "L2");
+    }
+
+    #[test]
+    fn test_kitty_unscroll_respects_scroll_region() {
+        let (mut screen, mut parser) = unscroll_fixture();
+        parser.parse(&mut screen, b"\x1b[2;3r");
+
+        parser.parse(&mut screen, b"\x1b[1+T");
+
+        // Rows outside the region are untouched; the pulled line lands at the
+        // top of the region and the region's bottom line is discarded.
+        assert_eq!(screen.grid().row(0).unwrap().text(), "L2");
+        assert_eq!(screen.grid().row(1).unwrap().text(), "L1");
+        assert_eq!(screen.grid().row(2).unwrap().text(), "L3");
+        assert_eq!(screen.scrollback().len(), 1);
+        assert_eq!(screen.scrollback()[0].text(), "L0");
+    }
+
+    #[test]
+    fn test_kitty_unscroll_without_scrollback_inserts_blanks() {
+        let mut screen = Screen::new(
+            8,
+            3,
+            ScreenConfig {
+                scrollback_lines: 0,
+            },
+        );
+        let mut parser = Parser::new();
+        parser.parse(&mut screen, b"L0\r\nL1\r\nL2");
+        assert!(screen.scrollback().is_empty());
+
+        parser.parse(&mut screen, b"\x1b[2+T");
+
+        assert!(screen.grid().row(0).unwrap().is_all_empty());
+        assert!(screen.grid().row(1).unwrap().is_all_empty());
+        assert_eq!(screen.grid().row(2).unwrap().text(), "L0");
     }
 
     #[test]

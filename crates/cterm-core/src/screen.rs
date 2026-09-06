@@ -2209,6 +2209,62 @@ impl Screen {
         self.dirty = true;
     }
 
+    /// Kitty `CSI Ps + T`: scroll down within the scroll region, filling the
+    /// new top lines from scrollback instead of leaving them blank.
+    ///
+    /// This mirrors Kitty's `screen_reverse_scroll_and_fill_from_scrollback`:
+    /// the cursor is deliberately not moved (the application repositions it
+    /// itself), the scroll region is honored, bottom lines that shift out of
+    /// the region are discarded, and the request is clamped to at least one
+    /// screen worth. On the alternate screen, or when scrollback is empty,
+    /// there is nothing to pull, so this degrades to a plain scroll-down
+    /// with blank lines, exactly as the Kitty spec requires.
+    pub fn unscroll(&mut self, count: usize) {
+        if self.modes.alternate_screen {
+            self.scroll_down(count);
+            return;
+        }
+        let height = self.height();
+        let count = count.min(height.max(self.scrollback.len()));
+        let shift = count.min(
+            self.scroll_region
+                .bottom
+                .saturating_sub(self.scroll_region.top),
+        );
+        if shift == 0 {
+            return;
+        }
+        // Pull the newest rows back; drain preserves oldest-to-newest order
+        // so re-attached rows keep their original relative order.
+        let fill = shift.min(self.scrollback.len());
+        let mut pulled: Vec<Row> = Vec::with_capacity(fill);
+        if fill > 0 {
+            let start = self.scrollback.len() - fill;
+            pulled.extend(self.scrollback.drain(start..));
+        }
+        let width = self.width();
+        for row in &mut pulled {
+            if row.len() != width {
+                row.resize(width);
+            }
+        }
+        self.clear_multicells_crossing_row_boundary(self.scroll_region.top);
+        self.clear_multicells_crossing_row_boundary(self.scroll_region.bottom);
+        self.clear_multicells_intersecting_rows(
+            self.scroll_region.bottom.saturating_sub(shift),
+            self.scroll_region.bottom,
+        );
+        self.grid
+            .scroll_down(shift, self.scroll_region.top, self.scroll_region.bottom);
+        for (index, row) in pulled.into_iter().enumerate() {
+            if let Some(slot) = self.grid.row_mut(self.scroll_region.top + index) {
+                *slot = row;
+            }
+        }
+        self.scroll_offset = self.scroll_offset.min(self.scrollback.len());
+        self.dirty = true;
+    }
+
     /// Move cursor to position
     pub fn move_cursor(&mut self, row: usize, col: usize) {
         let (base_row, max_row) = if self.modes.origin_mode {
