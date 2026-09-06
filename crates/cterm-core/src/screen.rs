@@ -14,6 +14,7 @@ use crate::multiple_cursors::{
     ExtraCursor, ExtraCursorColor, ExtraCursorColorTarget, ExtraCursorColors, ExtraCursorShape,
     MultipleCursors,
 };
+use crate::pointer_shape::{PointerShape, MAX_POINTER_SHAPE_STACK_DEPTH};
 use crate::sixel::SixelImage;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -769,6 +770,14 @@ pub struct Screen {
     keyboard_main_stack: Vec<KeyboardEnhancementFlags>,
     /// Keyboard enhancement stack for the alternate screen.
     keyboard_alt_stack: Vec<KeyboardEnhancementFlags>,
+    /// Kitty OSC 22 pointer-shape stack for the primary screen.
+    ///
+    /// `None` entries are Kitty's `INVALID_POINTER`: an empty
+    /// `OSC 22 ;` stores one, and queries report it as `0`. Separate
+    /// stacks per screen match Kitty and mirror the keyboard stacks.
+    pointer_main_stack: Vec<Option<PointerShape>>,
+    /// Kitty OSC 22 pointer-shape stack for the alternate screen.
+    pointer_alt_stack: Vec<Option<PointerShape>>,
     /// DRCS fonts (soft fonts) keyed by designator
     drcs_fonts: HashMap<String, DrcsFont>,
     /// Incremented whenever an application starts (or restarts) a synchronized
@@ -1034,6 +1043,15 @@ fn reflow_rows(rows: &[Row], old_width: usize, new_width: usize) -> ReflowedRows
     reflowed
 }
 
+/// Keep the most recent entries of a restored pointer-shape stack.
+fn truncate_pointer_stack(mut stack: Vec<Option<PointerShape>>) -> Vec<Option<PointerShape>> {
+    if stack.len() > MAX_POINTER_SHAPE_STACK_DEPTH {
+        let excess = stack.len() - MAX_POINTER_SHAPE_STACK_DEPTH;
+        stack.drain(..excess);
+    }
+    stack
+}
+
 impl Screen {
     /// Create a new screen with the given dimensions
     pub fn new(width: usize, height: usize, config: ScreenConfig) -> Self {
@@ -1095,6 +1113,8 @@ impl Screen {
             cell_width_hint: 8.0,   // Default assumption
             keyboard_main_stack: Vec::new(),
             keyboard_alt_stack: Vec::new(),
+            pointer_main_stack: Vec::new(),
+            pointer_alt_stack: Vec::new(),
             drcs_fonts: HashMap::new(),
             sync_update_generation: 0,
         }
@@ -1260,6 +1280,97 @@ impl Screen {
             &mut self.keyboard_alt_stack
         } else {
             &mut self.keyboard_main_stack
+        }
+    }
+
+    /// Active Kitty OSC 22 pointer shape.
+    ///
+    /// `None` means the terminal is free to use its own pointer policy
+    /// (I-beam over text, pointing hand over hyperlinks): either the active
+    /// stack is empty or its top is an empty `OSC 22 ;` slot. Native
+    /// frontends fall back to their hyperlink/divider cursors in this case,
+    /// but must yield to `Some` shapes (except while drag-selecting text,
+    /// where a drag cursor may win, matching Kitty).
+    pub fn current_pointer_shape(&self) -> Option<PointerShape> {
+        self.active_pointer_stack().last().copied().flatten()
+    }
+
+    /// Pointer-shape stack for the primary screen (oldest first).
+    pub fn pointer_main_stack(&self) -> &[Option<PointerShape>] {
+        &self.pointer_main_stack
+    }
+
+    /// Pointer-shape stack for the alternate screen (oldest first).
+    pub fn pointer_alt_stack(&self) -> &[Option<PointerShape>] {
+        &self.pointer_alt_stack
+    }
+
+    /// Replace the current pointer shape without changing stack depth,
+    /// mirroring Kitty's `=` operator (`change_pointer_shape` in
+    /// `kitty/screen.c`). `None` is an empty `OSC 22 ;` slot: it reports
+    /// as `0` and renders with the frontend default until popped.
+    pub(crate) fn set_pointer_shape(&mut self, shape: Option<PointerShape>) {
+        let stack = self.active_pointer_stack_mut();
+        if let Some(current) = stack.last_mut() {
+            *current = shape;
+        } else {
+            stack.push(shape);
+        }
+        self.dirty = true;
+    }
+
+    /// Push one pointer shape, evicting the bottom entry at capacity,
+    /// mirroring Kitty's `>` operator.
+    pub(crate) fn push_pointer_shape(&mut self, shape: PointerShape) {
+        let stack = self.active_pointer_stack_mut();
+        if stack.len() >= MAX_POINTER_SHAPE_STACK_DEPTH {
+            stack.remove(0);
+        }
+        stack.push(Some(shape));
+        self.dirty = true;
+    }
+
+    /// Pop the top pointer shape. Further pops on an empty stack have no
+    /// effect, mirroring Kitty's `<` operator.
+    pub(crate) fn pop_pointer_shape(&mut self) {
+        if self.active_pointer_stack_mut().pop().is_some() {
+            self.dirty = true;
+        }
+    }
+
+    /// Empty both pointer-shape stacks (terminal reset).
+    pub(crate) fn reset_pointer_shapes(&mut self) {
+        self.pointer_main_stack.clear();
+        self.pointer_alt_stack.clear();
+        self.dirty = true;
+    }
+
+    /// Authoritatively replace both stacks from a daemon snapshot.
+    /// Oversized stacks keep the most recent entries; unknown names must
+    /// already have been filtered by the caller.
+    pub fn replace_pointer_stacks(
+        &mut self,
+        main: Vec<Option<PointerShape>>,
+        alt: Vec<Option<PointerShape>>,
+    ) {
+        self.pointer_main_stack = truncate_pointer_stack(main);
+        self.pointer_alt_stack = truncate_pointer_stack(alt);
+        self.dirty = true;
+    }
+
+    fn active_pointer_stack(&self) -> &[Option<PointerShape>] {
+        if self.modes.alternate_screen {
+            &self.pointer_alt_stack
+        } else {
+            &self.pointer_main_stack
+        }
+    }
+
+    fn active_pointer_stack_mut(&mut self) -> &mut Vec<Option<PointerShape>> {
+        if self.modes.alternate_screen {
+            &mut self.pointer_alt_stack
+        } else {
+            &mut self.pointer_main_stack
         }
     }
 
@@ -2833,6 +2944,7 @@ impl Screen {
         self.drcs_fonts.clear();
         self.keyboard_main_stack.clear();
         self.keyboard_alt_stack.clear();
+        self.reset_pointer_shapes();
     }
 
     /// Search for text in scrollback and visible buffer

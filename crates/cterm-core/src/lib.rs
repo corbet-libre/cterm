@@ -21,6 +21,7 @@ pub mod mouse;
 mod multiple_cursors;
 mod osc1337;
 pub mod parser;
+pub mod pointer_shape;
 pub mod pty;
 pub mod screen;
 pub mod sixel;
@@ -45,6 +46,9 @@ pub use kitty_file_transfer::{
 pub use kitty_graphics::GraphicsAnimationTick;
 pub use multiple_cursors::{ExtraCursor, ExtraCursorColor, ExtraCursorColors, ExtraCursorShape};
 pub use parser::Parser;
+pub use pointer_shape::{
+    PointerShape, DEFAULT_POINTER_CSS, GRABBED_POINTER_CSS, MAX_POINTER_SHAPE_STACK_DEPTH,
+};
 #[cfg(unix)]
 pub use pty::save_original_nofile_limit;
 pub use pty::{Pty, PtyConfig, PtyError, PtySize};
