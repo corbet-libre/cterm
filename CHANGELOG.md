@@ -56,6 +56,14 @@ is omitted for readability.
   (GTK consent prompt + text/plain, Cocoa text/HTML, Win32 text/plain),
   with daemon snapshot persistence of the paste-event mode. Text OSC 52
   behavior is unchanged.
+- Kitty all-SGR DECCARA: rectangular attribute changes now apply the full
+  SGR repertoire (every boolean attribute, styled underlines, and
+  fg/bg/underline colors in ANSI, indexed, and truecolor forms, including
+  colon subparameters and empty-list reset) while honoring origin mode,
+  scrolling margins, active-page clipping, and cursor preservation.
+  DECRARA toggles the full boolean set and deliberately leaves colors
+  untouched, since color reversal is undefined. No renderer change was
+  needed: rectangle-styled cells are identical to SGR-styled ones.
 
 ### Fixed
 - Streamed OSC 1337 interception now replays incomplete, cancelled, and

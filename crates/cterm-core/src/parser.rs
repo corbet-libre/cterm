@@ -11,8 +11,8 @@ use std::sync::Arc;
 use std::time::Duration;
 use vte::Params;
 
-use crate::cell::{CellAttrs, Hyperlink};
-use crate::color::{AnsiColor, Color, Rgb};
+use crate::cell::{apply_sgr_sequence, CellAttrs, Hyperlink, SgrTarget};
+use crate::color::{Color, Rgb};
 use crate::dnd::DndProtocolState;
 use crate::drcs::DecdldDecoder;
 use crate::image_decode::decode_image;
@@ -1075,13 +1075,8 @@ impl vte::Perform for ScreenPerformer<'_> {
                 if let Some((top, left, bottom, right)) =
                     rectangular_area(self.screen, &params_vec, 0)
                 {
-                    self.screen.change_rectangular_attributes(
-                        top,
-                        left,
-                        bottom,
-                        right,
-                        params_vec.get(4..).unwrap_or_default(),
-                    );
+                    self.screen
+                        .change_rectangular_attributes(top, left, bottom, right, params);
                 }
             }
             // Reverse Attributes in Rectangular Area (DECRARA).
@@ -1089,13 +1084,8 @@ impl vte::Perform for ScreenPerformer<'_> {
                 if let Some((top, left, bottom, right)) =
                     rectangular_area(self.screen, &params_vec, 0)
                 {
-                    self.screen.reverse_rectangular_attributes(
-                        top,
-                        left,
-                        bottom,
-                        right,
-                        params_vec.get(4..).unwrap_or_default(),
-                    );
+                    self.screen
+                        .reverse_rectangular_attributes(top, left, bottom, right, params);
                 }
             }
             // Copy Rectangular Area (DECCRA). cterm, like foot, supports the
@@ -2319,143 +2309,8 @@ impl ScreenPerformer<'_> {
             return;
         }
 
-        let mut iter = params.iter().peekable();
-
-        while let Some(param) = iter.next() {
-            match param {
-                // Reset
-                [0] => self.screen.style.reset(),
-                // Bold
-                [1] => self.screen.style.attrs.insert(CellAttrs::BOLD),
-                // Dim/faint
-                [2] => self.screen.style.attrs.insert(CellAttrs::DIM),
-                // Italic
-                [3] => self.screen.style.attrs.insert(CellAttrs::ITALIC),
-                // Underline
-                [4, style @ ..] => {
-                    self.screen.style.attrs.clear_underline();
-                    match style.first().copied().unwrap_or(1) {
-                        0 => {}
-                        2 => self.screen.style.attrs.insert(CellAttrs::DOUBLE_UNDERLINE),
-                        3 => self.screen.style.attrs.insert(CellAttrs::CURLY_UNDERLINE),
-                        4 => self.screen.style.attrs.insert(CellAttrs::DOTTED_UNDERLINE),
-                        5 => self.screen.style.attrs.insert(CellAttrs::DASHED_UNDERLINE),
-                        _ => self.screen.style.attrs.insert(CellAttrs::UNDERLINE),
-                    }
-                }
-                // Slow and rapid blink are mutually exclusive.
-                [5] => {
-                    self.screen.style.attrs.clear_blink();
-                    self.screen.style.attrs.insert(CellAttrs::BLINK);
-                }
-                [6] => {
-                    self.screen.style.attrs.clear_blink();
-                    self.screen.style.attrs.insert(CellAttrs::RAPID_BLINK);
-                }
-                // Inverse
-                [7] => self.screen.style.attrs.insert(CellAttrs::INVERSE),
-                // Hidden
-                [8] => self.screen.style.attrs.insert(CellAttrs::HIDDEN),
-                // Strikethrough
-                [9] => self.screen.style.attrs.insert(CellAttrs::STRIKETHROUGH),
-                // Normal intensity (not bold or dim)
-                [22] => {
-                    self.screen.style.attrs.remove(CellAttrs::BOLD);
-                    self.screen.style.attrs.remove(CellAttrs::DIM);
-                }
-                // Kitty extensions: reset bold and faint independently.
-                [221] => self.screen.style.attrs.remove(CellAttrs::BOLD),
-                [222] => self.screen.style.attrs.remove(CellAttrs::DIM),
-                // Not italic
-                [23] => self.screen.style.attrs.remove(CellAttrs::ITALIC),
-                // Not underlined
-                [24] => self.screen.style.attrs.clear_underline(),
-                // Not blinking
-                [25] => self.screen.style.attrs.clear_blink(),
-                // Not inverse
-                [27] => self.screen.style.attrs.remove(CellAttrs::INVERSE),
-                // Not hidden
-                [28] => self.screen.style.attrs.remove(CellAttrs::HIDDEN),
-                // Not strikethrough
-                [29] => self.screen.style.attrs.remove(CellAttrs::STRIKETHROUGH),
-                // Foreground colors (30-37)
-                [param @ 30..=37] => {
-                    if let Some(color) = AnsiColor::from_index((*param - 30) as u8) {
-                        self.screen.style.fg = Color::Ansi(color);
-                    }
-                }
-                // Extended foreground color, semicolon form.
-                [38] => {
-                    let mut color_params = iter.by_ref().map(|param| param[0]);
-                    if let Some(color) = parse_sgr_color(&mut color_params) {
-                        self.screen.style.fg = color;
-                    }
-                }
-                // Extended foreground color, colon form.
-                [38, color_params @ ..] => {
-                    if let Some(color) = parse_colon_sgr_color(color_params) {
-                        self.screen.style.fg = color;
-                    }
-                }
-                // Default foreground
-                [39] => self.screen.style.fg = Color::Default,
-                // Background colors (40-47)
-                [param @ 40..=47] => {
-                    if let Some(color) = AnsiColor::from_index((*param - 40) as u8) {
-                        self.screen.style.bg = Color::Ansi(color);
-                    }
-                }
-                // Extended background color, semicolon form.
-                [48] => {
-                    let mut color_params = iter.by_ref().map(|param| param[0]);
-                    if let Some(color) = parse_sgr_color(&mut color_params) {
-                        self.screen.style.bg = color;
-                    }
-                }
-                // Extended background color, colon form.
-                [48, color_params @ ..] => {
-                    if let Some(color) = parse_colon_sgr_color(color_params) {
-                        self.screen.style.bg = color;
-                    }
-                }
-                // Default background
-                [49] => self.screen.style.bg = Color::Default,
-                // Overline
-                [53] => self.screen.style.attrs.insert(CellAttrs::OVERLINE),
-                // Not overline
-                [55] => self.screen.style.attrs.remove(CellAttrs::OVERLINE),
-                // Underline color, semicolon form.
-                [58] => {
-                    let mut color_params = iter.by_ref().map(|param| param[0]);
-                    if let Some(color) = parse_sgr_color(&mut color_params) {
-                        self.screen.style.underline_color = Some(color);
-                    }
-                }
-                // Underline color, colon form.
-                [58, color_params @ ..] => {
-                    if let Some(color) = parse_colon_sgr_color(color_params) {
-                        self.screen.style.underline_color = Some(color);
-                    }
-                }
-                // Default underline color
-                [59] => self.screen.style.underline_color = None,
-                // Bright foreground colors (90-97)
-                [param @ 90..=97] => {
-                    if let Some(color) = AnsiColor::from_index((*param - 90 + 8) as u8) {
-                        self.screen.style.fg = Color::Ansi(color);
-                    }
-                }
-                // Bright background colors (100-107)
-                [param @ 100..=107] => {
-                    if let Some(color) = AnsiColor::from_index((*param - 100 + 8) as u8) {
-                        self.screen.style.bg = Color::Ansi(color);
-                    }
-                }
-                _ => {
-                    log::trace!("Unknown SGR parameter: {:?}", param);
-                }
-            }
-        }
+        let target = SgrTarget::from_style(&mut self.screen.style);
+        apply_sgr_sequence(target, params.iter());
     }
 
     fn handle_sixel_management(&mut self, params: &[usize]) {
@@ -2849,27 +2704,6 @@ fn osc7_hostname_is_local(host: &str) -> bool {
             .is_some_and(|local| host.eq_ignore_ascii_case(&local.to_string_lossy()))
 }
 
-/// Parse the colon form of an SGR color while tolerating the optional color
-/// space and tolerance fields accepted by foot and VTE.
-fn parse_colon_sgr_color(params: &[u16]) -> Option<Color> {
-    let components_start = if params.len() > 4 { 2 } else { 1 };
-    let mut params =
-        std::iter::once(*params.first()?).chain(params.get(components_start..)?.iter().copied());
-    parse_sgr_color(&mut params)
-}
-
-fn parse_sgr_color(params: &mut dyn Iterator<Item = u16>) -> Option<Color> {
-    match params.next()? {
-        5 => Some(Color::Indexed(u8::try_from(params.next()?).ok()?)),
-        2 => Some(Color::Rgb(Rgb::new(
-            u8::try_from(params.next()?).ok()?,
-            u8::try_from(params.next()?).ok()?,
-            u8::try_from(params.next()?).ok()?,
-        ))),
-        _ => None,
-    }
-}
-
 fn params_to_vec(params: &Params) -> Vec<usize> {
     let mut result = Vec::new();
     for item in params.iter() {
@@ -2949,6 +2783,7 @@ fn rectangular_area(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::color::AnsiColor;
     use crate::screen::ScreenConfig;
 
     fn make_screen() -> Screen {
@@ -4349,6 +4184,407 @@ mod tests {
         assert_eq!(screen.get_cell(2, 0).unwrap().text(), "Z");
         assert_eq!(screen.get_cell(2, 1).unwrap().text(), "Z");
         assert_eq!(screen.get_cell(3, 0).unwrap().text(), " ");
+    }
+
+    #[test]
+    fn test_deccara_full_sgr_boolean_attributes() {
+        let mut screen = make_screen();
+        let mut parser = Parser::new();
+
+        parser.parse(&mut screen, b"AB");
+        parser.parse(&mut screen, b"\x1b[1;1;1;2;2;3;6;8;9;53$r");
+        let first = screen.get_cell(0, 0).unwrap();
+        assert!(first.attrs.contains(CellAttrs::DIM));
+        assert!(first.attrs.contains(CellAttrs::ITALIC));
+        assert!(first.attrs.contains(CellAttrs::RAPID_BLINK));
+        assert!(!first.attrs.contains(CellAttrs::BLINK));
+        assert!(first.attrs.contains(CellAttrs::HIDDEN));
+        assert!(first.attrs.contains(CellAttrs::STRIKETHROUGH));
+        assert!(first.attrs.contains(CellAttrs::OVERLINE));
+        assert_eq!(first.text(), "A");
+
+        // `22` clears bold and dim together; `221`/`222` clear them alone.
+        parser.parse(&mut screen, b"\x1b[1;1;1;2;1$r");
+        parser.parse(&mut screen, b"\x1b[1;1;1;1;22$r");
+        assert!(!screen
+            .get_cell(0, 0)
+            .unwrap()
+            .attrs
+            .contains(CellAttrs::BOLD));
+        assert!(!screen
+            .get_cell(0, 0)
+            .unwrap()
+            .attrs
+            .contains(CellAttrs::DIM));
+        assert!(screen
+            .get_cell(0, 1)
+            .unwrap()
+            .attrs
+            .contains(CellAttrs::BOLD));
+
+        parser.parse(&mut screen, b"\x1b[1;2;1;2;221$r");
+        assert!(!screen
+            .get_cell(0, 1)
+            .unwrap()
+            .attrs
+            .contains(CellAttrs::BOLD));
+        parser.parse(&mut screen, b"\x1b[1;1;1;2;23;25;28;29;55$r");
+        for col in 0..2 {
+            let cell = screen.get_cell(0, col).unwrap();
+            assert!(!cell.attrs.contains(CellAttrs::ITALIC));
+            assert!(!cell.attrs.has_blink());
+            assert!(!cell.attrs.contains(CellAttrs::HIDDEN));
+            assert!(!cell.attrs.contains(CellAttrs::STRIKETHROUGH));
+            assert!(!cell.attrs.contains(CellAttrs::OVERLINE));
+        }
+        // `222` clears a dim cell set above on its own.
+        parser.parse(&mut screen, b"\x1b[1;2;1;2;2;222$r");
+        assert!(!screen
+            .get_cell(0, 1)
+            .unwrap()
+            .attrs
+            .contains(CellAttrs::DIM));
+    }
+
+    #[test]
+    fn test_deccara_styled_underlines() {
+        let mut screen = make_screen();
+        let mut parser = Parser::new();
+
+        parser.parse(&mut screen, b"ABCDEF");
+        for (col, sequence) in [
+            (0, &b"\x1b[1;1;1;1;4$r"[..]),
+            (1, &b"\x1b[1;2;1;2;4:2$r"[..]),
+            (2, &b"\x1b[1;3;1;3;4:3$r"[..]),
+            (3, &b"\x1b[1;4;1;4;4:4$r"[..]),
+            (4, &b"\x1b[1;5;1;5;4:5$r"[..]),
+        ] {
+            parser.parse(&mut screen, sequence);
+            assert!(screen.get_cell(0, col).unwrap().attrs.has_underline());
+        }
+        assert!(screen
+            .get_cell(0, 0)
+            .unwrap()
+            .attrs
+            .contains(CellAttrs::UNDERLINE));
+        assert!(screen
+            .get_cell(0, 1)
+            .unwrap()
+            .attrs
+            .contains(CellAttrs::DOUBLE_UNDERLINE));
+        assert!(screen
+            .get_cell(0, 2)
+            .unwrap()
+            .attrs
+            .contains(CellAttrs::CURLY_UNDERLINE));
+        assert!(screen
+            .get_cell(0, 3)
+            .unwrap()
+            .attrs
+            .contains(CellAttrs::DOTTED_UNDERLINE));
+        assert!(screen
+            .get_cell(0, 4)
+            .unwrap()
+            .attrs
+            .contains(CellAttrs::DASHED_UNDERLINE));
+
+        // `4:0` clears the underline without setting a new style.
+        parser.parse(&mut screen, b"\x1b[1;1;1;4;4:0$r");
+        for col in 0..4 {
+            assert!(!screen.get_cell(0, col).unwrap().attrs.has_underline());
+        }
+        assert!(screen.get_cell(0, 4).unwrap().attrs.has_underline());
+    }
+
+    #[test]
+    fn test_deccara_foreground_colors() {
+        let mut screen = make_screen();
+        let mut parser = Parser::new();
+
+        parser.parse(&mut screen, b"ABCDE");
+        parser.parse(&mut screen, b"\x1b[1;1;1;1;31$r");
+        parser.parse(&mut screen, b"\x1b[1;2;1;2;91$r");
+        parser.parse(&mut screen, b"\x1b[1;3;1;3;38;5;196$r");
+        parser.parse(&mut screen, b"\x1b[1;4;1;4;38;2;10;20;30$r");
+        parser.parse(&mut screen, b"\x1b[1;5;1;5;38:5:196$r");
+        assert_eq!(
+            screen.get_cell(0, 0).unwrap().fg,
+            Color::Ansi(AnsiColor::Red)
+        );
+        assert_eq!(
+            screen.get_cell(0, 1).unwrap().fg,
+            Color::Ansi(AnsiColor::BrightRed)
+        );
+        assert_eq!(screen.get_cell(0, 2).unwrap().fg, Color::Indexed(196));
+        assert_eq!(
+            screen.get_cell(0, 3).unwrap().fg,
+            Color::Rgb(Rgb::new(10, 20, 30))
+        );
+        assert_eq!(screen.get_cell(0, 4).unwrap().fg, Color::Indexed(196));
+
+        // Colon RGB with a color-space field and `39` default restore.
+        parser.parse(&mut screen, b"F\x1b[1;6;1;6;38:2:0:40:50:60$r");
+        assert_eq!(
+            screen.get_cell(0, 5).unwrap().fg,
+            Color::Rgb(Rgb::new(40, 50, 60))
+        );
+        parser.parse(&mut screen, b"\x1b[1;1;1;6;39$r");
+        for col in 0..6 {
+            assert_eq!(screen.get_cell(0, col).unwrap().fg, Color::Default);
+        }
+    }
+
+    #[test]
+    fn test_deccara_background_colors() {
+        let mut screen = make_screen();
+        let mut parser = Parser::new();
+
+        // Kitty's motivating example: paint a background rectangle.
+        parser.parse(&mut screen, b"\x1b[2*x\x1b[1;1;2;2;44$r\x1b[*x");
+        for row in 0..2 {
+            for col in 0..2 {
+                assert_eq!(
+                    screen.get_cell(row, col).unwrap().bg,
+                    Color::Ansi(AnsiColor::Blue)
+                );
+            }
+        }
+        assert_eq!(screen.get_cell(0, 2).unwrap().bg, Color::Default);
+
+        parser.parse(&mut screen, b"\x1b[1;3;1;3;104$r");
+        parser.parse(&mut screen, b"\x1b[1;4;1;4;48;5;42$r");
+        parser.parse(&mut screen, b"\x1b[1;5;1;5;48;2;70;80;90$r");
+        parser.parse(&mut screen, b"\x1b[1;6;1;6;48:5:42$r");
+        assert_eq!(
+            screen.get_cell(0, 2).unwrap().bg,
+            Color::Ansi(AnsiColor::BrightBlue)
+        );
+        assert_eq!(screen.get_cell(0, 3).unwrap().bg, Color::Indexed(42));
+        assert_eq!(
+            screen.get_cell(0, 4).unwrap().bg,
+            Color::Rgb(Rgb::new(70, 80, 90))
+        );
+        assert_eq!(screen.get_cell(0, 5).unwrap().bg, Color::Indexed(42));
+
+        parser.parse(&mut screen, b"\x1b[1;3;1;6;49$r");
+        for col in 2..6 {
+            assert_eq!(screen.get_cell(0, col).unwrap().bg, Color::Default);
+        }
+    }
+
+    #[test]
+    fn test_deccara_underline_color() {
+        let mut screen = make_screen();
+        let mut parser = Parser::new();
+
+        parser.parse(&mut screen, b"ABC");
+        parser.parse(&mut screen, b"\x1b[1;1;1;1;58;5;200$r");
+        parser.parse(&mut screen, b"\x1b[1;2;1;2;58;2;11;22;33$r");
+        parser.parse(&mut screen, b"\x1b[1;3;1;3;58:5:200$r");
+        assert_eq!(
+            screen.get_cell(0, 0).unwrap().underline_color,
+            Some(Color::Indexed(200))
+        );
+        assert_eq!(
+            screen.get_cell(0, 1).unwrap().underline_color,
+            Some(Color::Rgb(Rgb::new(11, 22, 33)))
+        );
+        assert_eq!(
+            screen.get_cell(0, 2).unwrap().underline_color,
+            Some(Color::Indexed(200))
+        );
+
+        parser.parse(&mut screen, b"\x1b[1;1;1;3;59$r");
+        for col in 0..3 {
+            assert_eq!(screen.get_cell(0, col).unwrap().underline_color, None);
+        }
+    }
+
+    #[test]
+    fn test_deccara_zero_and_empty_reset_preserves_content() {
+        let mut screen = make_screen();
+        let mut parser = Parser::new();
+
+        parser.parse(&mut screen, b"\x1b[1;3;38;2;1;2;3;48;5;42;4:3mAB\x1b[0m");
+        parser.parse(
+            &mut screen,
+            b"\x1b]8;;https://example.com\x1b\\C\x1b]8;;\x1b\\",
+        );
+        // `0` resets every SGR field but keeps text and hyperlinks.
+        parser.parse(&mut screen, b"\x1b[1;1;1;3;0$r");
+        for col in 0..3 {
+            let cell = screen.get_cell(0, col).unwrap();
+            assert_eq!(cell.fg, Color::Default);
+            assert_eq!(cell.bg, Color::Default);
+            assert_eq!(cell.underline_color, None);
+            assert!(cell.attrs.is_empty());
+        }
+        assert_eq!(screen.grid().row(0).unwrap().text(), "ABC");
+        assert!(screen.get_cell(0, 2).unwrap().hyperlink.is_some());
+
+        // An empty attribute list resets exactly like `0`.
+        parser.parse(&mut screen, b"\x1b[1;1;1;2;31;1$r\x1b[1;1;1;2$r");
+        for col in 0..2 {
+            let cell = screen.get_cell(0, col).unwrap();
+            assert_eq!(cell.fg, Color::Default);
+            assert!(cell.attrs.is_empty());
+        }
+    }
+
+    #[test]
+    fn test_deccara_origin_mode_margins_clipping_and_cursor() {
+        let mut screen = make_screen();
+        let mut parser = Parser::new();
+
+        parser.parse(&mut screen, b"\x1b[3;5r\x1b[?6h\x1b[10;10H");
+        // CUP is origin-relative too, so record wherever the cursor landed;
+        // the rectangle operations must leave it exactly there.
+        let cursor = (screen.cursor.row, screen.cursor.col);
+        parser.parse(&mut screen, b"\x1b[1;1;2;2;44$r");
+        // Origin-relative rows 1-2 land on margin rows 3-4, not screen rows.
+        assert_eq!(screen.get_cell(0, 0).unwrap().bg, Color::Default);
+        assert_eq!(
+            screen.get_cell(2, 0).unwrap().bg,
+            Color::Ansi(AnsiColor::Blue)
+        );
+        assert_eq!(
+            screen.get_cell(3, 1).unwrap().bg,
+            Color::Ansi(AnsiColor::Blue)
+        );
+        assert_eq!(screen.get_cell(4, 0).unwrap().bg, Color::Default);
+        // The rectangle operation never moves the cursor.
+        assert_eq!((screen.cursor.row, screen.cursor.col), cursor);
+
+        // Oversized coordinates clip to the active page instead of panicking.
+        // (Leaving origin mode homes the cursor, so park it elsewhere first
+        // to keep proving the rectangle preserves it.)
+        parser.parse(&mut screen, b"\x1b[?6l\x1b[20;20H");
+        let cursor = (screen.cursor.row, screen.cursor.col);
+        assert_eq!(cursor, (19, 19));
+        parser.parse(&mut screen, b"\x1b[1;1;99;99;41$r");
+        assert_eq!(
+            screen.get_cell(23, 79).unwrap().bg,
+            Color::Ansi(AnsiColor::Red)
+        );
+        assert_eq!((screen.cursor.row, screen.cursor.col), cursor);
+
+        // Reversed coordinates are a no-op: the green fill must not land
+        // anywhere, and the cursor stays put too.
+        parser.parse(&mut screen, b"\x1b[5;1;2;2;42$r");
+        assert_eq!(
+            screen.get_cell(4, 0).unwrap().bg,
+            Color::Ansi(AnsiColor::Red)
+        );
+        assert_eq!((screen.cursor.row, screen.cursor.col), cursor);
+    }
+
+    #[test]
+    fn test_deccara_overlap_applies_in_order_and_preserves_glyphs() {
+        let mut screen = make_screen();
+        let mut parser = Parser::new();
+
+        parser.parse(&mut screen, b"abcdefgh");
+        parser.parse(&mut screen, b"\x1b[1;1;1;4;41$r");
+        parser.parse(&mut screen, b"\x1b[1;3;1;6;44$r");
+        let expected = [
+            Color::Ansi(AnsiColor::Red),
+            Color::Ansi(AnsiColor::Red),
+            Color::Ansi(AnsiColor::Blue),
+            Color::Ansi(AnsiColor::Blue),
+            Color::Ansi(AnsiColor::Blue),
+            Color::Ansi(AnsiColor::Blue),
+        ];
+        for (col, bg) in expected.iter().enumerate() {
+            assert_eq!(&screen.get_cell(0, col).unwrap().bg, bg);
+        }
+        assert_eq!(screen.grid().row(0).unwrap().text(), "abcdefgh");
+    }
+
+    #[test]
+    fn test_deccara_cell_matches_normal_sgr_styling() {
+        // Renderers already handle per-cell colors for normal text; a
+        // rectangle-styled cell must be indistinguishable from an SGR-styled
+        // one so no frontend change is needed.
+        let mut styled = make_screen();
+        let mut parser = Parser::new();
+        parser.parse(
+            &mut styled,
+            b"\x1b[1;3;38;2;10;20;30;48;5;42;4:3;58;2;1;2;3mX",
+        );
+
+        let mut rectangle = make_screen();
+        let mut parser = Parser::new();
+        parser.parse(&mut rectangle, b"Y");
+        parser.parse(
+            &mut rectangle,
+            b"\x1b[1;1;1;1;1;3;38;2;10;20;30;48;5;42;4:3;58;2;1;2;3$r",
+        );
+
+        let styled_cell = styled.get_cell(0, 0).unwrap();
+        let rect_cell = rectangle.get_cell(0, 0).unwrap();
+        assert_eq!(rect_cell.fg, styled_cell.fg);
+        assert_eq!(rect_cell.bg, styled_cell.bg);
+        assert_eq!(rect_cell.underline_color, styled_cell.underline_color);
+        assert_eq!(rect_cell.attrs, styled_cell.attrs);
+        assert_eq!(rect_cell.text(), "Y");
+    }
+
+    #[test]
+    fn test_decrara_extended_toggles_and_ignores_colors() {
+        let mut screen = make_screen();
+        let mut parser = Parser::new();
+
+        parser.parse(&mut screen, b"ABCD");
+        parser.parse(&mut screen, b"\x1b[1;1;1;4;2;3;6;8;9;53$t");
+        for col in 0..4 {
+            let attrs = screen.get_cell(0, col).unwrap().attrs;
+            assert!(attrs.contains(CellAttrs::DIM));
+            assert!(attrs.contains(CellAttrs::ITALIC));
+            assert!(attrs.contains(CellAttrs::RAPID_BLINK));
+            assert!(attrs.contains(CellAttrs::HIDDEN));
+            assert!(attrs.contains(CellAttrs::STRIKETHROUGH));
+            assert!(attrs.contains(CellAttrs::OVERLINE));
+        }
+        // Toggling twice restores the original state.
+        parser.parse(&mut screen, b"\x1b[1;1;1;4;2;3;6;8;9;53$t");
+        for col in 0..4 {
+            assert!(screen.get_cell(0, col).unwrap().attrs.is_empty());
+        }
+
+        // Colors have no reversal: they pass through untouched, and their
+        // numeric payloads must not leak into boolean toggles.
+        parser.parse(&mut screen, b"\x1b[1;1;1;4;31;44$r");
+        parser.parse(&mut screen, b"\x1b[1;1;1;1;38;5;196$t");
+        parser.parse(&mut screen, b"\x1b[1;2;1;2;48;2;1;2;3$t");
+        parser.parse(&mut screen, b"\x1b[1;3;1;3;38:5:196$t");
+        parser.parse(&mut screen, b"\x1b[1;4;1;4;22;23;24;25;27;28;29;55$t");
+        for col in 0..4 {
+            let cell = screen.get_cell(0, col).unwrap();
+            assert_eq!(cell.fg, Color::Ansi(AnsiColor::Red));
+            assert_eq!(cell.bg, Color::Ansi(AnsiColor::Blue));
+            assert!(cell.attrs.is_empty());
+        }
+    }
+
+    #[test]
+    fn test_decfra_fill_carries_full_sgr_style_without_hyperlink() {
+        let mut screen = make_screen();
+        let mut parser = Parser::new();
+
+        parser.parse(
+            &mut screen,
+            b"\x1b]8;;https://example.com\x1b\\\x1b[3;31;44;58;2;9;9;9m\x1b[88;1;1;1;2$x\x1b]8;;\x1b\\",
+        );
+        for col in 0..2 {
+            let filled = screen.get_cell(0, col).unwrap();
+            assert_eq!(filled.text(), "X");
+            assert!(filled.attrs.contains(CellAttrs::ITALIC));
+            assert_eq!(filled.fg, Color::Ansi(AnsiColor::Red));
+            assert_eq!(filled.bg, Color::Ansi(AnsiColor::Blue));
+            assert_eq!(filled.underline_color, Some(Color::Rgb(Rgb::new(9, 9, 9))));
+            // OSC 8 is not an SGR attribute, so fills never inherit links.
+            assert!(filled.hyperlink.is_none());
+        }
     }
 
     #[test]

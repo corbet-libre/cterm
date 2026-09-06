@@ -3,7 +3,7 @@
 //! A cell represents one display position in the terminal grid, including its
 //! extended grapheme cluster, colors, and attributes.
 
-use crate::color::Color;
+use crate::color::{AnsiColor, Color};
 use crate::text_sizing::{Multicell, MAX_TEXT_SIZE_PAYLOAD_BYTES};
 use bitflags::bitflags;
 use serde::{Deserialize, Serialize};
@@ -254,6 +254,21 @@ impl Cell {
         *self = Self::default();
     }
 
+    /// Reset only the SGR-addressable style, preserving character content,
+    /// hyperlink, multicell layout, and wide-cell structure.
+    ///
+    /// This is the rectangular-attribute (DECCARA `0`) and empty-`Ps` reset:
+    /// every SGR flag, the foreground/background colors, and the underline
+    /// color return to default. `WIDE`/`WIDE_SPACER` are structural grid
+    /// markers, not SGR state, so they survive.
+    pub(crate) fn reset_sgr(&mut self) {
+        const STRUCTURAL: CellAttrs = CellAttrs::WIDE.union(CellAttrs::WIDE_SPACER);
+        self.fg = Color::Default;
+        self.bg = Color::Default;
+        self.underline_color = None;
+        self.attrs = self.attrs.intersection(STRUCTURAL);
+    }
+
     /// Copy attributes from another cell (colors and attrs, not character)
     pub fn copy_style_from(&mut self, other: &Cell) {
         self.fg = other.fg;
@@ -300,6 +315,224 @@ impl CellStyle {
     /// Reset to default style
     pub fn reset(&mut self) {
         *self = Self::default();
+    }
+}
+
+/// Mutable view of the SGR-addressable fields shared by [`Cell`] and
+/// [`CellStyle`], so normal SGR and rectangular attribute changes apply the
+/// exact same repertoire.
+pub(crate) struct SgrTarget<'a> {
+    pub fg: &'a mut Color,
+    pub bg: &'a mut Color,
+    pub underline_color: &'a mut Option<Color>,
+    pub attrs: &'a mut CellAttrs,
+    /// Hyperlink slot, present only for [`CellStyle`]. Normal SGR `0` resets
+    /// the pending hyperlink; rectangular changes never touch it because
+    /// OSC 8 is not an SGR attribute (matching DECFRA).
+    pub hyperlink: Option<&'a mut Option<Arc<Hyperlink>>>,
+}
+
+impl<'a> SgrTarget<'a> {
+    pub fn from_cell(cell: &'a mut Cell) -> Self {
+        Self {
+            fg: &mut cell.fg,
+            bg: &mut cell.bg,
+            underline_color: &mut cell.underline_color,
+            attrs: &mut cell.attrs,
+            hyperlink: None,
+        }
+    }
+
+    pub fn from_style(style: &'a mut CellStyle) -> Self {
+        Self {
+            fg: &mut style.fg,
+            bg: &mut style.bg,
+            underline_color: &mut style.underline_color,
+            attrs: &mut style.attrs,
+            hyperlink: Some(&mut style.hyperlink),
+        }
+    }
+}
+
+/// Apply one SGR parameter sequence to a style target.
+///
+/// Each iterator item is one CSI parameter group: the parameter followed by
+/// any colon-separated subparameters (for example `[4, 3]` for `4:3`). This
+/// is exactly the grouping `vte::Params::iter` yields, so callers pass
+/// `params.iter()` (normal SGR) or `params.iter().skip(4)` (rectangular
+/// operations, where the first four groups are coordinates). Callers handle
+/// the empty-sequence reset themselves: normal SGR resets on zero parameters,
+/// rectangular operations reset on zero SGR groups after the coordinates.
+pub(crate) fn apply_sgr_sequence<'a>(
+    mut target: SgrTarget<'_>,
+    params: impl Iterator<Item = &'a [u16]>,
+) {
+    let mut iter = params.peekable();
+
+    while let Some(param) = iter.next() {
+        match param {
+            // Reset
+            [0] => {
+                *target.fg = Color::Default;
+                *target.bg = Color::Default;
+                *target.underline_color = None;
+                *target.attrs = CellAttrs::empty();
+                if let Some(hyperlink) = target.hyperlink.as_mut() {
+                    **hyperlink = None;
+                }
+            }
+            // Bold
+            [1] => target.attrs.insert(CellAttrs::BOLD),
+            // Dim/faint
+            [2] => target.attrs.insert(CellAttrs::DIM),
+            // Italic
+            [3] => target.attrs.insert(CellAttrs::ITALIC),
+            // Underline
+            [4, style @ ..] => {
+                target.attrs.clear_underline();
+                match style.first().copied().unwrap_or(1) {
+                    0 => {}
+                    2 => target.attrs.insert(CellAttrs::DOUBLE_UNDERLINE),
+                    3 => target.attrs.insert(CellAttrs::CURLY_UNDERLINE),
+                    4 => target.attrs.insert(CellAttrs::DOTTED_UNDERLINE),
+                    5 => target.attrs.insert(CellAttrs::DASHED_UNDERLINE),
+                    _ => target.attrs.insert(CellAttrs::UNDERLINE),
+                }
+            }
+            // Slow and rapid blink are mutually exclusive.
+            [5] => {
+                target.attrs.clear_blink();
+                target.attrs.insert(CellAttrs::BLINK);
+            }
+            [6] => {
+                target.attrs.clear_blink();
+                target.attrs.insert(CellAttrs::RAPID_BLINK);
+            }
+            // Inverse
+            [7] => target.attrs.insert(CellAttrs::INVERSE),
+            // Hidden
+            [8] => target.attrs.insert(CellAttrs::HIDDEN),
+            // Strikethrough
+            [9] => target.attrs.insert(CellAttrs::STRIKETHROUGH),
+            // Normal intensity (not bold or dim)
+            [22] => {
+                target.attrs.remove(CellAttrs::BOLD);
+                target.attrs.remove(CellAttrs::DIM);
+            }
+            // Kitty extensions: reset bold and faint independently.
+            [221] => target.attrs.remove(CellAttrs::BOLD),
+            [222] => target.attrs.remove(CellAttrs::DIM),
+            // Not italic
+            [23] => target.attrs.remove(CellAttrs::ITALIC),
+            // Not underlined
+            [24] => target.attrs.clear_underline(),
+            // Not blinking
+            [25] => target.attrs.clear_blink(),
+            // Not inverse
+            [27] => target.attrs.remove(CellAttrs::INVERSE),
+            // Not hidden
+            [28] => target.attrs.remove(CellAttrs::HIDDEN),
+            // Not strikethrough
+            [29] => target.attrs.remove(CellAttrs::STRIKETHROUGH),
+            // Foreground colors (30-37)
+            [param @ 30..=37] => {
+                if let Some(color) = AnsiColor::from_index((*param - 30) as u8) {
+                    *target.fg = Color::Ansi(color);
+                }
+            }
+            // Extended foreground color, semicolon form.
+            [38] => {
+                let mut color_params = iter.by_ref().map(|param| param[0]);
+                if let Some(color) = parse_sgr_color(&mut color_params) {
+                    *target.fg = color;
+                }
+            }
+            // Extended foreground color, colon form.
+            [38, color_params @ ..] => {
+                if let Some(color) = parse_colon_sgr_color(color_params) {
+                    *target.fg = color;
+                }
+            }
+            // Default foreground
+            [39] => *target.fg = Color::Default,
+            // Background colors (40-47)
+            [param @ 40..=47] => {
+                if let Some(color) = AnsiColor::from_index((*param - 40) as u8) {
+                    *target.bg = Color::Ansi(color);
+                }
+            }
+            // Extended background color, semicolon form.
+            [48] => {
+                let mut color_params = iter.by_ref().map(|param| param[0]);
+                if let Some(color) = parse_sgr_color(&mut color_params) {
+                    *target.bg = color;
+                }
+            }
+            // Extended background color, colon form.
+            [48, color_params @ ..] => {
+                if let Some(color) = parse_colon_sgr_color(color_params) {
+                    *target.bg = color;
+                }
+            }
+            // Default background
+            [49] => *target.bg = Color::Default,
+            // Overline
+            [53] => target.attrs.insert(CellAttrs::OVERLINE),
+            // Not overline
+            [55] => target.attrs.remove(CellAttrs::OVERLINE),
+            // Underline color, semicolon form.
+            [58] => {
+                let mut color_params = iter.by_ref().map(|param| param[0]);
+                if let Some(color) = parse_sgr_color(&mut color_params) {
+                    *target.underline_color = Some(color);
+                }
+            }
+            // Underline color, colon form.
+            [58, color_params @ ..] => {
+                if let Some(color) = parse_colon_sgr_color(color_params) {
+                    *target.underline_color = Some(color);
+                }
+            }
+            // Default underline color
+            [59] => *target.underline_color = None,
+            // Bright foreground colors (90-97)
+            [param @ 90..=97] => {
+                if let Some(color) = AnsiColor::from_index((*param - 90 + 8) as u8) {
+                    *target.fg = Color::Ansi(color);
+                }
+            }
+            // Bright background colors (100-107)
+            [param @ 100..=107] => {
+                if let Some(color) = AnsiColor::from_index((*param - 100 + 8) as u8) {
+                    *target.bg = Color::Ansi(color);
+                }
+            }
+            _ => {
+                log::trace!("Unknown SGR parameter: {:?}", param);
+            }
+        }
+    }
+}
+
+/// Parse the colon form of an SGR color while tolerating the optional color
+/// space and tolerance fields accepted by foot and VTE.
+fn parse_colon_sgr_color(params: &[u16]) -> Option<Color> {
+    let components_start = if params.len() > 4 { 2 } else { 1 };
+    let mut params =
+        std::iter::once(*params.first()?).chain(params.get(components_start..)?.iter().copied());
+    parse_sgr_color(&mut params)
+}
+
+fn parse_sgr_color(params: &mut dyn Iterator<Item = u16>) -> Option<Color> {
+    use crate::color::Rgb;
+    match params.next()? {
+        5 => Some(Color::Indexed(u8::try_from(params.next()?).ok()?)),
+        2 => Some(Color::Rgb(Rgb::new(
+            u8::try_from(params.next()?).ok()?,
+            u8::try_from(params.next()?).ok()?,
+            u8::try_from(params.next()?).ok()?,
+        ))),
+        _ => None,
     }
 }
 

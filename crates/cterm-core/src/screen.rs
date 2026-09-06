@@ -3,7 +3,7 @@
 //! Manages the visible grid and scrollback history, handling resize
 //! and scroll operations.
 
-use crate::cell::{Cell, CellAttrs, CellStyle, MAX_GRAPHEME_BYTES};
+use crate::cell::{apply_sgr_sequence, Cell, CellAttrs, CellStyle, SgrTarget, MAX_GRAPHEME_BYTES};
 use crate::color::{Color, ColorPalette, Rgb};
 use crate::dnd::DndCommand;
 use crate::drcs::{DrcsFont, DrcsGlyph};
@@ -3288,71 +3288,66 @@ impl Screen {
         self.dirty = true;
     }
 
-    /// Apply the DEC-supported SGR attribute subset to an inclusive rectangle.
+    /// Apply the full SGR repertoire to an inclusive rectangle (DECCARA).
     ///
-    /// DECCARA deliberately affects only bold, underline, blink and inverse;
-    /// colors and all other attributes remain untouched. This matches VT400
-    /// behavior and foot's implementation.
+    /// Kitty extends DECCARA from the DEC subset (bold, underline, blink,
+    /// inverse) to every SGR attribute cterm supports, including foreground,
+    /// background, and underline colors in indexed and truecolor forms. The
+    /// SGR groups after the four coordinates apply in order exactly as normal
+    /// SGR does, including `38`/`48`/`58` extended colors and `4:x` underline
+    /// styles; only the listed attributes change. An empty attribute list
+    /// resets the rectangle, and `0` resets every SGR field of each cell while
+    /// preserving character content, hyperlinks, and wide-cell structure.
     pub(crate) fn change_rectangular_attributes(
         &mut self,
         top: usize,
         left: usize,
         bottom: usize,
         right: usize,
-        params: &[usize],
+        params: &vte::Params,
     ) {
         if top > bottom || left > right {
             return;
         }
 
+        // DEC treats an empty attribute list as `0` (clear).
+        let reset_all = params.iter().nth(4).is_none();
         self.clear_selection_if_rows_selected(top, bottom);
         for row_index in top..=bottom.min(self.height().saturating_sub(1)) {
             let Some(row) = self.grid.row_mut(row_index) else {
                 continue;
             };
             for col in left..=right.min(row.len().saturating_sub(1)) {
-                let attrs = &mut row[col].attrs;
-                for &param in params {
-                    match param {
-                        0 => {
-                            attrs.remove(
-                                CellAttrs::BOLD
-                                    | CellAttrs::BLINK
-                                    | CellAttrs::RAPID_BLINK
-                                    | CellAttrs::INVERSE,
-                            );
-                            attrs.clear_underline();
-                        }
-                        1 => attrs.insert(CellAttrs::BOLD),
-                        4 => {
-                            attrs.clear_underline();
-                            attrs.insert(CellAttrs::UNDERLINE);
-                        }
-                        5 => {
-                            attrs.clear_blink();
-                            attrs.insert(CellAttrs::BLINK);
-                        }
-                        7 => attrs.insert(CellAttrs::INVERSE),
-                        22 => attrs.remove(CellAttrs::BOLD),
-                        24 => attrs.clear_underline(),
-                        25 => attrs.clear_blink(),
-                        27 => attrs.remove(CellAttrs::INVERSE),
-                        _ => {}
-                    }
+                if reset_all {
+                    row[col].reset_sgr();
+                } else {
+                    let target = SgrTarget::from_cell(&mut row[col]);
+                    apply_sgr_sequence(target, params.iter().skip(4));
                 }
             }
         }
         self.dirty = true;
     }
 
-    /// Invert the DEC-supported SGR attribute subset in an inclusive rectangle.
+    /// Invert SGR attributes in an inclusive rectangle (DECRARA).
+    ///
+    /// Each listed boolean attribute toggles; `0` toggles the DEC subset
+    /// (bold, slow blink, inverse, basic underline) exactly as before. Color
+    /// operations (`30-37`, `38`, `40-47`, `48`, `58`, `90-97`, `100-107`,
+    /// `39`, `49`, `59`) have no meaningful reversal, so they — including
+    /// their semicolon-form payload parameters — are skipped rather than
+    /// misread as boolean toggles. "Off" codes (`22`, `23`, `24`, `25`,
+    /// `27`, `28`, `29`, `55`, `221`, `222`) are likewise ignored under
+    /// reversal semantics. Kitty documents the all-SGR extension for DECCARA;
+    /// its DECRARA coverage is partial, so colors staying untouched here is
+    /// the documented best-effort behavior.
     pub(crate) fn reverse_rectangular_attributes(
         &mut self,
         top: usize,
         left: usize,
         bottom: usize,
         right: usize,
-        params: &[usize],
+        params: &vte::Params,
     ) {
         if top > bottom || left > right {
             return;
@@ -3365,20 +3360,50 @@ impl Screen {
             };
             for col in left..=right.min(row.len().saturating_sub(1)) {
                 let attrs = &mut row[col].attrs;
-                for &param in params {
-                    match param {
+                let mut sgr = params.iter().skip(4).peekable();
+                while let Some(group) = sgr.next() {
+                    match group.first().copied().unwrap_or(0) {
                         0 => {
                             attrs.toggle(CellAttrs::BOLD | CellAttrs::BLINK | CellAttrs::INVERSE);
                             attrs.remove(CellAttrs::RAPID_BLINK);
                             Self::toggle_basic_underline(attrs);
                         }
                         1 => attrs.toggle(CellAttrs::BOLD),
+                        2 => attrs.toggle(CellAttrs::DIM),
+                        3 => attrs.toggle(CellAttrs::ITALIC),
+                        // Any underline form toggles underlinedness, matching
+                        // the long-standing `toggle_basic_underline` behavior.
                         4 => Self::toggle_basic_underline(attrs),
                         5 => {
                             attrs.toggle(CellAttrs::BLINK);
                             attrs.remove(CellAttrs::RAPID_BLINK);
                         }
+                        6 => {
+                            attrs.toggle(CellAttrs::RAPID_BLINK);
+                            attrs.remove(CellAttrs::BLINK);
+                        }
                         7 => attrs.toggle(CellAttrs::INVERSE),
+                        8 => attrs.toggle(CellAttrs::HIDDEN),
+                        9 => attrs.toggle(CellAttrs::STRIKETHROUGH),
+                        53 => attrs.toggle(CellAttrs::OVERLINE),
+                        // Skip extended-color payloads so their numeric
+                        // components are not mistaken for toggles. A lone
+                        // group (`38:5:196`) carries its payload inline and
+                        // needs no skipping.
+                        38 | 48 | 58 if group.len() == 1 => {
+                            match sgr.next().and_then(|next| next.first().copied()) {
+                                Some(5) => {
+                                    sgr.next();
+                                }
+                                Some(2) => {
+                                    for _ in 0..3 {
+                                        sgr.next();
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                        38 | 48 | 58 => {}
                         _ => {}
                     }
                 }
