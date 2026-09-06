@@ -10,6 +10,17 @@ is omitted for readability.
 ## [Unreleased]
 
 ### Added
+- Deferred Cocoa/Win32 native mappings, foreign-target type-checked
+  (`aarch64`/`x86_64-apple-darwin`, `x86_64-pc-windows-msvc`) but still
+  awaiting macOS/Windows runtime verification: OSC 22 pointer-shape tables
+  (`NSCursor`: 16 exact, 14 documented fallbacks; `IDC_*`: 21 exact, 9
+  documented fallbacks) with GTK-matching hover precedence; Kitty
+  selection/cursor-text/visual-bell renderer hooks on both backends
+  (transparency slots stay stored-and-queried); and deny-by-default
+  rich-clipboard (OSC 5522) consent prompts mirroring the GTK adapter
+  (Allow once / Always allow with exact-token storage / Deny, exact-token
+  display, 120 s frontend-local expiry, lifecycle cancellation through the
+  existing consent seams).
 - Kitty-precursor alignment fixes, verified against Kitty 0.48.2 sources:
   OSC 5522 malformed reads silently ignored with a log and no reply
   (EINVAL stays write-side only); drag-source `t=k` exact-token approval

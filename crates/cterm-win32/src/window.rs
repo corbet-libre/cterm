@@ -444,6 +444,8 @@ struct PaneDivider {
 const PREVIOUS_KEY_STATE_BIT: usize = 1 << 30;
 const EXTENDED_KEY_BIT: usize = 1 << 24;
 const BLINK_TIMER_ID: usize = 0x4354;
+/// One-shot repaint that clears an expired Kitty visual-bell tint.
+const VISUAL_BELL_TIMER_ID: usize = 0x4355;
 
 fn configure_terminal_cursor(terminal: &mut Terminal, config: &Config) {
     terminal.screen_mut().configure_cursor(
@@ -636,6 +638,9 @@ pub struct WindowState {
     plugin_commands: menu::PluginCommandRegistry,
     /// Skip close confirmation (set during relaunch)
     pub skip_close_confirm: bool,
+    /// Active Kitty `visual_bell` flash (application color + arming time),
+    /// resolved and expiry-checked at paint time. `None` means no tint.
+    visual_bell_flash: Option<crate::terminal_canvas::VisualBellFlash>,
     /// An OSC 5113 consent dialog is running its nested message loop.
     tty_file_transfer_prompt_active: bool,
     /// `WM_CLOSE` arrived while the consent prompt owned this window. Window
@@ -759,6 +764,7 @@ impl WindowState {
             tool_commands,
             plugin_commands,
             skip_close_confirm: false,
+            visual_bell_flash: None,
             tty_file_transfer_prompt_active: false,
             tty_file_transfer_close_pending: false,
             remote_manager: cterm_client::RemoteManager::new(),
@@ -1663,6 +1669,7 @@ impl WindowState {
                 };
 
                 // Process the data (briefly lock the terminal)
+                let mut deferred_rich = Vec::new();
                 let (content_changed, sync_deadline) = {
                     let mut term = terminal.lock().unwrap();
                     let events = term.process(&buffer[..bytes_read]);
@@ -1698,7 +1705,7 @@ impl WindowState {
                                 post_dnd_command(hwnd, source_id, command);
                             }
                             TerminalEvent::RichClipboardRequest(op) => {
-                                handle_rich_clipboard_request(&mut term, op);
+                                deferred_rich.push(op);
                             }
                             TerminalEvent::ProcessExited(_) => {
                                 unsafe {
@@ -1715,10 +1722,30 @@ impl WindowState {
                             _ => {}
                         }
                     }
+                    // Core clears the flag when it emits the Bell event
+                    // above; this covers any path that set the flag without
+                    // one, mirroring the GTK bell check.
+                    if term.screen().bell {
+                        term.screen_mut().bell = false;
+                        unsafe {
+                            let _ = PostMessageW(
+                                Some(HWND(hwnd as *mut _)),
+                                WM_APP_BELL,
+                                WPARAM(source_id as usize),
+                                LPARAM(0),
+                            );
+                        }
+                    }
                     (content_changed, term.synchronized_update_deadline())
                 };
 
                 let _ = sync_watchdog.send(sync_deadline);
+
+                // Rich-clipboard consent prompts run off-thread and must not
+                // hold the terminal lock (see handle_rich_clipboard_request).
+                for op in deferred_rich {
+                    handle_rich_clipboard_request(&terminal, op);
+                }
 
                 if content_changed {
                     post_message(hwnd, WM_APP_PTY_DATA, source_id);
@@ -2705,6 +2732,16 @@ impl WindowState {
         let tab_bar = &mut self.tab_bar;
         let notification_bar = &mut self.notification_bar;
         let blink_phase = self.blink_clock.phase();
+        // Resolve the Kitty visual-bell tint here so only a live flash
+        // reaches the paint; an expired slot is cleared instead of
+        // repainting forever.
+        let bell_tint = self
+            .visual_bell_flash
+            .as_ref()
+            .and_then(|flash| flash.color_at(Instant::now()));
+        if bell_tint.is_none() {
+            self.visual_bell_flash = None;
+        }
 
         {
             let terminal = first_terminal.lock().unwrap();
@@ -2732,6 +2769,10 @@ impl WindowState {
                     &text_format,
                     tab_bar_height,
                 )?;
+            }
+            // Kitty visual-bell flash washes the whole frame last.
+            if let Some(tint) = bell_tint {
+                renderer.paint_visual_bell_tint(tint)?;
             }
             Ok::<(), windows::core::Error>(())
         })();
@@ -3938,6 +3979,28 @@ impl WindowState {
         let Some((tab_index, pane_id)) = self.source_location(source_id) else {
             return;
         };
+        // Arm the Kitty visual-bell tint from the application slot at
+        // bell-delivery time, mirroring the GTK hook. The tab marker and
+        // pane border still always update; a slot without an explicit color
+        // simply leaves no tint armed.
+        let tint = self
+            .tabs
+            .get(tab_index)
+            .and_then(|tab| tab.panes.get(&pane_id))
+            .and_then(|pane| {
+                crate::terminal_canvas::kitty_visual_bell(pane.terminal.lock().unwrap().screen())
+            });
+        self.visual_bell_flash = tint.map(crate::terminal_canvas::VisualBellFlash::arm);
+        if self.visual_bell_flash.is_some() {
+            unsafe {
+                let _ = SetTimer(
+                    Some(self.hwnd),
+                    VISUAL_BELL_TIMER_ID,
+                    crate::terminal_canvas::VisualBellFlash::CLEAR_AFTER.as_millis() as u32,
+                    None,
+                );
+            }
+        }
         let is_focused_pane = tab_index == self.active_tab_index
             && self.tabs[tab_index].pane_layout.active() == pane_id
             && self.window_has_focus();
@@ -4540,24 +4603,58 @@ impl WindowState {
 
         let divider = self.divider_at_client_point(x, y);
         let has_link = divider.is_none() && self.hyperlink_at(x, y).is_some();
+        // Kitty OSC 22 application shape, resolved with the same precedence
+        // the GTK frontend uses: the pointer shape wins over the hyperlink
+        // cursor, while selection/drag cursors keep theirs. A tracking drag
+        // (`mouse_report_button`) or an in-progress divider drag (returned
+        // above via `update_divider_drag`) never reaches this block, so
+        // `dragging` here covers only the button-held reporting case.
+        // Divider *hover* keeps the chrome resize cursor.
+        let osc_shape = self
+            .active_terminal()
+            .and_then(|terminal| terminal.lock().unwrap().screen().current_pointer_shape());
+        let decision = crate::pointer_shape::hover_cursor(
+            self.mouse_report_button.is_some(),
+            divider.is_some(),
+            osc_shape,
+            has_link,
+        );
 
         unsafe {
+            use crate::pointer_shape::{HoverDecision, Win32Cursor};
             use windows::Win32::UI::WindowsAndMessaging::{LoadCursorW, SetCursor};
-            let cursor = if let Some(divider) = divider {
-                LoadCursorW(
-                    None,
+            let idc = match decision {
+                HoverDecision::Keep => return,
+                HoverDecision::Divider => {
+                    let divider = divider.as_ref().expect("divider hover implies a divider");
                     if divider.direction == SplitDirection::Horizontal {
                         IDC_SIZEWE
                     } else {
                         IDC_SIZENS
-                    },
-                )
-                .unwrap_or_default()
-            } else if has_link {
-                LoadCursorW(None, IDC_HAND).unwrap_or_default()
-            } else {
-                LoadCursorW(None, IDC_IBEAM).unwrap_or_default()
+                    }
+                }
+                HoverDecision::Cursor(cursor, exact) => {
+                    if let Some(shape) = osc_shape {
+                        crate::pointer_shape::note_fallback(shape, exact);
+                    }
+                    match cursor {
+                        Win32Cursor::Arrow => IDC_ARROW,
+                        Win32Cursor::IBeam => IDC_IBEAM,
+                        Win32Cursor::Cross => IDC_CROSS,
+                        Win32Cursor::Hand => IDC_HAND,
+                        Win32Cursor::Help => IDC_HELP,
+                        Win32Cursor::No => IDC_NO,
+                        Win32Cursor::SizeAll => IDC_SIZEALL,
+                        Win32Cursor::SizeNs => IDC_SIZENS,
+                        Win32Cursor::SizeWe => IDC_SIZEWE,
+                        Win32Cursor::SizeNwse => IDC_SIZENWSE,
+                        Win32Cursor::SizeNesw => IDC_SIZENESW,
+                        Win32Cursor::Wait => IDC_WAIT,
+                        Win32Cursor::AppStarting => IDC_APPSTARTING,
+                    }
+                }
             };
+            let cursor = LoadCursorW(None, idc).unwrap_or_default();
             let _ = SetCursor(Some(cursor));
         }
     }
@@ -5690,6 +5787,11 @@ async fn run_daemon_io_loop(
                                     let mut term = terminal.lock().unwrap();
                                     let events = term.process_mirror(&chunk.data);
                                     let mut content_changed = false;
+                                    // Rich-clipboard consent prompts run
+                                    // off-thread and must not hold the
+                                    // terminal lock (see
+                                    // handle_rich_clipboard_request).
+                                    let mut deferred_rich = Vec::new();
                                     for event in events {
                                         match event {
                                             TerminalEvent::TitleChanged(_) => {
@@ -5709,13 +5811,24 @@ async fn run_daemon_io_loop(
                                                 post_dnd_command(hwnd, source_id, command);
                                             }
                                             TerminalEvent::RichClipboardRequest(op) => {
-                                                handle_rich_clipboard_request(&mut term, op);
+                                                deferred_rich.push(op);
                                             }
                                             TerminalEvent::ContentChanged => content_changed = true,
                                             _ => {}
                                         }
                                     }
+                                    // Core clears the flag when it emits the
+                                    // Bell event above; this covers any path
+                                    // that set the flag without one,
+                                    // mirroring the GTK bell check.
+                                    if term.screen().bell {
+                                        term.screen_mut().bell = false;
+                                        post_message(hwnd, WM_APP_BELL, source_id);
+                                    }
                                     drop(term);
+                                    for op in deferred_rich {
+                                        handle_rich_clipboard_request(&terminal, op);
+                                    }
                                     if content_changed {
                                         post_message(hwnd, WM_APP_PTY_DATA, source_id);
                                     }
@@ -5833,13 +5946,17 @@ fn post_desktop_notification(
     }
 }
 
-/// Handle one Kitty OSC 5522 operation on a thread that already holds the
-/// terminal lock. Replies travel through the terminal's write path (local
-/// PTY or daemon input channel). Only text/plain maps to the Win32
-/// clipboard (`CF_UNICODETEXT`); other types are skipped. Reads without
-/// prior consent are denied fail-closed — there is no prompt seam on this
-/// path yet (see the parity row).
-fn handle_rich_clipboard_request(term: &mut Terminal, op: cterm_core::RichClipboardOperation) {
+/// Handle one Kitty OSC 5522 operation without holding the terminal lock.
+/// Replies travel through the terminal's write path (local PTY or daemon
+/// input channel). Only text/plain maps to the Win32 clipboard
+/// (`CF_UNICODETEXT`); other types are skipped. Reads that core policy did
+/// not pre-authorize go through a native deny-by-default prompt on a worker
+/// thread (see `rich_clipboard_prompt`); every non-click path denies with
+/// `EPERM`.
+fn handle_rich_clipboard_request(
+    terminal: &Arc<Mutex<Terminal>>,
+    op: cterm_core::RichClipboardOperation,
+) {
     use cterm_core::{RichClipboardLocation, RichClipboardOperation as Op, RichClipboardStatus};
 
     match op {
@@ -5861,45 +5978,89 @@ fn handle_rich_clipboard_request(term: &mut Terminal, op: cterm_core::RichClipbo
         }
         Op::Read { request } => {
             if request.location == RichClipboardLocation::Primary {
-                let _ = term.fail_rich_clipboard_read(
-                    &request.id,
-                    request.location,
-                    RichClipboardStatus::NoSys,
-                );
-            } else if !request.pre_authorized {
-                let _ = term.fail_rich_clipboard_read(
-                    &request.id,
-                    request.location,
-                    RichClipboardStatus::Perm,
-                );
-            } else if request.list_only {
-                let types = clipboard::paste_from_clipboard()
-                    .ok()
-                    .map(|_| vec!["text/plain".to_string()])
-                    .unwrap_or_default();
-                if term
-                    .complete_rich_clipboard_list(&request.id, request.location, &types)
-                    .is_err()
-                {
-                    log::error!("Failed to answer OSC 5522 MIME-list read");
+                // No primary selection on Windows.
+                if let Ok(mut term) = terminal.lock() {
+                    let _ = term.fail_rich_clipboard_read(
+                        &request.id,
+                        request.location,
+                        RichClipboardStatus::NoSys,
+                    );
+                }
+            } else if request.list_only || request.pre_authorized {
+                if let Ok(mut term) = terminal.lock() {
+                    answer_rich_clipboard_read(&mut term, &request);
                 }
             } else {
-                let wants_text = request.mimes.iter().any(|mime| mime == "text/plain");
-                let items = match (clipboard::paste_from_clipboard(), wants_text) {
-                    (Ok(text), true) => vec![cterm_core::RichClipboardItem {
-                        mime: "text/plain".to_string(),
-                        data: text.into_bytes(),
-                    }],
-                    _ => Vec::new(),
-                };
-                if term
-                    .complete_rich_clipboard_read(&request.id, request.location, &items)
-                    .is_err()
-                {
-                    log::error!("Failed to answer OSC 5522 read");
-                }
+                let terminal = Arc::clone(terminal);
+                // Prompt off-thread so PTY output keeps flowing while the
+                // modal is open. Concurrent reads stack their own topmost
+                // modals (rare in practice, and core's pending-read cap
+                // bounds the queue). A pane torn down mid-prompt leaves
+                // nothing to answer: the lock fails or the pending read no
+                // longer matches, and the answer is dropped, so consent can
+                // never outlive its pane.
+                std::thread::spawn(move || {
+                    let choice = crate::rich_clipboard_prompt::show_prompt(&request);
+                    let Ok(mut term) = terminal.lock() else {
+                        return;
+                    };
+                    match choice {
+                        crate::rich_clipboard_prompt::RichClipboardChoice::AllowAlways => {
+                            if let Some(credential) = &request.credential {
+                                term.authorize_rich_clipboard(
+                                    &credential.password,
+                                    &credential.name,
+                                );
+                            }
+                            answer_rich_clipboard_read(&mut term, &request);
+                        }
+                        crate::rich_clipboard_prompt::RichClipboardChoice::AllowOnce => {
+                            answer_rich_clipboard_read(&mut term, &request);
+                        }
+                        crate::rich_clipboard_prompt::RichClipboardChoice::Deny => {
+                            let _ = term.fail_rich_clipboard_read(
+                                &request.id,
+                                request.location,
+                                RichClipboardStatus::Perm,
+                            );
+                        }
+                    }
+                });
             }
         }
+    }
+}
+
+/// Answer a consented OSC 5522 read with native `CF_UNICODETEXT` data.
+/// Requested types outside text/plain are unavailable here and skipped,
+/// per the protocol (possibly yielding an empty DONE).
+fn answer_rich_clipboard_read(term: &mut Terminal, request: &cterm_core::RichReadRequest) {
+    if request.list_only {
+        let types = clipboard::paste_from_clipboard()
+            .ok()
+            .map(|_| vec!["text/plain".to_string()])
+            .unwrap_or_default();
+        if term
+            .complete_rich_clipboard_list(&request.id, request.location, &types)
+            .is_err()
+        {
+            log::error!("Failed to answer OSC 5522 MIME-list read");
+        }
+        return;
+    }
+    let wants_text = request.mimes.iter().any(|mime| mime == "text/plain");
+    let items = match (clipboard::paste_from_clipboard(), wants_text) {
+        (Ok(text), true) => vec![cterm_core::RichClipboardItem {
+            mime: "text/plain".to_string(),
+            data: text.into_bytes(),
+        }],
+        _ => Vec::new(),
+    };
+    if term
+        .complete_rich_clipboard_read(&request.id, request.location, &items)
+        .is_err()
+    {
+        log::error!("Failed to answer OSC 5522 read");
     }
 }
 
@@ -6027,6 +6188,16 @@ extern "system" fn window_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPA
 
         WM_TIMER if wparam.0 == BLINK_TIMER_ID => {
             state.on_blink_timer();
+            LRESULT(0)
+        }
+
+        WM_TIMER if wparam.0 == VISUAL_BELL_TIMER_ID => {
+            unsafe {
+                let _ = KillTimer(Some(hwnd), VISUAL_BELL_TIMER_ID);
+            }
+            // The tint has expired; one repaint clears it (`render` drops
+            // the spent flash slot).
+            state.invalidate();
             LRESULT(0)
         }
 

@@ -3,6 +3,7 @@
 //! Hardware-accelerated terminal rendering using Direct2D and DirectWrite.
 
 use std::collections::HashMap;
+use std::time::{Duration, Instant};
 
 use cterm_core::color::{Color, Rgb};
 use cterm_core::{Cell, CellAttrs, CursorStyle, Screen};
@@ -437,6 +438,40 @@ impl TerminalRenderer {
         Ok(())
     }
 
+    /// Paint the Kitty visual-bell fullscreen tint over one presented frame.
+    ///
+    /// Call after pane/chrome drawing and before [`Self::end_frame`], passing
+    /// a live (unexpired) tint resolved by the caller — mirroring the GTK
+    /// hook, which paints its flash last. Uses a fresh alpha brush rather
+    /// than the opaque `brush_cache`.
+    pub fn paint_visual_bell_tint(&mut self, tint: Rgb) -> windows::core::Result<()> {
+        let Some(rt) = self.render_target.clone() else {
+            return Ok(());
+        };
+        let base: ID2D1RenderTarget = rt.cast()?;
+        let brush = unsafe {
+            base.CreateSolidColorBrush(
+                &D2D1_COLOR_F {
+                    r: tint.r as f32 / 255.0,
+                    g: tint.g as f32 / 255.0,
+                    b: tint.b as f32 / 255.0,
+                    a: VISUAL_BELL_FLASH_ALPHA,
+                },
+                None,
+            )?
+        };
+        let mut client = RECT::default();
+        unsafe { GetClientRect(self.hwnd, &mut client)? };
+        let rect = D2D_RECT_F {
+            left: 0.0,
+            top: 0.0,
+            right: (client.right - client.left).max(1) as f32,
+            bottom: (client.bottom - client.top).max(1) as f32,
+        };
+        unsafe { base.FillRectangle(&rect, &brush) };
+        Ok(())
+    }
+
     /// Render the terminal screen as a single full-window pane.
     pub fn render(
         &mut self,
@@ -548,6 +583,10 @@ impl TerminalRenderer {
         let rows = grid.height();
         let cols = grid.width();
         let visible_top = screen.visible_row_to_absolute_line(0);
+        // Explicit Kitty selection paint colors; when unset the selection
+        // keeps rendering as reverse video (mirrors the GTK hook, resolved
+        // via the same core slots).
+        let kitty_selection = kitty_selection_paint(screen);
 
         for row in 0..rows {
             let absolute_line = screen.visible_row_to_absolute_line(row);
@@ -571,6 +610,7 @@ impl TerminalRenderer {
                         screen,
                         blink_phase,
                         pass,
+                        kitty_selection,
                     )?;
                 }
             }
@@ -587,6 +627,7 @@ impl TerminalRenderer {
         screen: &Screen,
         blink_phase: BlinkPhase,
         pass: GridPass,
+        kitty_selection: (Option<Rgb>, Option<Rgb>),
     ) -> windows::core::Result<()> {
         let multicell = cell.multicell.as_ref();
         let metrics = multicell.map(multicell_render_metrics);
@@ -612,7 +653,13 @@ impl TerminalRenderer {
                 multicell_is_selected(screen, position.absolute_line, position.col, multicell)
             },
         );
-        let (fg, bg) = self.resolve_colors(cell, screen, screen.modes.reverse_video, is_selected);
+        let (fg, bg) = self.resolve_colors(
+            cell,
+            screen,
+            screen.modes.reverse_video,
+            is_selected,
+            kitty_selection,
+        );
         let palette = self.resolved_palette(screen);
         let cell_width = if let Some(multicell) = multicell {
             self.cell_dims.width * f32::from(multicell.columns)
@@ -794,6 +841,7 @@ impl TerminalRenderer {
         screen: &Screen,
         reverse_video: bool,
         selected: bool,
+        kitty_selection: (Option<Rgb>, Option<Rgb>),
     ) -> (Rgb, Rgb) {
         let palette = self.resolved_palette(screen);
         let normal_background = palette.background;
@@ -819,6 +867,20 @@ impl TerminalRenderer {
         // Cornflower blue for hyperlinks with default foreground
         if cell.hyperlink.is_some() && cell.fg == Color::Default && !is_inverted {
             fg = Rgb::new(100, 149, 237);
+        }
+
+        // Explicit Kitty selection paint wins on selected cells, mirroring
+        // the GTK hook: an explicit background replaces the reverse-video
+        // selection highlight, an explicit foreground wins over the resolved
+        // color. Unset slots keep the colors resolved above.
+        if selected {
+            let (kitty_bg, kitty_fg) = kitty_selection;
+            if let Some(explicit) = kitty_bg {
+                bg = explicit;
+            }
+            if let Some(explicit) = kitty_fg {
+                fg = explicit;
+            }
         }
 
         (fg, bg)
@@ -894,7 +956,7 @@ impl TerminalRenderer {
             screen.cursor.col,
             screen.cursor.style,
             cursor_color,
-            self.theme.cursor.text_color,
+            kitty_cursor_text(screen, self.theme.cursor.text_color),
         )
     }
 
@@ -1077,6 +1139,82 @@ fn rgb_to_d2d_color(rgb: Rgb) -> D2D1_COLOR_F {
     }
 }
 
+/// Alpha of the Kitty visual-bell fullscreen tint (matches GTK).
+pub const VISUAL_BELL_FLASH_ALPHA: f32 = 0.25;
+
+/// Explicit Kitty selection paint colors as `(background, foreground)`.
+///
+/// Each side is `Some` only when the application set an explicit `OSC 21`
+/// (or aliased `OSC 17`/`19`) color; `Default`/`Dynamic` keep the theme
+/// behavior (reverse-video highlight). Mirrors the GTK hook; consumed by
+/// the grid paint in [`TerminalRenderer::draw_cell`].
+pub fn kitty_selection_paint(screen: &Screen) -> (Option<Rgb>, Option<Rgb>) {
+    (
+        screen.kitty_explicit_color(cterm_core::KittyColorKey::SelectionBackground),
+        screen.kitty_explicit_color(cterm_core::KittyColorKey::SelectionForeground),
+    )
+}
+
+/// Cursor text color honoring the Kitty `cursor_text` slot.
+///
+/// Falls back to the theme cursor text color when the slot is unset or
+/// dynamic (dynamic means the underlying background, which the theme value
+/// approximates). Mirrors the GTK hook; consumed by the main-cursor draw in
+/// [`TerminalRenderer::draw_cursor`].
+pub fn kitty_cursor_text(screen: &Screen, fallback: Rgb) -> Rgb {
+    screen
+        .kitty_explicit_color(cterm_core::KittyColorKey::CursorText)
+        .unwrap_or(fallback)
+}
+
+/// Kitty `visual_bell` application color, if the slot holds an explicit one.
+///
+/// `None` (unset or dynamic) means the existing bell path (tab marker +
+/// pane border) runs without a flash. Mirrors the GTK hook; consumed through
+/// the bell path in the window state, which arms a [`VisualBellFlash`].
+pub fn kitty_visual_bell(screen: &Screen) -> Option<Rgb> {
+    screen.kitty_explicit_color(cterm_core::KittyColorKey::VisualBell)
+}
+
+/// Active Kitty visual-bell flash: the application `visual_bell` color plus
+/// its arming time, painted as a brief fullscreen tint.
+///
+/// Transparency (`transparent_background_color1..7`) is deliberately *not*
+/// consumed here: Direct2D layered-window opacity exists, but cterm applies
+/// no configured opacity to its windows today, so those slots stay
+/// stored-and-queried state until an opacity path exists — the same
+/// documented gap as the GTK frontend.
+#[derive(Debug, Clone, Copy)]
+pub struct VisualBellFlash {
+    color: Rgb,
+    armed_at: Instant,
+}
+
+impl VisualBellFlash {
+    /// How long the tint stays visible (matches the GTK hook).
+    pub const DURATION: Duration = Duration::from_millis(150);
+
+    /// How long after arming the window schedules its tint-clear repaint.
+    pub const CLEAR_AFTER: Duration = Duration::from_millis(200);
+
+    pub fn arm(color: Rgb) -> Self {
+        Self::arm_at(color, Instant::now())
+    }
+
+    pub fn arm_at(color: Rgb, armed_at: Instant) -> Self {
+        Self { color, armed_at }
+    }
+
+    /// The flash color while the tint is still visible, `None` once expired.
+    pub fn color_at(&self, now: Instant) -> Option<Rgb> {
+        if now.saturating_duration_since(self.armed_at) <= Self::DURATION {
+            Some(self.color)
+        } else {
+            None
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1096,5 +1234,71 @@ mod tests {
         let dims = CellDimensions::default();
         assert!(dims.width > 0.0);
         assert!(dims.height > 0.0);
+    }
+
+    /// Headless tests for the Kitty color-slot renderer hooks: slot
+    /// resolution, cursor-text fallback, flash arming/expiry. Pixel-level
+    /// visual assertions need Windows hardware and stay open (see
+    /// `docs/parity.md`); they run wherever this crate compiles (today: the
+    /// msvc target and native CI).
+    #[test]
+    fn kitty_slots_default_to_theme_behavior() {
+        use cterm_core::screen::{Screen, ScreenConfig};
+
+        let screen = Screen::new(80, 24, ScreenConfig::default());
+        assert_eq!(kitty_selection_paint(&screen), (None, None));
+        let fallback = Rgb::new(1, 2, 3);
+        assert_eq!(kitty_cursor_text(&screen, fallback), fallback);
+        assert_eq!(kitty_visual_bell(&screen), None);
+    }
+
+    #[test]
+    fn kitty_explicit_slots_override_theme() {
+        use cterm_core::screen::{KittyColorKey, KittyColorSetting, Screen, ScreenConfig};
+
+        let mut screen = Screen::new(80, 24, ScreenConfig::default());
+        screen.set_kitty_setting(
+            KittyColorKey::SelectionBackground,
+            KittyColorSetting::Color(Rgb::new(0x11, 0x22, 0x33)),
+        );
+        screen.set_kitty_setting(
+            KittyColorKey::SelectionForeground,
+            KittyColorSetting::Color(Rgb::new(0x44, 0x55, 0x66)),
+        );
+        screen.set_kitty_setting(
+            KittyColorKey::CursorText,
+            KittyColorSetting::Color(Rgb::new(0x77, 0x88, 0x99)),
+        );
+        screen.set_kitty_setting(
+            KittyColorKey::VisualBell,
+            KittyColorSetting::Color(Rgb::new(0xaa, 0xbb, 0xcc)),
+        );
+        assert_eq!(
+            kitty_selection_paint(&screen),
+            (
+                Some(Rgb::new(0x11, 0x22, 0x33)),
+                Some(Rgb::new(0x44, 0x55, 0x66))
+            )
+        );
+        assert_eq!(
+            kitty_cursor_text(&screen, Rgb::new(0, 0, 0)),
+            Rgb::new(0x77, 0x88, 0x99)
+        );
+        assert_eq!(kitty_visual_bell(&screen), Some(Rgb::new(0xaa, 0xbb, 0xcc)));
+    }
+
+    #[test]
+    fn kitty_visual_bell_flash_expires() {
+        let color = Rgb::new(0xaa, 0xbb, 0xcc);
+        let armed_at = Instant::now();
+        let flash = VisualBellFlash::arm_at(color, armed_at);
+        assert_eq!(
+            flash.color_at(armed_at + VisualBellFlash::DURATION),
+            Some(color)
+        );
+        assert_eq!(
+            flash.color_at(armed_at + VisualBellFlash::DURATION + Duration::from_millis(1)),
+            None
+        );
     }
 }
