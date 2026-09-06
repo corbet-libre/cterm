@@ -47,6 +47,11 @@ pub fn event_to_proto(event: &CoreEvent) -> Option<proto::TerminalEvent> {
         // native frontend. Sending it again on the event stream would apply a
         // drag command twice.
         CoreEvent::DndCommand(_) => return None,
+        // OSC 5522 stays in the mirrored PTY byte stream for the same reason:
+        // the frontend mirror owns the native clipboard, answers reads, and
+        // applies writes. Re-broadcasting would double-apply writes and
+        // double-answer reads.
+        CoreEvent::RichClipboardRequest(_) => return None,
     };
 
     Some(proto::TerminalEvent { event: Some(event) })
@@ -185,5 +190,32 @@ mod tests {
         });
 
         assert!(event_to_proto(&event).is_none());
+    }
+
+    #[test]
+    fn rich_clipboard_ops_stay_in_the_mirrored_pty_stream() {
+        let write = CoreEvent::RichClipboardRequest(cterm_core::RichClipboardOperation::Write {
+            id: String::new(),
+            location: cterm_core::RichClipboardLocation::Clipboard,
+            items: vec![cterm_core::RichClipboardItem {
+                mime: "text/plain".to_string(),
+                data: b"hi".to_vec(),
+            }],
+            aliases: Vec::new(),
+        });
+        assert!(event_to_proto(&write).is_none());
+
+        let read = CoreEvent::RichClipboardRequest(cterm_core::RichClipboardOperation::Read {
+            request: cterm_core::RichReadRequest {
+                id: String::new(),
+                location: cterm_core::RichClipboardLocation::Clipboard,
+                mimes: vec!["text/plain".to_string()],
+                list_only: false,
+                credential: None,
+                pre_authorized: true,
+                app_name: None,
+            },
+        });
+        assert!(event_to_proto(&read).is_none());
     }
 }

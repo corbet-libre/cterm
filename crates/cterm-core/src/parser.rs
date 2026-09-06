@@ -833,6 +833,13 @@ impl vte::Perform for ScreenPerformer<'_> {
                     }
                 }
             }
+            // Kitty rich clipboard: typed MIME reads/writes with consent.
+            // Daemon-owned replies (write DONE/errors, read validation
+            // errors) are queued at parse time; validated requests become
+            // frontend operations answered through Screen's completion APIs.
+            5522 => {
+                self.screen.handle_rich_clipboard(params);
+            }
             _ => {
                 log::trace!("Unhandled OSC: {}", command);
             }
@@ -2623,6 +2630,9 @@ impl ScreenPerformer<'_> {
             }
             // Bracketed Paste Mode
             2004 => self.screen.modes.bracketed_paste = set,
+            // Kitty rich-clipboard paste events. Takes precedence over
+            // bracketed paste for user paste actions while enabled.
+            5522 => self.screen.modes.rich_clipboard_paste_events = set,
             // Application synchronized updates
             2026 => self.screen.set_application_sync_updates(set),
             // Use a fresh palette for every Sixel image. Resetting this mode
@@ -2673,6 +2683,7 @@ impl ScreenPerformer<'_> {
             1016 => self.screen.modes.mouse_encoding == MouseEncoding::SgrPixels,
             1070 => self.screen.modes.sixel_private_palette,
             2004 => self.screen.modes.bracketed_paste,
+            5522 => self.screen.modes.rich_clipboard_paste_events,
             2026 => self.screen.modes.application_sync_updates,
             2031 => self.screen.modes.theme_change_reports,
             2033 => self.screen.modes.visibility_change_reports,

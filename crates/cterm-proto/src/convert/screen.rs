@@ -543,6 +543,7 @@ pub fn modes_to_proto(screen: &Screen) -> proto::TerminalModes {
         application_cursor: screen.modes.application_cursor,
         application_keypad: screen.modes.application_keypad,
         bracketed_paste: screen.modes.bracketed_paste,
+        rich_clipboard_paste_events: screen.modes.rich_clipboard_paste_events,
         focus_events: screen.modes.focus_events,
         charset_g0: screen.modes.charset_g0.clone(),
         charset_g1: screen.modes.charset_g1.clone(),
@@ -740,6 +741,7 @@ pub fn apply_screen_snapshot(terminal: &mut Terminal, screen_data: &proto::GetSc
         screen.modes.application_cursor = modes.application_cursor;
         screen.modes.application_keypad = modes.application_keypad;
         screen.modes.bracketed_paste = modes.bracketed_paste;
+        screen.modes.rich_clipboard_paste_events = modes.rich_clipboard_paste_events;
         screen.modes.focus_events = modes.focus_events;
         screen.modes.charset_g0 = modes.charset_g0.clone();
         screen.modes.charset_g1 = modes.charset_g1.clone();
@@ -1393,5 +1395,23 @@ mod tests {
         apply_screen_snapshot(&mut restored, &snapshot);
         assert_eq!(restored.screen().current_pointer_shape(), None);
         assert_eq!(restored.screen().pointer_main_stack().len(), 2);
+    }
+
+    #[test]
+    fn paste_event_mode_roundtrips_through_screen_snapshot() {
+        let mut source = Terminal::new(8, 2, ScreenConfig::default());
+        source.process(b"\x1b[?5522h");
+        let snapshot = screen_to_proto(source.screen(), false);
+        assert!(snapshot.modes.as_ref().unwrap().rich_clipboard_paste_events);
+
+        let mut restored = Terminal::new(8, 2, ScreenConfig::default());
+        apply_screen_snapshot(&mut restored, &snapshot);
+        assert!(restored.screen().rich_paste_events_enabled());
+
+        // An authoritative snapshot without the mode clears it again.
+        let empty = screen_to_proto(Terminal::new(8, 2, ScreenConfig::default()).screen(), false);
+        assert!(!empty.modes.as_ref().unwrap().rich_clipboard_paste_events);
+        apply_screen_snapshot(&mut restored, &empty);
+        assert!(!restored.screen().rich_paste_events_enabled());
     }
 }

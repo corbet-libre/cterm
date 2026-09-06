@@ -30,6 +30,7 @@ use cterm_app::ShortcutManager;
 use cterm_core::screen::{ScreenConfig, SelectionMode};
 use cterm_core::term::{Key, Modifiers as CoreModifiers, TerminalEvent};
 use cterm_core::{KeyEventKind, KeyEventMetadata, KeyboardEnhancementFlags, Terminal};
+use cterm_core::{RichClipboardItem, RichClipboardLocation, RichClipboardStatus};
 use cterm_ui::theme::Theme;
 use cterm_ui::{Action, BlinkClock, BlinkNeeds, BlinkPhase, KeyCode, Modifiers};
 
@@ -2359,6 +2360,12 @@ impl TerminalView {
                                                 TerminalEvent::ContentChanged => {
                                                     content_changed = true;
                                                 }
+                                                TerminalEvent::RichClipboardRequest(op) => {
+                                                    Self::handle_rich_clipboard_request(
+                                                        &mut term,
+                                                        op,
+                                                    );
+                                                }
                                                 _ => {}
                                             }
                                         }
@@ -3012,6 +3019,20 @@ impl TerminalView {
     }
 
     pub(crate) fn paste_clipboard(&self) {
+        // Paste-event mode replaces text pastes with an unsolicited MIME
+        // listing; the application then reads what it wants via OSC 5522.
+        let notified = self
+            .ivars()
+            .terminal
+            .lock()
+            .notify_rich_clipboard_paste(
+                RichClipboardLocation::Clipboard,
+                &["text/plain".to_string()],
+            )
+            .unwrap_or(false);
+        if notified {
+            return;
+        }
         let Some(text) = clipboard::get_text() else {
             return;
         };
@@ -3022,6 +3043,78 @@ impl TerminalView {
             text
         };
         self.write_to_pty(paste_text.as_bytes());
+    }
+
+    /// Handle one Kitty OSC 5522 operation in the frontend mirror, which owns
+    /// the native pasteboard. The caller holds the terminal lock; replies go
+    /// back through the terminal's write path (daemon input channel or local
+    /// PTY). Reads without prior consent are denied fail-closed: consent
+    /// prompts need the main thread, which this daemon reader cannot assume.
+    fn handle_rich_clipboard_request(term: &mut Terminal, op: cterm_core::RichClipboardOperation) {
+        use cterm_core::RichClipboardOperation as Op;
+
+        match op {
+            Op::Write { items, .. } => {
+                let plain = items
+                    .iter()
+                    .find(|item| item.mime == "text/plain")
+                    .and_then(|item| String::from_utf8(item.data.clone()).ok());
+                let html = items
+                    .iter()
+                    .find(|item| item.mime == "text/html")
+                    .and_then(|item| String::from_utf8(item.data.clone()).ok());
+                match (html, plain) {
+                    (Some(html), Some(plain)) => clipboard::set_html(&html, &plain),
+                    (Some(html), None) => clipboard::set_text(&html),
+                    (None, Some(plain)) => clipboard::set_text(&plain),
+                    (None, None) => log::debug!(
+                        "Ignoring OSC 5522 write with no text payload ({} types)",
+                        items.len()
+                    ),
+                }
+            }
+            Op::Read { request } => {
+                if request.location == RichClipboardLocation::Primary {
+                    // No primary selection on macOS.
+                    let _ = term.fail_rich_clipboard_read(
+                        &request.id,
+                        request.location,
+                        RichClipboardStatus::NoSys,
+                    );
+                } else if !request.pre_authorized {
+                    let _ = term.fail_rich_clipboard_read(
+                        &request.id,
+                        request.location,
+                        RichClipboardStatus::Perm,
+                    );
+                } else if request.list_only {
+                    let types = clipboard::get_text()
+                        .map(|_| vec!["text/plain".to_string()])
+                        .unwrap_or_default();
+                    if term
+                        .complete_rich_clipboard_list(&request.id, request.location, &types)
+                        .is_err()
+                    {
+                        log::error!("Failed to answer OSC 5522 MIME-list read");
+                    }
+                } else {
+                    let wants_text = request.mimes.iter().any(|mime| mime == "text/plain");
+                    let items = match (clipboard::get_text(), wants_text) {
+                        (Some(text), true) => vec![RichClipboardItem {
+                            mime: "text/plain".to_string(),
+                            data: text.into_bytes(),
+                        }],
+                        _ => Vec::new(),
+                    };
+                    if term
+                        .complete_rich_clipboard_read(&request.id, request.location, &items)
+                        .is_err()
+                    {
+                        log::error!("Failed to answer OSC 5522 read");
+                    }
+                }
+            }
+        }
     }
 
     pub(crate) fn select_all(&self) {

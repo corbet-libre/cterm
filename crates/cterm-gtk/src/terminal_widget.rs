@@ -25,6 +25,9 @@ use cterm_core::mouse::{
 use cterm_core::screen::{ClipboardOperation, CursorStyle, MouseEncoding, MouseMode, ScreenConfig};
 use cterm_core::term::{Key, Modifiers, Terminal, TerminalEvent};
 use cterm_core::KeyEventKind;
+use cterm_core::{
+    RichClipboardItem, RichClipboardLocation, RichClipboardOperation, RichClipboardStatus,
+};
 use cterm_ui::blink::{
     cell_foreground_visible, cursor_visible, BlinkClock, BlinkNeeds, BlinkPhase,
     BLINK_POLL_INTERVAL,
@@ -511,6 +514,186 @@ impl TerminalWidget {
         }
     }
 
+    /// Handle one Kitty OSC 5522 operation in the frontend mirror, which owns
+    /// the native clipboard. Runs on the GTK main thread.
+    pub fn handle_rich_clipboard_request(
+        terminal: &Arc<Mutex<Terminal>>,
+        drawing_area: &DrawingArea,
+        op: RichClipboardOperation,
+    ) {
+        let Some(display) = gdk::Display::default() else {
+            return;
+        };
+        match op {
+            RichClipboardOperation::Write { items, .. } => {
+                // Plain-text fallback: GDK has no typed-MIME read/write seam
+                // at this gtk4 version, so only text/plain maps (see the
+                // parity row for the remaining adapter work).
+                if let Some(text) = items
+                    .iter()
+                    .find(|item| item.mime == "text/plain")
+                    .and_then(|item| String::from_utf8(item.data.clone()).ok())
+                {
+                    display.clipboard().set_text(&text);
+                } else {
+                    log::debug!(
+                        "Ignoring OSC 5522 write with no text/plain payload ({} types)",
+                        items.len()
+                    );
+                }
+            }
+            RichClipboardOperation::Read { request } => {
+                let clipboard = match request.location {
+                    RichClipboardLocation::Primary => display.primary_clipboard(),
+                    RichClipboardLocation::Clipboard => display.clipboard(),
+                };
+                if request.pre_authorized {
+                    Self::answer_rich_clipboard_read(terminal, clipboard, request);
+                } else {
+                    Self::prompt_rich_clipboard_read(terminal, drawing_area, clipboard, request);
+                }
+            }
+        }
+    }
+
+    /// Answer a consented OSC 5522 read with native text/plain data.
+    /// Requested types outside text/plain are unavailable here and skipped,
+    /// per the protocol (possibly yielding an empty DONE).
+    fn answer_rich_clipboard_read(
+        terminal: &Arc<Mutex<Terminal>>,
+        clipboard: gdk::Clipboard,
+        request: cterm_core::RichReadRequest,
+    ) {
+        let terminal = Arc::clone(terminal);
+        clipboard.read_text_async(None::<&gio::Cancellable>, move |result| {
+            let text = result.ok().flatten().map(|text| text.to_string());
+            let mut term = terminal.lock();
+            if request.list_only {
+                let types = text
+                    .map(|_| vec!["text/plain".to_string()])
+                    .unwrap_or_default();
+                if term
+                    .complete_rich_clipboard_list(&request.id, request.location, &types)
+                    .is_err()
+                {
+                    log::error!("Failed to answer OSC 5522 MIME-list read");
+                }
+            } else {
+                let wants_text = request.mimes.iter().any(|mime| mime == "text/plain");
+                let items = match (text, wants_text) {
+                    (Some(text), true) => vec![RichClipboardItem {
+                        mime: "text/plain".to_string(),
+                        data: text.into_bytes(),
+                    }],
+                    _ => Vec::new(),
+                };
+                if term
+                    .complete_rich_clipboard_read(&request.id, request.location, &items)
+                    .is_err()
+                {
+                    log::error!("Failed to answer OSC 5522 read");
+                }
+            }
+        });
+    }
+
+    /// Deny-by-default consent prompt for an OSC 5522 data read. "Always
+    /// allow" stores the application's exact token for future reads on this
+    /// session; anything else answers exactly once or denies with EPERM.
+    /// Fully asynchronous (response signal), so it is safe on the main
+    /// thread where the mirror runs.
+    fn prompt_rich_clipboard_read(
+        terminal: &Arc<Mutex<Terminal>>,
+        drawing_area: &DrawingArea,
+        clipboard: gdk::Clipboard,
+        request: cterm_core::RichReadRequest,
+    ) {
+        use gtk4::{ButtonsType, DialogFlags, MessageDialog, MessageType, ResponseType};
+
+        let app = request
+            .app_name
+            .clone()
+            .unwrap_or_else(|| "A terminal application".to_string());
+        let scope: String = request.mimes.join(", ").chars().take(160).collect();
+        let body = if request.list_only {
+            format!("{app} wants to list the available clipboard types.")
+        } else {
+            format!("{app} wants to read the system clipboard ({scope}).")
+        };
+        let dialog = MessageDialog::new(
+            drawing_area.root().and_downcast::<gtk4::Window>().as_ref(),
+            DialogFlags::MODAL,
+            MessageType::Question,
+            ButtonsType::None,
+            "Allow clipboard access?",
+        );
+        dialog.format_secondary_text(Some(&body));
+        const ALLOW_ONCE: u16 = 0;
+        const ALLOW_ALWAYS: u16 = 1;
+        const DENY: u16 = 2;
+        dialog.add_button("Allow once", ResponseType::Other(ALLOW_ONCE));
+        if request.credential.is_some() {
+            dialog.add_button("Always allow", ResponseType::Other(ALLOW_ALWAYS));
+        }
+        dialog.add_button("Deny", ResponseType::Other(DENY));
+        dialog.set_default_response(ResponseType::Other(DENY));
+        let terminal = Arc::clone(terminal);
+        // `connect_response` is `Fn`: answer at most once even if the dialog
+        // emits several responses (button plus window-close).
+        let pending = Rc::new(RefCell::new(Some((clipboard, request))));
+        dialog.connect_response(move |dialog, response| {
+            dialog.close();
+            let Some((clipboard, request)) = pending.borrow_mut().take() else {
+                return;
+            };
+            let choice = match response {
+                ResponseType::Other(choice) => choice,
+                _ => DENY,
+            };
+            if choice == ALLOW_ALWAYS {
+                if let Some(credential) = &request.credential {
+                    terminal
+                        .lock()
+                        .authorize_rich_clipboard(&credential.password, &credential.name);
+                }
+            }
+            if choice == DENY {
+                let denied = terminal
+                    .lock()
+                    .fail_rich_clipboard_read(
+                        &request.id,
+                        request.location,
+                        RichClipboardStatus::Perm,
+                    )
+                    .unwrap_or(false);
+                if denied {
+                    log::debug!("Denied OSC 5522 clipboard read");
+                }
+                return;
+            }
+            Self::answer_rich_clipboard_read(&terminal, clipboard, request);
+        });
+        dialog.show();
+    }
+
+    /// Report a user paste as an unsolicited OSC 5522 MIME listing when
+    /// paste-event mode is enabled. Returns true when the notification was
+    /// sent (callers then skip the normal paste path: 5522 replaces
+    /// bracketed paste while enabled).
+    pub fn notify_rich_paste(&self, location: RichClipboardLocation) -> bool {
+        // text/plain is the only type this adapter serves; advertising
+        // exactly that keeps later reads answerable.
+        let types = vec!["text/plain".to_string()];
+        let mut term = self.terminal.lock();
+        match term.notify_rich_clipboard_paste(location, &types) {
+            Ok(notified) => notified,
+            Err(error) => {
+                log::error!("Failed to send OSC 5522 paste notification: {error}");
+                false
+            }
+        }
+    }
+
     /// Select all text in the terminal
     pub fn select_all(&self) {
         let mut term = self.terminal.lock();
@@ -543,6 +726,11 @@ impl TerminalWidget {
     #[cfg(unix)]
     #[allow(dead_code)]
     pub fn paste_primary(&self) {
+        // Paste-event mode replaces the text paste with an unsolicited MIME
+        // listing, like the clipboard paste path.
+        if self.notify_rich_paste(RichClipboardLocation::Primary) {
+            return;
+        }
         let Some(display) = gdk::Display::default() else {
             return;
         };
@@ -2157,6 +2345,10 @@ impl TerminalWidget {
                         let mut term = terminal_main.lock();
                         let events = term.process_mirror(&data);
                         let mut content_changed = false;
+                        // Rich-clipboard ops need the terminal lock (consent
+                        // + replies), which is held for this loop, so they
+                        // are handled after `drop(term)` below.
+                        let mut deferred_rich = Vec::new();
 
                         for event in events {
                             match event {
@@ -2204,6 +2396,9 @@ impl TerminalWidget {
                                 TerminalEvent::DesktopNotification(ref notification) => {
                                     crate::desktop_notification::handle(notification);
                                 }
+                                TerminalEvent::RichClipboardRequest(op) => {
+                                    deferred_rich.push(op);
+                                }
                                 TerminalEvent::ContentChanged => content_changed = true,
                                 TerminalEvent::DndCommand(command) => {
                                     let actions =
@@ -2223,6 +2418,10 @@ impl TerminalWidget {
 
                         let transfers = term.screen_mut().take_file_transfers();
                         drop(term);
+
+                        for op in deferred_rich {
+                            Self::handle_rich_clipboard_request(&terminal_main, &drawing_area, op);
+                        }
 
                         for transfer in transfers {
                             if let Some(ref callback) = *on_file_transfer.borrow() {

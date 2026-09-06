@@ -14,6 +14,7 @@ pub mod grid;
 pub mod image_decode;
 pub mod iterm2;
 pub mod keyboard;
+pub mod kitty_clipboard;
 pub mod kitty_file_transfer;
 mod kitty_graphics;
 mod kitty_placeholder;
@@ -38,6 +39,14 @@ pub use grid::Grid;
 pub use image_decode::{decode_image, DecodedImage, ImageDecodeError};
 pub use iterm2::{Iterm2Dimension, Iterm2FileParams};
 pub use keyboard::{KeyEventKind, KeyEventMetadata, KeyboardEnhancementFlags};
+pub use kitty_clipboard::{
+    PastePassword, RichClipboardAlias, RichClipboardItem, RichClipboardLocation,
+    RichClipboardOperation, RichClipboardStatus, RichCredential, RichReadRequest, RichWriteSession,
+    MAX_PASTE_PASSWORDS, MAX_PENDING_RICH_CLIPBOARD_OPS, MAX_PENDING_RICH_READS,
+    MAX_RICH_ALIAS_COUNT, MAX_RICH_CHUNK_BYTES, MAX_RICH_CREDENTIAL_BYTES, MAX_RICH_ID_CHARS,
+    MAX_RICH_ITEM_BYTES, MAX_RICH_MIME_BYTES, MAX_RICH_MIME_COUNT, MAX_RICH_SESSION_BYTES,
+    MAX_RICH_WRITE_ITEMS, PASTE_PASSWORD_TTL,
+};
 pub use kitty_file_transfer::{
     parse_file_transfer_command, FileTransferAction, FileTransferCodecError, FileTransferCommand,
     FileTransferCompression, FileTransferType, FileTransmissionType, MAX_FILE_TRANSFER_CHUNK_BYTES,
