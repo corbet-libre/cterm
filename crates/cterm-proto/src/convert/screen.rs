@@ -5,6 +5,7 @@ use crate::proto;
 use cterm_core::cell::Hyperlink;
 use cterm_core::drcs::{DrcsFont, DrcsGlyph};
 use cterm_core::grid::Row as CoreRow;
+use cterm_core::pointer_shape::{stack_entry_from_snapshot, stack_entry_to_snapshot};
 use cterm_core::term::Terminal;
 use cterm_core::{
     Cell, CellAttrs, Color, ColorQuery, CursorStyle, ExtraCursor, ExtraCursorColor,
@@ -527,11 +528,21 @@ pub fn modes_to_proto(screen: &Screen) -> proto::TerminalModes {
             MouseMode::AnyEvent => proto::MouseTrackingMode::AnyEvent,
         } as i32,
         mouse_encoding: match screen.modes.mouse_encoding {
-            MouseEncoding::Normal => proto::MouseCoordinateEncoding::Normal,
             MouseEncoding::Sgr => proto::MouseCoordinateEncoding::Sgr,
             MouseEncoding::Urxvt => proto::MouseCoordinateEncoding::Urxvt,
             MouseEncoding::SgrPixels => proto::MouseCoordinateEncoding::SgrPixels,
+            _ => proto::MouseCoordinateEncoding::Normal,
         } as i32,
+        pointer_main_stack: screen
+            .pointer_main_stack()
+            .iter()
+            .map(stack_entry_to_snapshot)
+            .collect(),
+        pointer_alt_stack: screen
+            .pointer_alt_stack()
+            .iter()
+            .map(stack_entry_to_snapshot)
+            .collect(),
     }
 }
 
@@ -722,6 +733,19 @@ pub fn apply_screen_snapshot(terminal: &mut Terminal, screen_data: &proto::GetSc
             cterm_core::KeyboardEnhancementFlags::from_bits_retain(
                 modes.keyboard_enhancement_flags as u8,
             ),
+        );
+        // Pointer-shape stacks are authoritative like the extra-cursor
+        // overlay: an absent entry means "no shape set". Unknown names from
+        // newer peers are dropped rather than corrupting the stack.
+        let decode_pointer_stack = |names: &[String]| {
+            names
+                .iter()
+                .filter_map(|name| stack_entry_from_snapshot(name))
+                .collect::<Vec<_>>()
+        };
+        screen.replace_pointer_stacks(
+            decode_pointer_stack(&modes.pointer_main_stack),
+            decode_pointer_stack(&modes.pointer_alt_stack),
         );
     }
 
@@ -1077,5 +1101,73 @@ mod tests {
 
         let encoded = terminal_image_to_proto(&image);
         assert_eq!(proto_to_terminal_image(&encoded), Some(image));
+    }
+
+    #[test]
+    fn pointer_shape_stacks_roundtrip_through_screen_snapshot() {
+        use cterm_core::PointerShape;
+
+        let mut source = Terminal::new(8, 2, ScreenConfig::default());
+        source.process(b"\x1b]22;>pointer\x1b\\\x1b]22;>wait\x1b\\");
+        source.process(b"\x1b[?1049h\x1b]22;text\x1b\\");
+
+        let snapshot = screen_to_proto(source.screen(), false);
+        let modes = snapshot.modes.as_ref().unwrap();
+        assert_eq!(modes.pointer_main_stack, vec!["pointer", "wait"]);
+        assert_eq!(modes.pointer_alt_stack, vec!["text"]);
+
+        let mut restored = Terminal::new(8, 2, ScreenConfig::default());
+        apply_screen_snapshot(&mut restored, &snapshot);
+
+        // The restored mirror starts on the main screen; its main stack has
+        // two entries topped by `wait`.
+        assert_eq!(
+            restored.screen().current_pointer_shape(),
+            Some(PointerShape::Wait)
+        );
+        assert_eq!(restored.screen().pointer_main_stack().len(), 2);
+
+        // Entering the alternate screen reveals the alt stack (`text`).
+        restored.screen_mut().enter_alternate_screen();
+        assert_eq!(
+            restored.screen().current_pointer_shape(),
+            Some(PointerShape::Text)
+        );
+        restored.screen_mut().exit_alternate_screen();
+        assert_eq!(
+            restored.screen().current_pointer_shape(),
+            Some(PointerShape::Wait)
+        );
+    }
+
+    #[test]
+    fn pointer_shape_snapshot_authoritatively_clears_and_filters_unknowns() {
+        use cterm_core::PointerShape;
+
+        let mut restored = Terminal::new(8, 2, ScreenConfig::default());
+        restored.process(b"\x1b]22;>pointer\x1b\\");
+        assert_eq!(
+            restored.screen().current_pointer_shape(),
+            Some(PointerShape::Pointer)
+        );
+
+        // An empty snapshot clears the stacks.
+        let empty = screen_to_proto(Terminal::new(8, 2, ScreenConfig::default()).screen(), false);
+        apply_screen_snapshot(&mut restored, &empty);
+        assert_eq!(restored.screen().current_pointer_shape(), None);
+        assert!(restored.screen().pointer_main_stack().is_empty());
+
+        // Unknown names from newer peers are dropped, empty slots survive.
+        let mut snapshot =
+            screen_to_proto(Terminal::new(8, 2, ScreenConfig::default()).screen(), false);
+        let modes = snapshot.modes.as_mut().unwrap();
+        modes.pointer_main_stack = vec![
+            "pointer".to_string(),
+            "bogus-shape".to_string(),
+            "".to_string(),
+        ];
+        apply_screen_snapshot(&mut restored, &snapshot);
+        assert_eq!(restored.screen().current_pointer_shape(), None);
+        assert_eq!(restored.screen().pointer_main_stack().len(), 2);
     }
 }

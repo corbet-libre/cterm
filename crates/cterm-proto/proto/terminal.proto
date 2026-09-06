@@ -722,6 +722,11 @@ message TerminalModes {
   bool visibility_change_reports = 15;
   MouseTrackingMode mouse_tracking = 16;
   MouseCoordinateEncoding mouse_encoding = 17;
+  // Kitty OSC 22 pointer-shape stacks (oldest first, "" = empty slot).
+  // Stored per screen so suspending a fullscreen app reveals the host
+  // screen's own pointer state.
+  repeated string pointer_main_stack = 18;
+  repeated string pointer_alt_stack = 19;
 }
 
 enum MouseTrackingMode {

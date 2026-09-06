@@ -24,6 +24,7 @@ use crate::kitty_graphics::{
 };
 use crate::multiple_cursors::{ExtraCursorColor, ExtraCursorColorTarget, ExtraCursorShape};
 use crate::osc1337::{InterceptorResult, Osc1337Interceptor};
+use crate::pointer_shape::{PointerShape, DEFAULT_POINTER_CSS, GRABBED_POINTER_CSS};
 #[cfg(test)]
 use crate::screen::DesktopNotificationAction;
 use crate::screen::{
@@ -721,6 +722,9 @@ impl vte::Perform for ScreenPerformer<'_> {
             13..=19 => {
                 log::trace!("Unhandled color OSC: {}", command);
             }
+            // Kitty mouse pointer shapes (OSC 22): CSS names with
+            // set/push/pop/query semantics and per-screen stacks.
+            22 => self.handle_osc22(params),
             // Reset dynamic default foreground/background/cursor colors.
             110..=112 => {
                 if let Some(target) = ColorQuery::from_osc_code(command - 100) {
@@ -1717,6 +1721,93 @@ impl ScreenPerformer<'_> {
                 }
                 _ => {}
             }
+        }
+    }
+
+    fn handle_osc22(&mut self, params: &[&[u8]]) {
+        // Kitty mouse pointer shapes. The payload is everything after
+        // `22;`; shape names never contain `;`, so rejoining extra params
+        // keeps malformed input visible as unknown names (rejected below)
+        // instead of silently truncating it.
+        let mut payload_parts = Vec::with_capacity(params.len().saturating_sub(1));
+        for part in params.iter().skip(1) {
+            let Ok(text) = std::str::from_utf8(part) else {
+                return;
+            };
+            payload_parts.push(text);
+        }
+        let payload = payload_parts.join(";");
+
+        let (op, value) = match payload.chars().next() {
+            Some(op @ ('=' | '>' | '<' | '?')) => (op, &payload[op.len_utf8()..]),
+            _ => ('=', payload.as_str()),
+        };
+
+        match op {
+            // Set: each name replaces the top of the active per-screen
+            // stack (pushing when empty), mirroring Kitty's `=` operator.
+            // Empty names store an INVALID slot reported as `0`; unknown
+            // names leave the stack untouched.
+            '=' => {
+                if value.is_empty() {
+                    self.screen.set_pointer_shape(None);
+                } else {
+                    for name in value.split(',') {
+                        if name.is_empty() {
+                            self.screen.set_pointer_shape(None);
+                        } else if let Some(shape) = PointerShape::from_name(name) {
+                            self.screen.set_pointer_shape(Some(shape));
+                        } else {
+                            log::debug!("Rejected Kitty OSC 22 set with unknown shape: {name:?}");
+                        }
+                    }
+                }
+            }
+            // Push: each known name is appended with the last as the
+            // current shape; the bottom entry is evicted at capacity.
+            // Empty names are no-ops, unknown names are skipped.
+            '>' => {
+                for name in value.split(',') {
+                    if name.is_empty() {
+                        continue;
+                    } else if let Some(shape) = PointerShape::from_name(name) {
+                        self.screen.push_pointer_shape(shape);
+                    } else {
+                        log::debug!("Rejected Kitty OSC 22 push with unknown shape: {name:?}");
+                    }
+                }
+            }
+            // Pop: the trailing name list is ignored; popping an empty
+            // stack has no effect.
+            '<' => self.screen.pop_pointer_shape(),
+            // Query: one comma-separated answer per question. Supported
+            // shape names answer `1`, anything else answers `0`, except the
+            // `__current__` / `__default__` / `__grabbed__` specials.
+            '?' => {
+                let mut answers = Vec::new();
+                for question in value.split(',') {
+                    if PointerShape::is_supported_name(question) {
+                        answers.push("1".to_string());
+                    } else if question == "__current__" {
+                        answers.push(
+                            self.screen.current_pointer_shape().map_or_else(
+                                || "0".to_string(),
+                                |shape| shape.css_name().to_string(),
+                            ),
+                        );
+                    } else if question == "__default__" {
+                        answers.push(DEFAULT_POINTER_CSS.to_string());
+                    } else if question == "__grabbed__" {
+                        answers.push(GRABBED_POINTER_CSS.to_string());
+                    } else {
+                        answers.push("0".to_string());
+                    }
+                }
+                let reply = answers.join(",");
+                self.screen
+                    .queue_response(format!("\x1b]22;{reply}\x1b\\").into_bytes());
+            }
+            _ => unreachable!("OSC 22 operator is one of = > < ?"),
         }
     }
 
@@ -4354,5 +4445,226 @@ mod tests {
         assert_eq!(images.len(), 1);
         assert_eq!(images[0].z_index, -1);
         assert_eq!(images[0].data.as_slice(), &[255, 0, 0, 255]);
+    }
+
+    #[test]
+    fn osc22_sets_and_resets_the_pointer_shape() {
+        use crate::PointerShape;
+
+        let mut screen = make_screen();
+        let mut parser = Parser::new();
+        assert_eq!(screen.current_pointer_shape(), None);
+
+        parser.parse(&mut screen, b"\x1b]22;pointer\x1b\\");
+        assert_eq!(screen.current_pointer_shape(), Some(PointerShape::Pointer));
+        assert_eq!(screen.pointer_main_stack().len(), 1);
+
+        // `=`-prefixed and alias forms also replace the top without growing.
+        parser.parse(&mut screen, b"\x1b]22;=wait\x1b\\");
+        assert_eq!(screen.current_pointer_shape(), Some(PointerShape::Wait));
+        assert_eq!(screen.pointer_main_stack().len(), 1);
+
+        parser.parse(&mut screen, b"\x1b]22;hand\x1b\\");
+        assert_eq!(screen.current_pointer_shape(), Some(PointerShape::Pointer));
+
+        parser.parse(&mut screen, b"\x1b]22;default\x1b\\");
+        assert_eq!(screen.current_pointer_shape(), Some(PointerShape::Default));
+
+        // BEL termination is accepted (unlike OSC 5113's ST-only rule).
+        parser.parse(&mut screen, b"\x1b]22;text\x07");
+        assert_eq!(screen.current_pointer_shape(), Some(PointerShape::Text));
+
+        // An empty payload stores an INVALID slot: no effective shape and a
+        // `0` query answer, matching Kitty's `change_pointer_shape`.
+        parser.parse(&mut screen, b"\x1b]22;\x1b\\");
+        assert_eq!(screen.current_pointer_shape(), None);
+        parser.parse(&mut screen, b"\x1b]22;?__current__\x1b\\");
+        assert_eq!(
+            screen.take_pending_responses(),
+            vec![b"\x1b]22;0\x1b\\".to_vec()]
+        );
+
+        parser.parse(&mut screen, b"\x1b]22;=\x1b\\");
+        assert_eq!(screen.current_pointer_shape(), None);
+    }
+
+    #[test]
+    fn osc22_push_and_pop_uses_a_bounded_stack() {
+        use crate::PointerShape;
+
+        let mut screen = make_screen();
+        let mut parser = Parser::new();
+
+        parser.parse(&mut screen, b"\x1b]22;>wait\x1b\\");
+        parser.parse(&mut screen, b"\x1b]22;>pointer\x1b\\");
+        assert_eq!(screen.current_pointer_shape(), Some(PointerShape::Pointer));
+
+        // One push can carry several shapes; the last is current.
+        parser.parse(&mut screen, b"\x1b]22;>text,copy\x1b\\");
+        assert_eq!(screen.current_pointer_shape(), Some(PointerShape::Copy));
+
+        // Popping ignores any trailing name list.
+        parser.parse(&mut screen, b"\x1b]22;<ignored,bogus\x1b\\");
+        assert_eq!(screen.current_pointer_shape(), Some(PointerShape::Text));
+        parser.parse(&mut screen, b"\x1b]22;<\x1b\\");
+        assert_eq!(screen.current_pointer_shape(), Some(PointerShape::Pointer));
+
+        // Popping an empty stack has no effect.
+        let mut empty = make_screen();
+        parser.parse(&mut empty, b"\x1b]22;<\x1b\\");
+        assert_eq!(empty.current_pointer_shape(), None);
+        assert!(empty.take_pending_responses().is_empty());
+
+        // At capacity the bottom entry is evicted (Kitty holds 16).
+        let mut full = make_screen();
+        for i in 0..17 {
+            let name = if i % 2 == 0 { "wait" } else { "pointer" };
+            parser.parse(&mut full, format!("\x1b]22;>{name}\x1b\\").as_bytes());
+        }
+        assert_eq!(full.pointer_main_stack().len(), 16);
+        assert_eq!(full.current_pointer_shape(), Some(PointerShape::Wait));
+    }
+
+    #[test]
+    fn osc22_set_replaces_the_top_entry() {
+        use crate::PointerShape;
+
+        let mut screen = make_screen();
+        let mut parser = Parser::new();
+
+        parser.parse(&mut screen, b"\x1b]22;>pointer\x1b\\");
+        parser.parse(&mut screen, b"\x1b]22;>wait\x1b\\");
+        parser.parse(&mut screen, b"\x1b]22;text\x1b\\");
+        assert_eq!(screen.pointer_main_stack().len(), 2);
+        assert_eq!(screen.current_pointer_shape(), Some(PointerShape::Text));
+
+        // Comma-separated set applies left to right; the last name wins.
+        parser.parse(&mut screen, b"\x1b]22;=pointer,copy\x1b\\");
+        assert_eq!(screen.pointer_main_stack().len(), 2);
+        assert_eq!(screen.current_pointer_shape(), Some(PointerShape::Copy));
+
+        // An empty set hides the stack top until popped (Kitty INVALID slot).
+        parser.parse(&mut screen, b"\x1b]22;\x1b\\");
+        assert_eq!(screen.current_pointer_shape(), None);
+        parser.parse(&mut screen, b"\x1b]22;<\x1b\\");
+        assert_eq!(screen.current_pointer_shape(), Some(PointerShape::Pointer));
+    }
+
+    #[test]
+    fn osc22_queries_answer_current_and_supported_shapes() {
+        let mut screen = make_screen();
+        let mut parser = Parser::new();
+
+        parser.parse(&mut screen, b"\x1b]22;pointer\x1b\\");
+        parser.parse(&mut screen, b"\x1b]22;?__current__\x1b\\");
+        assert_eq!(
+            screen.take_pending_responses(),
+            vec![b"\x1b]22;pointer\x1b\\".to_vec()]
+        );
+
+        // The spec's support-probe example answers 1 per known shape.
+        parser.parse(
+            &mut screen,
+            b"\x1b]22;?pointer,crosshair,no-such-name,wait\x1b\\",
+        );
+        assert_eq!(
+            screen.take_pending_responses(),
+            vec![b"\x1b]22;1,1,0,1\x1b\\".to_vec()]
+        );
+
+        parser.parse(
+            &mut screen,
+            b"\x1b]22;?__default__,__grabbed__,__current__,pointer\x1b\\",
+        );
+        assert_eq!(
+            screen.take_pending_responses(),
+            vec![b"\x1b]22;text,default,pointer,1\x1b\\".to_vec()]
+        );
+
+        // An empty stack (or an INVALID top) reports `0` as current.
+        let mut empty = make_screen();
+        parser.parse(&mut empty, b"\x1b]22;?__current__\x1b\\");
+        assert_eq!(
+            empty.take_pending_responses(),
+            vec![b"\x1b]22;0\x1b\\".to_vec()]
+        );
+    }
+
+    #[test]
+    fn osc22_rejects_malformed_input_without_state_changes() {
+        use crate::PointerShape;
+
+        let mut screen = make_screen();
+        let mut parser = Parser::new();
+        parser.parse(&mut screen, b"\x1b]22;pointer\x1b\\");
+
+        // Unknown, upper-case, padded, and `;`-injected names are ignored.
+        for payload in [
+            "NoSuchShape",
+            "POINTER",
+            "pointer ",
+            " pointer",
+            "pointer;wait",
+            ">NoSuch",
+            "=bogus,also-bogus",
+        ] {
+            parser.parse(&mut screen, format!("\x1b]22;{payload}\x1b\\").as_bytes());
+        }
+        assert_eq!(screen.current_pointer_shape(), Some(PointerShape::Pointer));
+        assert_eq!(screen.pointer_main_stack().len(), 1);
+
+        // Unknown pushes never grow the stack; empty pushes are no-ops.
+        parser.parse(&mut screen, b"\x1b]22;>NoSuch\x1b\\");
+        parser.parse(&mut screen, b"\x1b]22;>\x1b\\");
+        assert_eq!(screen.pointer_main_stack().len(), 1);
+
+        // Non-UTF8 payloads are dropped wholesale.
+        parser.parse(&mut screen, b"\x1b]22;\xff\x1b\\");
+        assert_eq!(screen.current_pointer_shape(), Some(PointerShape::Pointer));
+        assert!(screen.take_pending_responses().is_empty());
+
+        // Unknown queries answer `0` rather than altering state.
+        parser.parse(&mut screen, b"\x1b]22;?bogus-name\x1b\\");
+        assert_eq!(
+            screen.take_pending_responses(),
+            vec![b"\x1b]22;0\x1b\\".to_vec()]
+        );
+        assert_eq!(screen.current_pointer_shape(), Some(PointerShape::Pointer));
+    }
+
+    #[test]
+    fn osc22_stacks_are_per_screen_like_the_kitty_keyboard_flags() {
+        use crate::PointerShape;
+
+        let mut screen = make_screen();
+        let mut parser = Parser::new();
+
+        // Documented decision: the stacks are per-screen (main vs
+        // alternate), matching Kitty — suspending a fullscreen app reveals
+        // the shell's own pointer state, and vice versa.
+        parser.parse(&mut screen, b"\x1b]22;pointer\x1b\\");
+        parser.parse(&mut screen, b"\x1b[?1049h");
+        assert_eq!(screen.current_pointer_shape(), None);
+
+        parser.parse(&mut screen, b"\x1b]22;>wait\x1b\\");
+        assert_eq!(screen.current_pointer_shape(), Some(PointerShape::Wait));
+
+        parser.parse(&mut screen, b"\x1b[?1049l");
+        assert_eq!(screen.current_pointer_shape(), Some(PointerShape::Pointer));
+
+        parser.parse(&mut screen, b"\x1b[?1049h");
+        assert_eq!(screen.current_pointer_shape(), Some(PointerShape::Wait));
+        parser.parse(&mut screen, b"\x1b[?1049l");
+
+        // Terminal reset empties both stacks.
+        parser.parse(&mut screen, b"\x1bc");
+        assert_eq!(screen.current_pointer_shape(), None);
+        assert!(screen.pointer_main_stack().is_empty());
+        assert!(screen.pointer_alt_stack().is_empty());
+        parser.parse(&mut screen, b"\x1b]22;?__current__\x1b\\");
+        assert_eq!(
+            screen.take_pending_responses(),
+            vec![b"\x1b]22;0\x1b\\".to_vec()]
+        );
     }
 }

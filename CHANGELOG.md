@@ -42,6 +42,9 @@ is omitted for readability.
 - Foot-compatible independent cursor blink sources and native cursor/text
   blink rendering across GTK/Wayland, Cocoa, and Win32, including distinct
   slow and rapid SGR phases and daemon snapshot persistence.
+- Kitty OSC 22 mouse pointer shapes: application set/push/pop/query with
+  per-screen stacks, daemon snapshot persistence, and GTK cursor mapping
+  (Cocoa/Win32 native mappings pending).
 
 ### Fixed
 - Streamed OSC 1337 interception now replays incomplete, cancelled, and

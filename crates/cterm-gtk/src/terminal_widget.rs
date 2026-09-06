@@ -1282,8 +1282,15 @@ impl TerminalWidget {
                 return;
             }
 
-            // Check for hyperlink under cursor
+            // Kitty OSC 22 application pointer shape wins over the local
+            // hyperlink cursor. Drag paths above already returned, so
+            // selection and mouse-tracking drags keep their own cursors,
+            // matching Kitty's drag exemption.
             let term = terminal_motion.lock();
+            let osc_shape = term
+                .screen()
+                .current_pointer_shape()
+                .map(|shape| shape.css_name());
             let has_link = term
                 .screen()
                 .get_cell(row, col)
@@ -1296,7 +1303,10 @@ impl TerminalWidget {
                 .map(|h| h.uri.clone());
             drop(term);
 
-            if has_link {
+            if let Some(shape) = osc_shape {
+                drawing_area_motion.set_cursor_from_name(Some(shape));
+                drawing_area_motion.set_tooltip_text(uri.as_deref());
+            } else if has_link {
                 drawing_area_motion.set_cursor_from_name(Some("pointer"));
                 if let Some(uri) = uri {
                     drawing_area_motion.set_tooltip_text(Some(&uri));
