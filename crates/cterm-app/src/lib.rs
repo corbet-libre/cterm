@@ -29,6 +29,7 @@ pub mod shortcuts;
 pub mod ssh_history;
 pub mod template_launch;
 pub mod transfer_bypass;
+pub mod transfer_cli;
 pub mod upgrade;
 
 pub use config::{

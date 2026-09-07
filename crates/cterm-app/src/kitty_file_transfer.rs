@@ -80,11 +80,14 @@ pub enum TtyTransferBypassKind {
     /// Still prompts unless the direction was explicitly allowed *and* a
     /// password is configured *and* the credential verifies.
     PasswordCredential,
-    /// Proposed: a session the local user pre-authorized on the same TTY.
-    /// Undecided: always prompts (an explicit direction deny still refuses).
+    /// Decided + implemented: a session the local user pre-authorized on
+    /// the same TTY (`cterm transfer --allow-once`). The daemon consumes
+    /// the binding at session-start evaluation; the policy seam itself
+    /// still prompts for this kind (an explicit direction deny refuses),
+    /// since the consumed pre-auth arrives as `Allow` from the worker.
     SameTtyPreauthorized,
     /// Proposed: loopback automation where the peer is the local machine.
-    /// Undecided: always prompts (an explicit direction deny still refuses).
+    /// Declined: always prompts (an explicit direction deny still refuses).
     LoopbackAutomation,
 }
 
@@ -238,8 +241,10 @@ impl TransferConsentAudit<'_> {
 ///
 /// - An explicit direction deny hard-refuses (`Deny`) without prompting, for
 ///   every bypass kind including the proposed (undecided) ones.
-/// - `SameTtyPreauthorized` and `LoopbackAutomation` always prompt: those
-///   policy conditions are undecided (see `docs/transfer-bypass-policy.md`).
+/// - `SameTtyPreauthorized` and `LoopbackAutomation` always prompt here:
+///   same-TTY skips are consumed daemon-side (arriving as `Allow` from the
+///   worker, decided policy) and loopback automation was declined, so this
+///   seam never authorizes either kind itself.
 /// - `None` always prompts and ignores any wire credential, exactly like the
 ///   legacy [`evaluate_transfer_bypass`].
 /// - `PasswordCredential` prompts unless the direction was *explicitly* set

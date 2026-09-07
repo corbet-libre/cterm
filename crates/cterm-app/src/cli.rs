@@ -1,6 +1,6 @@
 //! Shared command-line contract for all native UI backends.
 
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::str::FromStr;
@@ -132,6 +132,43 @@ pub struct Args {
     /// Path to upgrade state file (internal use).
     #[arg(long, hide = true)]
     pub upgrade_state: Option<String>,
+
+    /// Management command that talks to the running local daemon and exits
+    /// (e.g. `cterm transfer --allow-once --session <id>`). Takes no window.
+    #[command(subcommand)]
+    pub subcommand: Option<UiCommand>,
+}
+
+/// Windowless management commands (see [`Args::subcommand`]).
+#[derive(Debug, Clone, Subcommand)]
+pub enum UiCommand {
+    /// Manage decided-policy same-TTY transfer pre-authorizations.
+    Transfer(TransferCommand),
+}
+
+/// `cterm transfer` arguments: mint, list, or revoke single-use consent
+/// bypasses for one daemon session. Exactly one action flag is required.
+#[derive(Debug, Clone, clap::Args)]
+pub struct TransferCommand {
+    /// Mint a single-use pre-authorization: the next matching session-start
+    /// in SESSION skips its consent dialog once, then everything prompts
+    /// again. Dies with the session; never survives daemon relaunch.
+    #[arg(long, requires = "session", conflicts_with_all = ["list", "revoke"])]
+    pub allow_once: bool,
+    /// List live pre-authorizations for SESSION (auditable).
+    #[arg(long, requires = "session", conflicts_with_all = ["allow_once", "revoke"])]
+    pub list: bool,
+    /// Revoke pre-authorizations for SESSION before they are consumed.
+    #[arg(long, requires = "session", conflicts_with_all = ["allow_once", "list"])]
+    pub revoke: bool,
+    /// Daemon session id to act on.
+    #[arg(long, value_name = "ID")]
+    pub session: Option<String>,
+    /// Bind to (mint) or revoke one transfer id. Absent means the armed
+    /// next-request wildcard: mint arms it, revoke disarms it. `--list`
+    /// always shows the full live set.
+    #[arg(long, value_name = "ID")]
+    pub transfer_id: Option<String>,
 }
 
 impl Args {
@@ -391,6 +428,58 @@ mod tests {
     #[test]
     fn rejects_trailing_args_without_execute() {
         assert!(Args::try_parse_from(["cterm", "orphan"]).is_err());
+    }
+
+    #[test]
+    fn parses_transfer_subcommand_actions() {
+        let args =
+            Args::try_parse_from(["cterm", "transfer", "--allow-once", "--session", "sess-1"])
+                .unwrap();
+        let Some(UiCommand::Transfer(command)) = args.subcommand else {
+            panic!("expected a transfer subcommand");
+        };
+        assert!(command.allow_once);
+        assert_eq!(command.session.as_deref(), Some("sess-1"));
+        assert_eq!(command.transfer_id, None);
+
+        let args = Args::try_parse_from([
+            "cterm",
+            "transfer",
+            "--revoke",
+            "--session",
+            "sess-1",
+            "--transfer-id",
+            "xfer-9",
+        ])
+        .unwrap();
+        let Some(UiCommand::Transfer(command)) = args.subcommand else {
+            panic!("expected a transfer subcommand");
+        };
+        assert!(command.revoke);
+        assert_eq!(command.transfer_id.as_deref(), Some("xfer-9"));
+
+        // Action flags are mutually exclusive and need a session.
+        assert!(Args::try_parse_from(["cterm", "transfer", "--allow-once"]).is_err());
+        assert!(Args::try_parse_from([
+            "cterm",
+            "transfer",
+            "--allow-once",
+            "--list",
+            "--session",
+            "s"
+        ])
+        .is_err());
+        assert!(Args::try_parse_from(["cterm", "transfer", "--session", "s"]).is_ok());
+    }
+
+    #[test]
+    fn execute_child_wins_over_transfer_subcommand_name() {
+        // A child whose first argument is literally `transfer` keeps its
+        // long-standing meaning; the subcommand only applies without
+        // `--execute`.
+        let args = Args::try_parse_from(["cterm", "--execute", "tool", "transfer"]).unwrap();
+        assert_eq!(args.command.as_deref(), Some("tool"));
+        assert!(crate::transfer_cli::run_if_requested(&args).is_none());
     }
 
     #[test]

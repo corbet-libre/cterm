@@ -1998,6 +1998,9 @@ fn get_theme(config: &Config) -> Theme {
 pub fn run() {
     // Parse command-line arguments first
     let args = Args::parse();
+    if let Some(code) = cterm_app::transfer_cli::run_if_requested(&args) {
+        std::process::exit(code);
+    }
     if args.managed {
         let executable = std::env::current_exe().unwrap_or_else(|error| {
             eprintln!("cterm: managed mode could not resolve the UI executable: {error}");

@@ -172,6 +172,23 @@ Windows, `--daemon-socket` is an exact named-pipe path such as
 pipe name prevents accidental collisions but is not an authorization secret;
 Windows still applies the launching process token's default pipe DACL.
 
+### Transfer pre-authorization
+
+Kitty file transfers always prompt out of the box. For one explicitly
+opted-in transfer, authorize it from inside the same terminal session first:
+
+```bash
+cterm transfer --allow-once --session <id>                # next transfer skips one dialog
+cterm transfer --allow-once --session <id> --transfer-id <tid>  # or bind one exact transfer
+cterm transfer --list --session <id>                      # audit what is armed
+cterm transfer --revoke --session <id> [--transfer-id <tid>]    # revoke before use
+```
+
+Each mint is single-use, dies with the session, never survives daemon
+relaunch, and is audit-logged. An explicit `--execute` child always wins
+over the subcommand name. See `docs/transfer-bypass-policy.md` for the
+decided policy.
+
 ## Configuration
 
 Configuration files are stored in platform-specific locations:

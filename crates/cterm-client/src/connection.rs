@@ -874,6 +874,72 @@ impl DaemonConnection {
         Ok(response.into_inner())
     }
 
+    /// Mint a single-use same-TTY transfer pre-authorization: `Some`
+    /// transfer id binds exactly that transfer, `None` arms the next
+    /// session-start in the named session. Explicit operator action over
+    /// the daemon socket (decided policy).
+    pub async fn pre_authorize_transfer(
+        &self,
+        session_id: &str,
+        transfer_id: Option<String>,
+    ) -> Result<bool> {
+        let response = self
+            .client
+            .lock()
+            .await
+            .pre_authorize_transfer(PreAuthorizeTransferRequest {
+                session_id: session_id.to_string(),
+                transfer_id,
+            })
+            .await?;
+
+        Ok(response.into_inner().success)
+    }
+
+    /// List live pre-authorizations for a session: exact transfer ids plus
+    /// at most one armed next-request wildcard (`None`).
+    pub async fn list_transfer_pre_authorizations(
+        &self,
+        session_id: &str,
+    ) -> Result<Vec<Option<String>>> {
+        let response = self
+            .client
+            .lock()
+            .await
+            .list_transfer_pre_authorizations(ListTransferPreAuthorizationsRequest {
+                session_id: session_id.to_string(),
+            })
+            .await?;
+
+        Ok(response
+            .into_inner()
+            .authorizations
+            .into_iter()
+            .map(|entry| entry.transfer_id)
+            .collect())
+    }
+
+    /// Revoke a pre-authorization before it is consumed: one exact transfer
+    /// id, or the armed wildcard when absent. Returns whether anything was
+    /// armed for that scope.
+    pub async fn revoke_transfer_pre_authorization(
+        &self,
+        session_id: &str,
+        transfer_id: Option<String>,
+    ) -> Result<bool> {
+        let response = self
+            .client
+            .lock()
+            .await
+            .revoke_transfer_pre_authorization(RevokeTransferPreAuthorizationRequest {
+                session_id: session_id.to_string(),
+                transfer_id,
+            })
+            .await?;
+
+        Ok(response.into_inner().revoked)
+    }
+
     /// Get info about a specific session
     pub async fn get_session(&self, session_id: &str) -> Result<SessionInfo> {
         let response = self

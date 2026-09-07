@@ -7,7 +7,9 @@ use std::sync::{Arc, Weak};
 use std::time::Duration;
 
 use cterm_app::{
-    BypassDecision, TtyTransferAction, TtyTransferFilesystem, TtyTransferLimits, TtyTransferManager,
+    BypassDecision, TransferConsentAudit, TransferConsentDecision, TtyTransferAction,
+    TtyTransferBypassKind, TtyTransferDirection, TtyTransferFilesystem, TtyTransferLimits,
+    TtyTransferManager,
 };
 use cterm_core::{FileTransferAction, FileTransferCommand};
 use tokio::sync::{mpsc, oneshot};
@@ -214,7 +216,42 @@ async fn run_worker(
                             FileTransferAction::Send | FileTransferAction::Receive
                         ) && !bypass.contains_key(&transfer_id)
                         {
-                            let decision = transfer_context.evaluate_session_start(&command);
+                            let mut decision =
+                                transfer_context.evaluate_session_start(&command);
+                            // Decided-policy same-TTY pre-authorization: an
+                            // explicit direction deny above already refused,
+                            // so a live pre-auth can only turn a prompt into
+                            // one dialog skip. Consumption removes the entry,
+                            // keeping every mint single-use.
+                            if decision == BypassDecision::Prompt {
+                                if let Some(session) = session.upgrade() {
+                                    if session.consume_transfer_preauth(&transfer_id) {
+                                        let direction = match command.action {
+                                            FileTransferAction::Send => {
+                                                Some(TtyTransferDirection::Send)
+                                            }
+                                            FileTransferAction::Receive => {
+                                                Some(TtyTransferDirection::Receive)
+                                            }
+                                            _ => None,
+                                        };
+                                        log::info!(
+                                            "{}",
+                                            TransferConsentAudit {
+                                                request_id: None,
+                                                transfer_id: Some(transfer_id.as_str()),
+                                                direction,
+                                                decision: TransferConsentDecision::Allow,
+                                                bypass_kind:
+                                                    TtyTransferBypassKind::SameTtyPreauthorized,
+                                                token_hash: None,
+                                            }
+                                            .line()
+                                        );
+                                        decision = BypassDecision::Allow;
+                                    }
+                                }
+                            }
                             if decision != BypassDecision::Prompt {
                                 bypass.insert(transfer_id.clone(), decision);
                             }
