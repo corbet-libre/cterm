@@ -1213,7 +1213,11 @@ impl CtermWindow {
                         } else {
                             cterm_client::DaemonConnection::connect_local().await?
                         };
-                        connection.create_session(opts).await
+                        let session = connection.create_session(opts).await?;
+                        // The mirror listener must know this split is ours before
+                        // the UI receives its asynchronous creation result.
+                        crate::app::mark_owned_session(session.session_id());
+                        Ok(session)
                     })
                 });
 

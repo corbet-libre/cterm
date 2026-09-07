@@ -307,6 +307,9 @@ is omitted for readability.
   leaving clients out of sync; GTK listeners stop when their window closes.
 - Mirrored session changes locate inactive split panes, remove only the
   affected pane, and restore shell titles when a custom title is cleared.
+  New split sessions are marked as owned before reaching the UI, preventing
+  the event listener from opening a duplicate tab and stealing focus.
+  GTK mirrored tabs retain the daemon's initial screen snapshot.
 - Streamed OSC 1337 interception now replays incomplete, cancelled, and
   oversized sequences atomically instead of leaving the VTE parser inside a
   partial control string. Large replay and decoded-transfer spill files are

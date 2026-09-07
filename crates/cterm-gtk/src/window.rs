@@ -4163,7 +4163,11 @@ fn spawn_daemon_pane(context: &PaneActionContext, direction: SplitDirection) {
                 } else {
                     cterm_client::DaemonConnection::connect_local().await?
                 };
-                connection.create_session(opts).await
+                let session = connection.create_session(opts).await?;
+                // The mirror listener must know this split is ours before
+                // the UI receives its asynchronous creation result.
+                mark_owned_session(session.session_id());
+                Ok(session)
             }),
             Err(error) => Err(cterm_client::ClientError::Connection(error.to_string())),
         };
