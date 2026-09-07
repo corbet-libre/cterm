@@ -8,6 +8,15 @@ on:
       - Cargo.lock
       - crates/cterm-core/benches/**
       - crates/cterm-core/Cargo.toml
+  pull_request:
+    branches: [master, main]
+    paths:
+      - .github/workflows/benchmarks.yml
+      - Cargo.lock
+      - crates/cterm-core/benches/**
+      - crates/cterm-core/Cargo.toml
+      - crates/cterm-core/src/**
+      - scripts/check_perf_baseline.sh
   schedule:
     - cron: '17 3 * * 1'
   workflow_dispatch:
@@ -27,6 +36,9 @@ jobs:
     name: Criterion (Linux x86_64)
     runs-on: ubuntu-24.04
     timeout-minutes: 30
+    # The report job runs on pushes, schedules, and manual dispatch; PRs get
+    # the perf-gate comparison below instead.
+    if: github.event_name != 'pull_request'
     steps:
       - uses: actions/checkout@v7
 
@@ -53,3 +65,49 @@ jobs:
           path: target/criterion/
           if-no-files-found: error
           retention-days: 30
+
+  perf-gate:
+    name: Perf gate (PR vs base)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    # PRs touching cterm-core only (path-gated above): mint on the base ref,
+    # check on the head, same runner, then fail on confirmed regression.
+    if: github.event_name == 'pull_request'
+    steps:
+      - name: Checkout base
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          path: base
+
+      - name: Checkout head
+        uses: actions/checkout@v7
+        with:
+          path: head
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            base -> target
+            head -> target
+
+      - name: Mint baseline on base
+        working-directory: base
+        run: scripts/check_perf_baseline.sh mint --baseline pr-base
+
+      - name: Carry baseline to head tree
+        run: |
+          mkdir -p head/target/criterion
+          cp -r base/target/criterion/pr-base head/target/criterion/pr-base
+
+      - name: Check head against baseline, with one confirmation rerun
+        working-directory: head
+        # Default 10% same-host median gate; a breach re-runs once to
+        # confirm (shared-runner noise) before failing the job.
+        run: |
+          scripts/check_perf_baseline.sh check --baseline pr-base \
+            || scripts/check_perf_baseline.sh check --baseline pr-base

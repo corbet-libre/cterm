@@ -113,24 +113,15 @@ up to +63% minute-to-minute (all parser benches within +/-3% on the rerun,
 mint-then-check passed all 9. Regression verdicts require full pinned runs
 plus the re-run discipline above.
 
-## Proposed CI gate (NOT applied -- needs Julian's go; do not touch `.github/workflows` without it)
+## CI gate (APPLIED 2026-09-07 — Julian's go; see `benchmarks.yml` `perf-gate`)
 
 ```yaml
-# benchmarks.yml, new job after the existing report upload (sketch):
-perf-gate:
-  runs-on: ubuntu-24.04
-  steps:
-    - uses: actions/checkout@v7
-      with: { ref: ${{ github.event.pull_request.base.ref || 'main' }} }  # or: mint on main, check on PR head
-    - run: scripts/check_perf_baseline.sh mint --baseline pr-base
-    - uses: actions/checkout@v7  # PR head
-    - run: scripts/check_perf_baseline.sh check --baseline pr-base
-      # on failure: re-run once to confirm (shared-runner noise), then fail the job
+# benchmarks.yml `perf-gate` (as applied): PRs touching cterm-core mint on
+# the base ref, carry target/criterion/pr-base into the head tree, and check
+# with one confirmation rerun before failing. Threshold 10% (script default);
+# baselines stay host-local, HTML report retention unchanged (30 days).
 ```
 
-Decisions for Julian: (a) gate on PRs touching `crates/cterm-core/**`
-(path-gate, like `benchmarks.yml` today) vs weekly-main only; (b) threshold
-(10% default ok?); (c) breach policy -- fail the job vs non-blocking comment;
-(d) whether to upload `target/criterion/` as the existing 30-day HTML artifact
-already covers, or extend retention for minted baselines. Until decided, the
-gate stays local-only: `mint` + `check` as documented above.
+Decided 2026-09-07: (a) path-gated PRs on `crates/cterm-core/**`; (b) 10%
+default; (c) fail-with-rerun; (d) reuse the existing 30-day HTML artifact.
+The local-only procedure below still applies for pre-push verification.
