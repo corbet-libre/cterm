@@ -151,6 +151,15 @@ pub(crate) fn mark_owned_session(session_id: &str) {
     }
 }
 
+/// Forget a destroyed session id so the owned set tracks live sessions
+/// only instead of growing for the life of the process. Forgetting an
+/// id this process never owned is a no-op.
+fn forget_owned_session(session_id: &str) {
+    if let Ok(mut set) = owned_sessions().lock() {
+        set.remove(session_id);
+    }
+}
+
 /// Whether this process created or attached the given session id itself.
 fn is_owned_session(session_id: &str) -> bool {
     owned_sessions()
@@ -1350,8 +1359,8 @@ impl AppDelegate {
     /// thread and apply session lifecycle / metadata changes to the tab display
     /// on the main thread. Sessions this process created itself are filtered out
     /// via [`is_owned_session`] so we never double-add our own tabs. When
-    /// `dedup_key` is set, claims a process-wide slot (released when the stream
-    /// ends) so a remote daemon gets only one listener.
+    /// `dedup_key` is set, claims a process-wide slot for the application's
+    /// lifetime so a remote daemon gets only one reconnecting listener.
     fn spawn_daemon_event_listener(&self, connect: ListenerConnect, dedup_key: Option<String>) {
         if let Some(ref key) = dedup_key {
             if !try_claim_remote_listener(key) {
@@ -1494,6 +1503,7 @@ impl AppDelegate {
     /// close when it would shut the last window (and thus quit the app) so that
     /// another client destroying a shared session can't quit us unexpectedly.
     fn remove_mirrored_tab(&self, session_id: &str) {
+        forget_owned_session(session_id);
         let Some(window) = self.find_window_for_session(session_id) else {
             return;
         };

@@ -1013,3 +1013,164 @@ async fn test_invalid_session_id() {
 
     assert!(result.is_err(), "Should fail for invalid session ID");
 }
+
+/// Read the next daemon-wide event, failing on timeout, stream error, or
+/// a closed stream.
+async fn next_daemon_event(stream: &mut tonic::Streaming<DaemonEvent>) -> DaemonEvent {
+    tokio::time::timeout(Duration::from_secs(10), stream.message())
+        .await
+        .expect("timed out waiting for daemon event")
+        .expect("daemon event stream failed")
+        .expect("daemon event stream ended early")
+}
+
+fn spawn_session_request() -> CreateSessionRequest {
+    CreateSessionRequest {
+        cols: 80,
+        rows: 24,
+        shell: None,
+        args: vec![],
+        cwd: None,
+        env: Default::default(),
+        term: None,
+        ssh: None,
+        pixel_width: 0,
+        pixel_height: 0,
+        base_palette: None,
+        theme_appearance: 0,
+        window_visibility: 0,
+        cursor_style: None,
+        cursor_blink: None,
+    }
+}
+
+#[tokio::test]
+async fn test_daemon_events_broadcast_session_lifecycle() {
+    let server = CtermdServer::spawn();
+    let mut subscriber = connect(&server.address()).await;
+    let mut actor = connect(&server.address()).await;
+
+    let mut events = subscriber
+        .stream_daemon_events(StreamDaemonEventsRequest {})
+        .await
+        .expect("stream_daemon_events failed")
+        .into_inner();
+
+    // A session created by another client arrives as SessionCreated.
+    let session_id = actor
+        .create_session(spawn_session_request())
+        .await
+        .expect("create_session failed")
+        .get_ref()
+        .session_id
+        .clone();
+    match next_daemon_event(&mut events).await.event {
+        Some(daemon_event::Event::SessionCreated(event)) => {
+            let info = event.session.expect("created event without session");
+            assert_eq!(info.session_id, session_id);
+        }
+        other => panic!("expected SessionCreated, got {other:?}"),
+    }
+
+    // Destroying it arrives as SessionDestroyed.
+    actor
+        .destroy_session(DestroySessionRequest {
+            session_id: session_id.clone(),
+            signal: None,
+        })
+        .await
+        .expect("destroy_session failed");
+    match next_daemon_event(&mut events).await.event {
+        Some(daemon_event::Event::SessionDestroyed(event)) => {
+            assert_eq!(event.session_id, session_id);
+        }
+        other => panic!("expected SessionDestroyed, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn test_daemon_events_broadcast_metadata_changes() {
+    let server = CtermdServer::spawn();
+    let mut subscriber = connect(&server.address()).await;
+    let mut actor = connect(&server.address()).await;
+
+    let mut events = subscriber
+        .stream_daemon_events(StreamDaemonEventsRequest {})
+        .await
+        .expect("stream_daemon_events failed")
+        .into_inner();
+
+    let session_id = actor
+        .create_session(spawn_session_request())
+        .await
+        .expect("create_session failed")
+        .get_ref()
+        .session_id
+        .clone();
+    // Drain the creation event so only metadata events remain.
+    assert!(matches!(
+        next_daemon_event(&mut events).await.event,
+        Some(daemon_event::Event::SessionCreated(_))
+    ));
+
+    // A title change broadcasts the full current metadata.
+    actor
+        .set_session_title(SetSessionTitleRequest {
+            session_id: session_id.clone(),
+            custom_title: "renamed".to_string(),
+        })
+        .await
+        .expect("set_session_title failed");
+    match next_daemon_event(&mut events).await.event {
+        Some(daemon_event::Event::SessionMetadataChanged(event)) => {
+            assert_eq!(event.session_id, session_id);
+            assert_eq!(event.custom_title, "renamed");
+        }
+        other => panic!("expected SessionMetadataChanged, got {other:?}"),
+    }
+
+    // A masked metadata update broadcasts the merged values.
+    actor
+        .set_session_metadata(SetSessionMetadataRequest {
+            session_id: session_id.clone(),
+            custom_title: String::new(),
+            tab_color: "#ff0000".to_string(),
+            template_name: String::new(),
+            fields_mask: 0b010,
+        })
+        .await
+        .expect("set_session_metadata failed");
+    match next_daemon_event(&mut events).await.event {
+        Some(daemon_event::Event::SessionMetadataChanged(event)) => {
+            assert_eq!(event.session_id, session_id);
+            assert_eq!(event.custom_title, "renamed");
+            assert_eq!(event.tab_color, "#ff0000");
+        }
+        other => panic!("expected SessionMetadataChanged, got {other:?}"),
+    }
+
+    // A zero mask changes nothing and broadcasts nothing.
+    actor
+        .set_session_metadata(SetSessionMetadataRequest {
+            session_id: session_id.clone(),
+            custom_title: "ignored".to_string(),
+            tab_color: String::new(),
+            template_name: String::new(),
+            fields_mask: 0,
+        })
+        .await
+        .expect("set_session_metadata failed");
+    let quiet = tokio::time::timeout(Duration::from_secs(1), events.message()).await;
+    assert!(
+        quiet.is_err(),
+        "zero-mask metadata update must not broadcast, got {quiet:?}"
+    );
+
+    actor
+        .destroy_session(DestroySessionRequest {
+            session_id,
+            signal: None,
+        })
+        .await
+        .expect("destroy_session failed");
+}
