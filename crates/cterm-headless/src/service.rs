@@ -725,19 +725,23 @@ impl TerminalService for TerminalServiceImpl {
     type StreamDaemonEventsStream =
         Pin<Box<dyn Stream<Item = Result<DaemonEvent, Status>> + Send + 'static>>;
 
+    // Tonic requires the stream's error type to be its unboxed Status.
+    #[allow(clippy::result_large_err)]
     async fn stream_daemon_events(
         &self,
         _request: Request<StreamDaemonEventsRequest>,
     ) -> Result<Response<Self::StreamDaemonEventsStream>, Status> {
         let rx = self.session_manager.subscribe_daemon_events();
-        let stream = BroadcastStream::new(rx).filter_map(|result| match result {
-            Ok(event) => Some(Ok(event)),
+        let stream = BroadcastStream::new(rx).map(|result| match result {
+            Ok(event) => Ok(event),
             Err(BroadcastStreamRecvError::Lagged(count)) => {
                 log::warn!(
                     "stream_daemon_events: client lagged, dropped {} events",
                     count,
                 );
-                None
+                Err(Status::data_loss(
+                    "Daemon events lost; resubscribe and refresh sessions",
+                ))
             }
         });
         Ok(Response::new(Box::pin(stream)))

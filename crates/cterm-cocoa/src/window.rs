@@ -1323,6 +1323,21 @@ impl CtermWindow {
         }
     }
 
+    /// Remove only the pane whose session disappeared on the daemon. Return
+    /// false for the last pane so the delegate can preserve its last window.
+    pub(crate) fn remove_mirrored_session_pane(&self, session_id: &str) -> bool {
+        let target = {
+            let panes = self.ivars().panes.borrow();
+            if panes.len() <= 1 {
+                return false;
+            }
+            panes.id_matching(|entry| entry.terminal.session_id().as_deref() == Some(session_id))
+        };
+        let Some(target) = target else { return false };
+        self.remove_pane(target);
+        true
+    }
+
     fn remove_pane(&self, target: PaneId) {
         let close_result = { self.ivars().panes.borrow_mut().close(target) };
         match close_result {

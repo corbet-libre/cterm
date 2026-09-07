@@ -348,10 +348,8 @@ pub(crate) fn parse_metadata(metadata: &str) -> RichMetadata {
             continue;
         };
         match key {
-            "type" => {
-                if parsed.packet_type.is_none() {
-                    parsed.packet_type = Some(value.to_string());
-                }
+            "type" if parsed.packet_type.is_none() => {
+                parsed.packet_type = Some(value.to_string());
             }
             "loc" => {
                 if let Some(location) = RichClipboardLocation::from_loc_value(value) {

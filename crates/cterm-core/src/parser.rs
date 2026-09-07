@@ -2226,42 +2226,35 @@ impl ScreenPerformer<'_> {
                         }
                     }
                 }
-                b't' => {
-                    if notif_types.len() < MAX_NOTIFICATION_TYPES {
-                        if let Some(decoded) =
-                            crate::notifications::decode_notification_base64(value.as_bytes())
-                        {
-                            if let Ok(text) = std::str::from_utf8(&decoded) {
-                                let text = text.trim();
-                                if !text.is_empty() {
-                                    notif_types.push(
-                                        crate::notifications::truncate_utf8(
-                                            text,
-                                            MAX_NOTIFICATION_TYPE_BYTES,
-                                        )
-                                        .to_owned(),
-                                    );
-                                }
+                b't' if notif_types.len() < MAX_NOTIFICATION_TYPES => {
+                    if let Some(decoded) =
+                        crate::notifications::decode_notification_base64(value.as_bytes())
+                    {
+                        if let Ok(text) = std::str::from_utf8(&decoded) {
+                            let text = text.trim();
+                            if !text.is_empty() {
+                                notif_types.push(
+                                    crate::notifications::truncate_utf8(
+                                        text,
+                                        MAX_NOTIFICATION_TYPE_BYTES,
+                                    )
+                                    .to_owned(),
+                                );
                             }
                         }
                     }
                 }
-                b'n' => {
-                    if icon_names.len() < MAX_ICON_NAMES {
-                        if let Some(decoded) =
-                            crate::notifications::decode_notification_base64(value.as_bytes())
-                        {
-                            if let Ok(text) = std::str::from_utf8(&decoded) {
-                                let text = text.trim();
-                                if !text.is_empty() {
-                                    icon_names.push(
-                                        crate::notifications::truncate_utf8(
-                                            text,
-                                            MAX_ICON_NAME_BYTES,
-                                        )
+                b'n' if icon_names.len() < MAX_ICON_NAMES => {
+                    if let Some(decoded) =
+                        crate::notifications::decode_notification_base64(value.as_bytes())
+                    {
+                        if let Ok(text) = std::str::from_utf8(&decoded) {
+                            let text = text.trim();
+                            if !text.is_empty() {
+                                icon_names.push(
+                                    crate::notifications::truncate_utf8(text, MAX_ICON_NAME_BYTES)
                                         .to_owned(),
-                                    );
-                                }
+                                );
                             }
                         }
                     }

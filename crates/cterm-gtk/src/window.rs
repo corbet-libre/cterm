@@ -102,15 +102,7 @@ fn release_remote_listener(key: &str) {
     }
 }
 
-/// How a daemon-event listener reaches its daemon.
-#[derive(Clone)]
-enum ListenerConnect {
-    /// The local daemon (auto-starts it if needed).
-    Local,
-    /// A specific socket path — a real local socket or a synthetic SSH-tunnel
-    /// key that `connect_unix` dials over the registered tunnel.
-    Unix(std::path::PathBuf),
-}
+use cterm_client::DaemonEventTarget as ListenerConnect;
 
 /// A daemon-wide event decoded off the event stream, forwarded to the GTK main
 /// thread for application to this window's tabs.
@@ -4546,7 +4538,7 @@ fn create_daemon_tab_titled(
     drop(cfg);
 
     // Connect and attach in background thread, then create tab on main thread
-    let (tx, rx) = std::sync::mpsc::channel::<DaemonAttachResult>();
+    let (tx, rx) = std::sync::mpsc::channel::<DaemonSnapshotAttachResult>();
 
     let connect_for_thread = connect_socket.clone();
     std::thread::spawn(move || {
@@ -4562,10 +4554,10 @@ fn create_daemon_tab_titled(
                     }
                     None => cterm_client::DaemonConnection::connect_local().await?,
                 };
-                let (session, _initial_screen) =
+                let (session, initial_screen) =
                     conn.attach_session(&session_id, cols, rows).await?;
                 mark_owned_session(session.session_id());
-                Ok(session)
+                Ok((session, initial_screen))
             }),
             Err(e) => Err(cterm_client::ClientError::Connection(e.to_string())),
         };
@@ -4577,14 +4569,29 @@ fn create_daemon_tab_titled(
         match rx.try_recv() {
             Ok(result) => {
                 match result {
-                    Ok(session) => {
+                    Ok((session, screen)) => {
                         let sid = session.session_id().to_string();
                         let title = initial_title
                             .clone()
                             .filter(|t| !t.is_empty())
                             .unwrap_or_else(|| "Terminal".to_string());
                         let cfg = config.borrow();
-                        let terminal = TerminalWidget::from_daemon(session, &cfg, &theme);
+                        let terminal = TerminalWidget::from_daemon_with_screen(
+                            cterm_app::daemon_reconnect::ReconnectedSession {
+                                handle: session,
+                                title: title.clone(),
+                                custom_title: if title_locked {
+                                    title.clone()
+                                } else {
+                                    String::new()
+                                },
+                                tab_color: initial_color.clone().unwrap_or_default(),
+                                template_name: String::new(),
+                                screen,
+                            },
+                            &cfg,
+                            &theme,
+                        );
                         drop(cfg);
 
                         let tab_id = generate_tab_id(&next_tab_id);
@@ -4649,6 +4656,14 @@ fn create_daemon_tab_titled(
 type DaemonAttachResult =
     std::result::Result<cterm_client::SessionHandle, cterm_client::ClientError>;
 
+type DaemonSnapshotAttachResult = std::result::Result<
+    (
+        cterm_client::SessionHandle,
+        Option<cterm_proto::proto::GetScreenResponse>,
+    ),
+    cterm_client::ClientError,
+>;
+
 /// Core of a daemon-wide event listener: subscribe to one daemon's event stream
 /// on a background thread and mirror its session lifecycle / metadata changes
 /// into this window's tabs (new session → tab, destroyed → tab removed, metadata
@@ -4683,7 +4698,13 @@ fn spawn_daemon_event_listener(
         }
     }
 
-    let (tx, rx) = std::sync::mpsc::channel::<DaemonUiEvent>();
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<DaemonUiEvent>();
+    let (stop_tx, mut stop_rx) = tokio::sync::watch::channel(false);
+    // The polling closure holds window references, so finalization (destroy)
+    // can be delayed. Unrealize fires when the native window actually closes.
+    window.connect_unrealize(move |_| {
+        let _ = stop_tx.send(true);
+    });
 
     let dedup_for_thread = dedup_key.clone();
     std::thread::spawn(move || {
@@ -4702,54 +4723,35 @@ fn spawn_daemon_event_listener(
         };
 
         rt.block_on(async move {
-            let conn = match connect {
-                ListenerConnect::Local => cterm_client::DaemonConnection::connect_local().await,
-                ListenerConnect::Unix(ref path) => {
-                    cterm_client::DaemonConnection::connect_unix(path, false).await
-                }
-            };
-            match conn {
-                Ok(conn) => match conn.stream_daemon_events().await {
-                    Ok(mut stream) => {
-                        use tokio_stream::StreamExt;
-                        while let Some(result) = stream.next().await {
-                            let event = match result {
-                                Ok(e) => e,
-                                Err(e) => {
-                                    log::debug!("daemon event stream ended: {e}");
-                                    break;
-                                }
-                            };
-                            let ui_event = match event.event {
-                                Some(cterm_proto::proto::daemon_event::Event::SessionCreated(
-                                    c,
-                                )) => match c.session {
-                                    Some(info) => DaemonUiEvent::Created(Box::new(info)),
-                                    None => continue,
-                                },
-                                Some(
-                                    cterm_proto::proto::daemon_event::Event::SessionDestroyed(d),
-                                ) => DaemonUiEvent::Destroyed(d.session_id),
-                                Some(
-                                    cterm_proto::proto::daemon_event::Event::SessionMetadataChanged(
-                                        m,
-                                    ),
-                                ) => DaemonUiEvent::MetadataChanged {
-                                    session_id: m.session_id,
-                                    custom_title: m.custom_title,
-                                    tab_color: m.tab_color,
-                                },
-                                None => continue,
-                            };
-                            // If the receiver is gone the window has closed; stop.
-                            if tx.send(ui_event).is_err() {
-                                break;
-                            }
+            let mut listener = cterm_client::DaemonEventListener::new(connect);
+            loop {
+                let (_, event) = tokio::select! {
+                    event = listener.next_event() => event,
+                    _ = stop_rx.changed() => break,
+                    _ = tx.closed() => break,
+                };
+                let ui_event = match event.event {
+                    Some(cterm_proto::proto::daemon_event::Event::SessionCreated(c)) => {
+                        match c.session {
+                            Some(info) => DaemonUiEvent::Created(Box::new(info)),
+                            None => continue,
                         }
                     }
-                    Err(e) => log::warn!("daemon event listener: subscribe failed: {e}"),
-                },
-                Err(e) => log::warn!("daemon event listener: connect failed: {e}"),
+                    Some(cterm_proto::proto::daemon_event::Event::SessionDestroyed(d)) => {
+                        DaemonUiEvent::Destroyed(d.session_id)
+                    }
+                    Some(cterm_proto::proto::daemon_event::Event::SessionMetadataChanged(m)) => {
+                        DaemonUiEvent::MetadataChanged {
+                            session_id: m.session_id,
+                            custom_title: m.custom_title,
+                            tab_color: m.tab_color,
+                        }
+                    }
+                    None => continue,
+                };
+                if tx.send(ui_event).is_err() {
+                    break;
+                }
             }
             if let Some(key) = dedup_for_thread {
                 release_remote_listener(&key);
@@ -4760,11 +4762,11 @@ fn spawn_daemon_event_listener(
     glib::timeout_add_local(std::time::Duration::from_millis(50), move || loop {
         let ui_event = match rx.try_recv() {
             Ok(ev) => ev,
-            Err(std::sync::mpsc::TryRecvError::Empty) => {
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {
                 return glib::ControlFlow::Continue;
             }
             // Background thread ended (daemon gone / window closing).
-            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+            Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
                 return glib::ControlFlow::Break;
             }
         };
@@ -4773,10 +4775,11 @@ fn spawn_daemon_event_listener(
             DaemonUiEvent::Created(info) => {
                 // Skip sessions we created ourselves, and any we already show.
                 let already = is_owned_session(&info.session_id)
-                    || tabs
-                        .borrow()
-                        .iter()
-                        .any(|t| t.session_id.as_deref() == Some(info.session_id.as_str()));
+                    || tabs.borrow().iter().any(|t| {
+                        t.panes.iter().any(|(_, pane)| {
+                            pane.session_id.as_deref() == Some(info.session_id.as_str())
+                        })
+                    });
                 if already || !info.running {
                     continue;
                 }
@@ -4813,13 +4816,14 @@ fn spawn_daemon_event_listener(
                 );
             }
             DaemonUiEvent::Destroyed(session_id) => {
-                let tab_id = tabs
-                    .borrow()
-                    .iter()
-                    .find(|t| t.session_id.as_deref() == Some(session_id.as_str()))
-                    .map(|t| t.id);
-                if let Some(id) = tab_id {
-                    remove_tab_from_ui(&notebook, &tabs, &tab_bar, &window, id);
+                let target = tabs.borrow().iter().find_map(|tab| {
+                    tab.panes.iter().find_map(|(pane_id, pane)| {
+                        (pane.session_id.as_deref() == Some(session_id.as_str()))
+                            .then_some((tab.id, pane_id))
+                    })
+                });
+                if let Some((tab_id, pane_id)) = target {
+                    close_pane_by_id(&notebook, &tabs, &tab_bar, &window, tab_id, pane_id, false);
                 }
             }
             DaemonUiEvent::MetadataChanged {
@@ -4827,35 +4831,41 @@ fn spawn_daemon_event_listener(
                 custom_title,
                 tab_color,
             } => {
-                let tab_id = tabs
-                    .borrow()
-                    .iter()
-                    .find(|t| t.session_id.as_deref() == Some(session_id.as_str()))
-                    .map(|t| t.id);
-                let Some(id) = tab_id else { continue };
-
-                let color = if tab_color.is_empty() {
-                    None
-                } else {
-                    Some(tab_color.clone())
+                let mut entries = tabs.borrow_mut();
+                let target = entries.iter().enumerate().find_map(|(index, tab)| {
+                    tab.panes.iter().find_map(|(pane_id, pane)| {
+                        (pane.session_id.as_deref() == Some(session_id.as_str()))
+                            .then_some((index, pane_id))
+                    })
+                });
+                let Some((index, pane_id)) = target else {
+                    continue;
                 };
-                // Apply visual color only — do NOT push back to the daemon, or
-                // we'd echo the change we just received.
-                tab_bar.set_color(id, color.as_deref());
-
-                if !custom_title.is_empty() {
-                    tab_bar.set_title(id, &custom_title);
-                }
-
-                let mut tabs_mut = tabs.borrow_mut();
-                if let Some(tab) = tabs_mut.iter_mut().find(|t| t.id == id) {
-                    tab.color = color;
-                    if custom_title.is_empty() {
-                        // Custom title cleared elsewhere: let OSC titles win again.
-                        tab.title_locked = false;
+                let tab = &mut entries[index];
+                let active = tab.active_pane_id() == pane_id;
+                let pane = tab.panes.get_mut(pane_id).unwrap();
+                let title_locked = !custom_title.is_empty();
+                let title = if title_locked {
+                    custom_title
+                } else {
+                    let title = pane.terminal.terminal().lock().screen().title.clone();
+                    if title.is_empty() {
+                        "Terminal".to_string()
                     } else {
-                        tab.title = custom_title.clone();
-                        tab.title_locked = true;
+                        title
+                    }
+                };
+                pane.title_locked = title_locked;
+                pane.title = title.clone();
+                let color = (!tab_color.is_empty()).then_some(tab_color);
+                tab.color = color.clone();
+                tab_bar.set_color(tab.id, color.as_deref());
+                if active {
+                    tab.title_locked = title_locked;
+                    tab.title = title.clone();
+                    tab_bar.set_title(tab.id, &title);
+                    if notebook.current_page() == Some(index as u32) {
+                        window.set_title(Some(&title));
                     }
                 }
             }

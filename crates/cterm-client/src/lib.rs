@@ -4,6 +4,7 @@
 //! TCP, or SSH, and `SessionHandle` for interacting with individual terminal sessions.
 
 mod connection;
+mod daemon_events;
 mod error;
 mod remote_manager;
 mod session;
@@ -17,6 +18,7 @@ pub use connection::{
 };
 /// SSH session parameters (re-exported proto type) for [`CreateSessionOpts::ssh`].
 pub use cterm_proto::proto::SshParams;
+pub use daemon_events::{DaemonEventListener, DaemonEventTarget};
 pub use error::ClientError;
 pub use remote_manager::RemoteManager;
 pub use session::SessionHandle;

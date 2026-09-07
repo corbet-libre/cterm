@@ -290,6 +290,12 @@ is omitted for readability.
   `docs/transfer-bypass-policy.md`, whose 5 open questions stay open).
 
 ### Fixed
+- GTK and macOS tab synchronization reconnects after daemon stream failures
+  and refreshes session membership and metadata to recover missed events.
+  Daemon event-buffer overflow now reports data loss instead of silently
+  leaving clients out of sync; GTK listeners stop when their window closes.
+- Mirrored session changes locate inactive split panes, remove only the
+  affected pane, and restore shell titles when a custom title is cleared.
 - Streamed OSC 1337 interception now replays incomplete, cancelled, and
   oversized sequences atomically instead of leaving the VTE parser inside a
   partial control string. Large replay and decoded-transfer spill files are

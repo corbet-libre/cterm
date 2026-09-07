@@ -185,14 +185,7 @@ fn release_remote_listener(key: &str) {
 }
 
 /// How a daemon-event listener reaches its daemon.
-#[derive(Clone)]
-enum ListenerConnect {
-    /// The local daemon (auto-starts it if needed).
-    Local,
-    /// A specific socket path — a real local socket or a synthetic SSH-tunnel
-    /// key that `connect_unix` dials over the registered tunnel.
-    Unix(std::path::PathBuf),
-}
+use cterm_client::DaemonEventTarget as ListenerConnect;
 
 /// Application state stored in the delegate
 pub struct AppDelegateIvars {
@@ -1387,111 +1380,68 @@ impl AppDelegate {
             };
 
             rt.block_on(async move {
-                let conn = match connect {
-                    ListenerConnect::Local => {
-                        cterm_client::DaemonConnection::connect_local().await
-                    }
-                    ListenerConnect::Unix(ref path) => {
-                        cterm_client::DaemonConnection::connect_unix(path, false).await
-                    }
-                };
-                match conn {
-                    Ok(conn) => match conn.stream_daemon_events().await {
-                        Ok(mut stream) => {
-                            use tokio_stream::StreamExt;
-                            while let Some(result) = stream.next().await {
-                                let event = match result {
-                                    Ok(e) => e,
-                                    Err(e) => {
-                                        log::debug!("daemon event stream ended: {e}");
-                                        break;
-                                    }
-                                };
-                                match event.event {
-                                    Some(
-                                        cterm_proto::proto::daemon_event::Event::SessionCreated(c),
-                                    ) => {
-                                        let Some(info) = c.session else { continue };
-                                        // Skip sessions we created ourselves.
-                                        if is_owned_session(&info.session_id) {
-                                            continue;
-                                        }
-                                        let session_id = info.session_id.clone();
-                                        // Attach here (we have a runtime) then
-                                        // build the tab on the main thread.
-                                        let Some(recon) =
-                                            cterm_app::daemon_reconnect::attach_session_from_info(
-                                                &conn, info,
-                                            )
-                                            .await
-                                        else {
-                                            continue;
-                                        };
-                                        mark_owned_session(&session_id);
-                                        dispatch2::Queue::main().exec_async(move || {
-                                            let mtm =
-                                                unsafe { MainThreadMarker::new_unchecked() };
-                                            let delegate = unsafe {
-                                                &*(delegate_ptr as *const AppDelegate)
-                                            };
-                                            delegate.add_mirrored_tab(mtm, recon, &session_id);
-                                        });
-                                    }
-                                    Some(
-                                        cterm_proto::proto::daemon_event::Event::SessionDestroyed(
-                                            d,
-                                        ),
-                                    ) => {
-                                        let session_id = d.session_id;
-                                        dispatch2::Queue::main().exec_async(move || {
-                                            let delegate = unsafe {
-                                                &*(delegate_ptr as *const AppDelegate)
-                                            };
-                                            delegate.remove_mirrored_tab(&session_id);
-                                        });
-                                    }
-                                    Some(
-                                        cterm_proto::proto::daemon_event::Event::SessionMetadataChanged(
-                                            m,
-                                        ),
-                                    ) => {
-                                        dispatch2::Queue::main().exec_async(move || {
-                                            let delegate = unsafe {
-                                                &*(delegate_ptr as *const AppDelegate)
-                                            };
-                                            delegate.apply_mirrored_metadata(
-                                                &m.session_id,
-                                                &m.custom_title,
-                                                &m.tab_color,
-                                            );
-                                        });
-                                    }
-                                    None => {}
-                                }
+                let mut listener = cterm_client::DaemonEventListener::new(connect);
+                loop {
+                    let (conn, event) = listener.next_event().await;
+                    match event.event {
+                        Some(cterm_proto::proto::daemon_event::Event::SessionCreated(c)) => {
+                            let Some(info) = c.session else { continue };
+                            // Skip sessions we created ourselves.
+                            if is_owned_session(&info.session_id) {
+                                continue;
                             }
+                            let session_id = info.session_id.clone();
+                            // Attach here (we have a runtime) then
+                            // build the tab on the main thread.
+                            let Some(recon) =
+                                cterm_app::daemon_reconnect::attach_session_from_info(&conn, info)
+                                    .await
+                            else {
+                                continue;
+                            };
+                            mark_owned_session(&session_id);
+                            dispatch2::Queue::main().exec_async(move || {
+                                let mtm = unsafe { MainThreadMarker::new_unchecked() };
+                                let delegate = unsafe { &*(delegate_ptr as *const AppDelegate) };
+                                delegate.add_mirrored_tab(mtm, recon, &session_id);
+                            });
                         }
-                        Err(e) => log::warn!("daemon event listener: subscribe failed: {e}"),
-                    },
-                    Err(e) => log::warn!("daemon event listener: connect failed: {e}"),
-                }
-                if let Some(key) = dedup_for_thread {
-                    release_remote_listener(&key);
+                        Some(cterm_proto::proto::daemon_event::Event::SessionDestroyed(d)) => {
+                            let session_id = d.session_id;
+                            dispatch2::Queue::main().exec_async(move || {
+                                let delegate = unsafe { &*(delegate_ptr as *const AppDelegate) };
+                                delegate.remove_mirrored_tab(&session_id);
+                            });
+                        }
+                        Some(cterm_proto::proto::daemon_event::Event::SessionMetadataChanged(
+                            m,
+                        )) => {
+                            dispatch2::Queue::main().exec_async(move || {
+                                let delegate = unsafe { &*(delegate_ptr as *const AppDelegate) };
+                                delegate.apply_mirrored_metadata(
+                                    &m.session_id,
+                                    &m.custom_title,
+                                    &m.tab_color,
+                                );
+                            });
+                        }
+                        None => {}
+                    }
                 }
             });
         });
     }
 
-    /// Find the tracked window whose active terminal is attached to `session_id`.
+    /// Find the tracked window containing `session_id`, including inactive panes.
     fn find_window_for_session(&self, session_id: &str) -> Option<Retained<CtermWindow>> {
         self.ivars()
             .windows
             .borrow()
             .iter()
             .find(|w| {
-                w.active_terminal()
-                    .and_then(|tv| tv.session_id())
-                    .as_deref()
-                    == Some(session_id)
+                w.terminal_views()
+                    .iter()
+                    .any(|tv| tv.session_id().as_deref() == Some(session_id))
             })
             .cloned()
     }
@@ -1547,6 +1497,9 @@ impl AppDelegate {
         let Some(window) = self.find_window_for_session(session_id) else {
             return;
         };
+        if window.remove_mirrored_session_pane(session_id) {
+            return;
+        }
         if self.ivars().windows.borrow().len() > 1 {
             // close() bypasses the running-process confirmation (performClose:)
             // — the session is already gone.
@@ -1570,15 +1523,30 @@ impl AppDelegate {
         };
         window.set_tab_color_visual(color);
 
-        if custom_title.is_empty() {
-            // Custom title cleared elsewhere: let OSC titles win again.
-            if let Some(tv) = window.active_terminal() {
-                tv.set_title_locked(false);
-            }
-        } else {
-            window.setTitle(&NSString::from_str(custom_title));
-            if let Some(tv) = window.active_terminal() {
-                tv.set_title_locked(true);
+        if let Some(tv) = window
+            .terminal_views()
+            .into_iter()
+            .find(|tv| tv.session_id().as_deref() == Some(session_id))
+        {
+            let title = if custom_title.is_empty() {
+                let title = tv.terminal().lock().screen().title.clone();
+                if title.is_empty() {
+                    "Terminal".to_string()
+                } else {
+                    title
+                }
+            } else {
+                custom_title.to_string()
+            };
+            tv.set_title_locked(!custom_title.is_empty());
+            tv.set_current_title(title.clone());
+            if window
+                .active_terminal()
+                .and_then(|active| active.session_id())
+                .as_deref()
+                == Some(session_id)
+            {
+                window.setTitle(&NSString::from_str(&title));
             }
         }
     }
