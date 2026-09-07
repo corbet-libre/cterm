@@ -9,7 +9,7 @@ use cterm_core::term::TerminalEvent;
 use cterm_core::Pty;
 use cterm_core::{FileTransferAction, FileTransferCommand, PtyConfig, PtySize, Terminal};
 use parking_lot::RwLock;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use tokio::sync::broadcast;
@@ -59,6 +59,64 @@ impl TtyTransferPrompt {
 }
 
 /// Session state wrapping a Terminal instance
+/// Decided-policy same-TTY pre-authorizations for one session.
+///
+/// Exact transfer ids plus a single next-request wildcard. Every entry is
+/// single-use: consumption removes it, so exactly one dialog skip happens
+/// per mint. Never snapshotted or persisted.
+#[derive(Debug, Default)]
+struct TransferPreAuthSet {
+    exact: HashSet<String>,
+    wildcard_armed: bool,
+}
+
+impl TransferPreAuthSet {
+    fn insert(&mut self, transfer_id: Option<String>) {
+        match transfer_id {
+            Some(id) => {
+                self.exact.insert(id);
+            }
+            None => {
+                self.wildcard_armed = true;
+            }
+        }
+    }
+
+    /// Consume the pre-authorization matching `transfer_id`, if any. An
+    /// exact binding wins over the wildcard so arming "next" never steals
+    /// a transfer another entry names exactly.
+    fn consume(&mut self, transfer_id: &str) -> bool {
+        if self.exact.remove(transfer_id) {
+            return true;
+        }
+        if self.wildcard_armed {
+            self.wildcard_armed = false;
+            return true;
+        }
+        false
+    }
+
+    fn revoke(&mut self, transfer_id: Option<&str>) -> bool {
+        match transfer_id {
+            Some(id) => self.exact.remove(id),
+            None => std::mem::replace(&mut self.wildcard_armed, false),
+        }
+    }
+
+    fn list(&self) -> Vec<Option<String>> {
+        let mut entries: Vec<Option<String>> = self.exact.iter().cloned().map(Some).collect();
+        entries.sort();
+        if self.wildcard_armed {
+            entries.push(None);
+        }
+        entries
+    }
+
+    fn is_empty(&self) -> bool {
+        self.exact.is_empty() && !self.wildcard_armed
+    }
+}
+
 pub struct SessionState {
     /// The terminal instance
     terminal: RwLock<Terminal>,
@@ -119,6 +177,11 @@ pub struct SessionState {
 
     /// Live OSC 5113 approval events for attached native clients.
     tty_transfer_prompt_tx: broadcast::Sender<crate::proto::TtyFileTransferApprovalEvent>,
+
+    /// Decided-policy same-TTY pre-authorizations: exact transfer ids plus
+    /// one next-request wildcard. In-memory only — entries die with the
+    /// session and never survive daemon relaunch or snapshots.
+    transfer_preauths: parking_lot::Mutex<TransferPreAuthSet>,
 
     /// Current bounded approval set, replayed to reconnecting subscribers.
     tty_transfer_prompt_registry: parking_lot::Mutex<HashMap<u64, TtyTransferPrompt>>,
@@ -210,6 +273,7 @@ impl SessionState {
             tty_transfer_accepting: AtomicBool::new(true),
             tty_transfer_prompt_tx: broadcast::channel(32).0,
             tty_transfer_prompt_registry: parking_lot::Mutex::new(HashMap::new()),
+            transfer_preauths: parking_lot::Mutex::new(TransferPreAuthSet::default()),
             pty_writer: OnceLock::new(),
             sync_update_active: AtomicBool::new(false),
         });
@@ -256,6 +320,7 @@ impl SessionState {
             tty_transfer_accepting: AtomicBool::new(true),
             tty_transfer_prompt_tx: broadcast::channel(32).0,
             tty_transfer_prompt_registry: parking_lot::Mutex::new(HashMap::new()),
+            transfer_preauths: parking_lot::Mutex::new(TransferPreAuthSet::default()),
             pty_writer: OnceLock::new(),
             sync_update_active: AtomicBool::new(false),
         })
@@ -355,6 +420,39 @@ impl SessionState {
     /// The transfer consent context this session's worker evaluates under.
     pub fn transfer_context(&self) -> SharedTransferContext {
         self.transfer_context.read().clone()
+    }
+
+    /// Mint a decided-policy same-TTY pre-authorization: `Some` transfer id
+    /// binds exactly that transfer, `None` arms the next session-start in
+    /// this session. Minting is an explicit operator action over the daemon
+    /// socket; the binding is by named session, and entries die with it.
+    pub fn preauthorize_transfer(&self, transfer_id: Option<String>) {
+        self.transfer_preauths.lock().insert(transfer_id);
+    }
+
+    /// Consume the pre-authorization matching `transfer_id` for one dialog
+    /// skip. Exact bindings win over the armed wildcard; consumption removes
+    /// the entry so each mint skips at most one dialog.
+    pub fn consume_transfer_preauth(&self, transfer_id: &str) -> bool {
+        self.transfer_preauths.lock().consume(transfer_id)
+    }
+
+    /// Live pre-authorizations: exact transfer ids sorted, with the armed
+    /// next-request wildcard (if any) last as `None`.
+    pub fn list_transfer_preauths(&self) -> Vec<Option<String>> {
+        self.transfer_preauths.lock().list()
+    }
+
+    /// Revoke a pre-authorization before it is consumed: one exact transfer
+    /// id, or the armed wildcard when absent. Returns whether anything was
+    /// armed for that scope.
+    pub fn revoke_transfer_preauth(&self, transfer_id: Option<&str>) -> bool {
+        self.transfer_preauths.lock().revoke(transfer_id)
+    }
+
+    /// Whether any pre-authorization is live for this session.
+    pub fn has_transfer_preauth(&self) -> bool {
+        !self.transfer_preauths.lock().is_empty()
     }
 
     /// Subscribe to current and future OSC 5113 consent requests.
@@ -566,6 +664,7 @@ impl SessionState {
             tty_transfer_accepting: AtomicBool::new(true),
             tty_transfer_prompt_tx: broadcast::channel(32).0,
             tty_transfer_prompt_registry: parking_lot::Mutex::new(HashMap::new()),
+            transfer_preauths: parking_lot::Mutex::new(TransferPreAuthSet::default()),
             pty_writer: OnceLock::new(),
             sync_update_active: AtomicBool::new(false),
         });
@@ -1162,6 +1261,153 @@ mod tests {
             responses[0].status.as_deref(),
             Some("EPERM:User refused the transfer")
         );
+        session.shutdown_tty_transfers().await;
+    }
+
+    #[test]
+    fn transfer_preauth_store_is_single_use_exact_and_wildcard() {
+        let mut set = TransferPreAuthSet::default();
+        assert!(set.is_empty());
+
+        // Exact bindings win over the armed wildcard.
+        set.insert(Some("a".to_string()));
+        assert!(!set.consume("b"), "unknown ids consume nothing");
+        assert!(set.consume("a"));
+        assert!(set.is_empty());
+
+        set.insert(Some("a".to_string()));
+        set.insert(None);
+        assert!(!set.is_empty());
+        assert_eq!(
+            set.list(),
+            vec![Some("a".to_string()), None],
+            "exact ids sort first, wildcard last"
+        );
+        assert!(set.consume("a"));
+        assert!(!set.is_empty(), "wildcard stays armed");
+        assert_eq!(set.list(), vec![None]);
+        // The wildcard covers exactly one start.
+        assert!(set.consume("anything"));
+        assert!(set.is_empty());
+
+        // Revocation is scoped and reports whether anything was armed.
+        set.insert(Some("x".to_string()));
+        set.insert(None);
+        assert!(!set.revoke(Some("y")));
+        assert!(set.revoke(Some("x")));
+        assert!(!set.revoke(Some("x")));
+        assert!(set.revoke(None));
+        assert!(!set.revoke(None));
+        assert!(set.is_empty());
+    }
+
+    /// A wildcard pre-authorization skips exactly one dialog: the first
+    /// session-start auto-approves with no prompt published, the next one
+    /// prompts again.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn preauth_wildcard_skips_one_dialog_then_prompts() {
+        use std::sync::Mutex;
+
+        let session =
+            SessionState::new_ssh_connecting("preauth-once".to_string(), PtySize::default(), 0);
+        let writes = Arc::new(Mutex::new(Vec::new()));
+        let observed = Arc::clone(&writes);
+        session.with_terminal_mut(|terminal| {
+            terminal.set_write_fn(Box::new(move |data| {
+                observed.lock().unwrap().extend_from_slice(data);
+                Ok(())
+            }));
+        });
+        session.set_transfer_context(Arc::new(DaemonTransferContext::with_defaults()));
+        let controller = TtyTransferController::spawn(&session).unwrap();
+        assert!(session.tty_transfer.set(Some(controller)).is_ok());
+        let (_, approvals) = session.subscribe_tty_transfer_prompts();
+        let mut approvals = approvals;
+        session.preauthorize_transfer(None);
+
+        session
+            .process_output(&send_start("first", None).encode().unwrap())
+            .await;
+        // Auto-approved: an OK response and no published prompt, consumed.
+        let responses = wait_for_transfer_responses(&writes, 1).await;
+        assert_eq!(responses[0].status.as_deref(), Some("OK"));
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(
+            matches!(
+                approvals.try_recv(),
+                Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+            ),
+            "pre-authorized start must not publish a prompt"
+        );
+        assert!(
+            session.subscribe_tty_transfer_prompts().0.is_empty(),
+            "no approval may be pending after a pre-authorized start"
+        );
+        assert!(
+            !session.has_transfer_preauth(),
+            "the wildcard is consumed by one skip"
+        );
+
+        // The next start prompts again.
+        session
+            .process_output(&send_start("second", None).encode().unwrap())
+            .await;
+        let event = tokio::time::timeout(std::time::Duration::from_secs(2), approvals.recv())
+            .await
+            .expect("second start must prompt again")
+            .expect("approval channel closed");
+        assert_eq!(event.transfer_id, "second");
+        session.shutdown_tty_transfers().await;
+    }
+
+    /// An exact pre-authorization ignores other transfer ids (leaving the
+    /// entry armed) and skips only its own start.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn preauth_exact_binding_ignores_other_ids() {
+        let session =
+            SessionState::new_ssh_connecting("preauth-exact".to_string(), PtySize::default(), 0);
+        session.preauthorize_transfer(Some("wanted".to_string()));
+        let context = DaemonTransferContext::with_defaults();
+        session.set_transfer_context(Arc::new(context));
+        let controller = TtyTransferController::spawn(&session).unwrap();
+        assert!(session.tty_transfer.set(Some(controller)).is_ok());
+        let (_, approvals) = session.subscribe_tty_transfer_prompts();
+        let mut approvals = approvals;
+
+        session
+            .process_output(&send_start("other", None).encode().unwrap())
+            .await;
+        let event = tokio::time::timeout(std::time::Duration::from_secs(2), approvals.recv())
+            .await
+            .expect("non-matching start must prompt")
+            .expect("approval channel closed");
+        assert_eq!(event.transfer_id, "other");
+        assert!(
+            session
+                .respond_tty_transfer_approval(event.request_id, false)
+                .await,
+            "denial must be accepted"
+        );
+        assert_eq!(
+            session.list_transfer_preauths(),
+            vec![Some("wanted".to_string())],
+            "a non-matching start must not consume the binding"
+        );
+
+        session
+            .process_output(&send_start("wanted", None).encode().unwrap())
+            .await;
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(
+            matches!(
+                approvals.try_recv(),
+                Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+            ),
+            "the bound start must not publish a prompt"
+        );
+        assert!(!session.has_transfer_preauth());
         session.shutdown_tty_transfers().await;
     }
 

@@ -1174,3 +1174,265 @@ async fn test_daemon_events_broadcast_metadata_changes() {
         .await
         .expect("destroy_session failed");
 }
+
+#[tokio::test]
+async fn test_transfer_preauth_mint_list_revoke_roundtrip() {
+    let server = CtermdServer::spawn();
+    let mut client = connect(&server.address()).await;
+    let session_id = client
+        .create_session(spawn_session_request())
+        .await
+        .expect("create_session failed")
+        .get_ref()
+        .session_id
+        .clone();
+
+    // Unknown sessions fail closed with NotFound on every pre-auth RPC.
+    for result in [
+        client
+            .pre_authorize_transfer(PreAuthorizeTransferRequest {
+                session_id: "no-such-session".to_string(),
+                transfer_id: None,
+            })
+            .await
+            .map(|_| ()),
+        client
+            .list_transfer_pre_authorizations(ListTransferPreAuthorizationsRequest {
+                session_id: "no-such-session".to_string(),
+            })
+            .await
+            .map(|_| ()),
+        client
+            .revoke_transfer_pre_authorization(RevokeTransferPreAuthorizationRequest {
+                session_id: "no-such-session".to_string(),
+                transfer_id: None,
+            })
+            .await
+            .map(|_| ()),
+    ] {
+        let error = result.expect_err("pre-auth RPC must fail for unknown sessions");
+        assert_eq!(error.code(), tonic::Code::NotFound);
+    }
+
+    let list = async |client: &mut TerminalServiceClient<Channel>| {
+        client
+            .list_transfer_pre_authorizations(ListTransferPreAuthorizationsRequest {
+                session_id: session_id.clone(),
+            })
+            .await
+            .expect("list failed")
+            .into_inner()
+            .authorizations
+    };
+    assert!(list(&mut client).await.is_empty());
+
+    // Mint an exact binding and a wildcard; listing shows both, exact first.
+    assert!(
+        client
+            .pre_authorize_transfer(PreAuthorizeTransferRequest {
+                session_id: session_id.clone(),
+                transfer_id: Some("xfer-1".to_string()),
+            })
+            .await
+            .expect("mint failed")
+            .get_ref()
+            .success
+    );
+    assert!(
+        client
+            .pre_authorize_transfer(PreAuthorizeTransferRequest {
+                session_id: session_id.clone(),
+                transfer_id: None,
+            })
+            .await
+            .expect("mint failed")
+            .get_ref()
+            .success
+    );
+    let entries: Vec<Option<String>> = list(&mut client)
+        .await
+        .into_iter()
+        .map(|entry| entry.transfer_id)
+        .collect();
+    assert_eq!(entries, vec![Some("xfer-1".to_string()), None]);
+
+    // Revoking the exact binding leaves the wildcard; revoking the wildcard
+    // empties the set; revoking again reports nothing armed.
+    assert!(
+        client
+            .revoke_transfer_pre_authorization(RevokeTransferPreAuthorizationRequest {
+                session_id: session_id.clone(),
+                transfer_id: Some("xfer-1".to_string()),
+            })
+            .await
+            .expect("revoke failed")
+            .get_ref()
+            .revoked
+    );
+    let entries: Vec<Option<String>> = list(&mut client)
+        .await
+        .into_iter()
+        .map(|entry| entry.transfer_id)
+        .collect();
+    assert_eq!(entries, vec![None]);
+    assert!(
+        client
+            .revoke_transfer_pre_authorization(RevokeTransferPreAuthorizationRequest {
+                session_id: session_id.clone(),
+                transfer_id: None,
+            })
+            .await
+            .expect("revoke failed")
+            .get_ref()
+            .revoked
+    );
+    assert!(list(&mut client).await.is_empty());
+    assert!(
+        !client
+            .revoke_transfer_pre_authorization(RevokeTransferPreAuthorizationRequest {
+                session_id: session_id.clone(),
+                transfer_id: None,
+            })
+            .await
+            .expect("revoke failed")
+            .get_ref()
+            .revoked
+    );
+
+    client
+        .destroy_session(DestroySessionRequest {
+            session_id,
+            signal: None,
+        })
+        .await
+        .expect("destroy_session failed");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn test_transfer_preauth_skips_one_live_dialog() {
+    let server = CtermdServer::spawn();
+    let mut client = connect(&server.address()).await;
+    // The shell emits two sends; the minted wildcard must skip exactly the
+    // first dialog while the second one still prompts.
+    let create_response = client
+        .create_session(CreateSessionRequest {
+            cols: 80,
+            rows: 24,
+            shell: Some("/bin/sh".to_string()),
+            args: vec![
+                "-c".to_string(),
+                "sleep 1; printf '\\033]5113;ac=send;id=preauth-first\\033\\\\'; sleep 3; printf '\\033]5113;ac=send;id=preauth-second\\033\\\\'; sleep 30".to_string(),
+            ],
+            cwd: None,
+            env: Default::default(),
+            term: Some("xterm-256color".to_string()),
+            ssh: None,
+            pixel_width: 0,
+            pixel_height: 0,
+            base_palette: None,
+            theme_appearance: 0,
+            window_visibility: 0,
+            cursor_style: None,
+            cursor_blink: None,
+        })
+        .await
+        .expect("create_session failed")
+        .into_inner();
+
+    client
+        .pre_authorize_transfer(PreAuthorizeTransferRequest {
+            session_id: create_response.session_id.clone(),
+            transfer_id: None,
+        })
+        .await
+        .expect("mint failed");
+
+    let mut events = client
+        .stream_events(StreamEventsRequest {
+            session_id: create_response.session_id.clone(),
+        })
+        .await
+        .expect("stream_events failed")
+        .into_inner();
+    // After the first send the wildcard must be consumed (bisects worker
+    // evaluation from event delivery if anything below fails).
+    tokio::time::sleep(Duration::from_millis(2500)).await;
+    let authorizations = client
+        .list_transfer_pre_authorizations(ListTransferPreAuthorizationsRequest {
+            session_id: create_response.session_id.clone(),
+        })
+        .await
+        .expect("list failed")
+        .into_inner()
+        .authorizations;
+    assert!(
+        authorizations.is_empty(),
+        "first send must consume the wildcard"
+    );
+
+    // The only approval that may ever arrive is the second send's.
+    let approval = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let event = events
+                .message()
+                .await
+                .expect("event stream failed")
+                .expect("event stream closed before the second consent");
+            if let Some(terminal_event::Event::TtyFileTransferApproval(approval)) = event.event {
+                break approval;
+            }
+        }
+    })
+    .await
+    .expect("second send must still prompt after one pre-authorized skip");
+    assert_eq!(approval.transfer_id, "preauth-second");
+
+    client
+        .destroy_session(DestroySessionRequest {
+            session_id: create_response.session_id,
+            signal: None,
+        })
+        .await
+        .expect("destroy_session failed");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn test_transfer_preauth_client_methods_roundtrip() {
+    let directory = tempfile::tempdir().expect("tempdir failed");
+    let socket_path = directory.path().join("preauth-ctermd.sock");
+    let _server = LocalCtermdServer::spawn(&socket_path, "cterm", None);
+    let connection = cterm_client::DaemonConnection::connect_unix(&socket_path, false).await;
+
+    // DaemonConnection may need a moment while a cold daemon starts.
+    let connection = match connection {
+        Ok(connection) => connection,
+        Err(_) => {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            cterm_client::DaemonConnection::connect_unix(&socket_path, false)
+                .await
+                .expect("daemon client connect failed")
+        }
+    };
+
+    let sessions = connection
+        .list_sessions()
+        .await
+        .expect("list_sessions failed");
+    assert!(sessions.is_empty());
+
+    // Pre-auth RPCs through the UI client surface fail closed on ghosts.
+    assert!(connection
+        .pre_authorize_transfer("no-such-session", None)
+        .await
+        .is_err());
+    assert!(connection
+        .list_transfer_pre_authorizations("no-such-session")
+        .await
+        .is_err());
+    assert!(connection
+        .revoke_transfer_pre_authorization("no-such-session", None)
+        .await
+        .is_err());
+}

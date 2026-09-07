@@ -62,6 +62,15 @@ service TerminalService {
   // TtyFileTransferApprovalEvent.
   rpc RespondTtyFileTransferApproval(RespondTtyFileTransferApprovalRequest) returns (RespondTtyFileTransferApprovalResponse);
 
+  // Mint a single-use same-TTY transfer pre-authorization: the next matching
+  // session-start in the named session skips its consent dialog (decided
+  // policy; defaults unchanged for everyone else).
+  rpc PreAuthorizeTransfer(PreAuthorizeTransferRequest) returns (PreAuthorizeTransferResponse);
+  // List live pre-authorizations for a session (auditable, revocable).
+  rpc ListTransferPreAuthorizations(ListTransferPreAuthorizationsRequest) returns (ListTransferPreAuthorizationsResponse);
+  // Revoke a pre-authorization before it is consumed.
+  rpc RevokeTransferPreAuthorization(RevokeTransferPreAuthorizationRequest) returns (RevokeTransferPreAuthorizationResponse);
+
   // Daemon Management
   rpc GetDaemonInfo(GetDaemonInfoRequest) returns (GetDaemonInfoResponse);
   rpc Shutdown(ShutdownRequest) returns (ShutdownResponse);
@@ -936,6 +945,43 @@ message RespondTtyFileTransferApprovalRequest {
 message RespondTtyFileTransferApprovalResponse {
   // False means the request was already answered, expired, or unknown.
   bool success = 1;
+}
+
+// Same-TTY pre-authorization for one OSC 5113 transfer (decided policy).
+// Bound to the exact daemon session; an absent transfer id arms the next
+// session-start in that session instead of one exact transfer.
+message PreAuthorizeTransferRequest {
+  string session_id = 1;
+  optional string transfer_id = 2;
+}
+
+message PreAuthorizeTransferResponse {
+  bool success = 1;
+}
+
+// One live pre-authorization. An absent transfer id is the armed
+// next-request wildcard; one entry is consumed by exactly one skip.
+message TransferPreAuthorization {
+  optional string transfer_id = 1;
+}
+
+message ListTransferPreAuthorizationsRequest {
+  string session_id = 1;
+}
+
+message ListTransferPreAuthorizationsResponse {
+  repeated TransferPreAuthorization authorizations = 1;
+}
+
+message RevokeTransferPreAuthorizationRequest {
+  string session_id = 1;
+  // Revoke one exact transfer id, or the wildcard when absent.
+  optional string transfer_id = 2;
+}
+
+message RevokeTransferPreAuthorizationResponse {
+  // False means nothing was armed for that scope.
+  bool revoked = 1;
 }
 
 message DesktopNotificationEvent {

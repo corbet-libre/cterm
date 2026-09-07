@@ -58,6 +58,9 @@ fn fatal_startup_error(message: &str, exit_code: i32) -> ! {
 pub fn run() {
     // Parse command-line arguments
     let args = Args::parse();
+    if let Some(code) = cterm_app::transfer_cli::run_if_requested(&args) {
+        std::process::exit(code);
+    }
     if args.managed {
         let executable = std::env::current_exe().unwrap_or_else(|error| {
             fatal_startup_error(

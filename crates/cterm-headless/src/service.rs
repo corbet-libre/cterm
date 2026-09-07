@@ -292,6 +292,77 @@ impl TerminalService for TerminalServiceImpl {
         Ok(Response::new(SetSessionTitleResponse { success: true }))
     }
 
+    async fn pre_authorize_transfer(
+        &self,
+        request: Request<PreAuthorizeTransferRequest>,
+    ) -> Result<Response<PreAuthorizeTransferResponse>, Status> {
+        let req = request.into_inner();
+        let session = self
+            .session_manager
+            .get_session(&req.session_id)
+            .map_err(Status::from)?;
+
+        session.preauthorize_transfer(req.transfer_id.clone());
+        match &req.transfer_id {
+            Some(transfer_id) => log::info!(
+                "OSC 5113 preauth minted session={} transfer={} (single-use, dies with session)",
+                req.session_id,
+                transfer_id,
+            ),
+            None => log::info!(
+                "OSC 5113 preauth minted session={} next-request wildcard (single-use, dies with session)",
+                req.session_id,
+            ),
+        }
+
+        Ok(Response::new(PreAuthorizeTransferResponse {
+            success: true,
+        }))
+    }
+
+    async fn list_transfer_pre_authorizations(
+        &self,
+        request: Request<ListTransferPreAuthorizationsRequest>,
+    ) -> Result<Response<ListTransferPreAuthorizationsResponse>, Status> {
+        let req = request.into_inner();
+        let session = self
+            .session_manager
+            .get_session(&req.session_id)
+            .map_err(Status::from)?;
+
+        let authorizations = session
+            .list_transfer_preauths()
+            .into_iter()
+            .map(|transfer_id| TransferPreAuthorization { transfer_id })
+            .collect();
+        Ok(Response::new(ListTransferPreAuthorizationsResponse {
+            authorizations,
+        }))
+    }
+
+    async fn revoke_transfer_pre_authorization(
+        &self,
+        request: Request<RevokeTransferPreAuthorizationRequest>,
+    ) -> Result<Response<RevokeTransferPreAuthorizationResponse>, Status> {
+        let req = request.into_inner();
+        let session = self
+            .session_manager
+            .get_session(&req.session_id)
+            .map_err(Status::from)?;
+
+        let revoked = session.revoke_transfer_preauth(req.transfer_id.as_deref());
+        log::info!(
+            "OSC 5113 preauth revoked session={} transfer={} revoked={}",
+            req.session_id,
+            req.transfer_id.as_deref().unwrap_or("<wildcard>"),
+            revoked,
+        );
+
+        Ok(Response::new(RevokeTransferPreAuthorizationResponse {
+            revoked,
+        }))
+    }
+
     async fn set_session_metadata(
         &self,
         request: Request<SetSessionMetadataRequest>,

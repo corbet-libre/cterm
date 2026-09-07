@@ -10,6 +10,12 @@ is omitted for readability.
 ## [Unreleased]
 
 ### Added
+- Same-TTY transfer pre-authorization (decided policy, condition 1):
+  `cterm transfer --allow-once --session <id>` mints a single-use skip
+  for the next matching transfer (or one exact `--transfer-id`), with
+  `--list`/`--revoke`, daemon-side single-use consumption before any
+  prompt publishes, audit rows, session-scoped lifetime, and an explicit
+  direction deny still refusing first.
 - Daemon event-bus integration evidence: `StreamDaemonEvents` lifecycle
   (created/destroyed) and metadata-change broadcasts now covered end to
   end over real gRPC (`cterm-headless` integration tests, incl. the

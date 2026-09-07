@@ -150,11 +150,20 @@ logged; a bypass adds rows, never removes them:
 
 ## Open questions for Julian — DECIDED 2026-09-07
 
-1. Condition 1 (same-TTY `--allow-once`): **APPROVED.** An explicit opt-in
-   command in the same terminal session may mint a single-use, short-lived
-   pre-authorization for the exact `(daemon session, transfer id)` pair.
-   (Implementation of the CLI + daemon pre-auth store is queued work; the
-   design constraint — exact match, nothing else skips — is fixed.)
+1. Condition 1 (same-TTY `--allow-once`): **APPROVED and IMPLEMENTED.**
+   An explicit opt-in command in the same terminal session mints a
+   single-use pre-authorization for the exact `(daemon session, transfer
+   id)` pair: `cterm transfer --allow-once --session <id>` arms the next
+   session-start (`--transfer-id` binds one exact transfer instead).
+   Daemon-side single-use consumption happens at session-start
+   evaluation *after* an explicit direction deny (which still refuses
+   first); only the next matching request skips its dialog, everything
+   else still prompts. `--list`/`--revoke` expose the live set for audit;
+   entries die with the session and never survive relaunch or snapshots.
+   The minting binding is by explicitly named session id over the daemon
+   socket (same trust domain as the daemon), not OS-verified TTY
+   provenance — documented here rather than implied. Native session-badge
+   rendering stays frontend follow-up work.
 2. Condition 2 (loopback automation flag): **DECLINED — not needed.**
    Scripted tests already drive transfers through the default-deny bypass
    hook; no new production flag will be added.

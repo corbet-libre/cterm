@@ -56,6 +56,9 @@ pub fn run() {
 
     // Parse command-line arguments first (before GTK consumes them)
     let args = Args::parse();
+    if let Some(code) = cterm_app::transfer_cli::run_if_requested(&args) {
+        std::process::exit(code);
+    }
     if args.managed {
         let Some(executable) = EXE_PATH.get() else {
             eprintln!("cterm: managed mode could not resolve the UI executable path");
