@@ -1982,9 +1982,16 @@ impl ScreenPerformer<'_> {
                 // Empty value: dynamic where the slot stores it, reset where
                 // the Kitty spec marks dynamic not-applicable, and ignored
                 // for palette entries where the spec forbids dynamic.
+                // Transparency keys are ignored when empty: Kitty parses the
+                // empty color to nothing (`to_color('')` is `None` in
+                // `kitty/window.py`), so `transparent_background_colorN=`
+                // never stores `Dynamic` — only a bare key resets the slot.
                 Some([]) => {
                     if let Some(key) = key {
-                        if matches!(key, KittyColorKey::Palette(_)) {
+                        if matches!(
+                            key,
+                            KittyColorKey::Palette(_) | KittyColorKey::TransparentBackground(_)
+                        ) {
                             continue;
                         }
                         let setting = if key.stores_dynamic() {
@@ -4126,7 +4133,7 @@ mod tests {
             b"\x1b]21;foreground=#112233;background=rgb:44/55/66;cursor=#778899\x1b\\\
               \x1b]21;selection_background=#aabbcc;selection_foreground=#ddeeff\x1b\\\
               \x1b]21;cursor_text=#123456;visual_bell=rgbi:1.0/0.0/0.0\x1b\\\
-              \x1b]21;transparent_background_color1=#010203;transparent_background_color7=#040506\x1b\\\
+              \x1b]21;transparent_background_color1=#010203;transparent_background_color8=#040506\x1b\\\
               \x1b]21;5=#654321;nonsense=value\x1b\\",
         );
 
@@ -4163,7 +4170,7 @@ mod tests {
             Setting::Color(Rgb::new(0x01, 0x02, 0x03))
         );
         assert_eq!(
-            screen.kitty_setting(Key::TransparentBackground(7)),
+            screen.kitty_setting(Key::TransparentBackground(8)),
             Setting::Color(Rgb::new(0x04, 0x05, 0x06))
         );
         // Numeric keys alias the OSC 4 palette.
@@ -4218,6 +4225,35 @@ mod tests {
     }
 
     #[test]
+    fn test_osc21_transparent_empty_value_ignored_bare_key_resets() {
+        use crate::screen::{KittyColorKey as Key, KittyColorSetting as Setting};
+
+        let mut screen = make_screen();
+        let mut parser = Parser::new();
+
+        // Kitty parses the empty color to nothing (`to_color('')` is `None`),
+        // so `transparent_background_colorN=` is a no-op — unlike the
+        // selection/cursor-text slots, it never stores `Dynamic`.
+        parser.parse(
+            &mut screen,
+            b"\x1b]21;transparent_background_color5=#0a0b0c\x1b\\\
+              \x1b]21;transparent_background_color5=\x1b\\",
+        );
+        assert_eq!(
+            screen.kitty_setting(Key::TransparentBackground(5)),
+            Setting::Color(Rgb::new(0x0a, 0x0b, 0x0c))
+        );
+        assert!(screen.take_kitty_queries().is_empty());
+
+        // A bare key (no `=`) resets the slot, like Kitty.
+        parser.parse(&mut screen, b"\x1b]21;transparent_background_color5\x1b\\");
+        assert_eq!(
+            screen.kitty_setting(Key::TransparentBackground(5)),
+            Setting::Default
+        );
+    }
+
+    #[test]
     fn test_osc21_rejects_malformed_input() {
         use crate::screen::{KittyColorKey as Key, KittyColorSetting as Setting};
 
@@ -4228,7 +4264,7 @@ mod tests {
             &mut screen,
             b"\x1b]21;foreground=green;cursor_text=not-a-color;5=256;\
               \x1b]21;transparent_background_color0=#ffffff;\
-              transparent_background_color8=#ffffff;FOREGROUND=#ffffff\x1b\\",
+              transparent_background_color9=#ffffff;FOREGROUND=#ffffff\x1b\\",
         );
         // Named colors now resolve through the vendored Kitty/X11 table, so
         // `foreground=green` applies; bogus specs, bad slots, and
@@ -4239,6 +4275,10 @@ mod tests {
         );
         assert_eq!(screen.kitty_setting(Key::CursorText), Setting::Default);
         assert_eq!(screen.kitty_setting(Key::Palette(5)), Setting::Default);
+        assert_eq!(
+            screen.kitty_setting(Key::TransparentBackground(8)),
+            Setting::Default
+        );
         assert!(screen.take_kitty_queries().is_empty());
 
         // Empty, overlong, and non-UTF8 keys are skipped outright.

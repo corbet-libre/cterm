@@ -455,7 +455,7 @@ pub const MAX_OSC21_FIELDS: usize = 128;
 
 /// Maximum accepted Kitty OSC 21 key length, in bytes.
 ///
-/// The longest legitimate key (`transparent_background_color7`) is well under
+/// The longest legitimate key (`transparent_background_color8`) is well under
 /// this; anything longer cannot name a known color and is skipped outright so
 /// huge keys cannot amplify into huge `unknown=` replies.
 pub const MAX_OSC21_KEY_LEN: usize = 64;
@@ -484,8 +484,8 @@ impl KittyColorKey {
     ///
     /// Matching is case-sensitive with no whitespace trimming: anything else
     /// is an unknown key, never a near-miss. Transparency slots are the
-    /// single digits `1`-`7`; numeric palette keys are one to three ASCII
-    /// digits in `0`-`255`.
+    /// single digits `1`-`8` (matching Kitty, which accepts indices 1-8);
+    /// numeric palette keys are one to three ASCII digits in `0`-`255`.
     pub fn from_key_name(name: &str) -> Option<Self> {
         match name {
             "foreground" => Some(Self::Foreground),
@@ -505,6 +505,7 @@ impl KittyColorKey {
                         "5" => Some(Self::TransparentBackground(5)),
                         "6" => Some(Self::TransparentBackground(6)),
                         "7" => Some(Self::TransparentBackground(7)),
+                        "8" => Some(Self::TransparentBackground(8)),
                         _ => None,
                     };
                 }
@@ -593,7 +594,7 @@ pub struct KittyColorSnapshot {
     pub selection_foreground: KittyColorSetting,
     pub cursor_text: KittyColorSetting,
     pub visual_bell: KittyColorSetting,
-    pub transparent_background: [KittyColorSetting; 7],
+    pub transparent_background: [KittyColorSetting; 8],
 }
 
 /// Native urgency requested by Kitty OSC 99.
@@ -1008,8 +1009,8 @@ pub struct Screen {
     kitty_selection_foreground: KittyColorSetting,
     kitty_cursor_text: KittyColorSetting,
     kitty_visual_bell: KittyColorSetting,
-    /// Dedicated Kitty OSC 21 transparency slots 1-7 (index 0 holds key 1).
-    kitty_transparent_background: [KittyColorSetting; 7],
+    /// Dedicated Kitty OSC 21 transparency slots 1-8 (index 0 holds key 1).
+    kitty_transparent_background: [KittyColorSetting; 8],
     /// Ordered Kitty OSC 21 query replies awaiting daemon PTY responses.
     pending_kitty_queries: Vec<Vec<KittyQueryField>>,
     /// xterm color-palette stack. The index is one-based, matching the wire
@@ -1063,7 +1064,7 @@ struct DynamicColorState {
     selection_foreground: KittyColorSetting,
     cursor_text: KittyColorSetting,
     visual_bell: KittyColorSetting,
-    transparent_background: [KittyColorSetting; 7],
+    transparent_background: [KittyColorSetting; 8],
 }
 
 /// Reflowed physical rows plus a mapping from old cell coordinates to their
@@ -1380,7 +1381,7 @@ impl Screen {
             kitty_selection_foreground: KittyColorSetting::Default,
             kitty_cursor_text: KittyColorSetting::Default,
             kitty_visual_bell: KittyColorSetting::Default,
-            kitty_transparent_background: [KittyColorSetting::Default; 7],
+            kitty_transparent_background: [KittyColorSetting::Default; 8],
             pending_kitty_queries: Vec::new(),
             color_stack: Vec::new(),
             color_stack_index: 0,
@@ -2354,7 +2355,7 @@ impl Screen {
 
     /// Index into the transparency array for a `TransparentBackground` slot.
     fn transparent_slot_index(slot: u8) -> Option<usize> {
-        (1..=7).contains(&slot).then(|| usize::from(slot - 1))
+        (1..=8).contains(&slot).then(|| usize::from(slot - 1))
     }
 
     /// Snapshot the application setting for one Kitty OSC 21 slot.
@@ -5313,6 +5314,10 @@ mod tests {
             Key::from_key_name("transparent_background_color7"),
             Some(Key::TransparentBackground(7))
         );
+        assert_eq!(
+            Key::from_key_name("transparent_background_color8"),
+            Some(Key::TransparentBackground(8))
+        );
         assert_eq!(Key::from_key_name("0"), Some(Key::Palette(0)));
         assert_eq!(Key::from_key_name("255"), Some(Key::Palette(255)));
         assert_eq!(Key::from_key_name("007"), Some(Key::Palette(7)));
@@ -5334,7 +5339,7 @@ mod tests {
             "foreground ",
             "selection_background ",
             "transparent_background_color0",
-            "transparent_background_color8",
+            "transparent_background_color9",
             "transparent_background_color10",
             "transparent_background_color",
             "transparent_background_color1 ",
@@ -5398,9 +5403,15 @@ mod tests {
             screen.kitty_setting(Key::TransparentBackground(1)),
             Setting::Default
         );
+        // Slot 8 is valid (Kitty accepts indices 1-8); 0 and 9 stay ignored.
+        screen.set_kitty_setting(Key::TransparentBackground(8), Setting::Color(color));
+        assert_eq!(
+            screen.kitty_setting(Key::TransparentBackground(8)),
+            Setting::Color(color)
+        );
         // Out-of-range transparency slots are ignored, never panic.
         screen.set_kitty_setting(Key::TransparentBackground(0), Setting::Color(color));
-        screen.set_kitty_setting(Key::TransparentBackground(8), Setting::Color(color));
+        screen.set_kitty_setting(Key::TransparentBackground(9), Setting::Color(color));
         let expected = [
             Setting::Default,
             Setting::Default,
@@ -5408,6 +5419,7 @@ mod tests {
             Setting::Default,
             Setting::Default,
             Setting::Default,
+            Setting::Color(color),
             Setting::Color(color),
         ];
         assert_eq!(

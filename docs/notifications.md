@@ -33,7 +33,7 @@ c=1
 | `p=alive` polling | Yes (daemon optimistic set) | Yes | Yes |
 | Icons (`n=`/`p=icon`/`g=`) | Names via theme, bytes via BytesIcon | Degraded: app icon (attachment file-URL hop open)¹ | Degraded: app icon¹ |
 | Sounds (`s=`) | Degraded: no GNotification sound control | `silent` suppresses, rest default | `silent` → NOSOUND, rest default |
-| Expiry (`w=`) | Terminal-enforced withdraw + close report; `w=0` never schedules a timer (persists until replaced/closed/evicted/app-exit, OS may still retire) | Enforced, pre-existing thread + close report¹ | Enforced, pre-existing thread + close report¹ (the 12 s default timer also covers `w=0` — known gap, see below) |
+| Expiry (`w=`) | Terminal-enforced withdraw + close report; `w=0` never schedules a timer (persists until replaced/closed/evicted/app-exit, OS may still retire) | Enforced, pre-existing thread + close report¹ | Enforced, pre-existing thread + close report¹; `w=0` schedules no timer (foreign-checked only, needs a Windows host to verify) |
 | Filtering (`o=`) | Focus/visibility checked | `invisible` ≈ `unfocused` (no tab-visibility hook)¹ | Focus/visibility checked¹ |
 | Filter identity (`f=`/`t=`) | Parsed + user allow/deny lists (`[notifications]`, default allow-all) | Parsed, user filtering still open | Parsed, user filtering still open |
 
@@ -74,10 +74,8 @@ by the 64-ID oldest-first cap, or the frontend process exits. A daemon
 reconnect does not clear the daemon-side `p=alive` entry (sessions
 survive UI restarts), but the frontend registry is process-local: after a
 UI restart the banner is gone locally with no replay while the daemon
-still lists the ID until the app closes it.
-
-Known gap: Win32 applies its 12 s default timer also to `w=0` (needs a
-Windows host to verify a fix); GTK/Cocoa schedule no timer for `w=0`.
+still lists the ID until the app closes it. Win32 now also skips the
+timer for `w=0` (foreign-checked only; needs a Windows host to verify).
 
 ## User filtering (`[notifications]`)
 

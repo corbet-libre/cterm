@@ -66,6 +66,15 @@ fn mark_owned_session(session_id: &str) {
     }
 }
 
+/// Forget a destroyed session id so the owned set tracks live sessions
+/// only instead of growing for the life of the process. Forgetting an
+/// id this process never owned is a no-op.
+fn forget_owned_session(session_id: &str) {
+    if let Ok(mut set) = owned_sessions().lock() {
+        set.remove(session_id);
+    }
+}
+
 /// Whether this process created or attached the given session id itself.
 fn is_owned_session(session_id: &str) -> bool {
     owned_sessions()
@@ -4813,6 +4822,7 @@ fn spawn_daemon_event_listener(
                 );
             }
             DaemonUiEvent::Destroyed(session_id) => {
+                forget_owned_session(&session_id);
                 let tab_id = tabs
                     .borrow()
                     .iter()
@@ -5692,6 +5702,26 @@ fn calculate_initial_cell_dimensions(config: &Config) -> CellDimensions {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn owned_session_set_tracks_live_sessions_only() {
+        // Unique ids: the owned set is process-global and shared with every
+        // other test in this binary.
+        let owned = "gtk-owned-set-test-live";
+        let never_owned = "gtk-owned-set-test-absent";
+        forget_owned_session(owned);
+        forget_owned_session(never_owned);
+
+        assert!(!is_owned_session(owned));
+        mark_owned_session(owned);
+        assert!(is_owned_session(owned));
+        // Destroyed sessions are forgotten so the set cannot grow for the
+        // life of the process; forgetting an unknown id is a no-op.
+        forget_owned_session(owned);
+        assert!(!is_owned_session(owned));
+        forget_owned_session(never_owned);
+        assert!(!is_owned_session(never_owned));
+    }
 
     #[test]
     fn local_split_inherits_shell_arguments_and_cwd() {

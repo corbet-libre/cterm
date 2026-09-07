@@ -10,6 +10,17 @@ is omitted for readability.
 ## [Unreleased]
 
 ### Added
+- Daemon event-bus integration evidence: `StreamDaemonEvents` lifecycle
+  (created/destroyed) and metadata-change broadcasts now covered end to
+  end over real gRPC (`cterm-headless` integration tests, incl. the
+  zero-mask silent update); owned-session dedup sets prune on destroy so
+  they track live sessions only (GTK unit-tested, Cocoa foreign-checked).
+- Win32 `w=0` never-expire: no terminal timer is scheduled anymore, so the
+  balloon persists until replaced/closed/evicted/exit like GTK/Cocoa
+  (foreign-checked only; needs a Windows host to verify).
+- Kitty transparency key parity: `transparent_background_color8` accepted
+  (Kitty takes indices 1-8) and empty `=` values ignored instead of
+  storing `Dynamic`, matching `kitty/window.py`.
 - Notification `filter_rules`: Kitty `filter_notification` deny rules
   (`field:regexp` over title/body/app/type with and/or/not/parens/quotes
   and `all`, unanchored Rust-regexp search, invalid rules logged and
