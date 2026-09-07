@@ -151,6 +151,15 @@ pub(crate) fn mark_owned_session(session_id: &str) {
     }
 }
 
+/// Forget a destroyed session id so the owned set tracks live sessions
+/// only instead of growing for the life of the process. Forgetting an
+/// id this process never owned is a no-op.
+fn forget_owned_session(session_id: &str) {
+    if let Ok(mut set) = owned_sessions().lock() {
+        set.remove(session_id);
+    }
+}
+
 /// Whether this process created or attached the given session id itself.
 fn is_owned_session(session_id: &str) -> bool {
     owned_sessions()
@@ -1544,6 +1553,7 @@ impl AppDelegate {
     /// close when it would shut the last window (and thus quit the app) so that
     /// another client destroying a shared session can't quit us unexpectedly.
     fn remove_mirrored_tab(&self, session_id: &str) {
+        forget_owned_session(session_id);
         let Some(window) = self.find_window_for_session(session_id) else {
             return;
         };

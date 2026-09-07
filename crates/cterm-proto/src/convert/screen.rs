@@ -819,7 +819,7 @@ pub fn apply_screen_snapshot(terminal: &mut Terminal, screen_data: &proto::GetSc
             kitty.cursor_text = kitty_setting_from_proto(colors.cursor_text.as_ref());
             kitty.visual_bell = kitty_setting_from_proto(colors.visual_bell.as_ref());
             for entry in &colors.transparent_background {
-                if !(1..=7).contains(&entry.index) {
+                if !(1..=8).contains(&entry.index) {
                     continue;
                 }
                 if let Some(slot) = kitty

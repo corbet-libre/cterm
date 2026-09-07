@@ -223,6 +223,12 @@ fn show(hwnd: HWND, notification: &cterm_core::DesktopNotification, report: Repo
     let report_sink = report.clone();
     let protocol_id = notification.id.clone();
     let report_close = notification.report_close;
+    // `w=0` never expires: schedule no terminal timer, so the balloon
+    // persists until replaced, closed, evicted, or frontend exit — matching
+    // GTK/Cocoa (`never_expires`). All other cases keep the timer above.
+    if cterm_core::notifications::never_expires(notification.expire_time) {
+        return;
+    }
     std::thread::spawn(move || {
         std::thread::sleep(Duration::from_millis(timeout as u64));
         if remove_if_current(native_id, generation) {
