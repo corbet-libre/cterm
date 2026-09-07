@@ -4,8 +4,10 @@ on:
   push:
     branches: [master, main]
     tags: ['v*']
+    paths-ignore: ['docs/**', '*.md', 'LICENSES/**']
   pull_request:
     branches: [master, main]
+    paths-ignore: ['docs/**', '*.md', 'LICENSES/**']
   workflow_dispatch:
 
 env:
@@ -204,6 +206,8 @@ jobs:
 
   test-freebsd:
     name: Build and test (FreeBSD 14.4)
+    # Heavy job: main/tag pushes and dispatch always run it; PRs only with the `full-ci` label.
+    if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'full-ci')
     runs-on: ubuntu-24.04
     timeout-minutes: 35
     needs: format
@@ -247,6 +251,8 @@ jobs:
 
   test-freebsd-ui:
     name: UI smoke (FreeBSD 14.4, Wayland)
+    # Heavy job: main/tag pushes and dispatch always run it; PRs only with the `full-ci` label.
+    if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'full-ci')
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     needs: test-freebsd
@@ -390,6 +396,8 @@ jobs:
 
   compatibility-linux:
     name: Compatibility (foot + real TUIs)
+    # Heavy job: main/tag pushes and dispatch always run it; PRs only with the `full-ci` label.
+    if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'full-ci')
     runs-on: ubuntu-22.04
     container: archlinux:base-devel
     timeout-minutes: 15
@@ -524,6 +532,8 @@ jobs:
 
   build-linux:
     name: Build Linux (Ubuntu 22.04)
+    # Heavy job: main/tag pushes and dispatch always run it; PRs only with the `full-ci` label.
+    if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'full-ci')
     runs-on: ubuntu-22.04
     needs: [test-linux, compatibility-linux]
     steps:
@@ -626,6 +636,8 @@ jobs:
 
   build-linux-arm64:
     name: Build Linux (ARM64)
+    # Heavy job: main/tag pushes and dispatch always run it; PRs only with the `full-ci` label.
+    if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'full-ci')
     runs-on: ubuntu-22.04-arm
     needs: [test-linux, compatibility-linux]
     steps:
@@ -774,6 +786,8 @@ jobs:
 
   build-windows:
     name: Build Windows
+    # Heavy job: main/tag pushes and dispatch always run it; PRs only with the `full-ci` label.
+    if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'full-ci')
     runs-on: windows-latest
     needs: test-windows
     steps:
@@ -933,6 +947,8 @@ jobs:
 
   build-macos-intel:
     name: Build macOS (Intel)
+    # Heavy job: main/tag pushes and dispatch always run it; PRs only with the `full-ci` label.
+    if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'full-ci')
     runs-on: macos-15-intel
     needs: test-macos
     steps:
@@ -977,6 +993,8 @@ jobs:
 
   build-macos-arm:
     name: Build macOS (Apple Silicon)
+    # Heavy job: main/tag pushes and dispatch always run it; PRs only with the `full-ci` label.
+    if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'full-ci')
     runs-on: macos-latest
     needs: build-macos-intel
     steps:

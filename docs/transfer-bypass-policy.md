@@ -1,8 +1,8 @@
-# Transfer consent-bypass policy (PROPOSAL — policy undecided, mechanism implemented)
+# Transfer consent-bypass policy (DECIDED 2026-09-07 — mechanism implemented, defaults unchanged)
 
-Status: **draft for Julian's decision. The consent *mechanism* is implemented
-with defaults unchanged (still always prompts out of the box); no bypass
-*policy* is decided — the 5 open questions below are all still open.**
+Status: **decided by Julian 2026-09-07, following agent recommendations.**
+The consent *mechanism* is implemented with defaults unchanged (still always
+prompts out of the box); the policy below is now the authorized design.
 `TtyTransferBypassKind` (`crates/cterm-app/src/kitty_file_transfer.rs`) and
 the legacy `evaluate_transfer_bypass` still resolve every request to
 `BypassDecision::Prompt`, and the regression tests
@@ -148,16 +148,20 @@ logged; a bypass adds rows, never removes them:
 - Deny-by-default violations (a bypass authorizing outside its exact scope)
   must be a hard error with staging discarded, mirroring `reject_session`.
 
-## Open questions for Julian
+## Open questions for Julian — DECIDED 2026-09-07
 
-1. Is condition 1 (same-TTY `--allow-once`) acceptable at all, or should
-   every transfer always show a dialog, no exceptions?
-2. Is condition 2 (loopback automation flag) needed for scripted
-   test/tooling flows, and if so, who may set the flag (UI process only?
-   config file?).
-3. Should pre-authorizations be visible/auditable in the UI (e.g. a session
-   badge), and should loopback use require a config opt-in defaulting off?
-4. Retention: how long may pre-authorizations live (single next request only
-   vs. time-boxed), and must they be listed/revocable?
-5. Does the shared-secret (`pw`) style bypass need any interop story for
-   Kitty-native tooling, or is "always prompt" the permanent answer?
+1. Condition 1 (same-TTY `--allow-once`): **APPROVED.** An explicit opt-in
+   command in the same terminal session may mint a single-use, short-lived
+   pre-authorization for the exact `(daemon session, transfer id)` pair.
+   (Implementation of the CLI + daemon pre-auth store is queued work; the
+   design constraint — exact match, nothing else skips — is fixed.)
+2. Condition 2 (loopback automation flag): **DECLINED — not needed.**
+   Scripted tests already drive transfers through the default-deny bypass
+   hook; no new production flag will be added.
+3. Visibility + loopback opt-in: **APPROVED as specified.** Pre-auths get a
+   session badge and audit rows; had loopback existed it would have required
+   a default-off config opt-in (moot after Q2).
+4. Retention: **single next matching request only**, listed and revocable.
+   No time-boxing.
+5. Shared-secret (`pw`) bypass: **no interop story — always-prompt is the
+   permanent answer.** The verification primitive stays inert mechanism.
