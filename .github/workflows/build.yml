@@ -96,6 +96,8 @@ jobs:
 
   lint-macos:
     name: Clippy (macOS)
+    # Hosted native checks are reserved for the selected events.
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event_name == 'release' || startsWith(github.ref, 'refs/tags/') }}
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v7
@@ -116,6 +118,8 @@ jobs:
 
   lint-windows:
     name: Clippy (Windows)
+    # Hosted native checks are reserved for the selected events.
+    if: ${{ (github.event_name == 'workflow_dispatch' || github.event_name == 'release' || startsWith(github.ref, 'refs/tags/')) || (github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master')) }}
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v7
@@ -206,7 +210,7 @@ jobs:
 
   test-freebsd:
     name: Build and test (FreeBSD 14.4)
-    # Heavy job: main/tag pushes and dispatch always run it; PRs only with the `full-ci` label.
+    # Native release artifacts are built only on tag/release/manual events.
     if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'full-ci')
     runs-on: ubuntu-24.04
     timeout-minutes: 35
@@ -251,7 +255,7 @@ jobs:
 
   test-freebsd-ui:
     name: UI smoke (FreeBSD 14.4, Wayland)
-    # Heavy job: main/tag pushes and dispatch always run it; PRs only with the `full-ci` label.
+    # Native release artifacts are built only on tag/release/manual events.
     if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'full-ci')
     runs-on: ubuntu-24.04
     timeout-minutes: 15
@@ -396,7 +400,7 @@ jobs:
 
   compatibility-linux:
     name: Compatibility (foot + real TUIs)
-    # Heavy job: main/tag pushes and dispatch always run it; PRs only with the `full-ci` label.
+    # Native release artifacts are built only on tag/release/manual events.
     if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'full-ci')
     runs-on: ubuntu-22.04
     container: archlinux:base-devel
@@ -489,6 +493,8 @@ jobs:
 
   test-macos:
     name: Test (macOS)
+    # Hosted native checks are reserved for the selected events.
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event_name == 'release' || startsWith(github.ref, 'refs/tags/') }}
     runs-on: macos-latest
     needs: [format, lint-macos]
     steps:
@@ -532,7 +538,7 @@ jobs:
 
   build-linux:
     name: Build Linux (Ubuntu 22.04)
-    # Heavy job: main/tag pushes and dispatch always run it; PRs only with the `full-ci` label.
+    # Native release artifacts are built only on tag/release/manual events.
     if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'full-ci')
     runs-on: ubuntu-22.04
     needs: [test-linux, compatibility-linux]
@@ -636,7 +642,7 @@ jobs:
 
   build-linux-arm64:
     name: Build Linux (ARM64)
-    # Heavy job: main/tag pushes and dispatch always run it; PRs only with the `full-ci` label.
+    # Native release artifacts are built only on tag/release/manual events.
     if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'full-ci')
     runs-on: ubuntu-22.04-arm
     needs: [test-linux, compatibility-linux]
@@ -740,6 +746,8 @@ jobs:
 
   test-windows:
     name: Test (Windows)
+    # Hosted native checks are reserved for the selected events.
+    if: ${{ (github.event_name == 'workflow_dispatch' || github.event_name == 'release' || startsWith(github.ref, 'refs/tags/')) || (github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master')) }}
     runs-on: windows-latest
     needs: [format, lint-windows]
     steps:
@@ -786,10 +794,9 @@ jobs:
 
   build-windows:
     name: Build Windows
-    # Heavy job: main/tag pushes and dispatch always run it; PRs only with the `full-ci` label.
-    if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'full-ci')
-    runs-on: windows-latest
-    needs: test-windows
+    # Native release artifacts are built only on tag/release/manual events.
+    if: >-
+      ${{ github.event_name == 'workflow_dispatch' || github.event_name == 'release' || startsWith(github.ref, 'refs/tags/') }}
     steps:
       - uses: actions/checkout@v7
 
@@ -947,9 +954,9 @@ jobs:
 
   build-macos-intel:
     name: Build macOS (Intel)
-    # Heavy job: main/tag pushes and dispatch always run it; PRs only with the `full-ci` label.
-    if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'full-ci')
-    runs-on: macos-15-intel
+    # Native release artifacts are built only on tag/release/manual events.
+    if: >-
+      ${{ github.event_name == 'workflow_dispatch' || github.event_name == 'release' || startsWith(github.ref, 'refs/tags/') }}
     needs: test-macos
     steps:
       - uses: actions/checkout@v7
@@ -993,9 +1000,9 @@ jobs:
 
   build-macos-arm:
     name: Build macOS (Apple Silicon)
-    # Heavy job: main/tag pushes and dispatch always run it; PRs only with the `full-ci` label.
-    if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'full-ci')
-    runs-on: macos-latest
+    # Native release artifacts are built only on tag/release/manual events.
+    if: >-
+      ${{ github.event_name == 'workflow_dispatch' || github.event_name == 'release' || startsWith(github.ref, 'refs/tags/') }}
     needs: build-macos-intel
     steps:
       - uses: actions/checkout@v7
