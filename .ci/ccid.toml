@@ -1,0 +1,15 @@
+schema = 1
+project = "cterm"
+
+# Linux requires existing GTK/Wayland/protobuf/native tools. macOS/Windows/FreeBSD and UI runtime/compatibility gates remain separate; canonical dirty WIP is not included.
+
+[checks.linux]
+kind = "cargo"
+actions = ["fmt", "test", "clippy"]
+workspace = true
+exclude = ["cterm-cocoa", "cterm-win32"]
+all_targets = true
+
+[checks.fmt]
+kind = "cargo"
+actions = ["fmt"]
