@@ -1,0 +1,12 @@
+schema = 1
+project = "cterm"
+
+# Linux requires existing GTK/Wayland/protobuf/native tools. macOS/Windows/FreeBSD and UI runtime/compatibility gates remain separate; canonical dirty WIP is not included.
+
+[checks.linux]
+kind = "commands"
+commands = [["bash", ".ci/linux.sh"]]
+
+[checks.fmt]
+kind = "cargo"
+actions = ["fmt"]
