@@ -169,7 +169,7 @@ jobs:
         run: cargo build -p cterm-headless
 
       - name: Run ctermd integration tests
-        run: cargo test -p cterm-headless --test grpc_integration -- --test-threads=1
+        run: cargo test -p cterm-headless --test grpc_integration --test daemon_sync_recovery -- --test-threads=1
 
       - name: Build cterm for UI tests
         run: cargo build -p cterm -p cterm-plugin-host
@@ -232,7 +232,7 @@ jobs:
           run: |
             cargo build --locked -p cterm -p cterm-headless -p cterm-plugin-host
             cargo test --locked --workspace --exclude cterm-cocoa --exclude cterm-win32 --lib
-            cargo test --locked -p cterm-headless --test grpc_integration -- --test-threads=1
+            cargo test --locked -p cterm-headless --test grpc_integration --test daemon_sync_recovery -- --test-threads=1
 
             mkdir -p freebsd-ui-binaries
             install -m 0755 \
@@ -413,10 +413,12 @@ jobs:
             foot \
             git \
             gtk4 \
+            less \
             libadwaita \
             neovim \
             protobuf \
             tmux \
+            vim \
             weston \
             xorg-server-xvfb
 
@@ -510,7 +512,7 @@ jobs:
         run: cargo build -p cterm-headless
 
       - name: Run ctermd integration tests
-        run: cargo test -p cterm-headless --test grpc_integration -- --test-threads=1
+        run: cargo test -p cterm-headless --test grpc_integration --test daemon_sync_recovery -- --test-threads=1
 
       - name: Build cterm for UI tests
         run: cargo build -p cterm -p cterm-plugin-host

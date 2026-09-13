@@ -322,6 +322,14 @@ is omitted for readability.
   unique and private, and failed receptions remove their temporary storage.
 - Windows file-transfer hardlinks are created from retained source and
   destination handles, preserving private staging and ancestor-rename safety.
+- Kitty OSC 72 drag-source locality is decided from the machine id cached at
+  session construction instead of re-reading `/etc/machine-id` on every
+  check, so aborts and resets cannot flip a peer between same-machine and
+  remote mid-drag; unknown local ids stay fail-closed behind exact-token
+  approval, and the unit tests pin both localities with fixed hashes instead
+  of depending on the host's `/etc/machine-id`.
+- `cterm-headless` transfer-policy test imports are gated to Unix so the
+  crate's unit tests also compile on Windows targets.
 
 ### Security
 - Plugin package files are size-checked before allocation, read through a

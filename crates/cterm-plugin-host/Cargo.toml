@@ -20,4 +20,4 @@ wasmi_wasi = { version = "=1.1.0", default-features = false }
 [dev-dependencies]
 base64.workspace = true
 tempfile = "3"
-wat = "=1.239.0"
+wat = "1.239.0"

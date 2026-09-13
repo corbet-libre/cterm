@@ -448,6 +448,7 @@ struct IngressBuffer {
 #[derive(Debug)]
 pub struct DndSource {
     policy: DndSourcePolicy,
+    local_machine_id: Option<String>,
     phase: SourcePhase,
     client_id: u32,
     /// Peer machine id as sent with `t=o:x=1` (unhashed wire value).
@@ -482,8 +483,13 @@ impl Default for DndSource {
 
 impl DndSource {
     pub fn with_policy(policy: DndSourcePolicy) -> Self {
+        Self::with_machine_id(policy, local_machine_id())
+    }
+
+    fn with_machine_id(policy: DndSourcePolicy, local_machine_id: Option<String>) -> Self {
         Self {
             policy,
+            local_machine_id,
             phase: SourcePhase::Idle,
             client_id: 0,
             peer_machine_id: None,
@@ -812,10 +818,7 @@ impl DndSource {
         let Some(peer) = self.peer_machine_id.as_deref() else {
             return false;
         };
-        let Some(local) = local_machine_id() else {
-            return false;
-        };
-        !is_remote_peer(Some(&local), peer)
+        !is_remote_peer(self.local_machine_id.as_deref(), peer)
     }
 
     /// The OS drag finished (`t=e:x=4:y`, terminal: `y=1` canceled, `y=0`
@@ -1336,8 +1339,7 @@ impl DndSource {
     fn abort_to_armed(&mut self) {
         let client_id = self.client_id;
         let peer_machine_id = self.peer_machine_id.clone();
-        let policy = self.policy;
-        *self = Self::with_policy(policy);
+        self.reset();
         // A finished or failed drag keeps the registration: the application
         // stays willing until it sends an explicit `t=o:x=2`. Abort paths
         // only run from armed phases, so Armed is always correct here.
@@ -1370,7 +1372,8 @@ impl DndSource {
 
     fn reset(&mut self) {
         let policy = self.policy;
-        *self = Self::with_policy(policy);
+        let local_machine_id = self.local_machine_id.take();
+        *self = Self::with_machine_id(policy, local_machine_id);
     }
 }
 
@@ -2176,8 +2179,9 @@ mod tests {
 
     #[test]
     fn same_machine_remote_reads_need_no_prompt() {
-        let local = local_machine_id().expect("test host provides /etc/machine-id");
-        let mut source = DndSource::default();
+        let local = hash_machine_id("local-machine-for-test");
+        let mut source =
+            DndSource::with_machine_id(DndSourcePolicy::default(), Some(local.clone()));
         arm_with_peer(&mut source, Some(&local));
         gesture(&mut source);
         offer(&mut source, 1, "text/uri-list");
@@ -2197,14 +2201,19 @@ mod tests {
             "same-machine t=k must not prompt, got {actions:?}"
         );
         assert!(source.approvals.is_empty());
+        source.os_finished(false);
+        assert!(!source.remote_read_needs_approval());
+        source.reset();
+        arm_with_peer(&mut source, Some(&local));
+        assert!(!source.remote_read_needs_approval());
     }
 
     #[test]
     fn different_machine_remote_reads_need_approval() {
-        let local = local_machine_id().expect("test host provides /etc/machine-id");
+        let local = hash_machine_id("local-machine-for-test");
         let remote = hash_machine_id("different-machine-for-test");
         assert_ne!(local, remote);
-        let mut source = DndSource::default();
+        let mut source = DndSource::with_machine_id(DndSourcePolicy::default(), Some(local));
         arm_with_peer(&mut source, Some(&remote));
         gesture(&mut source);
         offer(&mut source, 1, "text/uri-list");
@@ -2463,10 +2472,15 @@ mod tests {
         source.set_allow_remote_reads(true);
         assert!(!source.remote_read_needs_approval());
         // Same-machine peers never need it.
-        let local = local_machine_id().expect("test host provides /etc/machine-id");
-        let mut source = DndSource::default();
+        let local = hash_machine_id("local-machine-for-test");
+        let mut source =
+            DndSource::with_machine_id(DndSourcePolicy::default(), Some(local.clone()));
         arm_with_peer(&mut source, Some(&local));
         assert!(!source.remote_read_needs_approval());
+        // A known peer cannot bypass approval when the local id is unavailable.
+        let mut source = DndSource::with_machine_id(DndSourcePolicy::default(), None);
+        arm_with_peer(&mut source, Some(&local));
+        assert!(source.remote_read_needs_approval());
     }
 
     #[test]

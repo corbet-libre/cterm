@@ -1,14 +1,9 @@
 #![cfg(unix)]
 //! Real-program TUI fixtures through the cterm PTY layer.
 //!
-//! Host availability (checked 2026-09-06, also gated per-test at runtime):
-//! - nvim, vim, tmux, less, man, fzf, lazygit: present (vim/less added here;
-//!   man exercises less as its pager; fzf/lazygit are present but too
-//!   interactive/flaky for deterministic fixtures, so they stay documented
-//!   rather than asserted).
-//! - screen, emacs-nox, htop: absent here — skipped by design. CI installs
-//!   only foot/neovim/tmux for the hard gate, so vim/less run wherever the
-//!   binaries exist and skip otherwise via `require_program`.
+//! The Linux compatibility job installs Neovim, Vim, tmux, and less and
+//! runs these ignored tests explicitly. Missing programs fail the gate;
+//! ordinary unit-test runs do not require these external applications.
 
 use cterm_core::screen::ScreenConfig;
 use cterm_core::{PtyConfig, Terminal};

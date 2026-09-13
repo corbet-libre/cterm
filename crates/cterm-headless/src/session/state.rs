@@ -14,7 +14,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use tokio::sync::broadcast;
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 use super::transfer_policy::DaemonTransferContext;
 use super::transfer_policy::SharedTransferContext;
 use super::tty_transfer::TtyTransferController;
@@ -1077,6 +1077,7 @@ impl SessionState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
     use std::sync::Mutex;
 
     /// Drive one session-start command through a session whose worker evaluates
@@ -1131,6 +1132,7 @@ mod tests {
         .expect("timed out waiting for daemon transfer responses")
     }
 
+    #[cfg(unix)]
     fn send_start(id: &str, bypass: Option<String>) -> FileTransferCommand {
         FileTransferCommand {
             action: FileTransferAction::Send,
