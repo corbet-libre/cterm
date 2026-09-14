@@ -694,6 +694,112 @@ fn placement_cursor_advance_and_suppression_are_deterministic() {
     );
 }
 
+/// Straight-alpha OVER blend of one RGBA pixel over another, truncating
+/// integer math. Reference software composite for the
+/// renderer-independent z-order contract: `BehindCellBackground` < cell
+/// background < `BehindText` < text < `AboveText`. Cocoa, GTK, and
+/// Direct2D implement this same order; this pins the blend here so native
+/// pixel assertions have a headless reference (backends quantize
+/// identically for these fixtures; premultiplied rounding may differ by
+/// at most one step on other inputs).
+fn alpha_over(dst: [u8; 4], src: [u8; 4]) -> [u8; 4] {
+    let (dr, dg, db, da) = (
+        u32::from(dst[0]),
+        u32::from(dst[1]),
+        u32::from(dst[2]),
+        u32::from(dst[3]),
+    );
+    let (sr, sg, sb, sa) = (
+        u32::from(src[0]),
+        u32::from(src[1]),
+        u32::from(src[2]),
+        u32::from(src[3]),
+    );
+    let inv = 255 - sa;
+    let out_a = sa + da * inv / 255;
+    if out_a == 0 {
+        return [0, 0, 0, 0];
+    }
+    let blend = |s: u32, d: u32| ((s * sa + d * da * inv / 255) / out_a) as u8;
+    [blend(sr, dr), blend(sg, dg), blend(sb, db), out_a as u8]
+}
+
+#[test]
+fn kitty_layered_placements_composite_in_documented_z_order() {
+    let mut screen = make_small_screen();
+    let mut parser = Parser::new();
+    screen.cursor.col = 0;
+    screen.cursor.row = 0;
+    // Three opaque 1x1 placements stacked on the same cell, one per layer.
+    // C=1 keeps the cursor home so every placement lands on (0, 0).
+    for (id, z, rgba) in [
+        (140, -2_000_000_000, [255, 0, 0, 255]),
+        (141, -1, [0, 255, 0, 255]),
+        (142, 5, [0, 0, 255, 255]),
+    ] {
+        let control = format!("a=T,f=32,s=1,v=1,i={id},z={z},C=1");
+        parser.parse(&mut screen, &kitty_apc(&control, &rgba));
+    }
+    assert_eq!(screen.images().len(), 3);
+    for image in screen.images() {
+        assert_eq!((image.col, screen.image_visible_row(image)), (0, Some(0)));
+        assert_eq!((image.pixel_width, image.pixel_height), (1, 1));
+    }
+    let by_protocol = |id: u32| {
+        screen
+            .images()
+            .into_iter()
+            .find(|image| image.protocol_image_id == id)
+            .unwrap_or_else(|| panic!("placement {id} must be stored"))
+    };
+    assert_eq!(by_protocol(140).layer(), ImageLayer::BehindCellBackground);
+    assert_eq!(by_protocol(141).layer(), ImageLayer::BehindText);
+    assert_eq!(by_protocol(142).layer(), ImageLayer::AboveText);
+    // Reference composite in paint order: red, then green, then blue.
+    let mut pixel = [0, 0, 0, 0];
+    for layer in [
+        ImageLayer::BehindCellBackground,
+        ImageLayer::BehindText,
+        ImageLayer::AboveText,
+    ] {
+        for image in screen.visible_images_in_layer(layer) {
+            let data = image.data.as_slice();
+            pixel = alpha_over(pixel, [data[0], data[1], data[2], data[3]]);
+        }
+    }
+    assert_eq!(
+        pixel,
+        [0, 0, 255, 255],
+        "opaque blue on the top layer must win"
+    );
+}
+
+#[test]
+fn kitty_semitransparent_placement_blends_over_lower_layer() {
+    let mut screen = make_small_screen();
+    let mut parser = Parser::new();
+    screen.cursor.col = 0;
+    screen.cursor.row = 0;
+    parser.parse(
+        &mut screen,
+        &kitty_apc("a=T,f=32,s=1,v=1,i=143,z=-1,C=1", &[255, 0, 0, 255]),
+    );
+    parser.parse(
+        &mut screen,
+        &kitty_apc("a=T,f=32,s=1,v=1,i=144,z=5,C=1", &[0, 0, 255, 128]),
+    );
+    assert_eq!(screen.images().len(), 2);
+    let mut pixel = [0, 0, 0, 0];
+    for layer in [ImageLayer::BehindText, ImageLayer::AboveText] {
+        for image in screen.visible_images_in_layer(layer) {
+            let data = image.data.as_slice();
+            pixel = alpha_over(pixel, [data[0], data[1], data[2], data[3]]);
+        }
+    }
+    // 50% blue over opaque red: exact under truncating integer math.
+    assert_eq!(pixel, [127, 0, 128, 255]);
+}
+
 #[test]
 fn animation_alpha_blend_preserves_destination_where_source_is_transparent() {
     let mut screen = make_small_screen();

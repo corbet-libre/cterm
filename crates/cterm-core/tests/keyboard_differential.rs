@@ -65,7 +65,9 @@
 //! - Modifiers share one bit layout (`Modifiers`); lock-bit sources differ:
 //!   Win32 wires CapsLock + NumLock toggle state (`get_modifiers`), GTK wires
 //!   CapsLock via `LOCK_MASK`, Cocoa wires CapsLock via NSEvent flags. NumLock
-//!   (+128) currently has no GTK/Cocoa source — see OPEN Q3.
+//!   (+128) has no GTK/Cocoa source by platform limitation (see Q3): GDK4
+//!   exposes no Mod2 mask, NSEvent no toggle API — no approximate bit is
+//!   emitted instead.
 //!
 //! # Seams with no encoder traffic (pinned by contract, not bytes)
 //!
@@ -85,16 +87,27 @@
 //!   using release-time flags/modifiers; without event-types there is nothing
 //!   to drain (GTK clears its pressed map silently for the same reason).
 //!
-//! # OPEN questions (need a live-Kitty or native pass — do NOT "fix" blindly)
+//! # Remaining open questions (need a native pass — do NOT "fix" blindly)
 //!
-//! - Q1: Enter/Tab/Backspace stay legacy under event-types alone (flag 2)
-//!   while Escape/cursors/tilde/function keys are promoted. Pinned as-is;
-//!   verify against live Kitty before changing.
-//! - Q2: the encoder passes alternate fields through for functional keys, but
-//!   no frontend supplies them today. Pinned as-is; confirm no frontend ever
-//!   sends them, then decide whether the encoder should strip.
-//! - Q3: `NUM_LOCK` (+128) encodes correctly but has no GTK/Cocoa source yet
-//!   (Win32 wires it). Rows below prove the encoder half.
+//! - Q1 (verified live against Kitty 0.48.2 under Xvfb, same bytes):
+//!   Enter/Tab/Backspace stay legacy (`0d`/`09`/`7f`) under event-types
+//!   alone (flag 2) — Kitty replies `CSI ? 2 u` to the mode query, emits no
+//!   release sequences for these keys, and Escape/cursors/tilde/function
+//!   keys are promoted. Pinned behavior confirmed, not changed.
+//! - Q2 (decided: strip — constructor audit of all three frontends proves
+//!   shifted/base metadata only ever accompanies `Key::Char`; live Kitty
+//!   0.48.2 confirms the wire side too (flags=13: F5/Shift+F5/Menu report
+//!   `15~`, `57441;2u`, `15;2~`, `57363u`, none with alternate fields).
+//!   The encoder now drops alternates for functional keys instead of
+//!   passing them through).
+//! - Q3 (resolved: platform limitation, not a wiring gap — only Win32 wires
+//!   the source bit via `GetKeyState(VK_NUMLOCK)`. GTK has no source: GDK4
+//!   `ModifierType` exposes no Mod2 mask on Wayland, and local toggle
+//!   tracking would desync against the seat-global lock, so no approximate
+//!   bit is emitted. Cocoa has no public NumLock-toggle API either. The
+//!   wire format itself is confirmed live against Kitty 0.48.2 (Xvfb):
+//!   NumLock key `57360`, modifier +128, keypad digits with associated
+//!   text; the lock is a toggle, matching the level-read model).
 
 use cterm_core::screen::ScreenConfig;
 use cterm_core::term::{Key, Modifiers, NamedKey, Terminal};
@@ -397,7 +410,8 @@ fn release_events_need_event_types_even_in_all_keys_mode() {
             meta: NO_META,
             expected: Some("\x1b[1;1:3A"),
         },
-        // OPEN Q1: Enter/Tab/Backspace stay legacy under event-types alone.
+        // Q1 (live-verified, see header): Enter/Tab/Backspace stay legacy
+        // under event-types alone.
         KeyVector {
             name: "event-types enter press stays legacy",
             setup: "\x1b[=2u",
@@ -688,11 +702,11 @@ fn alternate_keys_representative_set() {
             meta: NO_META,
             expected: Some("\x1b[167;1:1u"),
         },
-        // OPEN Q2: no frontend supplies alternates for functional keys, but
-        // the encoder passes them through. Pinned until native passes confirm
-        // the seam stays empty (then the encoder should strip).
+        // Q2 (decided: strip — audit of GTK/Cocoa/Win32 proves no frontend
+        // populates shifted/base metadata for functional keys by
+        // construction, so the passthrough arm could never fire).
         KeyVector {
-            name: "functional key alternate passthrough",
+            name: "functional key alternate stripped",
             setup: "\x1b[=13u",
             key: Key::Named(NamedKey::Menu),
             mods: Modifiers::empty(),
@@ -702,7 +716,7 @@ fn alternate_keys_representative_set() {
                 base: Some('m'),
                 text: None,
             },
-            expected: Some("\x1b[57363::109;1u"),
+            expected: Some("\x1b[57363;1u"),
         },
     ];
     for row in ROWS {
@@ -715,8 +729,8 @@ fn alternate_keys_representative_set() {
 // pin the Kitty `mods+1` parameter (shift+1, alt+2, ctrl+4, super+8,
 // hyper+16, meta+32, caps-lock+64, num-lock+128). Native replay notes:
 // Command->Super and Option->Alt on Cocoa, Win->Super on Win32, the GDK masks
-// on GTK. OPEN Q3: num-lock rows prove the encoder half; only Win32 wires
-// the source bit today.
+// on GTK. Q3 resolved: num-lock rows prove the encoder half; only Win32 wires
+// the source bit (GTK/Cocoa lack an OS source — documented limitation).
 // ---------------------------------------------------------------------------
 
 #[test]

@@ -569,6 +569,11 @@ pub enum KittyColorSetting {
     Dynamic,
     /// Application-provided color. Queries report it.
     Color(Rgb),
+    /// Application-provided transparent-background color with Kitty opacity
+    /// quanta (`0..=255`, stored truncated from the `@opacity` float exactly
+    /// as Kitty quantizes it). Only `TransparentBackground` slots hold this;
+    /// queries report `rgb:rr/gg/bb@opacity`.
+    TransparentColor { color: Rgb, alpha: u8 },
 }
 
 /// One ordered field of a pending OSC 21 query reply.
@@ -2403,6 +2408,9 @@ impl Screen {
         let legacy = |slot: &mut Option<Rgb>| {
             *slot = match setting {
                 KittyColorSetting::Color(color) => Some(color),
+                // Unreachable via the parser (only transparent slots hold
+                // opacity); preserve the color if it ever arrives here.
+                KittyColorSetting::TransparentColor { color, .. } => Some(color),
                 KittyColorSetting::Default | KittyColorSetting::Dynamic => None,
             };
         };
@@ -2436,6 +2444,9 @@ impl Screen {
     pub fn kitty_explicit_color(&self, key: KittyColorKey) -> Option<Rgb> {
         match self.kitty_setting(key) {
             KittyColorSetting::Color(color) => Some(color),
+            // Opacity stays in the setting (see the OSC 21 query path);
+            // renderers composite the color and keep their own opacity.
+            KittyColorSetting::TransparentColor { color, .. } => Some(color),
             KittyColorSetting::Default | KittyColorSetting::Dynamic => None,
         }
     }
@@ -2451,6 +2462,7 @@ impl Screen {
     ) -> Option<Rgb> {
         match setting {
             KittyColorSetting::Color(color) => Some(color),
+            KittyColorSetting::TransparentColor { color, .. } => Some(color),
             KittyColorSetting::Dynamic => None,
             KittyColorSetting::Default => match key {
                 KittyColorKey::Foreground => Some(self.base_palette.foreground),

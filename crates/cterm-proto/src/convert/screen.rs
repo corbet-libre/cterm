@@ -492,6 +492,12 @@ pub fn extra_cursors_to_proto(screen: &Screen) -> proto::ExtraCursorsUpdate {
 fn kitty_setting_to_proto(setting: KittyColorSetting) -> Option<proto::Color> {
     match setting {
         KittyColorSetting::Color(color) => Some(color_to_proto(&Color::Rgb(color))),
+        // Transparent slots use the dedicated builder below (which carries
+        // the opacity quanta); this arm only preserves the color for the
+        // shared non-transparent callers, which never see this variant.
+        KittyColorSetting::TransparentColor { color, .. } => {
+            Some(color_to_proto(&Color::Rgb(color)))
+        }
         KittyColorSetting::Default | KittyColorSetting::Dynamic => None,
     }
 }
@@ -568,6 +574,7 @@ pub fn modes_to_proto(screen: &Screen) -> proto::TerminalModes {
                 .map(|(index, color)| proto::DynamicPaletteColor {
                     index: u32::from(index),
                     color: Some(color_to_proto(&Color::Rgb(color))),
+                    alpha: None,
                 })
                 .collect(),
             selection_background: kitty_setting_to_proto(
@@ -587,7 +594,15 @@ pub fn modes_to_proto(screen: &Screen) -> proto::TerminalModes {
                     KittyColorSetting::Color(color) => Some(proto::DynamicPaletteColor {
                         index: index as u32 + 1,
                         color: Some(color_to_proto(&Color::Rgb(*color))),
+                        alpha: None,
                     }),
+                    KittyColorSetting::TransparentColor { color, alpha } => {
+                        Some(proto::DynamicPaletteColor {
+                            index: index as u32 + 1,
+                            color: Some(color_to_proto(&Color::Rgb(*color))),
+                            alpha: Some(u32::from(*alpha)),
+                        })
+                    }
                     KittyColorSetting::Default | KittyColorSetting::Dynamic => None,
                 })
                 .collect(),
@@ -826,7 +841,17 @@ pub fn apply_screen_snapshot(terminal: &mut Terminal, screen_data: &proto::GetSc
                     .transparent_background
                     .get_mut(entry.index as usize - 1)
                 {
-                    *slot = kitty_setting_from_proto(entry.color.as_ref());
+                    // Transparent slots always restore as TransparentColor
+                    // (legacy snapshots without quanta upgrade to opaque);
+                    // out-of-range quanta clamp, anything else resets.
+                    // Non-RGB colors cannot carry opacity.
+                    *slot = match kitty_setting_from_proto(entry.color.as_ref()) {
+                        KittyColorSetting::Color(rgb) => KittyColorSetting::TransparentColor {
+                            color: rgb,
+                            alpha: entry.alpha.map(|alpha| alpha.min(255) as u8).unwrap_or(255),
+                        },
+                        _ => KittyColorSetting::Default,
+                    };
                 }
             }
         }
@@ -1215,7 +1240,18 @@ mod tests {
         set(
             source.screen_mut(),
             KittyColorKey::TransparentBackground(2),
-            KittyColorSetting::Color(cterm_core::Rgb::new(7, 8, 9)),
+            KittyColorSetting::TransparentColor {
+                color: cterm_core::Rgb::new(7, 8, 9),
+                alpha: 255,
+            },
+        );
+        set(
+            source.screen_mut(),
+            KittyColorKey::TransparentBackground(3),
+            KittyColorSetting::TransparentColor {
+                color: cterm_core::Rgb::new(10, 11, 12),
+                alpha: 127,
+            },
         );
         set(
             source.screen_mut(),
@@ -1236,6 +1272,17 @@ mod tests {
         assert_eq!(
             restored.screen().kitty_color_snapshot(),
             source.screen().kitty_color_snapshot()
+        );
+        // Opacity quanta survive the snapshot: slot 3 keeps alpha 127,
+        // slot 2 stays opaque.
+        assert_eq!(
+            restored
+                .screen()
+                .kitty_setting(KittyColorKey::TransparentBackground(3)),
+            KittyColorSetting::TransparentColor {
+                color: cterm_core::Rgb::new(10, 11, 12),
+                alpha: 127,
+            }
         );
         // Dynamic survives as Dynamic (empty-reporting), not as theme
         // fallback: selection_background has a theme color, so this is
@@ -1273,6 +1320,7 @@ mod tests {
                         color: Some(crate::convert::color::color_to_proto(
                             &cterm_core::Color::Rgb(cterm_core::Rgb::new(9, 9, 9)),
                         )),
+                        alpha: None,
                     });
                 colors
                     .transparent_background
@@ -1281,6 +1329,7 @@ mod tests {
                         color: Some(crate::convert::color::color_to_proto(
                             &cterm_core::Color::Rgb(cterm_core::Rgb::new(9, 9, 9)),
                         )),
+                        alpha: None,
                     });
             }
         }

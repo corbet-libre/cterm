@@ -181,6 +181,40 @@ fn editing_kitty_unscroll_refills_from_scrollback() {
     assert_eq!(screen.grid().row(0).unwrap().text().trim(), "");
 }
 
+#[test]
+fn editing_kitty_unscroll_margin_interaction_matches_live_kitty() {
+    // Recorded live transcript (Kitty 0.48.2, Xvfb, 66x139 and re-checked
+    // at this 10x8 scale): sub-region unscroll refills the region top from
+    // scrollback — blank when scrollback is empty — deletes the lines that
+    // fall off the region bottom, and leaves lines outside the region
+    // untouched.
+    let mut input = b"\x1b[3J\x1b[2J\x1b[H".to_vec();
+    for line in ["L01", "L02", "L03", "L04", "L05", "L06", "L07"] {
+        input.extend_from_slice(line.as_bytes());
+        input.extend_from_slice(b"\r\n");
+    }
+    input.extend_from_slice(b"L08");
+    input.extend_from_slice(b"\x1b[3;6r\x1b[H\x1b[2+T");
+    let mut screen = make_narrow(10, 8);
+    Parser::new().parse(&mut screen, &input);
+    let grid: Vec<String> = (0..8)
+        .map(|row| {
+            screen
+                .grid()
+                .row(row)
+                .unwrap()
+                .text()
+                .trim_end()
+                .to_string()
+        })
+        .collect();
+    assert_eq!(
+        grid,
+        vec!["L01", "L02", "", "", "L03", "L04", "L07", "L08",],
+        "margin interaction must match the recorded Kitty transcript"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Modes
 // ---------------------------------------------------------------------------

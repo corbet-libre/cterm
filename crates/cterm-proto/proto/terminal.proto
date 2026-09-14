@@ -788,6 +788,11 @@ message DynamicColors {
 message DynamicPaletteColor {
   uint32 index = 1;
   Color color = 2;
+  // Kitty transparent-background opacity quanta (0-255). Only set on
+  // transparent_background entries; absent means opaque (255), which keeps
+  // older writers readable. Added without renumbering, so old readers
+  // skip it and old writers restore as opaque.
+  optional uint32 alpha = 3;
 }
 
 message GetCellRequest {

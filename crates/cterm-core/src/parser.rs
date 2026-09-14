@@ -2018,7 +2018,22 @@ impl ScreenPerformer<'_> {
                 // Set: strict values only; malformed input changes nothing.
                 Some(value) => {
                     if let Some(key) = key {
-                        if let Ok(value) = std::str::from_utf8(value) {
+                        // Transparent slots carry Kitty's `@opacity` suffix
+                        // (`kitty/window.py`, verified live against 0.48.2):
+                        // the color parses strictly, and the opacity float is
+                        // truncated to 1/255 quanta. A missing, unparseable,
+                        // NaN, or negative opacity means opaque (255), matching
+                        // Kitty's `-1.0` fallback; values above 1.0 saturate.
+                        if let KittyColorKey::TransparentBackground(_) = key {
+                            if let Ok(value) = std::str::from_utf8(value) {
+                                if let Some((color, alpha)) = Self::osc21_transparent_color(value) {
+                                    self.screen.set_kitty_setting(
+                                        key,
+                                        KittyColorSetting::TransparentColor { color, alpha },
+                                    );
+                                }
+                            }
+                        } else if let Ok(value) = std::str::from_utf8(value) {
                             if let Some(color) = Rgb::from_kitty_color_spec(value) {
                                 self.screen
                                     .set_kitty_setting(key, KittyColorSetting::Color(color));
@@ -2040,6 +2055,29 @@ impl ScreenPerformer<'_> {
             return None;
         }
         std::str::from_utf8(raw_key).ok()
+    }
+
+    /// Split a transparent-background value into color and Kitty opacity
+    /// quanta (`transparent_background_color_control` in `kitty/window.py`,
+    /// verified live against 0.48.2): partition at the first `@`; the color
+    /// must parse strictly or the whole set is ignored, while the opacity
+    /// falls back to opaque (255) whenever it is missing, unparseable, NaN,
+    /// or negative, truncates to 1/255 quanta otherwise, and saturates
+    /// above 1.0.
+    fn osc21_transparent_color(value: &str) -> Option<(Rgb, u8)> {
+        let (color_part, alpha) = match value.split_once('@') {
+            None => (value, 255),
+            Some((color, opacity)) => {
+                let alpha = opacity
+                    .parse::<f64>()
+                    .ok()
+                    .filter(|opacity| *opacity >= 0.0)
+                    .map(|opacity| (opacity * 255.0) as u8)
+                    .unwrap_or(255);
+                (color, alpha)
+            }
+        };
+        Rgb::from_kitty_color_spec(color_part).map(|color| (color, alpha))
     }
 
     fn handle_osc22(&mut self, params: &[&[u8]]) {
@@ -4160,11 +4198,17 @@ mod tests {
         );
         assert_eq!(
             screen.kitty_setting(Key::TransparentBackground(1)),
-            Setting::Color(Rgb::new(0x01, 0x02, 0x03))
+            Setting::TransparentColor {
+                color: Rgb::new(0x01, 0x02, 0x03),
+                alpha: 255,
+            }
         );
         assert_eq!(
             screen.kitty_setting(Key::TransparentBackground(8)),
-            Setting::Color(Rgb::new(0x04, 0x05, 0x06))
+            Setting::TransparentColor {
+                color: Rgb::new(0x04, 0x05, 0x06),
+                alpha: 255,
+            }
         );
         // Numeric keys alias the OSC 4 palette.
         assert_eq!(
@@ -4234,7 +4278,10 @@ mod tests {
         );
         assert_eq!(
             screen.kitty_setting(Key::TransparentBackground(5)),
-            Setting::Color(Rgb::new(0x0a, 0x0b, 0x0c))
+            Setting::TransparentColor {
+                color: Rgb::new(0x0a, 0x0b, 0x0c),
+                alpha: 255,
+            }
         );
         assert!(screen.take_kitty_queries().is_empty());
 

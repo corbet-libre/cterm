@@ -10,8 +10,8 @@ use crate::kitty_graphics::GraphicsAnimationTick;
 use crate::parser::Parser;
 use crate::pty::{Pty, PtyConfig, PtyError, PtySize};
 use crate::screen::{
-    ClipboardOperation, ColorQuery, DesktopNotificationAction, FrontendState, KittyQueryField,
-    Screen, ScreenConfig, SearchResult,
+    ClipboardOperation, ColorQuery, DesktopNotificationAction, FrontendState, KittyColorKey,
+    KittyColorSetting, KittyQueryField, Screen, ScreenConfig, SearchResult,
 };
 use crate::{KeyEventKind, KeyEventMetadata, KeyboardEnhancementFlags};
 use std::time::{Duration, Instant};
@@ -339,8 +339,27 @@ impl Terminal {
                 KittyQueryField::Known { key, setting } => {
                     reply.push_str(&key.key_name());
                     reply.push('=');
-                    if let Some(color) = screen.kitty_effective_color(*key, *setting) {
-                        reply.push_str(&color.to_osc_spec());
+                    match (*key, setting) {
+                        // Transparent slots round-trip Kitty's opacity
+                        // quanta exactly (`rgb:rr/gg/bb@opacity`, 2-digit
+                        // channels like Kitty's own serializer).
+                        (
+                            KittyColorKey::TransparentBackground(_),
+                            KittyColorSetting::TransparentColor { color, alpha },
+                        ) => {
+                            reply.push_str(&format!(
+                                "rgb:{:02x}/{:02x}/{:02x}@{:.4}",
+                                color.r,
+                                color.g,
+                                color.b,
+                                f64::from(*alpha) / 255.0
+                            ));
+                        }
+                        _ => {
+                            if let Some(color) = screen.kitty_effective_color(*key, *setting) {
+                                reply.push_str(&color.to_osc_spec());
+                            }
+                        }
                     }
                 }
                 KittyQueryField::Unknown { encoded } => {
@@ -759,7 +778,7 @@ impl Terminal {
                             | Modifiers::META,
                     );
                 if disambiguate && needs_escape {
-                    Some(csi_u_key(c as u32, modifiers, kind, flags, metadata))
+                    Some(csi_u_key(c as u32, modifiers, kind, flags, metadata, true))
                 } else if kind == KeyEventKind::Release {
                     None
                 } else if let Some(sequence) =
@@ -778,7 +797,9 @@ impl Terminal {
                         Key::Backspace => 127,
                         _ => unreachable!(),
                     };
-                    Some(csi_u_key(codepoint, modifiers, kind, flags, metadata))
+                    Some(csi_u_key(
+                        codepoint, modifiers, kind, flags, metadata, false,
+                    ))
                 } else if kind == KeyEventKind::Release {
                     None
                 } else {
@@ -787,7 +808,7 @@ impl Terminal {
             }
             Key::Escape => {
                 if disambiguate || report_events {
-                    Some(csi_u_key(27, modifiers, kind, flags, metadata))
+                    Some(csi_u_key(27, modifiers, kind, flags, metadata, false))
                 } else if kind == KeyEventKind::Release {
                     None
                 } else {
@@ -856,6 +877,7 @@ impl Terminal {
                 kind,
                 flags,
                 metadata,
+                false,
             )),
             Key::F(n) => enhanced_function_key(n, modifiers, kind, report_events)
                 .or_else(|| self.handle_non_release_legacy(key, modifiers, kind)),
@@ -868,7 +890,7 @@ impl Terminal {
             | Key::NumpadEnter => {
                 if disambiguate || report_events {
                     kitty_numpad_code(key)
-                        .map(|code| csi_u_key(code, modifiers, kind, flags, metadata))
+                        .map(|code| csi_u_key(code, modifiers, kind, flags, metadata, false))
                 } else {
                     self.handle_non_release_legacy(key, modifiers, kind)
                 }
@@ -883,6 +905,7 @@ impl Terminal {
                         kind,
                         flags,
                         metadata,
+                        false,
                     ))
                 }
             }
@@ -938,6 +961,7 @@ impl Terminal {
                     KeyEventKind::Release,
                     flags,
                     metadata,
+                    true,
                 ));
             }
         }
@@ -1044,6 +1068,7 @@ impl Terminal {
                 KeyEventKind::Press,
                 KeyboardEnhancementFlags::empty(),
                 KeyEventMetadata::default(),
+                false,
             )),
         }
     }
@@ -1091,9 +1116,14 @@ fn csi_u_key(
     kind: KeyEventKind,
     flags: KeyboardEnhancementFlags,
     metadata: KeyEventMetadata<'_>,
+    allow_alternates: bool,
 ) -> Vec<u8> {
     let mut key_field = codepoint.to_string();
-    if flags.contains(KeyboardEnhancementFlags::REPORT_ALTERNATE_KEYS) {
+    // Alternate shifted/base fields are character-key metadata. No frontend
+    // supplies them for functional keys (GTK/Cocoa/Win32 populate layout
+    // metadata for `Key::Char` only), so the encoder strips them there
+    // rather than emitting fields no producer can set.
+    if allow_alternates && flags.contains(KeyboardEnhancementFlags::REPORT_ALTERNATE_KEYS) {
         let shifted_key = modifiers
             .contains(Modifiers::SHIFT)
             .then_some(metadata.shifted_key)
@@ -1845,6 +1875,92 @@ mod tests {
                 format!("\x1b]10;{theme}\x1b\\").into_bytes(),
                 format!("\x1b]21;foreground={theme}\x1b\\").into_bytes(),
             ]
+        );
+    }
+
+    #[test]
+    fn daemon_osc21_transparent_opacity_round_trips_like_live_kitty() {
+        // Live reference matrix (Kitty 0.48.2, per-tab state): opacity is
+        // truncated to 1/255 quanta, missing/unparseable/NaN/negative means
+        // opaque, values above 1.0 saturate, and queries report
+        // `rgb:rr/gg/bb@opacity` (2-digit channels, 4 decimals).
+        let mut term = Terminal::new(80, 24, ScreenConfig::default());
+
+        // Unset slots report empty.
+        let (_, responses) =
+            term.process_collecting(b"\x1b]21;transparent_background_color2=?\x1b\\");
+        assert_eq!(
+            responses,
+            [b"\x1b]21;transparent_background_color2=\x1b\\".to_vec()]
+        );
+
+        let (_, responses) = term.process_collecting(
+            b"\x1b]21;transparent_background_color1=#ff0000@0.5\x1b\\\
+              \x1b]21;transparent_background_color1=?\x1b\\\
+              \x1b]21;transparent_background_color2=#00ff00\x1b\\\
+              \x1b]21;transparent_background_color2=?\x1b\\\
+              \x1b]21;transparent_background_color3=#00ff00@bogus\x1b\\\
+              \x1b]21;transparent_background_color3=?\x1b\\\
+              \x1b]21;transparent_background_color4=#0000ff@1.0\x1b\\\
+              \x1b]21;transparent_background_color4=?\x1b\\\
+              \x1b]21;transparent_background_color5=#ffff00@0.0\x1b\\\
+              \x1b]21;transparent_background_color5=?\x1b\\",
+        );
+        assert_eq!(
+            responses,
+            [
+                b"\x1b]21;transparent_background_color1=rgb:ff/00/00@0.4980\x1b\\".to_vec(),
+                b"\x1b]21;transparent_background_color2=rgb:00/ff/00@1.0000\x1b\\".to_vec(),
+                b"\x1b]21;transparent_background_color3=rgb:00/ff/00@1.0000\x1b\\".to_vec(),
+                b"\x1b]21;transparent_background_color4=rgb:00/00/ff@1.0000\x1b\\".to_vec(),
+                b"\x1b]21;transparent_background_color5=rgb:ff/ff/00@0.0000\x1b\\".to_vec(),
+            ]
+        );
+
+        // Truncation (not rounding), saturation, and the opaque fallback for
+        // NaN/inf/empty opacities.
+        let (_, responses) = term.process_collecting(
+            b"\x1b]21;transparent_background_color6=#112233@0.1\x1b\\\
+              \x1b]21;transparent_background_color6=?\x1b\\\
+              \x1b]21;transparent_background_color7=#112233@2.0\x1b\\\
+              \x1b]21;transparent_background_color7=?\x1b\\\
+              \x1b]21;transparent_background_color8=#112233@-0.5\x1b\\\
+              \x1b]21;transparent_background_color8=?\x1b\\",
+        );
+        assert_eq!(
+            responses,
+            [
+                b"\x1b]21;transparent_background_color6=rgb:11/22/33@0.0980\x1b\\".to_vec(),
+                b"\x1b]21;transparent_background_color7=rgb:11/22/33@1.0000\x1b\\".to_vec(),
+                b"\x1b]21;transparent_background_color8=rgb:11/22/33@1.0000\x1b\\".to_vec(),
+            ]
+        );
+        let (_, responses) = term.process_collecting(
+            b"\x1b]21;transparent_background_color6=#112233@nan\x1b\\\
+              \x1b]21;transparent_background_color6=?\x1b\\\
+              \x1b]21;transparent_background_color7=#112233@inf\x1b\\\
+              \x1b]21;transparent_background_color7=?\x1b\\\
+              \x1b]21;transparent_background_color8=#aabbcc@\x1b\\\
+              \x1b]21;transparent_background_color8=?\x1b\\",
+        );
+        assert_eq!(
+            responses,
+            [
+                b"\x1b]21;transparent_background_color6=rgb:11/22/33@1.0000\x1b\\".to_vec(),
+                b"\x1b]21;transparent_background_color7=rgb:11/22/33@1.0000\x1b\\".to_vec(),
+                b"\x1b]21;transparent_background_color8=rgb:aa/bb/cc@1.0000\x1b\\".to_vec(),
+            ]
+        );
+
+        // An invalid color invalidates the whole set, like Kitty: the slot
+        // keeps its previous value.
+        let (_, responses) = term.process_collecting(
+            b"\x1b]21;transparent_background_color1=#gggggg@0.5\x1b\\\
+              \x1b]21;transparent_background_color1=?\x1b\\",
+        );
+        assert_eq!(
+            responses,
+            [b"\x1b]21;transparent_background_color1=rgb:ff/00/00@0.4980\x1b\\".to_vec()]
         );
     }
 

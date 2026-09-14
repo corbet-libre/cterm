@@ -7,6 +7,9 @@ export CTERM_CI_WORKER_PATH="$PATH"
 exec nix develop --command bash -euo pipefail -c '
   export PATH="$CTERM_CI_WORKER_PATH:$PATH"
   cargo fmt --all -- --check
+  # Integration tests spawn the daemon binary (mirrors GHA's
+  # "Build ctermd for integration tests" step).
+  cargo build --locked -p cterm-headless
   cargo test --locked --workspace --exclude cterm-cocoa --exclude cterm-win32 --all-targets
   cargo clippy --locked --workspace --exclude cterm-cocoa --exclude cterm-win32 --all-targets -- -D warnings
 '

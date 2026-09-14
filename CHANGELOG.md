@@ -15,7 +15,11 @@ is omitted for readability.
   for the next matching transfer (or one exact `--transfer-id`), with
   `--list`/`--revoke`, daemon-side single-use consumption before any
   prompt publishes, audit rows, session-scoped lifetime, and an explicit
-  direction deny still refusing first.
+  direction deny still refusing first. Proven end to end against the live
+  daemon (mint → pre-auth consumption → staged data → atomic commit with
+  exact file bytes); the GTK consent dialog itself verified surfaced with
+  exact copy, limits, and expiry (physical click-through still needs a
+  compositor with working synthetic input).
 - Daemon event-bus integration evidence: `StreamDaemonEvents` lifecycle
   (created/destroyed) and metadata-change broadcasts now covered end to
   end over real gRPC (`cterm-headless` integration tests, incl. the
@@ -26,7 +30,11 @@ is omitted for readability.
   (foreign-checked only; needs a Windows host to verify).
 - Kitty transparency key parity: `transparent_background_color8` accepted
   (Kitty takes indices 1-8) and empty `=` values ignored instead of
-  storing `Dynamic`, matching `kitty/window.py`.
+  storing `Dynamic`, matching `kitty/window.py`. The `@opacity` suffix now
+  round-trips exactly: truncated to 1/255 quanta with Kitty's opaque
+  fallback for missing/unparseable/negative values, saturation above 1.0,
+  `rgb:rr/gg/bb@opacity` query replies, and snapshot survival through an
+  additive proto field — verified live against Kitty 0.48.2.
 - Notification `filter_rules`: Kitty `filter_notification` deny rules
   (`field:regexp` over title/body/app/type with and/or/not/parens/quotes
   and `all`, unanchored Rust-regexp search, invalid rules logged and
@@ -160,7 +168,17 @@ is omitted for readability.
   `handle_text_input` seam, focus-in/out vs release-drain semantics, flag-stack
   pop-imbalance/overflow and per-screen isolation, and hostile associated-text
   handling. Native dead-key/IME/alternate-key/release verification per platform
-  remains open (needs a compositor, macOS, and Windows hosts).
+  remains open (needs a compositor, macOS, and Windows hosts); the
+  Enter/Tab/Backspace legacy question under event-types alone is closed,
+  verified byte-identical against live Kitty 0.48.2 (mode reply `CSI ? 2 u`,
+  `0d`/`09`/`7f` presses, releases suppressed). Functional-key alternate
+  fields are stripped by the encoder: a constructor audit of all three
+  frontends proves shifted/base metadata only ever accompanies character
+  keys, so the passthrough arm could never fire. NumLock (+128) stays
+  Win32-only at the source: GTK/Cocoa expose no OS toggle state (no Mod2
+  mask in GDK4, no NSEvent API), and no approximate bit is emitted instead;
+  the wire format (key `57360`, +128 modifier, keypad text, toggle
+  semantics) is confirmed live against Kitty 0.48.2.
 - Kitty OSC 99 desktop-notification completion over one shared
   `cterm-core::notifications` model: `a=report` activation reports (whole
   notification plus 1-based button numbers) and `c=1` close reports
@@ -190,7 +208,10 @@ is omitted for readability.
 - Kitty screen unscrolling (`CSI Ps + T`): scroll down within the scroll
   region, refilling the new top lines from scrollback instead of blanking
   them. Falls back to blank lines on the alternate screen or with empty
-  scrollback; ordinary `CSI Ps T` behavior is unchanged.
+  scrollback; ordinary `CSI Ps T` behavior is unchanged. Margin interaction
+  (region-top refill, region-bottom deletion, untouched lines outside the
+  region) is byte-identical to live Kitty 0.48.2 and pinned by a recorded
+  differential test.
 - A living, evidence-backed foot and Kitty parity inventory that distinguishes
   implementation from user-observable verification.
 - Kitty OSC 5113 decoding and exact-token consent, plus bidirectional

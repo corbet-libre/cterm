@@ -595,7 +595,12 @@ allow = ["cterm:new-tab"]
 
     #[cfg(unix)]
     fn scripted_host(script: impl Into<OsString>) -> HostCommand {
-        let mut host = HostCommand::new(fs::canonicalize("/bin/sh").unwrap());
+        // Deliberately unresolved: canonicalizing /bin/sh to the multi-call
+        // binary behind it (e.g. busybox) rewrites argv[0], which breaks
+        // applet dispatch ("-c: applet not found"). exec resolves the link
+        // with argv[0] intact; a missing /bin/sh still fails loudly at
+        // fixture setup instead of passing silently.
+        let mut host = HostCommand::new(PathBuf::from("/bin/sh"));
         host.prefix_arguments = vec!["-c".into(), script.into(), "cterm-broker-fixture".into()];
         host
     }
