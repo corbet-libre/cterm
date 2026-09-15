@@ -3,6 +3,7 @@
 //! This crate implements the cterm terminal emulator UI using GTK4.
 
 mod app;
+mod broadcast;
 mod desktop_notification;
 mod dialogs;
 mod docker_dialog;

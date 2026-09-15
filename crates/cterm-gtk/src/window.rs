@@ -149,6 +149,9 @@ struct TabEntry {
     remote_name: Option<String>,
     pane_container: GtkBox,
     panes: PaneSet<PaneEntry>,
+    /// Broadcast input to every pane of this tab (tmux `synchronize-panes`
+    /// semantics). Wired into each pane widget by [`TabEntry::sync_broadcast_peers`].
+    broadcast_input: bool,
 }
 
 impl TabEntry {
@@ -193,6 +196,30 @@ impl TabEntry {
         self.panes.rebuild(&self.pane_container, |pane| {
             pane.terminal.widget().clone().upcast()
         });
+        self.sync_broadcast_peers();
+    }
+
+    /// Set the per-tab broadcast-input flag (toggle action entry point).
+    fn set_broadcast_input(&mut self, enabled: bool) {
+        self.broadcast_input = enabled;
+    }
+
+    /// Refresh every pane widget's broadcast wiring: the tab's toggle flag
+    /// plus weak handles to all pane terminals (dead panes drop out
+    /// harmlessly at fan-out time).
+    fn sync_broadcast_peers(&self) {
+        use std::sync::Weak;
+        let peers: Vec<Weak<parking_lot::Mutex<cterm_core::term::Terminal>>> = self
+            .panes
+            .iter()
+            .map(|(_, pane)| std::sync::Arc::downgrade(pane.terminal.terminal()))
+            .collect();
+        for (_, pane) in self.panes.iter() {
+            let link = pane.terminal.broadcast_state();
+            let mut state = link.borrow_mut();
+            state.enabled = self.broadcast_input;
+            state.peers = peers.clone();
+        }
     }
 }
 
@@ -298,6 +325,7 @@ fn gtk_action_activation(action: &Action) -> GtkActionActivation {
         Action::ResizePane(PaneDirection::Up) => GtkActionActivation::simple("resize-pane-up"),
         Action::ResizePane(PaneDirection::Down) => GtkActionActivation::simple("resize-pane-down"),
         Action::TogglePaneZoom => GtkActionActivation::simple("toggle-pane-zoom"),
+        Action::BroadcastInput => GtkActionActivation::simple("broadcast-input"),
         Action::NewWindow => GtkActionActivation::simple("new-window"),
         Action::CloseWindow => GtkActionActivation::simple("close-window"),
         Action::Copy => GtkActionActivation::simple("copy"),
@@ -317,6 +345,8 @@ fn gtk_action_activation(action: &Action) -> GtkActionActivation {
         Action::PromptNext => GtkActionActivation::simple("prompt-next"),
         Action::OpenPreferences => GtkActionActivation::simple("preferences"),
         Action::FindText => GtkActionActivation::simple("find"),
+        Action::FindNext => GtkActionActivation::simple("find-next"),
+        Action::FindPrevious => GtkActionActivation::simple("find-previous"),
         Action::ResetTerminal => GtkActionActivation::simple("reset"),
         Action::QuickOpenTemplate => GtkActionActivation::simple("quick-open"),
     }
@@ -435,6 +465,7 @@ fn is_managed_restricted_action(action: &Action) -> bool {
             | Action::FocusPane(_)
             | Action::ResizePane(_)
             | Action::TogglePaneZoom
+            | Action::BroadcastInput
             | Action::NewWindow
             | Action::OpenPreferences
             | Action::QuickOpenTemplate
@@ -643,6 +674,20 @@ fn perform_pane_action(context: &PaneActionContext, action: Action) {
             };
             terminal.widget().grab_focus();
         }
+        Action::BroadcastInput => {
+            let Some(page) = context.notebook.current_page() else {
+                return;
+            };
+            let mut tabs = context.tabs.borrow_mut();
+            let Some(tab) = tabs.get_mut(page as usize) else {
+                return;
+            };
+            // Flip the per-tab flag and push it into every pane widget;
+            // single-pane tabs broadcast to no peers (harmless no-op).
+            let enabled = !tab.broadcast_input;
+            tab.set_broadcast_input(enabled);
+            tab.sync_broadcast_peers();
+        }
         _ => {}
     }
 }
@@ -670,6 +715,7 @@ fn register_pane_actions(window: &ApplicationWindow, context: &PaneActionContext
         ("resize-pane-up", Action::ResizePane(PaneDirection::Up)),
         ("resize-pane-down", Action::ResizePane(PaneDirection::Down)),
         ("toggle-pane-zoom", Action::TogglePaneZoom),
+        ("broadcast-input", Action::BroadcastInput),
     ] {
         let context = context.clone();
         let gtk_action = gio::SimpleAction::new(name, None);
@@ -1189,10 +1235,13 @@ impl CtermWindow {
                 // Get info from the active terminal
                 let (cwd, daemon_socket) = {
                     let tabs_borrow = tabs.borrow();
+                    let inherit_cwd = config.borrow().general.tab_inherit_cwd;
                     if let Some(page_idx) = notebook.current_page() {
                         let entry = tabs_borrow.get(page_idx as usize);
                         #[cfg(unix)]
-                        let cwd = entry.and_then(|e| e.terminal.foreground_cwd());
+                        let cwd = inherit_cwd
+                            .then(|| entry.and_then(|e| e.terminal.foreground_cwd()))
+                            .flatten();
                         #[cfg(not(unix))]
                         let cwd: Option<String> = None;
                         let socket = entry.and_then(|e| e.daemon_socket.clone());
@@ -1739,6 +1788,36 @@ impl CtermWindow {
                         }
                     }
                 });
+            });
+            window.add_action(&action);
+        }
+
+        {
+            let tabs = Rc::clone(&tabs);
+            let notebook = notebook.clone();
+            let action = gio::SimpleAction::new("find-next", None);
+            action.connect_activate(move |_, _| {
+                if let Some(page_idx) = notebook.current_page() {
+                    let tabs = tabs.borrow();
+                    if let Some(tab) = tabs.get(page_idx as usize) {
+                        tab.terminal.find_next();
+                    }
+                }
+            });
+            window.add_action(&action);
+        }
+
+        {
+            let tabs = Rc::clone(&tabs);
+            let notebook = notebook.clone();
+            let action = gio::SimpleAction::new("find-previous", None);
+            action.connect_activate(move |_, _| {
+                if let Some(page_idx) = notebook.current_page() {
+                    let tabs = tabs.borrow();
+                    if let Some(tab) = tabs.get(page_idx as usize) {
+                        tab.terminal.find_previous();
+                    }
+                }
             });
             window.add_action(&action);
         }
@@ -3558,7 +3637,11 @@ impl CtermWindow {
             remote_name: active.remote_name.clone(),
             pane_container,
             panes,
+            broadcast_input: false,
         });
+        if let Some(tab) = self.tabs.borrow().last() {
+            tab.sync_broadcast_peers();
+        }
 
         for (pane_id, terminal, keep_open) in callback_terminals {
             setup_tab_callbacks(
@@ -3905,7 +3988,11 @@ fn finalize_new_tab(
         remote_name,
         pane_container,
         panes,
+        broadcast_input: false,
     });
+    if let Some(tab) = tabs.borrow().last() {
+        tab.sync_broadcast_peers();
+    }
 
     tab_bar.update_visibility();
     notebook.set_current_page(Some(page_num));
@@ -4133,7 +4220,13 @@ fn spawn_daemon_pane(context: &PaneActionContext, direction: SplitDirection) {
     let mut opts = inherited_pane_session_options(
         &config,
         remote_backend,
-        cwd,
+        // Splits start in the active pane's foreground directory unless
+        // configured off (falling back to the template/default directory).
+        if config.general.split_inherit_cwd {
+            cwd
+        } else {
+            None
+        },
         native_ssh,
         launch_context.as_ref(),
     );
@@ -5830,6 +5923,8 @@ mod tests {
             (Action::ToggleFullscreen, "toggle-fullscreen"),
             (Action::OpenPreferences, "preferences"),
             (Action::FindText, "find"),
+            (Action::FindNext, "find-next"),
+            (Action::FindPrevious, "find-previous"),
             (Action::ResetTerminal, "reset"),
         ] {
             assert_eq!(
@@ -5878,6 +5973,8 @@ mod tests {
             Action::SelectAll,
             Action::ToggleFullscreen,
             Action::FindText,
+            Action::FindNext,
+            Action::FindPrevious,
             Action::ResetTerminal,
         ] {
             assert!(!is_managed_restricted_action(&action), "{action:?}");

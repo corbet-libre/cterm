@@ -84,7 +84,7 @@ base64 = "0.22"
 regex = "1"
 
 # Image decoding
-image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif"] }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp", "pnm"] }
 tiny-skia = "0.12"
 
 # Async

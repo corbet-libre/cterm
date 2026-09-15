@@ -58,6 +58,7 @@ fn is_managed_restricted_action(action: &Action) -> bool {
             | Action::FocusPane(_)
             | Action::ResizePane(_)
             | Action::TogglePaneZoom
+            | Action::BroadcastInput
             | Action::NewWindow
             | Action::OpenPreferences
             | Action::QuickOpenTemplate
@@ -697,12 +698,23 @@ impl CtermWindow {
             }
             Action::OpenPreferences => self.dispatch_app_action(AppAction::OpenPreferences),
             Action::FindText => self.show_find_dialog(),
+            // Find-match highlight and keyboard navigation follow the GTK
+            // implementation; these arms keep the shared actions dispatchable.
+            Action::FindNext | Action::FindPrevious => {
+                log::debug!("Find navigation is not yet wired on Cocoa");
+            }
             Action::ResetTerminal => {
                 if let Some(terminal) = self.active_terminal() {
                     terminal.reset();
                 }
             }
             Action::QuickOpenTemplate => self.show_quick_open(),
+            // Broadcast input is GTK-only for now; the shared action,
+            // config key, and per-tab semantics already exist for the
+            // Cocoa wiring to reuse.
+            Action::BroadcastInput => {
+                log::debug!("Broadcast input is not yet wired on Cocoa");
+            }
         }
     }
 

@@ -66,6 +66,11 @@ fn configure_terminal_cursor(terminal: &mut Terminal, config: &Config) {
         config.appearance.cursor_style.core_style(),
         config.appearance.cursor_blink,
     );
+    // Terminal-level notification policy lives here too so every setup path
+    // installs it exactly once.
+    terminal
+        .screen_mut()
+        .set_command_finish_policy(config.notifications.to_command_finish_policy());
 }
 
 fn replace_shortcut_bindings(shortcuts: &RefCell<ShortcutManager>, config: &ShortcutsConfig) {

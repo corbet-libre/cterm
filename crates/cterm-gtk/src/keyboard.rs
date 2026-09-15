@@ -8,8 +8,8 @@ use gtk4::{gdk, EventControllerKey};
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct ReportedKey {
     pub(crate) key: Key,
-    shifted_key: Option<char>,
-    base_layout_key: Option<char>,
+    pub(crate) shifted_key: Option<char>,
+    pub(crate) base_layout_key: Option<char>,
 }
 
 impl ReportedKey {

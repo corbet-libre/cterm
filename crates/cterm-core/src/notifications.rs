@@ -94,6 +94,56 @@ pub fn should_deliver(occasion: NotificationOccasion, is_focused: bool, is_visib
     }
 }
 
+/// Maximum command-line characters kept for command-finished notifications.
+pub const MAX_COMMAND_LINE_CHARS: usize = 200;
+
+/// Policy for command-finished notifications (Ghostty
+/// `notify-on-command-finish` semantics over OSC 133 `C`/`D` markers).
+/// Disabled by default; frontends install it from user configuration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CommandFinishPolicy {
+    /// Whether finished commands may notify at all.
+    pub enabled: bool,
+    /// Minimum command runtime before notifying.
+    pub min_duration: std::time::Duration,
+    /// Only notify while the issuing window is hidden.
+    pub only_when_unfocused: bool,
+}
+
+impl Default for CommandFinishPolicy {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            min_duration: std::time::Duration::from_secs(5),
+            only_when_unfocused: true,
+        }
+    }
+}
+
+/// Human duration for command-finished notification bodies (`3s`, `1m40s`).
+pub fn format_command_duration(duration: std::time::Duration) -> String {
+    let secs = duration.as_secs();
+    if secs < 60 {
+        // Sub-second commands still show a duration, never blank.
+        format!("{}s", secs.max(1))
+    } else if secs < 3600 {
+        format!("{}m{:02}s", secs / 60, secs % 60)
+    } else {
+        format!("{}h{:02}m", secs / 3600, (secs % 3600) / 60)
+    }
+}
+
+/// Strip control characters and enforce [`MAX_COMMAND_LINE_CHARS`] on a
+/// shell-reported command line (input-injection hardening: the value lands
+/// in a desktop notification body).
+pub fn sanitize_command_line(cmdline: &str) -> String {
+    let cleaned: String = cmdline.chars().filter(|c| !c.is_control()).collect();
+    // Bound by characters (not bytes) so narrow and wide scripts share one
+    // budget; the byte cap below only guards pathological encodings.
+    let truncated: String = cleaned.chars().take(MAX_COMMAND_LINE_CHARS).collect();
+    truncate_utf8(&truncated, MAX_COMMAND_LINE_CHARS * 4).to_string()
+}
+
 /// Strict Kitty identifier: `[a-zA-Z0-9_\-+.]{1,64}`.
 /// `i=0` is reserved for untracked responses and must never be used by apps.
 pub fn notification_id_is_valid(id: &str) -> bool {
@@ -1429,5 +1479,14 @@ mod tests {
             "build",
             "all green"
         ));
+    }
+
+    #[test]
+    fn command_duration_formats_without_blank_or_ambiguity() {
+        use std::time::Duration;
+        assert_eq!(format_command_duration(Duration::ZERO), "1s");
+        assert_eq!(format_command_duration(Duration::from_secs(3)), "3s");
+        assert_eq!(format_command_duration(Duration::from_secs(100)), "1m40s");
+        assert_eq!(format_command_duration(Duration::from_secs(3723)), "1h02m");
     }
 }

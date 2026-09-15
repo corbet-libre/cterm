@@ -1016,3 +1016,59 @@ fn hostile_truncated_kitty_png_fails_closed() {
         "truncated PNG must be EINVAL, got: {reply}"
     );
 }
+
+#[test]
+fn hostile_cve_shaped_graphics_input_fails_closed_without_panic() {
+    // Kitty CVE-2026-33633 shape: arbitrary garbage declared as a direct
+    // PNG upload. Must fail closed, never panic, never store.
+    let mut screen = make_small_screen();
+    let mut parser = Parser::new();
+    parser.parse(
+        &mut screen,
+        &kitty_apc(
+            "a=T,f=100,i=200,C=1",
+            b"definitely not a png \x00\xff\x89PNG\r\n trailing garbage",
+        ),
+    );
+    assert!(screen.images().is_empty());
+    assert_eq!(screen.take_pending_responses().len(), 1);
+
+    // PNG magic with lying dimensions but no backing data: the dimension
+    // cap must reject cheaply, without multi-gigabyte allocation attempts.
+    let mut lying = b"\x89PNG\r\n\x1a\n".to_vec();
+    lying.extend_from_slice(&[0, 0, 0, 13, b'I', b'H', b'D', b'R']);
+    lying.extend_from_slice(&[0x0f, 0x27, 0x00, 0x0f, 0x27, 0x00]); // 999999x999999
+    lying.extend_from_slice(&[8, 2, 0, 0, 0, 0, 0, 0, 0]);
+    parser.parse(&mut screen, &kitty_apc("a=T,f=100,i=201,C=1", &lying));
+    assert!(screen.images().is_empty());
+
+    // Kitty CVE-2026-33642 shape: compose commands with hostile offsets,
+    // against a live image and against nothing at all.
+    parser.parse(
+        &mut screen,
+        &kitty_apc("a=T,f=32,s=1,v=1,i=202,C=1", &[9, 9, 9, 255]),
+    );
+    parser.parse(
+        &mut screen,
+        &kitty_apc("a=f,i=202,c=1,f=32,s=1,v=1,X=0", &[1, 2, 3, 255]),
+    );
+    for control in [
+        "a=c,i=202,r=2,c=1,X=1,Y=0,x=-5,y=-5,w=1,h=1,C=1",
+        "a=c,i=202,r=2,c=1,X=1,Y=0,x=4294967295,y=4294967295,w=1,h=1,C=1",
+        "a=c,i=202,r=2,c=1,X=2147483647,Y=2147483647,x=0,y=0,w=2147483647,h=2147483647,C=1",
+        "a=c,i=999,r=2,c=1,X=1,Y=0,x=0,y=0,w=1,h=1,C=1",
+    ] {
+        parser.parse(&mut screen, &kitty_control_only(control));
+    }
+    // Every hostile compose drew an error reply; the base image still has
+    // consistent dimensions and data.
+    let replies = screen.take_pending_responses();
+    assert!(
+        replies.len() >= 4,
+        "expected one error reply per hostile compose, got {}",
+        replies.len()
+    );
+    for image in screen.images() {
+        assert_eq!(image.data.len(), image.pixel_width * image.pixel_height * 4);
+    }
+}

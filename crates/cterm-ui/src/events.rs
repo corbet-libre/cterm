@@ -348,6 +348,7 @@ pub enum Action {
     FocusPane(PaneDirection),
     ResizePane(PaneDirection),
     TogglePaneZoom,
+    BroadcastInput,
 
     // Window actions
     NewWindow,
@@ -377,6 +378,8 @@ pub enum Action {
     // Other
     OpenPreferences,
     FindText,
+    FindNext,
+    FindPrevious,
     ResetTerminal,
     QuickOpenTemplate,
 }
@@ -399,6 +402,7 @@ pub mod action_ids {
     pub const FOCUS_PANE: &str = "cterm:focus-pane";
     pub const RESIZE_PANE: &str = "cterm:resize-pane";
     pub const TOGGLE_PANE_ZOOM: &str = "cterm:toggle-pane-zoom";
+    pub const BROADCAST_INPUT: &str = "cterm:broadcast-input";
 
     pub const NEW_WINDOW: &str = "cterm:new-window";
     pub const CLOSE_WINDOW: &str = "cterm:close-window";
@@ -423,6 +427,8 @@ pub mod action_ids {
 
     pub const OPEN_PREFERENCES: &str = "cterm:open-preferences";
     pub const FIND_TEXT: &str = "cterm:find-text";
+    pub const FIND_NEXT: &str = "cterm:find-next";
+    pub const FIND_PREVIOUS: &str = "cterm:find-previous";
     pub const RESET_TERMINAL: &str = "cterm:reset-terminal";
     pub const QUICK_OPEN_TEMPLATE: &str = "cterm:quick-open-template";
 
@@ -439,6 +445,7 @@ pub mod action_ids {
         FOCUS_PANE,
         RESIZE_PANE,
         TOGGLE_PANE_ZOOM,
+        BROADCAST_INPUT,
         NEW_WINDOW,
         CLOSE_WINDOW,
         COPY,
@@ -458,6 +465,8 @@ pub mod action_ids {
         PROMPT_NEXT,
         OPEN_PREFERENCES,
         FIND_TEXT,
+        FIND_NEXT,
+        FIND_PREVIOUS,
         RESET_TERMINAL,
         QUICK_OPEN_TEMPLATE,
     ];
@@ -576,6 +585,7 @@ impl Action {
             Self::FocusPane(_) => ids::FOCUS_PANE,
             Self::ResizePane(_) => ids::RESIZE_PANE,
             Self::TogglePaneZoom => ids::TOGGLE_PANE_ZOOM,
+            Self::BroadcastInput => ids::BROADCAST_INPUT,
             Self::NewWindow => ids::NEW_WINDOW,
             Self::CloseWindow => ids::CLOSE_WINDOW,
             Self::Copy => ids::COPY,
@@ -595,6 +605,8 @@ impl Action {
             Self::PromptNext => ids::PROMPT_NEXT,
             Self::OpenPreferences => ids::OPEN_PREFERENCES,
             Self::FindText => ids::FIND_TEXT,
+            Self::FindNext => ids::FIND_NEXT,
+            Self::FindPrevious => ids::FIND_PREVIOUS,
             Self::ResetTerminal => ids::RESET_TERMINAL,
             Self::QuickOpenTemplate => ids::QUICK_OPEN_TEMPLATE,
         }
@@ -648,6 +660,7 @@ impl TryFrom<&ActionInvocation> for Action {
             ids::FOCUS_PANE => pane_direction_parameter(invocation).map(Self::FocusPane),
             ids::RESIZE_PANE => pane_direction_parameter(invocation).map(Self::ResizePane),
             ids::TOGGLE_PANE_ZOOM => no_parameter(invocation, Self::TogglePaneZoom),
+            ids::BROADCAST_INPUT => no_parameter(invocation, Self::BroadcastInput),
             ids::NEW_WINDOW => no_parameter(invocation, Self::NewWindow),
             ids::CLOSE_WINDOW => no_parameter(invocation, Self::CloseWindow),
             ids::COPY => no_parameter(invocation, Self::Copy),
@@ -667,6 +680,8 @@ impl TryFrom<&ActionInvocation> for Action {
             ids::PROMPT_NEXT => no_parameter(invocation, Self::PromptNext),
             ids::OPEN_PREFERENCES => no_parameter(invocation, Self::OpenPreferences),
             ids::FIND_TEXT => no_parameter(invocation, Self::FindText),
+            ids::FIND_NEXT => no_parameter(invocation, Self::FindNext),
+            ids::FIND_PREVIOUS => no_parameter(invocation, Self::FindPrevious),
             ids::RESET_TERMINAL => no_parameter(invocation, Self::ResetTerminal),
             ids::QUICK_OPEN_TEMPLATE => no_parameter(invocation, Self::QuickOpenTemplate),
             unknown => Err(ActionInvocationError::UnknownId(unknown.to_string())),

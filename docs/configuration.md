@@ -23,6 +23,12 @@ shell_args = []
 # Initial working directory (optional)
 working_directory = "/home/user/projects"
 
+# New tabs/splits start in the active pane's foreground directory (GTK;
+# Cocoa/Win32 keep their current behavior). Set false to always use
+# working_directory above instead.
+tab_inherit_cwd = true
+split_inherit_cwd = true
+
 # Number of lines to keep in scrollback buffer
 scrollback_lines = 10000
 
@@ -48,6 +54,14 @@ family = "JetBrains Mono"
 
 # Font size in points
 size = 12
+
+# Background image (absolute path recommended, empty = none). Painted
+# under default cell backgrounds; explicit cell colors still cover it.
+# GTK-only for now.
+# background_image = "/home/user/wallpaper.png"
+# Background image opacity (0.0 - 1.0) and fit: cover, contain, stretch, tile.
+# background_image_opacity = 1.0
+# background_image_fit = "cover"
 
 [appearance.cursor]
 # Cursor style: "block", "underline", or "bar"
@@ -86,6 +100,12 @@ tab_bar_position = "top"
 # allow_types = ["email"]
 # deny_types = ["marketing"]
 # filter_rules = ["app:spammy or body:\"(?i)promo\""]
+# Notify when a shell command finishes (needs OSC 133 markers from the
+# shell): off by default; only commands running at least this long, and
+# only while the window is hidden by default.
+# command_finished = false
+# command_finished_min_secs = 5
+# command_finished_only_unfocused = true
 ```
 
 ### Keyboard Shortcuts
@@ -105,6 +125,10 @@ split_pane_horizontal = "Ctrl+Shift+Backslash"
 split_pane_vertical = "Ctrl+Shift+Minus"
 close_pane = "Ctrl+Shift+Delete"
 toggle_pane_zoom = "Ctrl+Shift+Enter"
+# Mirror every key to all panes of the active tab (tmux
+# `synchronize-panes` semantics). GTK-only for now; Cocoa/Win32 follow.
+# Applies to keys, not pastes.
+broadcast_input = "Ctrl+Shift+Y"
 
 # Pane focus and divider movement
 focus_pane_left = "Ctrl+Alt+Left"
@@ -133,6 +157,8 @@ prompt_next = "Ctrl+Shift+X"
 
 # Find
 find = "Ctrl+Shift+F"
+find_next = "F3"
+find_previous = "Shift+F3"
 ```
 
 ## Sticky Tabs (`sticky_tabs.toml`)

@@ -19,12 +19,14 @@ use crate::multiple_cursors::{
     ExtraCursor, ExtraCursorColor, ExtraCursorColorTarget, ExtraCursorColors, ExtraCursorShape,
     MultipleCursors,
 };
+use crate::notifications::CommandFinishPolicy;
 use crate::pointer_shape::{PointerShape, MAX_POINTER_SHAPE_STACK_DEPTH};
 use crate::sixel::SixelImage;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Instant;
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
@@ -290,6 +292,10 @@ pub struct TerminalModes {
     /// Report native window visibility changes (DEC private mode 2033).
     #[serde(default)]
     pub visibility_change_reports: bool,
+    /// In-band window-resize notifications (Kitty DEC private mode 2048):
+    /// report resizes as `CSI 48;rows;cols;height;width t`.
+    #[serde(default)]
+    pub inband_resize_notification: bool,
     /// Focus events reporting
     pub focus_events: bool,
     /// Alternate screen buffer active
@@ -618,6 +624,27 @@ pub enum NotificationUrgency {
 /// the full 0.36+ protocol; frontends degrade gracefully per the matrix in
 /// `docs/parity.md` (GTK has no native sound control, Win32 balloons have no
 /// buttons, user-dismiss detection is best-effort outside Win32).
+/// ConEmu taskbar progress state (`OSC 9;4;st;pr`).
+///
+/// `st`: 0 removes progress, 1 sets a 0-100 value, 2 marks error
+/// (optional value), 3 is indeterminate, 4 is paused (optional value).
+/// Values above 100 clamp; anything unparseable leaves state unchanged.
+/// Renderers surface this per backend (taskbar, dock, tab chrome).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum TaskProgress {
+    /// No progress reported.
+    #[default]
+    None,
+    /// Determinate progress, 0-100.
+    Normal(u8),
+    /// Error state with optional progress value.
+    Error(Option<u8>),
+    /// Indeterminate (ongoing, unknown share).
+    Indeterminate,
+    /// Paused state with optional progress value.
+    Paused(Option<u8>),
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct DesktopNotification {
     /// Stable Kitty notification identifier, when supplied.
@@ -993,6 +1020,21 @@ pub struct Screen {
     pending_rich_reads: Vec<PendingRichRead>,
     /// Pending desktop notifications from OSC 9/777/99.
     pending_notifications: Vec<DesktopNotificationAction>,
+    /// Current find matches for highlight rendering (point-in-time
+    /// snapshot: later output may shift lines, the next find refreshes).
+    find_matches: Vec<SearchResult>,
+    /// Index into `find_matches` of the active (navigated-to) match.
+    find_active: Option<usize>,
+    /// ConEmu taskbar progress (`OSC 9;4`). Sticky until removed or
+    /// replaced; renderers surface it per backend.
+    task_progress: TaskProgress,
+    /// Command-finished notification policy (Ghostty notify-on-command-finish
+    /// semantics over OSC 133 C/D); disabled by default, installed from user
+    /// configuration by every frontend.
+    command_finish_policy: CommandFinishPolicy,
+    /// Start time and reported command line of the running shell command
+    /// (OSC 133 C marker). Cleared when the command ends.
+    command_start: Option<(Instant, Option<String>)>,
     /// Validated Kitty OSC 72 commands for the native drag-and-drop adapter.
     pending_dnd_commands: Vec<DndCommand>,
     /// Pending color queries (OSC 4 and OSC 10-12)
@@ -1016,6 +1058,9 @@ pub struct Screen {
     kitty_visual_bell: KittyColorSetting,
     /// Dedicated Kitty OSC 21 transparency slots 1-8 (index 0 holds key 1).
     kitty_transparent_background: [KittyColorSetting; 8],
+    /// Shell-declared click behavior for OSC 133 prompt markers
+    /// (`click_events=1|2`, `special_key=1`, `redraw=0`, `k=s`).
+    prompt_click_settings: crate::shell_click::ShellPromptClickSettings,
     /// Ordered Kitty OSC 21 query replies awaiting daemon PTY responses.
     pending_kitty_queries: Vec<Vec<KittyQueryField>>,
     /// xterm color-palette stack. The index is one-based, matching the wire
@@ -1374,6 +1419,11 @@ impl Screen {
             pending_rich_clipboard_ops: Vec::new(),
             pending_rich_reads: Vec::new(),
             pending_notifications: Vec::new(),
+            find_matches: Vec::new(),
+            find_active: None,
+            task_progress: TaskProgress::None,
+            command_finish_policy: CommandFinishPolicy::default(),
+            command_start: None,
             pending_dnd_commands: Vec::new(),
             pending_color_queries: Vec::new(),
             base_palette: ColorPalette::default(),
@@ -1406,6 +1456,7 @@ impl Screen {
             pointer_main_stack: Vec::new(),
             pointer_alt_stack: Vec::new(),
             attribute_change_extent: AttributeChangeExtent::Stream,
+            prompt_click_settings: crate::shell_click::ShellPromptClickSettings::new(),
             drcs_fonts: HashMap::new(),
             sync_update_generation: 0,
         }
@@ -2102,6 +2153,17 @@ impl Screen {
     pub fn queue_notification(&mut self, notification: DesktopNotification) {
         self.pending_notifications
             .push(DesktopNotificationAction::Show(notification));
+    }
+
+    /// Current ConEmu taskbar progress for renderers to surface.
+    pub fn task_progress(&self) -> TaskProgress {
+        self.task_progress
+    }
+
+    /// Record ConEmu taskbar progress (`OSC 9;4;st;pr`).
+    pub fn set_task_progress(&mut self, progress: TaskProgress) {
+        self.task_progress = progress;
+        self.dirty = true;
     }
 
     /// Queue removal of a previously identified native notification.
@@ -2829,6 +2891,18 @@ impl Screen {
         self.extra_cursors.retain_within(height, width);
 
         self.dirty = true;
+
+        // Kitty in-band resize notifications (DEC private mode 2048):
+        // report the new geometry to the child (`kitty/window.py`,
+        // `notify_child_of_resize`). Unchanged dimensions return early
+        // above, so every report here reflects a real resize.
+        if self.modes.inband_resize_notification {
+            let width_px = (width as f64 * self.cell_width_hint).round().max(1.0) as usize;
+            let height_px = (height as f64 * self.cell_height_hint).round().max(1.0) as usize;
+            self.queue_response(
+                format!("\x1b[48;{height};{width};{height_px};{width_px}t").into_bytes(),
+            );
+        }
     }
 
     fn resize_primary_grid(&mut self, old_width: usize, width: usize, height: usize) {
@@ -3998,10 +4072,12 @@ impl Screen {
         let mut text_buf = String::new();
         // Reuse a lowercase buffer for case-insensitive search
         let mut lower_buf = String::new();
+        // Byte-offset to cell-column map, rebuilt per row next to the text.
+        let mut cell_map = Vec::new();
 
         // Search scrollback
         for (line_idx, row) in self.scrollback.iter().enumerate() {
-            row.write_text_to(&mut text_buf);
+            Self::row_text_with_cell_map(row, &mut text_buf, &mut cell_map);
             Self::search_in_text(
                 &text_buf,
                 &mut lower_buf,
@@ -4009,6 +4085,7 @@ impl Screen {
                 &search_pattern,
                 case_sensitive,
                 &regex_pattern,
+                &cell_map,
                 &mut results,
             );
         }
@@ -4017,7 +4094,7 @@ impl Screen {
         let scrollback_len = self.scrollback.len();
         for row_idx in 0..self.grid.height() {
             if let Some(row) = self.grid.row(row_idx) {
-                row.write_text_to(&mut text_buf);
+                Self::row_text_with_cell_map(row, &mut text_buf, &mut cell_map);
                 Self::search_in_text(
                     &text_buf,
                     &mut lower_buf,
@@ -4025,6 +4102,7 @@ impl Screen {
                     &search_pattern,
                     case_sensitive,
                     &regex_pattern,
+                    &cell_map,
                     &mut results,
                 );
             }
@@ -4033,7 +4111,107 @@ impl Screen {
         results
     }
 
-    /// Search for pattern matches within a single row's text
+    /// Row text plus a byte-offset to cell-column map, mirroring
+    /// `Row::write_text_to` (wide/multicell spacers skipped, so every text
+    /// byte lands on its lead cell). Lets match byte ranges convert to cell
+    /// coordinates for highlight rendering.
+    pub(crate) fn row_text_with_cell_map(row: &Row, text: &mut String, map: &mut Vec<u32>) {
+        text.clear();
+        map.clear();
+        for col in 0..row.len() {
+            let Some(cell) = row.get(col) else {
+                continue;
+            };
+            if cell.is_wide_spacer() || cell.is_multicell_spacer() {
+                continue;
+            }
+            let start = text.len();
+            text.push_str(cell.text());
+            map.extend(std::iter::repeat_n(col as u32, text.len() - start));
+        }
+        let trimmed_len = text.trim_end().len();
+        text.truncate(trimmed_len);
+        map.truncate(trimmed_len);
+    }
+
+    /// Store find matches for highlight rendering, activating the first.
+    pub fn set_find_matches(&mut self, matches: Vec<SearchResult>) {
+        self.find_active = if matches.is_empty() { None } else { Some(0) };
+        self.find_matches = matches;
+        self.dirty = true;
+    }
+
+    /// Drop stored find matches (next find repopulates).
+    pub fn clear_find_matches(&mut self) {
+        self.find_matches.clear();
+        self.find_active = None;
+        self.dirty = true;
+    }
+
+    /// Stored find matches in highlight order.
+    pub fn find_match_list(&self) -> &[SearchResult] {
+        &self.find_matches
+    }
+
+    /// Currently active (navigated-to) find match, if any.
+    pub fn active_find_match(&self) -> Option<&SearchResult> {
+        self.find_active
+            .and_then(|index| self.find_matches.get(index))
+    }
+
+    /// Advance the active match, wrapping around. Returns false when empty.
+    pub fn find_next(&mut self) -> bool {
+        if self.find_matches.is_empty() {
+            return false;
+        }
+        let next = self
+            .find_active
+            .map_or(0, |index| (index + 1) % self.find_matches.len());
+        self.find_active = Some(next);
+        self.dirty = true;
+        true
+    }
+
+    /// Move the active match back, wrapping around. Returns false when empty.
+    pub fn find_previous(&mut self) -> bool {
+        if self.find_matches.is_empty() {
+            return false;
+        }
+        let previous = self.find_active.map_or(0, |index| {
+            index.checked_sub(1).unwrap_or(self.find_matches.len() - 1)
+        });
+        self.find_active = Some(previous);
+        self.dirty = true;
+        true
+    }
+
+    /// Highlight state of one absolute-line cell: `Some(true)` for the
+    /// active match, `Some(false)` for any other match, `None` otherwise.
+    /// Linear scan; match lists are small in practice (bounded by the
+    /// buffer they were searched from).
+    pub fn find_match_at(&self, line: usize, col: usize) -> Option<bool> {
+        let mut found = None;
+        for (index, m) in self.find_matches.iter().enumerate() {
+            if m.line != line {
+                continue;
+            }
+            if col >= m.col && col < m.col.saturating_add(m.len.max(1)) {
+                if self.find_active == Some(index) {
+                    return Some(true);
+                }
+                found = Some(false);
+            }
+        }
+        found
+    }
+
+    /// Search for pattern matches within a single row's text.
+    ///
+    /// Coordinates are cell columns (not byte offsets): `cell_map` translates
+    /// match byte ranges, mirroring `Row::write_text_to`. Case-insensitive
+    /// matches are located in the lowered text and mapped through the
+    /// original row, which is exact except for length-changing folds.
+    #[allow(clippy::too_many_arguments)]
     fn search_in_text(
         line_text: &str,
         lower_buf: &mut String,
@@ -4041,15 +4219,35 @@ impl Screen {
         pattern: &str,
         case_sensitive: bool,
         regex_pattern: &Option<regex::Regex>,
+        cell_map: &[u32],
         results: &mut Vec<SearchResult>,
     ) {
+        fn push_match(
+            cell_map: &[u32],
+            line_idx: usize,
+            byte_start: usize,
+            byte_len: usize,
+            results: &mut Vec<SearchResult>,
+        ) {
+            if cell_map.is_empty() {
+                return;
+            }
+            let start = cell_map[byte_start.min(cell_map.len() - 1)] as usize;
+            let end_byte = (byte_start + byte_len).min(cell_map.len());
+            let end = if end_byte > byte_start {
+                cell_map[end_byte - 1] as usize + 1
+            } else {
+                start
+            };
+            results.push(SearchResult {
+                line: line_idx,
+                col: start,
+                len: end.saturating_sub(start),
+            });
+        }
         if let Some(re) = regex_pattern {
             for m in re.find_iter(line_text) {
-                results.push(SearchResult {
-                    line: line_idx,
-                    col: m.start(),
-                    len: m.len(),
-                });
+                push_match(cell_map, line_idx, m.start(), m.len(), results);
             }
         } else {
             // Simple string search - reuse lower_buf for case-insensitive
@@ -4063,13 +4261,9 @@ impl Screen {
 
             let mut start = 0;
             while let Some(pos) = search_text[start..].find(pattern) {
-                let col = start + pos;
-                results.push(SearchResult {
-                    line: line_idx,
-                    col,
-                    len: pattern.len(),
-                });
-                start = col + 1;
+                let byte_start = start + pos;
+                push_match(cell_map, line_idx, byte_start, pattern.len(), results);
+                start = byte_start + 1;
             }
         }
     }
@@ -4090,6 +4284,18 @@ impl Screen {
         }
     }
 
+    /// Shell-declared click behavior for OSC 133 prompt markers.
+    pub fn prompt_click_settings(&self) -> crate::shell_click::ShellPromptClickSettings {
+        self.prompt_click_settings
+    }
+
+    /// Mutable shell-declared click behavior (OSC 133 `A` parameters).
+    pub fn prompt_click_settings_mut(
+        &mut self,
+    ) -> &mut crate::shell_click::ShellPromptClickSettings {
+        &mut self.prompt_click_settings
+    }
+
     /// Mark the current cursor boundary as the start of command output
     /// (OSC 133 C).
     pub fn mark_command_start(&mut self) {
@@ -4104,6 +4310,75 @@ impl Screen {
         if let Some(row) = self.grid.row_mut(self.cursor.row) {
             row.shell_integration.command_end = Some(self.cursor.col.min(row.len()));
         }
+    }
+
+    /// Install the command-finished notification policy (every frontend
+    /// sets this from user configuration; disabled by default).
+    pub fn set_command_finish_policy(&mut self, policy: crate::notifications::CommandFinishPolicy) {
+        self.command_finish_policy = policy;
+    }
+
+    /// Record a shell command start (OSC 133 C) with its reported command
+    /// line, if any. Overwrites any unclosed start (a new prompt implies
+    /// the previous command ended without a `D` marker). The line is
+    /// sanitized and bounded here so notification bodies stay safe.
+    pub fn note_command_start(&mut self, cmdline: Option<String>) {
+        let cmdline = cmdline
+            .as_deref()
+            .filter(|line| !line.is_empty())
+            .map(crate::notifications::sanitize_command_line)
+            .filter(|line| !line.is_empty());
+        self.command_start = Some((Instant::now(), cmdline));
+    }
+
+    /// Record a shell command end (OSC 133 D) with its exit status, and
+    /// queue a command-finished notification when the installed policy
+    /// selects it: enabled, runtime at or above the threshold, and (for
+    /// unfocused-only policies) a hidden window.
+    pub fn note_command_end(&mut self, status: Option<i32>) {
+        let Some((started, cmdline)) = self.command_start.take() else {
+            return;
+        };
+        let policy = self.command_finish_policy;
+        if !policy.enabled {
+            return;
+        }
+        let duration = started.elapsed();
+        if duration < policy.min_duration {
+            return;
+        }
+        if policy.only_when_unfocused && self.frontend_state.visibility == WindowVisibility::Visible
+        {
+            return;
+        }
+        let when = crate::notifications::format_command_duration(duration);
+        let (title, body) = match (cmdline, status) {
+            (Some(cmd), Some(code)) => (
+                "Command finished".to_string(),
+                format!("{cmd} finished in {when} (exit {code})"),
+            ),
+            (Some(cmd), None) => (
+                "Command finished".to_string(),
+                format!("{cmd} finished in {when}"),
+            ),
+            (None, Some(code)) => (
+                "Command finished".to_string(),
+                format!("Finished in {when} (exit {code})"),
+            ),
+            (None, None) => (
+                "Command finished".to_string(),
+                format!("Finished in {when}"),
+            ),
+        };
+        // Untagged on purpose (see the `[notifications]` docs): an empty
+        // allow-list still delivers, and no deny entry can match, so the
+        // user's explicit toggle is the only gate besides this policy.
+        self.pending_notifications
+            .push(DesktopNotificationAction::Show(DesktopNotification {
+                title,
+                body,
+                ..Default::default()
+            }));
     }
 
     /// Move the viewport to the closest prompt before its current top edge.
@@ -5242,9 +5517,10 @@ pub enum ClearMode {
 pub struct SearchResult {
     /// Line index (0 = oldest scrollback line)
     pub line: usize,
-    /// Column where match starts
+    /// Cell column where the match starts (wide spacers excluded, so one
+    /// step per displayed cell).
     pub col: usize,
-    /// Length of match
+    /// Length of the match in cells.
     pub len: usize,
 }
 
@@ -5270,6 +5546,171 @@ mod tests {
         assert_eq!(screen.height(), 24);
         assert_eq!(screen.cursor.row, 0);
         assert_eq!(screen.cursor.col, 0);
+    }
+
+    fn find_results() -> Vec<SearchResult> {
+        vec![
+            SearchResult {
+                line: 0,
+                col: 0,
+                len: 3,
+            },
+            SearchResult {
+                line: 0,
+                col: 5,
+                len: 3,
+            },
+            SearchResult {
+                line: 2,
+                col: 1,
+                len: 2,
+            },
+        ]
+    }
+
+    #[test]
+    fn find_navigation_cycles_and_reports_cells() {
+        let mut screen = Screen::new(80, 24, ScreenConfig::default());
+        assert!(!screen.find_next());
+        assert!(!screen.find_previous());
+        assert_eq!(screen.find_match_at(0, 0), None);
+
+        screen.set_find_matches(find_results());
+        assert_eq!(screen.find_match_list().len(), 3);
+        // Active starts at the first match.
+        assert_eq!(screen.find_match_at(0, 0), Some(true));
+        assert_eq!(screen.find_match_at(0, 1), Some(true));
+        assert_eq!(screen.find_match_at(0, 3), None);
+        assert_eq!(screen.find_match_at(0, 5), Some(false));
+        assert_eq!(screen.find_match_at(1, 0), None);
+        assert_eq!(screen.find_match_at(2, 2), Some(false));
+
+        // Forward cycles with wraparound.
+        assert!(screen.find_next());
+        assert_eq!(screen.find_match_at(0, 0), Some(false));
+        assert_eq!(screen.find_match_at(0, 5), Some(true));
+        assert!(screen.find_next());
+        assert_eq!(screen.find_match_at(2, 1), Some(true));
+        assert!(screen.find_next());
+        assert_eq!(screen.find_match_at(0, 0), Some(true));
+
+        // Backward cycles with wraparound.
+        assert!(screen.find_previous());
+        assert_eq!(screen.find_match_at(2, 1), Some(true));
+        assert!(screen.find_previous());
+        assert_eq!(screen.find_match_at(0, 5), Some(true));
+
+        screen.clear_find_matches();
+        assert_eq!(screen.find_match_at(0, 0), None);
+        assert!(!screen.find_next());
+    }
+
+    fn enabled_command_finish_policy() -> crate::notifications::CommandFinishPolicy {
+        crate::notifications::CommandFinishPolicy {
+            enabled: true,
+            min_duration: std::time::Duration::ZERO,
+            only_when_unfocused: false,
+        }
+    }
+
+    fn finished_notification_titles(screen: &mut Screen) -> Vec<(String, String)> {
+        screen
+            .take_notifications()
+            .into_iter()
+            .filter_map(|action| match action {
+                DesktopNotificationAction::Show(notification) => {
+                    Some((notification.title, notification.body))
+                }
+                DesktopNotificationAction::Close(_) => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn command_finished_notifications_stay_off_by_default() {
+        let mut screen = Screen::new(80, 24, ScreenConfig::default());
+        screen.note_command_start(Some("sleep 100".to_string()));
+        screen.note_command_end(Some(0));
+        assert!(screen.take_notifications().is_empty());
+    }
+
+    #[test]
+    fn command_finished_notification_reports_command_status_and_duration() {
+        let mut screen = Screen::new(80, 24, ScreenConfig::default());
+        screen.set_command_finish_policy(enabled_command_finish_policy());
+        screen.note_command_start(Some("sleep 100".to_string()));
+        // Zero threshold: any runtime, however short, notifies.
+        screen.note_command_end(Some(0));
+        let shown = finished_notification_titles(&mut screen);
+        assert_eq!(shown.len(), 1);
+        assert_eq!(shown[0].0, "Command finished");
+        assert!(shown[0].1.starts_with("sleep 100 finished in "));
+        assert!(shown[0].1.ends_with(" (exit 0)"));
+    }
+
+    #[test]
+    fn command_finished_notification_omits_unknown_status() {
+        let mut screen = Screen::new(80, 24, ScreenConfig::default());
+        screen.set_command_finish_policy(enabled_command_finish_policy());
+        screen.note_command_start(None);
+        screen.note_command_end(None);
+        let shown = finished_notification_titles(&mut screen);
+        assert_eq!(shown.len(), 1);
+        assert_eq!(shown[0].0, "Command finished");
+        assert!(shown[0].1.starts_with("Finished in "));
+        assert!(!shown[0].1.contains("exit"));
+    }
+
+    #[test]
+    fn command_finished_notification_honors_threshold_and_focus() {
+        let mut screen = Screen::new(80, 24, ScreenConfig::default());
+        // Huge threshold: slow commands only.
+        screen.set_command_finish_policy(crate::notifications::CommandFinishPolicy {
+            enabled: true,
+            min_duration: std::time::Duration::from_secs(3600),
+            only_when_unfocused: false,
+        });
+        screen.note_command_start(Some("true".to_string()));
+        screen.note_command_end(Some(0));
+        assert!(screen.take_notifications().is_empty());
+
+        // Unfocused-only policy on a visible window: silent.
+        screen.set_command_finish_policy(crate::notifications::CommandFinishPolicy {
+            enabled: true,
+            min_duration: std::time::Duration::ZERO,
+            only_when_unfocused: true,
+        });
+        screen.set_window_visibility(WindowVisibility::Visible);
+        screen.note_command_start(Some("true".to_string()));
+        screen.note_command_end(Some(0));
+        assert!(screen.take_notifications().is_empty());
+
+        // Same policy on a hidden window: notifies.
+        screen.set_window_visibility(WindowVisibility::Hidden);
+        screen.note_command_start(Some("true".to_string()));
+        screen.note_command_end(Some(0));
+        assert_eq!(finished_notification_titles(&mut screen).len(), 1);
+    }
+
+    #[test]
+    fn command_finished_notifications_need_a_start_marker() {
+        let mut screen = Screen::new(80, 24, ScreenConfig::default());
+        screen.set_command_finish_policy(enabled_command_finish_policy());
+        // End without start: nothing to report, no crash.
+        screen.note_command_end(Some(0));
+        assert!(screen.take_notifications().is_empty());
+    }
+
+    #[test]
+    fn command_finished_command_line_is_bounded_and_safe() {
+        use crate::notifications::{sanitize_command_line, MAX_COMMAND_LINE_CHARS};
+        assert_eq!(sanitize_command_line("make test"), "make test");
+        assert_eq!(sanitize_command_line("a\x07b\x1bc"), "abc");
+        let long = "x".repeat(MAX_COMMAND_LINE_CHARS + 50);
+        assert_eq!(
+            sanitize_command_line(&long).chars().count(),
+            MAX_COMMAND_LINE_CHARS
+        );
     }
 
     #[test]

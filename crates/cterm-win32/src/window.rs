@@ -453,6 +453,11 @@ fn configure_terminal_cursor(terminal: &mut Terminal, config: &Config) {
         config.appearance.cursor_style.core_style(),
         config.appearance.cursor_blink,
     );
+    // Terminal-level notification policy lives here too so every setup path
+    // installs it exactly once.
+    terminal
+        .screen_mut()
+        .set_command_finish_policy(config.notifications.to_command_finish_policy());
 }
 
 /// Classify a Win32 key message without consulting mutable keyboard state.
@@ -674,6 +679,7 @@ fn action_restricted_in_managed_mode(action: &Action) -> bool {
         | Action::FocusPane(_)
         | Action::ResizePane(_)
         | Action::TogglePaneZoom
+        | Action::BroadcastInput
         | Action::OpenPreferences
         | Action::QuickOpenTemplate => true,
         Action::CloseTab
@@ -698,6 +704,8 @@ fn action_restricted_in_managed_mode(action: &Action) -> bool {
         | Action::PromptPrevious
         | Action::PromptNext
         | Action::FindText
+        | Action::FindNext
+        | Action::FindPrevious
         | Action::ResetTerminal => false,
     }
 }
@@ -3463,6 +3471,12 @@ impl WindowState {
             Action::FocusPane(direction) => self.focus_pane(direction),
             Action::ResizePane(direction) => self.resize_active_pane(direction),
             Action::TogglePaneZoom => self.toggle_active_pane_zoom(),
+            // Broadcast input is GTK-only for now; the shared action,
+            // config key, and per-tab semantics already exist for the
+            // Win32 wiring to reuse.
+            Action::BroadcastInput => {
+                log::debug!("Broadcast input is not yet wired on Win32");
+            }
             Action::NextTab => self.next_tab(),
             Action::PrevTab => self.prev_tab(),
             Action::NextAlertedTab => self.next_alerted_tab(),
@@ -3516,6 +3530,11 @@ impl WindowState {
                 self.launch_new_window();
             }
             Action::FindText => self.show_find_dialog(),
+            // Find-match highlight and keyboard navigation follow the GTK
+            // implementation; these arms keep the shared actions dispatchable.
+            Action::FindNext | Action::FindPrevious => {
+                log::debug!("Find navigation is not yet wired on Win32");
+            }
             Action::ResetTerminal => self.reset_terminal(),
             Action::OpenPreferences => self.show_preferences(),
             Action::QuickOpenTemplate => self.show_quick_open(),
@@ -3594,6 +3613,9 @@ impl WindowState {
                             );
                         }
                     }
+                }
+                MenuAction::BroadcastInput => {
+                    self.handle_action(Action::BroadcastInput);
                 }
                 MenuAction::CopyHtml => self.copy_selection_as_html(),
                 MenuAction::SetTitle => self.show_set_title_dialog(),

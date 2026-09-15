@@ -187,9 +187,9 @@ enum KittyPayloadType {
 /// Mirrors the mode list in Kitty's `copy_specific_modes` (`kitty/screen.c`),
 /// restricted to modes cterm implements: ANSI 4 (IRM) and 20 (LNM), DEC 1, 5,
 /// 7, 25, the 1000 mouse-tracking group, the 1005 mouse-encoding group, 1004,
-/// 2004, 2031, and 2033. Modes with side effects on other terminal state
+/// 2004, 2031, 2033, and 2048. Modes with side effects on other terminal state
 /// (notably DECOM 6 and DECCOLM 3) and modes cterm does not implement
-/// (DECARM 8, inband-resize 2048, paste-event 5522) are never captured.
+/// (DECARM 8, paste-event 5522) are never captured.
 #[derive(Debug, Clone, Copy, Default)]
 struct SafeModeSnapshot {
     insert_mode: bool,
@@ -204,6 +204,7 @@ struct SafeModeSnapshot {
     bracketed_paste: bool,
     theme_change_reports: bool,
     visibility_change_reports: bool,
+    inband_resize_notification: bool,
 }
 
 impl SafeModeSnapshot {
@@ -221,6 +222,7 @@ impl SafeModeSnapshot {
             bracketed_paste: screen.modes.bracketed_paste,
             theme_change_reports: screen.modes.theme_change_reports,
             visibility_change_reports: screen.modes.visibility_change_reports,
+            inband_resize_notification: screen.modes.inband_resize_notification,
         }
     }
 }
@@ -232,7 +234,7 @@ impl SafeModeSnapshot {
 fn is_safe_dec_mode(mode: usize) -> bool {
     matches!(
         mode,
-        1 | 5 | 7 | 25 | 1000 | 1002 | 1003 | 1004 | 1006 | 1015 | 1016 | 2004 | 2031 | 2033
+        1 | 5 | 7 | 25 | 1000 | 1002 | 1003 | 1004 | 1006 | 1015 | 1016 | 2004 | 2031 | 2033 | 2048
     )
 }
 
@@ -805,9 +807,12 @@ impl vte::Perform for ScreenPerformer<'_> {
             }
             // iTerm2 Growl notifications. Numeric prefixes belong to the
             // ConEmu/Windows Terminal OSC 9 extension and are intentionally
-            // ignored, matching Foot.
+            // ignored, matching Foot — except `9;4` taskbar progress,
+            // which cterm tracks per session for renderers to surface.
             9 => {
-                if let Some(notification) = parse_simple_notification(&params[1..], true) {
+                if params.get(1).is_some_and(|param| *param == b"4") {
+                    handle_osc9_progress(self.screen, &params[2..]);
+                } else if let Some(notification) = parse_simple_notification(&params[1..], true) {
                     self.screen.queue_notification(notification);
                 }
             }
@@ -924,10 +929,28 @@ impl vte::Perform for ScreenPerformer<'_> {
             }
             // FinalTerm/iTerm2 shell integration. Foot deliberately treats B
             // as informational and records A/C/D on the current physical row.
+            // `C` additionally carries the reported command line (`cmdline=`
+            // literal or `cmdline_url=` percent-decoded, bounded) and `D`
+            // the exit status for command-finished notifications.
             133 => match params.get(1).and_then(|value| value.first()).copied() {
-                Some(b'A') => self.screen.mark_shell_prompt(),
-                Some(b'C') => self.screen.mark_command_start(),
-                Some(b'D') => self.screen.mark_command_end(),
+                Some(b'A') => {
+                    self.screen.mark_shell_prompt();
+                    for param in params.iter().skip(2) {
+                        if let Ok(token) = std::str::from_utf8(param) {
+                            self.screen.prompt_click_settings_mut().apply_token(token);
+                        }
+                    }
+                }
+                Some(b'C') => {
+                    self.screen.mark_command_start();
+                    self.screen
+                        .note_command_start(Self::osc133_cmdline(&params[2..]));
+                }
+                Some(b'D') => {
+                    self.screen.mark_command_end();
+                    self.screen
+                        .note_command_end(Self::osc133_status(&params[2..]));
+                }
                 _ => {}
             },
             // URxvt's generic extension; only its widely implemented notify
@@ -2057,6 +2080,80 @@ impl ScreenPerformer<'_> {
         std::str::from_utf8(raw_key).ok()
     }
 
+    /// Extract the reported command line from OSC 133 `C` parameters.
+    ///
+    /// Prefers `cmdline_url=` (percent-decoded) over the literal `cmdline=`
+    /// form; overlong values are dropped before sanitizing so hostile shells
+    /// cannot stuff notification bodies.
+    fn osc133_cmdline(params: &[&[u8]]) -> Option<String> {
+        const MAX_CMDLINE_BYTES: usize = 1024;
+        let mut literal: Option<&str> = None;
+        for param in params {
+            let Ok(text) = std::str::from_utf8(param) else {
+                continue;
+            };
+            if text.len() > MAX_CMDLINE_BYTES {
+                continue;
+            }
+            if let Some(encoded) = text.strip_prefix("cmdline_url=") {
+                return Some(Self::percent_decode(encoded));
+            }
+            if literal.is_none() {
+                if let Some(value) = text.strip_prefix("cmdline=") {
+                    literal = Some(value);
+                }
+            }
+        }
+        literal.map(str::to_string)
+    }
+
+    /// Extract the exit status from OSC 133 `D` parameters (`D;0`).
+    /// Anything unparseable means "unknown status", never a default code.
+    fn osc133_status(params: &[&[u8]]) -> Option<i32> {
+        let raw = params.first()?;
+        std::str::from_utf8(raw).ok()?.trim().parse().ok()
+    }
+
+    /// Minimal `%XX` decoder for OSC 133 `cmdline_url=` values. Only ASCII
+    /// hex escapes decode; everything else (including a bare `%`) passes
+    /// through literally, and malformed output falls back to lossy text so
+    /// hostile input cannot break UTF-8 invariants downstream.
+    fn percent_decode(encoded: &str) -> String {
+        fn nibble(byte: u8) -> Option<u8> {
+            match byte {
+                b'0'..=b'9' => Some(byte - b'0'),
+                b'a'..=b'f' => Some(byte - b'a' + 10),
+                b'A'..=b'F' => Some(byte - b'A' + 10),
+                _ => None,
+            }
+        }
+        let bytes = encoded.as_bytes();
+        let mut out = Vec::with_capacity(bytes.len());
+        let mut index = 0;
+        while index < bytes.len() {
+            let mut decoded = None;
+            if bytes[index] == b'%' {
+                if let (Some(hi), Some(lo)) = (
+                    bytes.get(index + 1).and_then(|byte| nibble(*byte)),
+                    bytes.get(index + 2).and_then(|byte| nibble(*byte)),
+                ) {
+                    decoded = Some(hi << 4 | lo);
+                }
+            }
+            match decoded {
+                Some(byte) => {
+                    out.push(byte);
+                    index += 3;
+                }
+                None => {
+                    out.push(bytes[index]);
+                    index += 1;
+                }
+            }
+        }
+        String::from_utf8_lossy(&out).into_owned()
+    }
+
     /// Split a transparent-background value into color and Kitty opacity
     /// quanta (`transparent_background_color_control` in `kitty/window.py`,
     /// verified live against 0.48.2): partition at the first `@`; the color
@@ -2963,6 +3060,9 @@ impl ScreenPerformer<'_> {
                     self.screen.queue_visibility_report();
                 }
             }
+            // Kitty in-band window-resize notifications: the next resizes
+            // report `CSI 48;rows;cols;height;width t` to the child.
+            2048 => self.screen.modes.inband_resize_notification = set,
             // xterm Sixel Cursor Right of Graphics
             8452 => self.screen.modes.sixel_cursor_right = set,
             _ => {
@@ -3002,6 +3102,7 @@ impl ScreenPerformer<'_> {
             2026 => self.screen.modes.application_sync_updates,
             2031 => self.screen.modes.theme_change_reports,
             2033 => self.screen.modes.visibility_change_reports,
+            2048 => self.screen.modes.inband_resize_notification,
             8452 => self.screen.modes.sixel_cursor_right,
             // Recognized legacy encodings which cterm deliberately never uses.
             9 | 67 | 1001 | 1005 => return 4,
@@ -3056,6 +3157,7 @@ impl ScreenPerformer<'_> {
         self.handle_dec_mode(2004, snapshot.bracketed_paste);
         self.handle_dec_mode(2031, snapshot.theme_change_reports);
         self.handle_dec_mode(2033, snapshot.visibility_change_reports);
+        self.handle_dec_mode(2048, snapshot.inband_resize_notification);
     }
 
     /// Save one explicit `CSI ? Pm s` mode into the shared store
@@ -3077,6 +3179,9 @@ impl ScreenPerformer<'_> {
             2031 => snapshot.theme_change_reports = self.screen.modes.theme_change_reports,
             2033 => {
                 snapshot.visibility_change_reports = self.screen.modes.visibility_change_reports
+            }
+            2048 => {
+                snapshot.inband_resize_notification = self.screen.modes.inband_resize_notification
             }
             _ => {}
         }
@@ -3104,6 +3209,7 @@ impl ScreenPerformer<'_> {
             2004 => self.handle_dec_mode(2004, snapshot.bracketed_paste),
             2031 => self.handle_dec_mode(2031, snapshot.theme_change_reports),
             2033 => self.handle_dec_mode(2033, snapshot.visibility_change_reports),
+            2048 => self.handle_dec_mode(2048, snapshot.inband_resize_notification),
             _ => return false,
         }
         true
@@ -3206,6 +3312,36 @@ impl ScreenPerformer<'_> {
 }
 
 // Helper functions
+
+/// Record ConEmu taskbar progress (`OSC 9;4;st;pr`).
+///
+/// `st`: 0 removes progress, 1 sets a 0-100 value, 2 marks error
+/// (optional value), 3 is indeterminate, 4 is paused (optional value).
+/// Out-of-range values clamp to 0-100; anything unparseable leaves state
+/// unchanged. Renderers surface the stored state per backend.
+fn handle_osc9_progress(screen: &mut Screen, params: &[&[u8]]) {
+    use crate::screen::TaskProgress;
+    fn number(value: &[u8]) -> Option<u32> {
+        std::str::from_utf8(value).ok()?.trim().parse().ok()
+    }
+    let state = number(params.first().copied().unwrap_or_default());
+    let value = params
+        .get(1)
+        .and_then(|param| number(param))
+        .map(|percent| percent.min(100) as u8);
+    let progress = match state {
+        Some(0) => TaskProgress::None,
+        Some(1) => match value {
+            Some(percent) => TaskProgress::Normal(percent),
+            None => return,
+        },
+        Some(2) => TaskProgress::Error(value),
+        Some(3) => TaskProgress::Indeterminate,
+        Some(4) => TaskProgress::Paused(value),
+        _ => return,
+    };
+    screen.set_task_progress(progress);
+}
 
 fn parse_simple_notification(
     params: &[&[u8]],
@@ -4572,6 +4708,81 @@ mod tests {
     }
 
     #[test]
+    fn test_osc133_command_markers_feed_finished_notifications() {
+        use crate::notifications::CommandFinishPolicy;
+        use std::time::Duration;
+
+        let mut screen = make_screen();
+        screen.set_command_finish_policy(CommandFinishPolicy {
+            enabled: true,
+            min_duration: Duration::ZERO,
+            only_when_unfocused: false,
+        });
+        let mut parser = Parser::new();
+
+        // Command line arrives URL-encoded; the status rides on `D`.
+        parser.parse(
+            &mut screen,
+            b"\x1b]133;C;cmdline_url=sleep%20100\x07output\x1b]133;D;0\x1b\\",
+        );
+        let shown: Vec<String> = screen
+            .take_notifications()
+            .into_iter()
+            .filter_map(|action| match action {
+                crate::screen::DesktopNotificationAction::Show(notification) => {
+                    Some(notification.body)
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(shown.len(), 1);
+        assert!(shown[0].starts_with("sleep 100 finished in "));
+        assert!(shown[0].ends_with(" (exit 0)"));
+
+        // Unparseable status means unknown, never a default code; a second
+        // command without a new start marker still notifies once.
+        parser.parse(&mut screen, b"\x1b]133;C\x07more\x1b]133;D;bogus\x1b\\");
+        let shown: Vec<String> = screen
+            .take_notifications()
+            .into_iter()
+            .filter_map(|action| match action {
+                crate::screen::DesktopNotificationAction::Show(notification) => {
+                    Some(notification.body)
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(shown.len(), 1);
+        assert!(!shown[0].contains("exit"));
+    }
+
+    #[test]
+    fn test_osc133_a_parameters_configure_prompt_clicks() {
+        let mut screen = make_screen();
+        let mut parser = Parser::new();
+
+        // Plain A only marks; settings stay at power-on defaults.
+        parser.parse(&mut screen, b"\x1b]133;A\x07");
+        let settings = screen.prompt_click_settings();
+        assert!(!settings.supports_click_events);
+        assert!(!settings.use_special_key);
+        assert!(settings.redraws_prompts);
+        assert!(!settings.secondary_on_current_line);
+
+        // Kitty tokens apply sticky; unknown tokens are ignored.
+        parser.parse(
+            &mut screen,
+            b"\x1b]133;A;click_events=2;special_key=1;redraw=0;k=s;nonsense=x;click_events=9\x07",
+        );
+        let settings = screen.prompt_click_settings();
+        assert!(settings.supports_click_events);
+        assert!(settings.relative_click_events);
+        assert!(settings.use_special_key);
+        assert!(!settings.redraws_prompts);
+        assert!(settings.secondary_on_current_line);
+    }
+
+    #[test]
     fn test_osc9_and_777_desktop_notifications_match_foot() {
         let mut screen = make_screen();
         let mut parser = Parser::new();
@@ -4601,6 +4812,40 @@ mod tests {
                 }),
             ]
         );
+    }
+
+    #[test]
+    fn test_osc9_progress_state_matches_conemu() {
+        use crate::screen::TaskProgress;
+
+        let mut screen = make_screen();
+        let mut parser = Parser::new();
+        assert_eq!(screen.task_progress(), TaskProgress::None);
+
+        // Normal with value, error/indeterminate/paused, then removal.
+        // Values above 100 clamp; unparseable input leaves state unchanged.
+        parser.parse(&mut screen, b"\x1b]9;4;1;42\x07");
+        assert_eq!(screen.task_progress(), TaskProgress::Normal(42));
+        parser.parse(&mut screen, b"\x1b]9;4;1;250\x07");
+        assert_eq!(screen.task_progress(), TaskProgress::Normal(100));
+        parser.parse(&mut screen, b"\x1b]9;4;2\x07");
+        assert_eq!(screen.task_progress(), TaskProgress::Error(None));
+        parser.parse(&mut screen, b"\x1b]9;4;2;7\x07");
+        assert_eq!(screen.task_progress(), TaskProgress::Error(Some(7)));
+        parser.parse(&mut screen, b"\x1b]9;4;3;99\x07");
+        assert_eq!(screen.task_progress(), TaskProgress::Indeterminate);
+        parser.parse(&mut screen, b"\x1b]9;4;4\x07");
+        assert_eq!(screen.task_progress(), TaskProgress::Paused(None));
+        parser.parse(&mut screen, b"\x1b]9;4;9;9\x07");
+        assert_eq!(screen.task_progress(), TaskProgress::Paused(None));
+        parser.parse(&mut screen, b"\x1b]9;4;bogus\x07");
+        assert_eq!(screen.task_progress(), TaskProgress::Paused(None));
+        parser.parse(&mut screen, b"\x1b]9;4;0;0\x07");
+        assert_eq!(screen.task_progress(), TaskProgress::None);
+
+        // Progress sequences queue no notifications or replies.
+        assert!(screen.take_notifications().is_empty());
+        assert!(screen.take_pending_responses().is_empty());
     }
 
     #[test]
@@ -6161,6 +6406,51 @@ mod tests {
         parser.parse(&mut screen, b"\x1b[?1;2004r");
         assert!(screen.modes.application_cursor);
         assert!(screen.modes.bracketed_paste);
+    }
+
+    #[test]
+    fn test_kitty_inband_resize_reports_geometry() {
+        let mut screen = make_screen();
+        let mut parser = Parser::new();
+
+        // Unset by default: DECRQM reports reset and resizes stay silent.
+        parser.parse(&mut screen, b"\x1b[?2048$p");
+        assert_eq!(
+            screen.take_pending_responses(),
+            vec![b"\x1b[?2048;2$y".to_vec()]
+        );
+        screen.resize(100, 30);
+        assert!(screen.take_pending_responses().is_empty());
+
+        // Set: DECRQM reports set and every real resize reports
+        // `CSI 48;rows;cols;height;width t` (default 8x16 cell hints).
+        parser.parse(&mut screen, b"\x1b[?2048h");
+        parser.parse(&mut screen, b"\x1b[?2048$p");
+        screen.resize(100, 31);
+        assert_eq!(
+            screen.take_pending_responses(),
+            vec![
+                b"\x1b[?2048;1$y".to_vec(),
+                b"\x1b[48;31;100;496;800t".to_vec(),
+            ]
+        );
+
+        // Same-size resizes report nothing.
+        screen.resize(100, 31);
+        assert!(screen.take_pending_responses().is_empty());
+
+        // The mode round-trips through bare save/restore like Kitty's
+        // `copy_specific_modes`.
+        parser.parse(&mut screen, b"\x1b[?s");
+        parser.parse(&mut screen, b"\x1b[?2048l");
+        assert!(!screen.modes.inband_resize_notification);
+        parser.parse(&mut screen, b"\x1b[?r");
+        assert!(screen.modes.inband_resize_notification);
+
+        // Reset stops the reports.
+        parser.parse(&mut screen, b"\x1b[?2048l");
+        screen.resize(80, 24);
+        assert!(screen.take_pending_responses().is_empty());
     }
 
     #[test]

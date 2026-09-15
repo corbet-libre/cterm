@@ -35,6 +35,59 @@ is omitted for readability.
   fallback for missing/unparseable/negative values, saturation above 1.0,
   `rgb:rr/gg/bb@opacity` query replies, and snapshot survival through an
   additive proto field — verified live against Kitty 0.48.2.
+- Keyboard-hints matcher core: URL (`http(s)://`, `file://`, `www.`)
+  and file-path (`/`- and `~`-rooted) candidates with cell-accurate
+  coordinates, trailing-punctuation trimming, home-row labels, and a
+  256-match cap. Native overlay rendering plus open/copy/paste actions
+  follow per backend.
+- Background images on GTK (`background_image` plus opacity and
+  cover/contain/stretch/tile fit): painted under default cell backgrounds
+  while explicit colors still cover them, verified with text rendered over
+  the image. Cocoa/Win32 follow.
+- Find-match highlighting with keyboard navigation: `find` results use
+  cell-accurate coordinates (wide spacers excluded), matches highlight in
+  the viewport with the active match solid, and `F3`/`Shift+F3` cycle with
+  wraparound (configurable). GTK renders the highlights; Cocoa/Win32 and
+  a non-modal search bar follow.
+- Image decoding accepts WebP and NetPBM alongside PNG/JPEG/GIF
+  (animated-PNG default images ride the PNG path), with magic-byte routing
+  for the new formats.
+- Independent working-directory inheritance: `tab_inherit_cwd` and
+  `split_inherit_cwd` (both default on) control whether new tabs and
+  splits start in the active pane's foreground directory or fall back to
+  the configured default, on GTK for now.
+- ConEmu taskbar progress (`OSC 9;4;st;pr`): all five states parsed and
+  stored per session (values clamp to 0-100, malformed input changes
+  nothing) for renderers to surface per backend.
+- Rich copy on GTK serves both MIME types: "Copy as HTML" now offers
+  `text/plain` alongside `text/html` through a union content provider, so
+  rich targets paste formatted text while plain-text targets keep working
+  (macOS and Win32 already had their native equivalents).
+- Kitty in-band window-resize notifications (DEC private mode 2048):
+  resizes report `CSI 48;rows;cols;height;width t` to the child, with
+  DECRQM status and save/restore coverage matching Kitty's
+  `copy_specific_modes`.
+- Graphics hardening audit against Kitty CVE-2026-33633/33642: garbage
+  declared as PNG-direct, lying IHDR dimensions, and hostile compose
+  offsets (negative, `u32::MAX`, `i32::MAX`, unknown images) all fail
+  closed with error replies — no panic, no runaway allocation, and the
+  image store stays dimensionally consistent.
+- Command-finished notifications (Ghostty `notify-on-command-finish`
+  semantics): OSC 133 `C` records start time plus the reported command
+  line (`cmdline=` literal or percent-decoded `cmdline_url=`), `D` records
+  the exit status, and a shared-core policy (off by default; minimum
+  runtime; unfocused-only) queues a desktop notification through the
+  existing delivery pipeline on all three frontends.
+- Broadcast input to all panes of the active tab (tmux `synchronize-panes`
+  semantics, `Ctrl+Shift+Y`): every key is encoded through each pane's own
+  terminal (keyboard-protocol state stays per pane) and written to its
+  daemon session, releases included. GTK-only for now; Cocoa/Win32 reuse
+  the shared action and config key when wired. Keys only, not pastes.
+- Kitty click-to-move-cursor protocol state in shared core: OSC 133 `A`
+  parameters (`click_events=1|2`, `special_key=1`, `redraw=0`, `k=s`),
+  shell-prompt detection mirroring Kitty's scan, SGR-press forwarding,
+  and arrow-walk computation with Kitty-faithful wide-char counting.
+  Native mouse-hook wiring follows per backend.
 - Notification `filter_rules`: Kitty `filter_notification` deny rules
   (`field:regexp` over title/body/app/type with and/or/not/parens/quotes
   and `all`, unanchored Rust-regexp search, invalid rules logged and

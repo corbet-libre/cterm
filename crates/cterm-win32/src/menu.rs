@@ -232,6 +232,7 @@ pub enum MenuAction {
     ResizePaneUp = 3123,
     ResizePaneDown = 3124,
     TogglePaneZoom = 3131,
+    BroadcastInput = 3132,
 
     // Tabs menu
     PrevTab = 4001,
@@ -306,6 +307,7 @@ impl MenuAction {
             3123 => Some(Self::ResizePaneUp),
             3124 => Some(Self::ResizePaneDown),
             3131 => Some(Self::TogglePaneZoom),
+            3132 => Some(Self::BroadcastInput),
             4001 => Some(Self::PrevTab),
             4002 => Some(Self::NextTab),
             4003 => Some(Self::NextAlertedTab),
@@ -371,6 +373,7 @@ impl MenuAction {
             Self::ResizePaneUp => Some(Action::ResizePane(PaneDirection::Up)),
             Self::ResizePaneDown => Some(Action::ResizePane(PaneDirection::Down)),
             Self::TogglePaneZoom => Some(Action::TogglePaneZoom),
+            Self::BroadcastInput => Some(Action::BroadcastInput),
             Self::PrevTab => Some(Action::PrevTab),
             Self::NextTab => Some(Action::NextTab),
             Self::NextAlertedTab => Some(Action::NextAlertedTab),

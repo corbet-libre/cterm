@@ -12,7 +12,7 @@ in the living [parity inventory](docs/parity.md).
 - **True Color Support**: Full 24-bit RGB color with 256-color palette fallback
 - **Unicode Support**: Extended grapheme clusters, combining characters, ZWJ emoji, flags, and wide cells
 - **Scrollback Buffer**: Configurable history with grapheme-safe resize reflow
-- **Find in Scrollback**: Search through terminal history with regex support
+- **Find in Scrollback**: Search through terminal history with regex support, match highlighting, and `F3`/`Shift+F3` navigation
 
 ### User Interface
 - **Tabs**: Multiple terminal tabs with keyboard shortcuts
@@ -30,11 +30,11 @@ in the living [parity inventory](docs/parity.md).
 - **Hyperlinks**: Clickable URLs with OSC 8 support
 - **Clipboard**: OSC 52 clipboard integration for remote copy/paste
 - **Dynamic Colors**: Theme-aware OSC 10/11/12 query, set, and reset support
-- **Shell Integration**: OSC 133 prompt navigation and last-command output boundaries
+- **Shell Integration**: OSC 133 prompt navigation and last-command output boundaries, plus Kitty click-to-move-cursor protocol state (`click_events=1|2`, `special_key=1`, prompt detection, and arrow-walk computation in shared core; native mouse-hook wiring follows per backend)
 - **Desktop Notifications**: Native OSC 9/777 and Kitty OSC 99 notifications
 - **Alternate Screen**: Full alternate screen buffer support (for vim, less, etc.)
 - **Sixel Graphics**: Inline image display with DEC Sixel protocol support
-- **iTerm2 Graphics**: Inline images via OSC 1337 protocol (PNG, JPEG, GIF)
+- **iTerm2 Graphics**: Inline images via OSC 1337 protocol (PNG, JPEG, GIF, WebP, NetPBM)
 - **iTerm2 File Transfer**: Receive files via OSC 1337 with streaming support for large files
 - **DRCS Fonts**: Soft font support via DECDLD for custom character sets
 
@@ -374,6 +374,7 @@ identity_file = "~/.ssh/prod_key"
 | 2026 | — | Synchronized application updates |
 | 2031 | — | Native theme change reports |
 | 2033 | — | Native window visibility reports |
+| 2048 | — | In-band window-resize reports (`CSI 48;rows;cols;height;width t`) |
 | 8452 | — | Place the cursor to the right of Sixel graphics |
 
 ### Supported ANSI Modes (SM/RM)
@@ -394,6 +395,7 @@ identity_file = "~/.ssh/prod_key"
 | 7 | Track the shell-reported working directory (`file:` URI) |
 | 8 | Hyperlinks |
 | 9 | iTerm2/Foot desktop notifications |
+| 9;4 | ConEmu taskbar progress (stored per session for renderers) |
 | 10 | Query/set foreground color |
 | 11 | Query/set background color |
 | 12 | Query/set cursor color |
@@ -595,7 +597,7 @@ img2sixel image.png
 
 ### iTerm2 Graphics Protocol (OSC 1337)
 
-cterm supports iTerm2's inline image protocol for displaying PNG, JPEG, and GIF images:
+cterm supports iTerm2's inline image protocol for displaying PNG, JPEG, GIF, WebP, and NetPBM images:
 - Inline image display with `inline=1`
 - File transfer with `inline=0` (shows notification bar with Save/Save As/Discard)
 - Streaming file transfer support for large files (spills to disk when >1MB)

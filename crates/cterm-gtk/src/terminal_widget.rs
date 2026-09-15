@@ -42,6 +42,7 @@ use cterm_ui::text_sizing::{
 };
 use cterm_ui::theme::Theme;
 
+use crate::broadcast::{broadcast_to_peers, KeyRoute};
 use crate::keyboard::{
     associated_text_for_gdk_key, gtk_state_to_modifiers, keyval_to_key, reported_key_from_gdk,
     should_route_enhanced_key, ReportedKey,
@@ -128,9 +129,16 @@ pub struct TerminalWidget {
     dnd_destination: Rc<RefCell<DndDestination>>,
     /// Shared Kitty OSC 72 source-side state for outbound drags. Command
     /// routing lives here; the live `GtkDragSource` session that consumes
-    /// `BeginOsDrag` is built in `apply_dnd_source_actions` (see the
+    /// [`OsDragOffer`] on `BeginOsDrag` is built in `apply_dnd_source_actions` (see the
     /// gesture-arbitration policy on [`SOURCE_DRAG_THRESHOLD_PX`]).
     dnd_source: Rc<RefCell<DndSource>>,
+    /// Loaded background image (`[appearance] background_image`), shared
+    /// with the draw closure. Loaded once via [`TerminalWidget::set_background_image`].
+    background_image: Rc<RefCell<Option<LoadedBackgroundImage>>>,
+    /// Per-tab broadcast-input wiring (tmux `synchronize-panes` semantics).
+    /// Shared with every pane widget of the tab; the window refreshes peers
+    /// whenever panes are built or rebuilt. See `crate::broadcast`.
+    broadcast: Rc<RefCell<crate::broadcast::BroadcastState>>,
     /// Live outbound-drag `GtkDragSource`, if one is attached. Created upfront
     /// in `setup_source_drag` and configured from each negotiated
     /// [`OsDragOffer`] on `BeginOsDrag`; torn down on `CancelOsDrag`/drag-end.
@@ -174,6 +182,30 @@ impl TerminalWidget {
         if let Some(ref tx) = self.daemon_cmd_tx {
             let _ = tx.send(DaemonCommand::Detach);
         }
+    }
+
+    /// Shared broadcast-input wiring for this pane's tab.
+    pub(crate) fn broadcast_state(&self) -> Rc<RefCell<crate::broadcast::BroadcastState>> {
+        Rc::clone(&self.broadcast)
+    }
+
+    /// Load the configured background image, if any. Called once per widget
+    /// at build time; missing or undecodable files log a warning and leave
+    /// no image (there is no hot reload yet).
+    pub fn set_background_image(
+        &self,
+        path: Option<&std::path::Path>,
+        opacity: f64,
+        fit: cterm_app::config::BackgroundImageFit,
+    ) {
+        let loaded = path
+            .and_then(load_background_image)
+            .map(|surface| LoadedBackgroundImage {
+                surface,
+                opacity: opacity.clamp(0.0, 1.0),
+                fit,
+            });
+        *self.background_image.borrow_mut() = loaded;
     }
 
     /// Tell the daemon to clear the bell/alert state for this session.
@@ -364,21 +396,62 @@ impl TerminalWidget {
     ///
     /// Returns the number of matches found. If matches are found, scrolls to the first match.
     pub fn find(&self, pattern: &str, case_sensitive: bool, regex: bool) -> usize {
-        let term = self.terminal.lock();
-        let results = term.find(pattern, case_sensitive, regex);
+        let results = {
+            let term = self.terminal.lock();
+            term.find(pattern, case_sensitive, regex)
+        };
         let count = results.len();
 
-        if let Some(first) = results.first() {
-            // Need to release the lock before we can take mutable lock
-            let line_idx = first.line;
+        {
+            let mut term = self.terminal.lock();
+            term.screen_mut().set_find_matches(results);
+            if let Some(active) = term.screen().active_find_match() {
+                let line_idx = active.line;
+                drop(term);
+
+                let mut term = self.terminal.lock();
+                term.scroll_to_line(line_idx);
+                self.drawing_area.queue_draw();
+            }
+        }
+
+        count
+    }
+
+    /// Cycle to the next find match, scrolling it into view.
+    pub fn find_next(&self) -> bool {
+        let mut term = self.terminal.lock();
+        if !term.screen_mut().find_next() {
+            return false;
+        }
+        if let Some(active) = term.screen().active_find_match() {
+            let line_idx = active.line;
             drop(term);
 
             let mut term = self.terminal.lock();
             term.scroll_to_line(line_idx);
             self.drawing_area.queue_draw();
+            return true;
         }
+        false
+    }
 
-        count
+    /// Cycle to the previous find match, scrolling it into view.
+    pub fn find_previous(&self) -> bool {
+        let mut term = self.terminal.lock();
+        if !term.screen_mut().find_previous() {
+            return false;
+        }
+        if let Some(active) = term.screen().active_find_match() {
+            let line_idx = active.line;
+            drop(term);
+
+            let mut term = self.terminal.lock();
+            term.scroll_to_line(line_idx);
+            self.drawing_area.queue_draw();
+            return true;
+        }
+        false
     }
 
     /// Search and return all matches (for iteration/highlighting)
@@ -519,6 +592,20 @@ impl TerminalWidget {
         }
     }
 
+    /// MIME payloads for rich copy: plain text first so text targets keep
+    /// working, HTML second for rich targets (Ghostty multi-MIME parity).
+    /// Pure data (no GTK calls) so the contract stays headless-testable;
+    /// providers are built at the call site on the main thread.
+    pub(crate) fn rich_clipboard_contents<'a>(
+        text: &'a str,
+        html: &'a str,
+    ) -> [(&'static str, &'a [u8]); 2] {
+        [
+            ("text/plain;charset=utf-8", text.as_bytes()),
+            ("text/html", html.as_bytes()),
+        ]
+    }
+
     /// Copy the current selection to clipboard as HTML
     pub fn copy_selection_html(&self) {
         let term = self.terminal.lock();
@@ -526,14 +613,27 @@ impl TerminalWidget {
         let text = term.screen().get_selected_text();
         drop(term);
 
-        if let (Some(html), Some(_text)) = (html, text) {
+        if let (Some(html), Some(text)) = (html, text) {
             if let Some(display) = gdk::Display::default() {
                 let clipboard = display.clipboard();
-                // GTK4 clipboard can hold multiple formats via ContentProvider
-                // For simplicity, we set HTML as text - most apps will interpret it
-                // A full implementation would use ContentProvider with multiple MIME types
-                clipboard.set_text(&html);
-                log::debug!("Copied {} chars as HTML to clipboard", html.len());
+                let mut providers = Vec::with_capacity(2);
+                for (mime, bytes) in Self::rich_clipboard_contents(&text, &html) {
+                    providers.push(gdk::ContentProvider::for_bytes(
+                        mime,
+                        &glib::Bytes::from(bytes),
+                    ));
+                }
+                let union = gdk::ContentProvider::new_union(&providers);
+                match clipboard.set_content(Some(&union)) {
+                    Ok(()) => log::debug!(
+                        "Copied {} plain / {} HTML chars to clipboard",
+                        text.len(),
+                        html.len()
+                    ),
+                    Err(error) => {
+                        log::warn!("Failed to set rich clipboard content: {error}");
+                    }
+                }
             }
         }
     }
@@ -819,6 +919,7 @@ impl TerminalWidget {
         let sprite_cache = Rc::clone(&self.sprite_cache);
         let blink_clock = Rc::clone(&self.blink_clock);
         let visual_bell_flash = Rc::clone(&self.visual_bell_flash);
+        let background_image = Rc::clone(&self.background_image);
 
         self.drawing_area
             .set_draw_func(move |_area, cr, _width, _height| {
@@ -844,6 +945,7 @@ impl TerminalWidget {
                     cell_dims: dims,
                     background_override: bg_override,
                     visual_bell_flash: flash,
+                    background_image: background_image.borrow().clone(),
                 };
                 let mut sprites = sprite_cache.borrow_mut();
                 let blink_phase = blink_clock.borrow().phase();
@@ -900,16 +1002,27 @@ impl TerminalWidget {
 
         // IM commit: receives confirmed text from the input method
         let terminal_commit = Arc::clone(&terminal);
+        let broadcast_commit = Rc::clone(&self.broadcast);
+        let broadcast_commit_own = Arc::clone(&terminal);
         let drawing_area_commit = self.drawing_area.clone();
         im_context.connect_commit(move |_, text| {
             let mut term = terminal_commit.lock();
             term.scroll_viewport_to_bottom();
+            let route = KeyRoute::Text(text.to_string());
             let encoded = term.handle_text_input(text);
             if !encoded.is_empty() {
                 if let Err(e) = term.write(&encoded) {
                     log::error!("Failed to write IM text to PTY: {}", e);
                 }
             }
+            drop(term);
+            broadcast_to_peers(
+                &broadcast_commit,
+                &broadcast_commit_own,
+                &route,
+                Modifiers::empty(),
+                KeyEventKind::Press,
+            );
             drawing_area_commit.queue_draw();
         });
 
@@ -958,6 +1071,8 @@ impl TerminalWidget {
 
         // Key press handler
         let terminal_key = Arc::clone(&terminal);
+        let broadcast_key = Rc::clone(&self.broadcast);
+        let broadcast_own = Arc::clone(&terminal);
         let im_key = im_context.clone();
         let enhanced_keys_down = Rc::clone(&enhanced_keys);
         key_controller.connect_key_pressed(move |controller, keyval, keycode, state| {
@@ -995,6 +1110,12 @@ impl TerminalWidget {
                     };
                     let associated_text =
                         associated_text_for_gdk_key(reported.key, keyval, modifiers);
+                    let route = KeyRoute::Enhanced {
+                        key: reported.key,
+                        shifted: reported.shifted_key,
+                        base: reported.base_layout_key,
+                        text: associated_text.clone(),
+                    };
                     let metadata = reported
                         .metadata()
                         .with_associated_text(associated_text.as_deref());
@@ -1005,6 +1126,8 @@ impl TerminalWidget {
                             log::error!("Failed to write enhanced key event to PTY: {e}");
                         }
                     }
+                    drop(term);
+                    broadcast_to_peers(&broadcast_key, &broadcast_own, &route, modifiers, kind);
                     return glib::Propagation::Stop;
                 }
             }
@@ -1013,11 +1136,20 @@ impl TerminalWidget {
 
             // Handle special keys (arrows, function keys, etc.)
             if let Some(key) = keyval_to_key(keyval) {
+                let route = KeyRoute::Special(key);
                 let mut term = terminal_key.lock();
                 if let Some(bytes) = term.handle_key(key, modifiers) {
                     if let Err(e) = term.write(&bytes) {
                         log::error!("Failed to write to PTY: {}", e);
                     }
+                    drop(term);
+                    broadcast_to_peers(
+                        &broadcast_key,
+                        &broadcast_own,
+                        &route,
+                        modifiers,
+                        KeyEventKind::Press,
+                    );
                     return glib::Propagation::Stop;
                 }
             }
@@ -1043,12 +1175,21 @@ impl TerminalWidget {
                         if let Err(e) = term.write(&[byte]) {
                             log::error!("Failed to write to PTY: {}", e);
                         }
+                        drop(term);
+                        broadcast_to_peers(
+                            &broadcast_key,
+                            &broadcast_own,
+                            &KeyRoute::CtrlByte(byte),
+                            modifiers,
+                            KeyEventKind::Press,
+                        );
                         return glib::Propagation::Stop;
                     }
                 }
 
                 // Handle Alt+key -> ESC + key
                 if has_alt && !has_ctrl {
+                    let route = KeyRoute::AltChar(c);
                     let mut term = terminal_key.lock();
                     let mut buf = vec![0x1b]; // ESC
                     let mut char_buf = [0u8; 4];
@@ -1057,6 +1198,14 @@ impl TerminalWidget {
                     if let Err(e) = term.write(&buf) {
                         log::error!("Failed to write to PTY: {}", e);
                     }
+                    drop(term);
+                    broadcast_to_peers(
+                        &broadcast_key,
+                        &broadcast_own,
+                        &route,
+                        modifiers,
+                        KeyEventKind::Press,
+                    );
                     return glib::Propagation::Stop;
                 }
 
@@ -1066,12 +1215,21 @@ impl TerminalWidget {
                     let mut term = terminal_key.lock();
                     let mut buf = [0u8; 4];
                     let s = c.encode_utf8(&mut buf);
+                    let route = KeyRoute::Text(s.to_string());
                     let encoded = term.handle_text_input(s);
                     if !encoded.is_empty() {
                         if let Err(e) = term.write(&encoded) {
                             log::error!("Failed to write to PTY: {}", e);
                         }
                     }
+                    drop(term);
+                    broadcast_to_peers(
+                        &broadcast_key,
+                        &broadcast_own,
+                        &route,
+                        modifiers,
+                        KeyEventKind::Press,
+                    );
                     return glib::Propagation::Stop;
                 }
             }
@@ -1083,10 +1241,18 @@ impl TerminalWidget {
         // kitty event mode; all other releases still reach the IM context.
         let im_release = im_context.clone();
         let terminal_release = Arc::clone(&terminal);
+        let broadcast_release = Rc::clone(&self.broadcast);
+        let broadcast_release_own = Arc::clone(&terminal);
         let enhanced_keys_up = Rc::clone(&enhanced_keys);
         key_controller.connect_key_released(move |controller, _keyval, keycode, state| {
             if let Some(reported) = enhanced_keys_up.borrow_mut().remove(&keycode) {
                 let modifiers = gtk_state_to_modifiers(state);
+                let route = KeyRoute::Enhanced {
+                    key: reported.key,
+                    shifted: reported.shifted_key,
+                    base: reported.base_layout_key,
+                    text: None,
+                };
                 let mut term = terminal_release.lock();
                 if let Some(bytes) = term.handle_reported_key_release_with_metadata(
                     reported.key,
@@ -1097,6 +1263,14 @@ impl TerminalWidget {
                         log::error!("Failed to write enhanced key release to PTY: {e}");
                     }
                 }
+                drop(term);
+                broadcast_to_peers(
+                    &broadcast_release,
+                    &broadcast_release_own,
+                    &route,
+                    modifiers,
+                    KeyEventKind::Release,
+                );
                 return;
             }
             if let Some(event) = controller.current_event() {
@@ -2159,12 +2333,19 @@ impl TerminalWidget {
             visual_bell_flash: Rc::new(RefCell::new(None)),
             dnd_destination: Rc::new(RefCell::new(DndDestination::default())),
             dnd_source: Rc::new(RefCell::new(DndSource::default())),
+            background_image: Rc::new(RefCell::new(None)),
+            broadcast: Rc::new(RefCell::new(crate::broadcast::BroadcastState::default())),
             dnd_drag_session: Rc::new(RefCell::new(None)),
             source_gesture_anchor: Rc::new(RefCell::new(None)),
             daemon_cmd_tx: Some(cmd_tx.clone()),
         };
 
         let daemon_socket = session.socket_path().map(|p| p.to_owned());
+        widget.set_background_image(
+            config.appearance.background_image.as_deref(),
+            config.appearance.background_image_opacity,
+            config.appearance.background_image_fit,
+        );
         widget.setup_drawing();
         widget.setup_blink_clock();
         widget.setup_visibility_reporting();
@@ -2261,12 +2442,19 @@ impl TerminalWidget {
             visual_bell_flash: Rc::new(RefCell::new(None)),
             dnd_destination: Rc::new(RefCell::new(DndDestination::default())),
             dnd_source: Rc::new(RefCell::new(DndSource::default())),
+            background_image: Rc::new(RefCell::new(None)),
+            broadcast: Rc::new(RefCell::new(crate::broadcast::BroadcastState::default())),
             dnd_drag_session: Rc::new(RefCell::new(None)),
             source_gesture_anchor: Rc::new(RefCell::new(None)),
             daemon_cmd_tx: Some(cmd_tx.clone()),
         };
 
         let daemon_socket = recon.handle.socket_path().map(|p| p.to_owned());
+        widget.set_background_image(
+            config.appearance.background_image.as_deref(),
+            config.appearance.background_image_opacity,
+            config.appearance.background_image_fit,
+        );
         widget.setup_drawing();
         widget.setup_blink_clock();
         widget.setup_visibility_reporting();
@@ -3346,6 +3534,96 @@ struct RenderConfig<'a> {
     /// Active Kitty visual-bell tint, resolved (and expiry-checked) at draw
     /// time. `None` means no tint.
     visual_bell_flash: Option<cterm_core::color::Rgb>,
+    /// Loaded background image, if configured. Painted under default cell
+    /// backgrounds; explicit cell colors still cover it.
+    background_image: Option<LoadedBackgroundImage>,
+}
+
+/// A decoded background image ready to paint.
+#[derive(Clone)]
+struct LoadedBackgroundImage {
+    surface: cairo::ImageSurface,
+    opacity: f64,
+    fit: cterm_app::config::BackgroundImageFit,
+}
+
+/// Destination rectangle for a background image inside its area.
+///
+/// Returns `None` for tiling (the caller repeats the surface instead).
+/// Cover crops overflow, contain letterboxes, stretch ignores aspect ratio.
+/// All coordinates are in area pixels; the caller clips to the area.
+fn background_image_dest(
+    image_width: f64,
+    image_height: f64,
+    area_width: f64,
+    area_height: f64,
+    fit: cterm_app::config::BackgroundImageFit,
+) -> Option<(f64, f64, f64, f64)> {
+    use cterm_app::config::BackgroundImageFit;
+    if image_width <= 0.0 || image_height <= 0.0 || area_width <= 0.0 || area_height <= 0.0 {
+        return Some((0.0, 0.0, 0.0, 0.0));
+    }
+    match fit {
+        BackgroundImageFit::Stretch => Some((0.0, 0.0, area_width, area_height)),
+        BackgroundImageFit::Tile => None,
+        BackgroundImageFit::Contain => {
+            let scale = (area_width / image_width).min(area_height / image_height);
+            let width = image_width * scale;
+            let height = image_height * scale;
+            Some((
+                (area_width - width) / 2.0,
+                (area_height - height) / 2.0,
+                width,
+                height,
+            ))
+        }
+        BackgroundImageFit::Cover => {
+            let scale = (area_width / image_width).max(area_height / image_height);
+            let width = image_width * scale;
+            let height = image_height * scale;
+            Some((
+                (area_width - width) / 2.0,
+                (area_height - height) / 2.0,
+                width,
+                height,
+            ))
+        }
+    }
+}
+
+/// Decode a background image file into a paintable Cairo surface.
+/// Returns `None` (with a warning) for missing/undecodable/empty images.
+fn load_background_image(path: &std::path::Path) -> Option<cairo::ImageSurface> {
+    let bytes = std::fs::read(path)
+        .map_err(|error| {
+            log::warn!("Background image unreadable {}: {error}", path.display());
+        })
+        .ok()?;
+    let decoded = cterm_core::image_decode::decode_image(&bytes)
+        .map_err(|error| {
+            log::warn!("Background image undecodable {}: {error}", path.display());
+        })
+        .ok()?;
+    if decoded.width == 0 || decoded.height == 0 {
+        return None;
+    }
+    let Some(pixels) = cterm_ui::rgba_to_premultiplied_bgra(&decoded.data) else {
+        log::warn!("Background image has invalid RGBA data: {}", path.display());
+        return None;
+    };
+    let width = decoded.width as i32;
+    let height = decoded.height as i32;
+    let Ok(stride) = cairo::Format::ARgb32.stride_for_width(decoded.width as u32) else {
+        return None;
+    };
+    cairo::ImageSurface::create_for_data(pixels, cairo::Format::ARgb32, width, height, stride)
+        .map_err(|error| {
+            log::warn!(
+                "Background image surface failed {}: {error:?}",
+                path.display()
+            );
+        })
+        .ok()
 }
 
 /// Alpha of the Kitty visual-bell fullscreen tint.
@@ -3356,6 +3634,11 @@ fn configure_terminal_cursor(terminal: &mut Terminal, config: &Config) {
         config.appearance.cursor_style.core_style(),
         config.appearance.cursor_blink,
     );
+    // Terminal-level notification policy lives here too so every setup path
+    // (fresh tabs, reconnects, upgrades) installs it exactly once.
+    terminal
+        .screen_mut()
+        .set_command_finish_policy(config.notifications.to_command_finish_policy());
 }
 
 /// Draw the terminal contents
@@ -3409,6 +3692,20 @@ fn draw_terminal(
     let rows = grid.height();
     let cols = grid.width();
     let visible_top = screen.visible_row_to_absolute_line(0);
+
+    // Background image under default cell backgrounds (explicit cell
+    // colors, selections, and find highlights still cover it).
+    let has_background_image = config.background_image.is_some();
+    if let Some(image) = &config.background_image {
+        paint_background_image(
+            cr,
+            &image.surface,
+            image.opacity,
+            image.fit,
+            cols as f64 * cell_width,
+            rows as f64 * cell_height,
+        );
+    }
 
     draw_terminal_images(
         cr,
@@ -3513,14 +3810,41 @@ fn draw_terminal(
                 };
 
                 // Draw background (always draw for selected cells to show highlight)
-                let needs_bg = cell.bg != Color::Default
+                // Find matches tint underneath everything except selection:
+                // passive matches wash in selection color, the active match
+                // paints it solid.
+                let find_match = (!is_selected)
+                    .then(|| screen.find_match_at(absolute_line, col_idx))
+                    .flatten();
+                // A background image shows through default cell backgrounds;
+                // explicit colors, inversion, selection, and find highlights
+                // still paint over it.
+                let default_bg_transparent = has_background_image
+                    && cell.bg == Color::Default
+                    && !is_inverted
+                    && !is_selected
+                    && find_match.is_none();
+                let needs_bg = (cell.bg != Color::Default
                     || is_inverted
                     || is_selected
-                    || screen.modes.reverse_video;
+                    || find_match.is_some()
+                    || screen.modes.reverse_video)
+                    && !default_bg_transparent;
 
                 if !render_foreground && needs_bg {
-                    let bg_color =
-                        if let Some(sel) = is_selected.then_some(kitty_selection_bg).flatten() {
+                    if let Some(active) = find_match {
+                        let (r, g, b) = palette.selection.to_f64();
+                        if active {
+                            cr.set_source_rgb(r, g, b);
+                        } else {
+                            cr.set_source_rgba(r, g, b, 0.35);
+                        }
+                        cr.rectangle(x, y, char_width, char_height);
+                        cr.fill().ok();
+                    } else {
+                        let bg_color = if let Some(sel) =
+                            is_selected.then_some(kitty_selection_bg).flatten()
+                        {
                             // An explicit Kitty selection background replaces the
                             // reverse-video selection highlight.
                             sel
@@ -3537,11 +3861,12 @@ fn draw_terminal(
                             screen.resolve_color(cell.bg, palette)
                         };
 
-                    let (r, g, b) = bg_color.to_f64();
-                    cr.set_source_rgb(r, g, b);
+                        let (r, g, b) = bg_color.to_f64();
+                        cr.set_source_rgb(r, g, b);
 
-                    cr.rectangle(x, y, char_width, char_height);
-                    cr.fill().ok();
+                        cr.rectangle(x, y, char_width, char_height);
+                        cr.fill().ok();
+                    }
                 }
 
                 // Draw character
@@ -4092,6 +4417,46 @@ fn draw_sprite(
     cr.restore().ok();
 }
 
+/// Paint a configured background image under the terminal grid.
+///
+/// Cover crops overflow, contain letterboxes over the base background,
+/// stretch ignores aspect ratio, and tile repeats at native size.
+/// Runs on the caller's clip; zero opacity or empty areas paint nothing.
+fn paint_background_image(
+    cr: &cairo::Context,
+    surface: &cairo::ImageSurface,
+    opacity: f64,
+    fit: cterm_app::config::BackgroundImageFit,
+    area_width: f64,
+    area_height: f64,
+) {
+    use cterm_app::config::BackgroundImageFit;
+    if opacity <= 0.0 || area_width <= 0.0 || area_height <= 0.0 {
+        return;
+    }
+    let _ = cr.save();
+    if fit == BackgroundImageFit::Tile {
+        let pattern = cairo::SurfacePattern::create(surface);
+        pattern.set_extend(cairo::Extend::Repeat);
+        let _ = cr.set_source(&pattern);
+        cr.rectangle(0.0, 0.0, area_width, area_height);
+        let _ = cr.paint_with_alpha(opacity);
+        let _ = cr.restore();
+        return;
+    }
+    let image_width = f64::from(surface.width());
+    let image_height = f64::from(surface.height());
+    if let Some((x, y, width, height)) =
+        background_image_dest(image_width, image_height, area_width, area_height, fit)
+    {
+        cr.translate(x, y);
+        cr.scale(width / image_width, height / image_height);
+        let _ = cr.set_source_surface(surface, 0.0, 0.0);
+        let _ = cr.paint_with_alpha(opacity);
+    }
+    let _ = cr.restore();
+}
+
 /// Draw the terminal's decoded inline images with Cairo.
 fn draw_terminal_images(
     cr: &cairo::Context,
@@ -4217,6 +4582,46 @@ mod tests {
         let fallback = CellDimensions::conservative_fallback(f64::NAN);
         assert_eq!(fallback.width, 9.0);
         assert_eq!(fallback.height, 18.0);
+    }
+
+    #[test]
+    fn rich_copy_advertises_plain_and_html_mime_types() {
+        let pairs = TerminalWidget::rich_clipboard_contents("hi", "<b>hi</b>");
+        assert_eq!(pairs.len(), 2);
+        assert_eq!(pairs[0].0, "text/plain;charset=utf-8");
+        assert_eq!(pairs[0].1, b"hi");
+        assert_eq!(pairs[1].0, "text/html");
+        assert_eq!(pairs[1].1, b"<b>hi</b>");
+    }
+
+    #[test]
+    fn background_image_dest_matches_fit_semantics() {
+        use cterm_app::config::BackgroundImageFit;
+        // Stretch fills exactly.
+        assert_eq!(
+            background_image_dest(100.0, 50.0, 200.0, 200.0, BackgroundImageFit::Stretch),
+            Some((0.0, 0.0, 200.0, 200.0))
+        );
+        // Contain letterboxes a wide image.
+        assert_eq!(
+            background_image_dest(100.0, 50.0, 200.0, 200.0, BackgroundImageFit::Contain),
+            Some((0.0, 50.0, 200.0, 100.0))
+        );
+        // Cover crops a wide image.
+        assert_eq!(
+            background_image_dest(100.0, 50.0, 200.0, 200.0, BackgroundImageFit::Cover),
+            Some((-100.0, 0.0, 400.0, 200.0))
+        );
+        // Tile repeats at native size (no rect).
+        assert_eq!(
+            background_image_dest(100.0, 50.0, 200.0, 200.0, BackgroundImageFit::Tile),
+            None
+        );
+        // Degenerate inputs paint nothing.
+        assert_eq!(
+            background_image_dest(0.0, 50.0, 200.0, 200.0, BackgroundImageFit::Cover),
+            Some((0.0, 0.0, 0.0, 0.0))
+        );
     }
 
     #[test]

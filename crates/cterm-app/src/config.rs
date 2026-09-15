@@ -194,8 +194,11 @@ impl TransferConfig {
 /// # allow_types = ["email"] # a listed t= is required when non-empty
 /// # deny_types = ["marketing"]
 /// # filter_rules = ["app:spammy or body:\"(?i)promo\""]  # matching rules deny
+/// # command_finished = false        # notify when shell commands finish
+/// # command_finished_min_secs = 5   # only commands running at least this long
+/// # command_finished_only_unfocused = true  # only while the window is hidden
 /// ```
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct NotificationConfig {
     /// `f=` names that may deliver when non-empty.
@@ -214,6 +217,39 @@ pub struct NotificationConfig {
     /// logged and ignored).
     #[serde(default)]
     pub filter_rules: Vec<String>,
+    /// Notify when a shell command finishes (Ghostty notify-on-command-finish
+    /// semantics over OSC 133 `C`/`D` markers). Off by default.
+    #[serde(default)]
+    pub command_finished: bool,
+    /// Minimum command runtime in seconds before notifying.
+    #[serde(default = "default_command_finished_min_secs")]
+    pub command_finished_min_secs: u64,
+    /// Only notify while the issuing window is hidden.
+    #[serde(default = "default_command_finished_only_unfocused")]
+    pub command_finished_only_unfocused: bool,
+}
+
+fn default_command_finished_min_secs() -> u64 {
+    5
+}
+
+fn default_command_finished_only_unfocused() -> bool {
+    true
+}
+
+impl Default for NotificationConfig {
+    fn default() -> Self {
+        Self {
+            allow_apps: Vec::new(),
+            deny_apps: Vec::new(),
+            allow_types: Vec::new(),
+            deny_types: Vec::new(),
+            filter_rules: Vec::new(),
+            command_finished: false,
+            command_finished_min_secs: default_command_finished_min_secs(),
+            command_finished_only_unfocused: default_command_finished_only_unfocused(),
+        }
+    }
 }
 
 impl NotificationConfig {
@@ -238,6 +274,15 @@ impl NotificationConfig {
     /// allow everything, today's behavior).
     pub fn is_allow_all(&self) -> bool {
         self.to_filter().is_allow_all()
+    }
+
+    /// Compile to the command-finished notification policy.
+    pub fn to_command_finish_policy(&self) -> cterm_core::notifications::CommandFinishPolicy {
+        cterm_core::notifications::CommandFinishPolicy {
+            enabled: self.command_finished,
+            min_duration: std::time::Duration::from_secs(self.command_finished_min_secs),
+            only_when_unfocused: self.command_finished_only_unfocused,
+        }
     }
 }
 
@@ -287,6 +332,12 @@ pub struct GeneralConfig {
     pub copy_on_select: bool,
     /// Working directory for new tabs
     pub working_directory: Option<PathBuf>,
+    /// New tabs start in the active pane's foreground directory.
+    #[serde(default = "default_true")]
+    pub tab_inherit_cwd: bool,
+    /// New split panes start in the active pane's foreground directory.
+    #[serde(default = "default_true")]
+    pub split_inherit_cwd: bool,
     /// Environment variables to set
     pub env: HashMap<String, String>,
     /// TERM environment variable (default: xterm-256color)
@@ -305,11 +356,28 @@ impl Default for GeneralConfig {
             confirm_close_with_running: true,
             copy_on_select: false,
             working_directory: None,
+            tab_inherit_cwd: true,
+            split_inherit_cwd: true,
             env: HashMap::new(),
             term: None,
             show_debug_menu: false,
         }
     }
+}
+
+/// How a background image fills the terminal window.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum BackgroundImageFit {
+    /// Scale to cover the window, cropping overflow.
+    #[default]
+    Cover,
+    /// Scale to fit inside the window, letterboxing the rest.
+    Contain,
+    /// Stretch to the window exactly, ignoring aspect ratio.
+    Stretch,
+    /// Tile at native size.
+    Tile,
 }
 
 /// Appearance settings
@@ -328,6 +396,13 @@ pub struct AppearanceConfig {
     pub cursor_blink: bool,
     /// Opacity (0.0 - 1.0)
     pub opacity: f64,
+    /// Background image file (absolute path recommended). Painted under
+    /// default cell backgrounds; explicit cell colors still cover it.
+    pub background_image: Option<PathBuf>,
+    /// Background image opacity (0.0 - 1.0).
+    pub background_image_opacity: f64,
+    /// Background image fit within the window.
+    pub background_image_fit: BackgroundImageFit,
     /// Padding around terminal content
     pub padding: u32,
     /// Enable bold text
@@ -343,6 +418,9 @@ impl Default for AppearanceConfig {
             cursor_style: CursorStyleConfig::Block,
             cursor_blink: true,
             opacity: 1.0,
+            background_image: None,
+            background_image_opacity: 1.0,
+            background_image_fit: BackgroundImageFit::default(),
             padding: 4,
             bold_is_bright: false,
         }
@@ -670,6 +748,7 @@ pub struct ShortcutsConfig {
     pub resize_pane_up: String,
     pub resize_pane_down: String,
     pub toggle_pane_zoom: String,
+    pub broadcast_input: String,
     pub next_tab: String,
     pub prev_tab: String,
     pub new_window: String,
@@ -688,6 +767,8 @@ pub struct ShortcutsConfig {
     pub prompt_next: String,
     pub preferences: String,
     pub find: String,
+    pub find_next: String,
+    pub find_previous: String,
     pub reset: String,
 }
 
@@ -708,6 +789,7 @@ impl Default for ShortcutsConfig {
             resize_pane_up: "Ctrl+Alt+Shift+Up".into(),
             resize_pane_down: "Ctrl+Alt+Shift+Down".into(),
             toggle_pane_zoom: "Ctrl+Shift+Enter".into(),
+            broadcast_input: "Ctrl+Shift+Y".into(),
             next_tab: "Ctrl+Tab".into(),
             prev_tab: "Ctrl+Shift+Tab".into(),
             new_window: "Ctrl+Shift+N".into(),
@@ -726,6 +808,8 @@ impl Default for ShortcutsConfig {
             prompt_next: "Ctrl+Shift+X".into(),
             preferences: "Ctrl+Comma".into(),
             find: "Ctrl+Shift+F".into(),
+            find_next: "F3".into(),
+            find_previous: "Shift+F3".into(),
             reset: "Ctrl+Shift+R".into(),
         }
     }
@@ -1446,6 +1530,18 @@ mod tests {
         let config = Config::default();
         assert_eq!(config.general.scrollback_lines, 10000);
         assert!(config.general.confirm_close_with_running);
+        // Working-directory inheritance is on unless configured off.
+        assert!(config.general.tab_inherit_cwd);
+        assert!(config.general.split_inherit_cwd);
+    }
+
+    #[test]
+    fn test_working_directory_inheritance_parses() {
+        let config: Config =
+            toml::from_str("[general]\ntab_inherit_cwd = false\nsplit_inherit_cwd = false\n")
+                .unwrap();
+        assert!(!config.general.tab_inherit_cwd);
+        assert!(!config.general.split_inherit_cwd);
     }
 
     #[test]
@@ -1947,10 +2043,18 @@ mod tests {
             allow_types: vec!["email".into()],
             deny_types: vec![],
             filter_rules: vec!["body:secret".into()],
+            command_finished: true,
+            command_finished_min_secs: 10,
+            command_finished_only_unfocused: false,
         };
         let serialized = toml::to_string_pretty(&config).unwrap();
         assert!(serialized.contains("allow_apps"));
+        assert!(serialized.contains("command_finished"));
         let parsed: NotificationConfig = toml::from_str(&serialized).unwrap();
         assert_eq!(parsed, config);
+        let policy = parsed.to_command_finish_policy();
+        assert!(policy.enabled);
+        assert_eq!(policy.min_duration, std::time::Duration::from_secs(10));
+        assert!(!policy.only_when_unfocused);
     }
 }

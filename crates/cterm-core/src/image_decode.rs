@@ -1,7 +1,8 @@
 //! Image decoding for terminal graphics
 //!
-//! Decodes PNG, JPEG, and GIF images to RGBA pixel data suitable for display
-//! in the terminal.
+//! Decodes PNG (including animated PNG default images), JPEG, GIF, WebP,
+//! and NetPBM images to RGBA pixel data suitable for display in the
+//! terminal.
 
 use image::GenericImageView;
 use std::io::Cursor;
@@ -32,7 +33,7 @@ pub struct DecodedImage {
     pub height: usize,
 }
 
-/// Decode an image from raw bytes (PNG, JPEG, or GIF)
+/// Decode an image from raw bytes (PNG, JPEG, GIF, WebP, or NetPBM).
 ///
 /// Returns RGBA pixel data and dimensions. For GIF, only the first frame is decoded.
 pub fn decode_image(data: &[u8]) -> Result<DecodedImage, ImageDecodeError> {
@@ -94,6 +95,25 @@ pub fn looks_like_image(data: &[u8]) -> bool {
         return true;
     }
 
+    // NetPBM magic: P1-P7 followed by whitespace (P7 needs a newline and
+    // the PAM header, but the two-byte prefix is enough to route).
+    if data.len() >= 3
+        && data[0] == b'P'
+        && matches!(data[1], b'1'..=b'7')
+        && data[2].is_ascii_whitespace()
+    {
+        return true;
+    }
+
+    if data.len() < 12 {
+        return false;
+    }
+
+    // WebP magic: RIFF....WEBP
+    if data.starts_with(b"RIFF") && data[8..12] == *b"WEBP" {
+        return true;
+    }
+
     false
 }
 
@@ -114,6 +134,16 @@ mod tests {
         // GIF
         assert!(looks_like_image(b"GIF89a"));
         assert!(looks_like_image(b"GIF87a"));
+
+        // WebP (RIFF....WEBP)
+        assert!(looks_like_image(b"RIFF\x24\x00\x00\x00WEBPVP8 "));
+        assert!(!looks_like_image(b"RIFF\x24\x00\x00\x00AVI "));
+
+        // NetPBM (P1-P7 plus whitespace)
+        assert!(looks_like_image(b"P6\n2 2\n255\n"));
+        assert!(looks_like_image(b"P3 1 1 15 "));
+        assert!(!looks_like_image(b"P8\n"));
+        assert!(!looks_like_image(b"PX\n"));
 
         // Not an image
         assert!(!looks_like_image(b"Hello, World!"));
@@ -148,5 +178,36 @@ mod tests {
         assert_eq!(img.width, 1);
         assert_eq!(img.height, 1);
         assert_eq!(img.data.len(), 4); // 1x1 RGBA
+    }
+
+    #[test]
+    fn test_decode_webp_lossless_round_trip() {
+        use image::codecs::webp::WebPEncoder;
+        use image::ImageEncoder;
+
+        let rgba = [
+            200, 10, 20, 255, 30, 40, 50, 255, 60, 70, 80, 255, 90, 100, 110, 255,
+        ];
+        let mut encoded = Vec::new();
+        WebPEncoder::new_lossless(&mut encoded)
+            .write_image(&rgba, 2, 2, image::ExtendedColorType::Rgba8)
+            .unwrap();
+        assert!(looks_like_image(&encoded));
+
+        let img = decode_image(&encoded).expect("lossless WebP must decode");
+        assert_eq!((img.width, img.height), (2, 2));
+        assert_eq!(img.data.as_slice(), &rgba);
+    }
+
+    #[test]
+    fn test_decode_binary_ppm_netpbm() {
+        // Hand-written binary PPM (P6): 2x1 red/green pixels.
+        let mut ppm = b"P6\n2 1\n255\n".to_vec();
+        ppm.extend_from_slice(&[255, 0, 0, 0, 255, 0]);
+        assert!(looks_like_image(&ppm));
+
+        let img = decode_image(&ppm).expect("binary PPM must decode");
+        assert_eq!((img.width, img.height), (2, 1));
+        assert_eq!(img.data.as_slice(), &[255, 0, 0, 255, 0, 255, 0, 255]);
     }
 }

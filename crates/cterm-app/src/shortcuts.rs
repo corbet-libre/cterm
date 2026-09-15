@@ -75,6 +75,7 @@ impl ShortcutManager {
             Action::ResizePane(PaneDirection::Down),
         );
         manager.bind_str(&config.toggle_pane_zoom, Action::TogglePaneZoom);
+        manager.bind_str(&config.broadcast_input, Action::BroadcastInput);
         manager.bind_str(&config.next_tab, Action::NextTab);
         manager.bind_str(&config.prev_tab, Action::PrevTab);
         manager.bind_str(&config.new_window, Action::NewWindow);
@@ -93,6 +94,8 @@ impl ShortcutManager {
         manager.bind_str(&config.prompt_next, Action::PromptNext);
         manager.bind_str(&config.preferences, Action::OpenPreferences);
         manager.bind_str(&config.find, Action::FindText);
+        manager.bind_str(&config.find_next, Action::FindNext);
+        manager.bind_str(&config.find_previous, Action::FindPrevious);
         manager.bind_str(&config.reset, Action::ResetTerminal);
 
         manager
@@ -146,6 +149,7 @@ impl ShortcutManager {
             Action::ResizePane(PaneDirection::Down),
         );
         self.bind(Shortcut::ctrl_shift(KeyCode::Enter), Action::TogglePaneZoom);
+        self.bind(Shortcut::ctrl_shift(KeyCode::Y), Action::BroadcastInput);
         self.bind(
             Shortcut::new(KeyCode::Tab, Modifiers::CTRL),
             Action::NextTab,
@@ -199,6 +203,14 @@ impl ShortcutManager {
         // Other shortcuts
         self.bind(Shortcut::ctrl(KeyCode::Comma), Action::OpenPreferences);
         self.bind(Shortcut::ctrl_shift(KeyCode::F), Action::FindText);
+        self.bind(
+            Shortcut::new(KeyCode::F3, Modifiers::empty()),
+            Action::FindNext,
+        );
+        self.bind(
+            Shortcut::new(KeyCode::F3, Modifiers::SHIFT),
+            Action::FindPrevious,
+        );
 
         // Quick open (Cmd+G on macOS, Ctrl+Shift+G on Linux/Windows)
         #[cfg(target_os = "macos")]
