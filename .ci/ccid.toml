@@ -6,7 +6,22 @@ project = "cterm"
 [checks.linux]
 kind = "commands"
 commands = [["bash", ".ci/linux.sh"]]
+cache_tools = [["rustc", "-vV"], ["cargo", "--version"], ["nix", "--version"]]
 
 [checks.fmt]
 kind = "cargo"
 actions = ["fmt"]
+
+[checks.ui]
+kind = "commands"
+commands = [["bash", ".ci/ui.sh"]]
+cache_tools = [["rustc", "-vV"], ["cargo", "--version"], ["nix", "--version"], ["weston", "--version"]]
+
+[render]
+tool_revision = "77a5ac18542750de020ebf753d22c3200530282b"
+
+[jobs.verify]
+scheduler = "crow"
+checks = ["linux", "fmt", "ui"]
+workflow = "repository-jobs"
+command = ["bash", ".ci/run-cached.sh"]
