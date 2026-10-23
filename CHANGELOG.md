@@ -243,7 +243,7 @@ Daemon-centric architecture: all sessions now run through `ctermd`.
 - Full `devcontainer.json` support with Dockerfile building; auto-detect `devcontainer.json`.
 - Tab color picker and modifier-key support; snap window resize to the character grid.
 - In-app log viewer for debugging; reorganized template UI (General/Docker/Remote tabs).
-- `CLAUDE.md` guidance file and `run.sh` helper.
+- Contributor notes and `run.sh` helper.
 
 ### Fixed
 - Restore window position, size, and all tabs after relaunch.
