@@ -2,12 +2,7 @@ name: Build
 
 on:
   push:
-    branches: [master, main]
     tags: ['v*']
-    paths-ignore: ['docs/**', '*.md', 'LICENSES/**']
-  pull_request:
-    branches: [master, main]
-    paths-ignore: ['docs/**', '*.md', 'LICENSES/**']
   workflow_dispatch:
 
 env:

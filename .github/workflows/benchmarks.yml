@@ -1,24 +1,6 @@
 name: Core benchmarks
 
 on:
-  push:
-    branches: [master, main]
-    paths:
-      - .github/workflows/benchmarks.yml
-      - Cargo.lock
-      - crates/cterm-core/benches/**
-      - crates/cterm-core/Cargo.toml
-  pull_request:
-    branches: [master, main]
-    paths:
-      - .github/workflows/benchmarks.yml
-      - Cargo.lock
-      - crates/cterm-core/benches/**
-      - crates/cterm-core/Cargo.toml
-      - crates/cterm-core/src/**
-      - scripts/check_perf_baseline.sh
-  schedule:
-    - cron: '17 3 * * 1'
   workflow_dispatch:
 
 permissions:
